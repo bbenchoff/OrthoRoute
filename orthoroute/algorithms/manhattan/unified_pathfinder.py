@@ -42,10 +42,18 @@ class Portal:
 
 @dataclass
 class EdgeRec:
-    """Canonical edge record for PathFinder accounting"""
-    owner_net: Optional[str] = None
-    taboo_until_iter: int = 0
-    historical_cost: float = 0.0
+    """Edge record for canonical-edge PathFinder accounting."""
+    __slots__ = ("usage", "owners", "pres_cost", "hist_cost",
+                 "owner_net", "taboo_until_iter", "historical_cost")
+
+    def __init__(self):
+        self.usage = 0
+        self.owners = set()
+        self.pres_cost = 1.0
+        self.hist_cost = 0.0
+        self.owner_net = None
+        self.taboo_until_iter = 0
+        self.historical_cost = 0.0
 
 def canonical_edge_key(layer_id: int, u1: int, v1: int, u2: int, v2: int) -> tuple[int, int, int, int, int]:
     """
@@ -78,15 +86,6 @@ except ImportError:
     RawKernel = None  # No GPU kernel support when CuPy unavailable
     GPU_AVAILABLE = False
 
-class EdgeRec:
-    """Edge record with capacity, ownership, and PathFinder costs"""
-    __slots__ = ("usage", "owners", "pres_cost", "hist_cost")
-
-    def __init__(self):
-        self.usage = 0
-        self.owners = set()     # net_ids currently committed
-        self.pres_cost = 1.0    # present/congestion multiplier
-        self.hist_cost = 0.0    # accumulated history
 
 class SpatialHash:
     """Simple spatial hash for fast DRC collision detection"""
@@ -424,7 +423,7 @@ class UnifiedPathFinder:
         self._taboo = {}  # dict[net_id, set[edge_keys]] - blocked edges per net
         self._clearance_rtrees = {}  # dict[layer_id, rtree.Index] - spatial index per layer
         self._clearance_enabled = RTREE_AVAILABLE
-        self._net_edge_paths = {}  # dict[net_id, list[edge_keys]]
+        self._net_edge_paths = self.net_edge_paths  # alias for legacy references
         self.current_iteration = 0
         self._changed_last_iter = 0
         self._failed_nets_last_iter = set()
@@ -9737,8 +9736,8 @@ class UnifiedPathFinder:
         # Grid pitch for canonical keys
         self._grid_pitch = getattr(self.config, 'grid_pitch', 0.4)
 
-        # Initialize PathFinder edge store
-        self._edge_store = {}  # dict[tuple, EdgeRec]
+        # Initialize PathFinder edge store (alias to unified store)
+        self._edge_store = self.edge_store  # alias for legacy references
 
         # TABOO and clearance systems already initialized in constructor
 
@@ -9865,16 +9864,17 @@ class UnifiedPathFinder:
         current_iter = getattr(self, 'current_iteration', 0)
 
         for k in edge_keys:
-            if k in self.edge_store:
-                rec = self.edge_store[k]
-                if rec.owner_net == net_id:
-                    # Clear ownership
-                    rec.owner_net = None
-                    # Add taboo restriction to prevent immediate reclaim
-                    rec.taboo_until_iter = current_iter + 1
-                    # Increment historical cost for negotiation
-                    rec.historical_cost += 1.0
-                    ripped_edges += 1
+            rec = self.edge_store.get(k)
+            if rec is None:
+                continue
+            if rec.owner_net == net_id:
+                rec.owner_net = None
+            if net_id in rec.owners:
+                rec.owners.discard(net_id)
+            if rec.usage > 0:
+                rec.usage -= 1
+            rec.historical_cost += 1.0  # negotiation memory
+            ripped_edges += 1
 
         # Clear net's path
         if net_id in self.net_edge_paths:
@@ -9950,17 +9950,19 @@ class UnifiedPathFinder:
                                      int(x2/self.geometry.pitch), int(y2/self.geometry.pitch))
 
                 # Get/create edge record
-                if k not in self.edge_store:
-                    self.edge_store[k] = EdgeRec()
+                rec = self.edge_store.get(k)
+                if rec is None:
+                    rec = EdgeRec()
+                    self.edge_store[k] = rec
 
-                rec = self.edge_store[k]
-
-                # If edge is currently owned by different net, this creates contention (overuse)
+                # Capacity/ownership bookkeeping
                 if rec.owner_net is not None and rec.owner_net != net_id:
                     logger.debug(f"[COMMIT] Edge contention: {k} owned by {rec.owner_net}, claimed by {net_id}")
-
-                # Assign ownership to current net
+                    # We still record usage; negotiation will handle overuse later
                 rec.owner_net = net_id
+                rec.usage += 1
+                rec.owners.add(net_id)
+
                 edge_keys_for_net.append(k)
 
                 # Add to R-tree spatial index for clearance checking
@@ -9970,16 +9972,18 @@ class UnifiedPathFinder:
                 logger.debug(f"[COMMIT] Failed to process edge {from_idx} -> {to_idx}: {e}")
                 continue
 
-        # Store net's edge path for rip-up
+        # Persist per-net edge list for rip-up
         self.net_edge_paths[net_id] = edge_keys_for_net
 
-        # TABOO CLEAR: Successful commit clears taboo restrictions
+        # Taboo clear after successful commit
         if net_id in self._taboo:
             cleared_count = len(self._taboo[net_id])
             del self._taboo[net_id]
             logger.debug(f"[TABOO-CLEAR] net={net_id} cleared {cleared_count} taboo edges after commit")
 
+        unique_keys = set(edge_keys_for_net)
         logger.debug(f"[COMMIT] net={net_id}: committed {len(unique_keys)} unique edges")
+        return len(unique_keys)
 
     def update_congestion_costs(self, pres_fac_mult: float = None):
         """Update PathFinder costs after iteration with proper capping"""
@@ -9993,13 +9997,9 @@ class UnifiedPathFinder:
             overfull_count += extra
 
             if extra > 0:
-                # Accumulate historical cost with capping
                 rec.hist_cost = min(rec.hist_cost + self._hist_inc * extra, self._hist_cap)
-                # Increase present cost with capping
-                rec.pres_cost = min(rec.pres_cost * pres_fac_mult, self._pres_cap)
+            rec.pres_cost = min(rec.pres_cost * pres_fac_mult, self._pres_cap)
 
-        # THIS IS THE CRITICAL FIX - real overuse count from actual edge store
-        self.current_overuse = overfull_count
         logger.info(f"[PF-COSTS] Updated {len(self._edge_store)} edge costs, {overfull_count} overfull")
         return overfull_count
 
