@@ -2040,6 +2040,9 @@ class UnifiedPathFinder:
             # Track current iteration for phase switching
             self.current_iteration = iteration
 
+            # Configure mode early - needed for offender selection and routing
+            reroute_only_offenders = getattr(self.config, 'reroute_only_offenders', True)  # Default to incremental
+
             iter_start_time = time.time()
             logger.info(f"[NEGOTIATE] iter={iteration + 1} pres_fac={pres_fac:.3f} overflows=0")
             mode = "GPU" if self.use_gpu else "CPU"
@@ -2082,7 +2085,6 @@ class UnifiedPathFinder:
             # Mode B (incremental): Don't reset usage - only reroute offenders
             # Mode A (classic): Reset all usage and reroute everyone
             cost_update_start = time.time()
-            reroute_only_offenders = getattr(self.config, 'reroute_only_offenders', True)  # Default to incremental
             if not reroute_only_offenders:  # Classic mode A
                 if self.use_gpu:
                     self.edge_present_usage.fill(0.0)
