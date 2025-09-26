@@ -2052,6 +2052,16 @@ class UnifiedPathFinder:
             # PathFinder: Rip up offending nets before routing (not during routing)
             if iteration > 0:  # Don't rip on first iteration
                 offenders_to_rip = self._select_offenders_for_ripup(routing_queue)
+
+                # Guardrail: Never zero offenders while overuse > 0 (prevents deadlock)
+                if len(offenders_to_rip) == 0 and hasattr(self, '_last_overuse_sum') and self._last_overuse_sum > 0:
+                    logger.warning("[GUARDRAIL] Zero offenders with overuse > 0 - thawing frozen nets")
+                    if hasattr(self, '_frozen_nets'):
+                        self._frozen_nets.clear()
+                    total_nets = len(self.net_edge_paths)
+                    force_count = max(4, min(24, total_nets // 20))  # ~5%
+                    offenders_to_rip = self._force_top_k_offenders(force_count)
+
                 for net_id in offenders_to_rip:
                     if net_id in self.routed_nets:
                         self.rip_up_net(net_id)
@@ -2229,6 +2239,29 @@ class UnifiedPathFinder:
                 iteration_survived = successful  # Same as committed in full mode
 
             logger.info(f"[OVERUSE] sum={overuse_sum} edges={overuse_edges} (from {len(self._edge_store)} total edges)")
+
+            # Invariant assertions (cheap and decisive)
+            try:
+                # After commit/analysis: Usage must be non-negative
+                assert all(rec.usage >= 0 for rec in self._edge_store.values()), "Negative usage found"
+
+                # Path count must be non-negative
+                total_paths = sum(len(v) for v in self.net_edge_paths.values())
+                assert total_paths >= 0, "Negative path count"
+
+                # Overuse consistency check
+                calc_over_sum = sum(max(0, rec.usage - self._edge_capacity) for rec in self._edge_store.values())
+                calc_over_edges = sum(1 for rec in self._edge_store.values() if rec.usage > self._edge_capacity)
+                assert calc_over_sum == overuse_sum, f"Overuse sum mismatch: calc={calc_over_sum} vs reported={overuse_sum}"
+                assert calc_over_edges == overuse_edges, f"Overuse edges mismatch: calc={calc_over_edges} vs reported={overuse_edges}"
+
+            except AssertionError as e:
+                logger.error(f"[INVARIANT] {e}")
+                # In production, you might want to continue rather than crash
+                # raise  # Uncomment to crash on invariant violations
+
+            # Store for guardrail check next iteration
+            self._last_overuse_sum = overuse_sum
 
             # D) Check convergence
             if overuse_sum == 0:
@@ -10131,6 +10164,28 @@ class UnifiedPathFinder:
 
         selected = candidates[:num_to_rip]
         logger.debug(f"[OFFENDERS] {len(candidates)} candidates, {len(self._frozen_nets)} frozen, selected {len(selected)}")
+        return selected
+
+    def _force_top_k_offenders(self, k: int) -> List[str]:
+        """Force selection of top K offenders by blame (guardrail for deadlock)"""
+        blame = {}
+        for net_id, keys in self.net_edge_paths.items():
+            if not keys:
+                continue
+            s = 0
+            for key in keys:
+                rec = self.edge_store.get(key)
+                if rec:
+                    s += max(0, rec.usage - self._edge_capacity)
+            if s > 0:
+                blame[net_id] = s
+
+        if not blame:
+            return []
+
+        sorted_offenders = sorted(blame.items(), key=lambda x: -x[1])
+        selected = [net_id for net_id, score in sorted_offenders[:k]]
+        logger.info(f"[GUARDRAIL] Forced {len(selected)} top offenders: {selected[:5]}...")
         return selected
 
     def _compute_overuse_from_edge_store(self) -> tuple[int, int]:
