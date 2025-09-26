@@ -6,12 +6,10 @@ using a 3D lattice and PathFinder algorithm for dense PCB routing.
 """
 
 from .manhattan_router_rrg import ManhattanRouterRRG, ManhattanRRGRoutingEngine
-from .lattice_builder import LatticeBuilder
-from .gpu_pathfinder import GPUPathFinder
+from .unified_pathfinder import UnifiedPathFinder
 
 __all__ = [
     'ManhattanRouterRRG',
-    'ManhattanRRGRoutingEngine', 
-    'LatticeBuilder',
-    'GPUPathFinder'
+    'ManhattanRRGRoutingEngine',
+    'UnifiedPathFinder'
 ]
