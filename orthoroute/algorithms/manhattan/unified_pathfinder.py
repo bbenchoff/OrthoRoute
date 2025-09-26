@@ -2054,18 +2054,31 @@ class UnifiedPathFinder:
                 offenders_to_rip = self._select_offenders_for_ripup(routing_queue)
                 for net_id in offenders_to_rip:
                     if net_id in self.routed_nets:
-                        self.rip_up_net(net_id, self.routed_nets[net_id])
+                        self.rip_up_net(net_id)
                         del self.routed_nets[net_id]
                 logger.info(f"[RIPUP] Ripped {len(offenders_to_rip)} offending nets before iteration {iteration + 1}")
 
-            net_items = [(net_id, valid_nets[net_id]) for net_id in routing_queue if net_id in valid_nets]
-            
-            # Reset edge usage for this iteration (device operation)
-            cost_update_start = time.time()
-            if self.use_gpu:
-                self.edge_present_usage.fill(0.0)
+            # Mode B (incremental): Route only offenders that were ripped up
+            # Mode A (classic): Route all nets in priority order
+            if reroute_only_offenders and iteration > 0:
+                nets_to_route = offenders_to_rip  # Only route the nets we just ripped up
+                logger.info(f"[MODE] Incremental: routing {len(nets_to_route)} ripped offenders")
             else:
-                self.edge_present_usage.fill(0.0)
+                nets_to_route = routing_queue  # Route all nets (classic mode or first iteration)
+                logger.info(f"[MODE] {'Full' if not reroute_only_offenders else 'Initial'}: routing {len(nets_to_route)} nets")
+
+            net_items = [(net_id, valid_nets[net_id]) for net_id in nets_to_route if net_id in valid_nets]
+            
+            # Mode B (incremental): Don't reset usage - only reroute offenders
+            # Mode A (classic): Reset all usage and reroute everyone
+            cost_update_start = time.time()
+            reroute_only_offenders = getattr(self.config, 'reroute_only_offenders', True)  # Default to incremental
+            if not reroute_only_offenders:  # Classic mode A
+                if self.use_gpu:
+                    self.edge_present_usage.fill(0.0)
+                else:
+                    self.edge_present_usage.fill(0.0)
+                logger.debug("[MODE] Classic: Reset all edge usage for full reroute")
             
             # Update total costs on device (single elementwise operation)
             self._update_edge_total_costs(pres_fac)
@@ -2198,31 +2211,38 @@ class UnifiedPathFinder:
             
             routing_time = (time.time() - routing_start) * 1000  # ms
             
-            # Usage accumulation phase - update PathFinder congestion costs
+            # Incremental PathFinder analysis phase
             usage_start = time.time()
-            self.update_congestion_costs()
 
-            # Log PathFinder edge tracking diagnostics
-            total_edges_tracked = len(self._edge_store)
-            overused_edges = sum(1 for rec in self._edge_store.values() if rec.usage > 1)
-            logger.info(f"[PF-TRACKING] {total_edges_tracked} edges tracked, {overused_edges} overused")
+            # A) Analyze overuse from current commits (single source of truth)
+            overuse_sum, overuse_edges = self._compute_overuse_from_edge_store()
 
-            # Detailed diagnostics for verification
-            bad = [(k, r.usage) for k, r in self._edge_store.items() if r.usage > 1]
-            if bad[:10]:
-                logger.warning(f"[OVERFULL] {len(bad)} edges >1; sample {bad[:10]}")
-                # Track one specific overfull edge to verify owner changes
-                if bad:
-                    sample_key, sample_usage = bad[0]
-                    sample_rec = self._edge_store[sample_key]
-                    logger.info(f"[TRACK-EDGE] {sample_key}: usage={sample_usage}, owners={sample_rec.owners}")
+            # B) Update historical costs based on overuse
+            self._bump_history(overuse_sum)
 
-            # Sample a few edges for detailed verification
-            if total_edges_tracked > 0:
-                sample_keys = list(self._edge_store.keys())[:5]
-                for key in sample_keys:
-                    rec = self._edge_store[key]
-                    logger.debug(f"[EDGE-SAMPLE] key={key}: usage={rec.usage}, owners={rec.owners}, pres={rec.pres_cost:.3f}, hist={rec.hist_cost:.3f}")
+            # C) Count surviving nets (not ripped up this iteration)
+            if reroute_only_offenders and iteration > 0:
+                batch_committed = successful  # Nets that found path in offender subset
+                iteration_survived = len(self.routed_nets) - len(offenders_to_rip)  # Nets not touched
+            else:
+                batch_committed = successful  # All nets attempted
+                iteration_survived = successful  # Same as committed in full mode
+
+            logger.info(f"[OVERUSE] sum={overuse_sum} edges={overuse_edges} (from {len(self._edge_store)} total edges)")
+
+            # D) Check convergence
+            if overuse_sum == 0:
+                logger.info("[NEGOTIATE] Converged - no overuse remaining")
+                break
+
+            # E) Schedule next iteration - increase pressure
+            pres_fac = min(pres_fac * 1.3, 32.0)  # Cap at 32.0 to prevent overflow
+
+            # Detailed diagnostics for verification (sample only)
+            if overuse_edges > 0:
+                bad = [(k, r.usage) for k, r in self._edge_store.items() if r.usage > self._edge_capacity]
+                if bad[:5]:  # Limit sample for performance
+                    logger.debug(f"[OVERFULL-SAMPLE] {len(bad)} overfull edges, sample: {bad[:5]}")
 
             # Log phase information and verify progress
             phase = "SOFT" if self.current_iteration < self._phase_block_after else "HARD"
@@ -2266,11 +2286,12 @@ class UnifiedPathFinder:
                     gui_status = f"Iter {iteration+1}/{self.config.max_iterations}: {successful}/{len(valid_nets)} nets ({metrics['success_rate']:.1f}%), {metrics['over_capacity_edges']} violations, pres={pres_fac:.2f}"
                     self._gui_status_callback(gui_status)
             
-            # Log per-iteration metrics in compact table format
-            logger.info(f"ITER {iteration+1:2d} | Success: {successful:3d}/{len(valid_nets):3d} ({metrics['success_rate']:5.1f}%) | "
-                       f"Changed: {routes_changed:3d} | Failed: {failed_nets:3d} | "
-                       f"Overuse: {metrics['over_capacity_edges']:4d} | "
-                       f"History: {metrics['history_total']:8.1f}")
+            # Log per-iteration metrics with honest overuse reporting
+            mode_desc = "Incremental" if (reroute_only_offenders and iteration > 0) else "Full"
+            logger.info(f"ITER {iteration+1:2d} | {mode_desc} | Committed: {batch_committed:3d} | "
+                       f"Survived: {iteration_survived:3d}/{len(self.routed_nets):3d} | "
+                       f"Overuse sum: {overuse_sum:4d} on {overuse_edges:3d} edges | "
+                       f"pres_fac: {pres_fac:.2f}")
             
             logger.info(f"TIMING | Cost: {cost_update_time:5.1f}ms | Route: {routing_time:6.1f}ms | "
                        f"Usage: {usage_time:4.1f}ms | Total: {total_iter_time:6.1f}ms")
@@ -9851,7 +9872,7 @@ class UnifiedPathFinder:
 
         return cost
 
-    def rip_up_net(self, net_id: str, path_node_indices: list = None):
+    def rip_up_net(self, net_id: str):
         """
         Rip up net using canonical edge store - SINGLE SOURCE OF TRUTH
         """
@@ -9902,7 +9923,7 @@ class UnifiedPathFinder:
         edge_capacity = getattr(self, '_edge_capacity', 1)
         extra = max(0, rec.usage + 1 - edge_capacity)  # +1 for this net's hypothetical claim
         pres_fac = getattr(self, '_pres_mult', 1.0)
-        congestion_cost = pres_fac * extra
+        present_cost = pres_fac * extra  # Per-move present congestion pricing
 
         # TABOO CHECK: Net forbidden from reclaiming this edge?
         if rec.taboo_until_iter > current_iter:
@@ -9920,7 +9941,7 @@ class UnifiedPathFinder:
                 return float('inf')
 
         # PathFinder negotiation cost = base + historical + present congestion
-        return base_cost + rec.hist_cost + congestion_cost
+        return base_cost + rec.hist_cost + present_cost
 
     def commit_net_path(self, net_id: str, path_node_indices: list):
         """
@@ -10003,7 +10024,7 @@ class UnifiedPathFinder:
 
             if extra > 0:
                 rec.hist_cost = min(rec.hist_cost + self._hist_inc * extra, self._hist_cap)
-            rec.pres_cost = min(rec.pres_cost * pres_fac_mult, self._pres_cap)
+            # Note: present cost is computed per-move as pres_fac * extra, not stored per-edge
 
         logger.info(f"[PF-COSTS] Updated {len(self._edge_store)} edge costs, {overfull_count} overfull")
         return overfull_count
@@ -10050,33 +10071,91 @@ class UnifiedPathFinder:
         return queue
 
     def _select_offenders_for_ripup(self, routing_queue: List[str]) -> List[str]:
-        """Select subset of nets to rip up based on congestion blame"""
-        offenders = {}
+        """Select subset of nets to rip up based on congestion blame with freeze logic"""
+        from collections import defaultdict
 
-        # Calculate blame score for each net based on overfull edges they use
-        for key, rec in self._edge_store.items():
-            extra = rec.usage - self._edge_capacity
-            if extra > 0:  # Overfull edge
-                for owner in rec.owners:
-                    offenders[owner] = offenders.get(owner, 0) + extra
+        # Initialize freeze tracking if not exists
+        if not hasattr(self, '_frozen_nets'):
+            self._frozen_nets = set()
+            self._net_clean_iters = defaultdict(int)
+            self._freeze_clean_iters = 2  # Freeze nets clean for 2+ iterations
+
+        blame = {}
+        touched = []
+
+        # Calculate blame = sum over (usage - cap) on edges a net uses
+        for net_id, keys in self.net_edge_paths.items():
+            if not keys:  # Skip nets with no committed edges
+                continue
+            s = 0
+            for k in keys:
+                rec = self.edge_store.get(k)
+                if rec:
+                    s += max(0, rec.usage - self._edge_capacity)
+            blame[net_id] = s
+            if s == 0:
+                self._net_clean_iters[net_id] += 1
+                if self._net_clean_iters[net_id] >= self._freeze_clean_iters:
+                    self._frozen_nets.add(net_id)
+            else:
+                self._net_clean_iters[net_id] = 0
+                if net_id in self._frozen_nets:
+                    self._frozen_nets.discard(net_id)  # Unfreeze if now dirty
+                touched.append(net_id)
 
         # Add failed nets from last iteration (high priority)
         for net_id in self._failed_nets_last_iter:
-            offenders[net_id] = offenders.get(net_id, 0) + 10
+            if net_id not in blame:
+                blame[net_id] = 0
+            blame[net_id] += 10  # Boost priority
+            if net_id not in touched:
+                touched.append(net_id)
 
-        # Select top offenders (e.g., worst 30% or at least top 10)
-        if not offenders:
+        if not touched:
             return []
 
-        sorted_offenders = sorted(offenders.items(), key=lambda x: -x[1])
-        ripup_fraction = 0.3  # Rip up worst 30%
-        min_ripup = 5  # But at least 5 nets if available
-        max_ripup = 50  # But not more than 50 to avoid thrash
+        # Filter out frozen nets
+        candidates = [n for n in touched if n not in self._frozen_nets]
+        if not candidates:
+            return []
 
-        num_to_rip = max(min_ripup, min(max_ripup, int(len(routing_queue) * ripup_fraction)))
-        num_to_rip = min(num_to_rip, len(sorted_offenders))
+        candidates.sort(key=lambda n: blame[n], reverse=True)
 
-        return [net_id for net_id, score in sorted_offenders[:num_to_rip]]
+        # Tighter limits: 10% max, min 4, max 48
+        ripup_fraction = 0.10  # 10% instead of 30%
+        min_ripup = 4          # At least 4 nets
+        max_ripup = 48         # But not more than 48 to avoid thrash
+
+        num_to_rip = max(min_ripup, int(len(candidates) * ripup_fraction))
+        num_to_rip = min(num_to_rip, max_ripup, len(candidates))
+
+        selected = candidates[:num_to_rip]
+        logger.debug(f"[OFFENDERS] {len(candidates)} candidates, {len(self._frozen_nets)} frozen, selected {len(selected)}")
+        return selected
+
+    def _compute_overuse_from_edge_store(self) -> tuple[int, int]:
+        """Compute current overuse from edge store - single source of truth"""
+        overuse_sum = 0
+        overuse_edges = 0
+        for key, rec in self._edge_store.items():
+            extra = max(0, rec.usage - self._edge_capacity)
+            overuse_sum += extra
+            if extra > 0:
+                overuse_edges += 1
+        return overuse_sum, overuse_edges
+
+    def _bump_history(self, overuse_sum: int):
+        """Update historical costs based on current overuse"""
+        if overuse_sum == 0:
+            return
+
+        hist_inc = getattr(self, '_hist_inc', 0.4)
+        hist_cap = getattr(self, '_hist_cap', 1000.0)
+
+        for key, rec in self._edge_store.items():
+            extra = max(0, rec.usage - self._edge_capacity)
+            if extra > 0:
+                rec.hist_cost = min(rec.hist_cost + hist_inc * extra, hist_cap)
 
     def _get_adaptive_roi_margin(self, net_id: str, base_margin_mm: float = 10.0) -> float:
         """Get adaptive ROI margin based on net failure history"""
