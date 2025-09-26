@@ -434,6 +434,11 @@ class UnifiedPathFinder:
         else:
             logger.warning("[CLEARANCE] R-tree not available - clearance DRC disabled")
 
+        # Honest mode banner - report actual hardware acceleration status
+        gpu_enabled = (self.use_gpu and GPU_AVAILABLE)
+        mode = "GPU" if gpu_enabled else "CPU"
+        logger.info(f"[MODE] UnifiedPathFinder running in {mode} mode (use_gpu={self.use_gpu}, available={GPU_AVAILABLE})")
+
     def _uid_component(self, comp) -> str:
         """SURGICAL FIX: Single source of truth for component UIDs"""
         if comp is None:
@@ -1563,7 +1568,7 @@ class UnifiedPathFinder:
         else:
             logger.info(f"Using pre-initialized coordinate array with {self.node_coordinates.shape[0]} entries")
         
-        # Initialize GPU PathFinder state - ALL DEVICE ARRAYS
+        # Initialize PathFinder state - DEVICE ARRAYS (GPU/CPU mode-aware)
         num_edges = len(self.edges)
         if self.use_gpu:
             # Device arrays for GPU ∆-stepping
@@ -1990,7 +1995,7 @@ class UnifiedPathFinder:
             logger.warning(f"[REACHABILITY-TRIPWIRE] {unreachable}/{len(valid_nets)} terminals unreachable - routing will fail")
 
     def _pathfinder_negotiation(self, valid_nets: Dict[str, Tuple[int, int]], progress_cb=None, total=0) -> Dict[str, List[int]]:
-        """GPU PathFinder with device-side cost updates and ∆-stepping SSSP"""
+        """PathFinder with device-side cost updates and SSSP (GPU/CPU mode-aware)"""
         # Make absolutely sure arrays match live CSR before any cost math
         self._sync_edge_arrays_to_live_csr()
 
@@ -2026,7 +2031,8 @@ class UnifiedPathFinder:
         nodes = self.node_count
         edges = len(self.edges)
 
-        logger.info(f"Production batch: {batch_size} nets/batch (graph: {nodes:,} nodes, {edges:,} edges) [GPU PathFinder]")
+        mode = "GPU" if self.use_gpu else "CPU"
+        logger.info(f"Production batch: {batch_size} nets/batch (graph: {nodes:,} nodes, {edges:,} edges) [{mode} PathFinder]")
 
         for iteration in range(self.config.max_iterations):
             # Mark that negotiation is running
@@ -2037,7 +2043,8 @@ class UnifiedPathFinder:
 
             iter_start_time = time.time()
             logger.info(f"[NEGOTIATE] iter={iteration + 1} pres_fac={pres_fac:.3f} overflows=0")
-            logger.info(f"GPU PathFinder iteration {iteration + 1}/{self.config.max_iterations} (pres_fac={pres_fac:.2f})")
+            mode = "GPU" if self.use_gpu else "CPU"
+            logger.info(f"{mode} PathFinder iteration {iteration + 1}/{self.config.max_iterations} (pres_fac={pres_fac:.2f})")
 
             # Build congestion-driven rip-up queue
             valid_net_ids = list(valid_nets.keys())
@@ -2825,7 +2832,7 @@ class UnifiedPathFinder:
     
     def _gpu_delta_stepping_sssp_with_metrics(self, source_idx: int, sink_idx: int,
                                               time_budget_s: float = 0.0, t0: float = None, net_id: str = None) -> tuple:
-        """GPU ∆-stepping with detailed metrics - PRODUCTION MODE for actual routing"""
+        """∆-stepping with detailed metrics - PRODUCTION MODE for actual routing (GPU/CPU)"""
         if not self.use_gpu:
             path = self._cpu_dijkstra_fallback(source_idx, sink_idx)
             return path, {'relax_calls': 0, 'visited_nodes': 0, 'settled_nodes': 0, 'buckets_touched': 0}
@@ -3665,7 +3672,7 @@ class UnifiedPathFinder:
     
     def _gpu_near_far_worklist_sssp(self, source_idx: int, sink_idx: int, roi_adj_data, roi_size: int,
                                     time_budget_s: float = 0.0, t0: float = None, net_id: str = None):
-        """GPU-optimized Dijkstra with CSR format - replaces O(N²) CPU simulation"""
+        """Optimized Dijkstra with CSR format (GPU/CPU) - replaces O(N²) simulation"""
         if not roi_adj_data:
             return None
 
@@ -3798,7 +3805,7 @@ class UnifiedPathFinder:
     
     def _gpu_dijkstra_roi_csr(self, roi_source: int, roi_sink: int, roi_indptr, roi_indices, roi_weights, roi_size: int,
                              max_iters: int = 10_000_000, time_budget_s: float = 0.0, t0: float = None, net_id: str = None):
-        """GPU-native frontier-based Dijkstra - eliminates O(N²) global argmin bottleneck"""
+        """Native frontier-based Dijkstra (GPU/CPU) - eliminates O(N²) global argmin bottleneck"""
         # Initialize state arrays on GPU
         inf = cp.float32(cp.inf)
         dist = cp.full(roi_size, inf, dtype=cp.float32)
