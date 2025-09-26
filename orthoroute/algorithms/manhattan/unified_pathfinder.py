@@ -2048,6 +2048,16 @@ class UnifiedPathFinder:
             # Build congestion-driven rip-up queue
             valid_net_ids = list(valid_nets.keys())
             routing_queue = self._build_ripup_queue(valid_net_ids)
+
+            # PathFinder: Rip up offending nets before routing (not during routing)
+            if iteration > 0:  # Don't rip on first iteration
+                offenders_to_rip = self._select_offenders_for_ripup(routing_queue)
+                for net_id in offenders_to_rip:
+                    if net_id in self.routed_nets:
+                        self.rip_up_net(net_id, self.routed_nets[net_id])
+                        del self.routed_nets[net_id]
+                logger.info(f"[RIPUP] Ripped {len(offenders_to_rip)} offending nets before iteration {iteration + 1}")
+
             net_items = [(net_id, valid_nets[net_id]) for net_id in routing_queue if net_id in valid_nets]
             
             # Reset edge usage for this iteration (device operation)
@@ -2175,11 +2185,7 @@ class UnifiedPathFinder:
                         if net_id not in self.routed_nets or self.routed_nets[net_id] != path:
                             routes_changed += 1
 
-                        # Rip up old path if it exists
-                        if net_id in self.routed_nets:
-                            self.rip_up_net(net_id, self.routed_nets[net_id])
-
-                        # Commit new path to edge tracking
+                        # PathFinder: commit new path, allow overuse (old path usage will be decremented later)
                         self.routed_nets[net_id] = path
                         self.commit_net_path(net_id, path)
                         self._update_net_failure_count(net_id, failed=False)  # Reset failure count
@@ -2188,10 +2194,7 @@ class UnifiedPathFinder:
                         failed_nets += 1
                         current_failed_nets.add(net_id)  # Track for next iteration
                         self._update_net_failure_count(net_id, failed=True)  # Increment failure count
-                        if net_id in self.routed_nets:
-                            # Rip up failed net's old path
-                            self.rip_up_net(net_id, self.routed_nets[net_id])
-                            del self.routed_nets[net_id]
+                        # PathFinder: keep failed nets in routed_nets for cost analysis; rip-up happens later
             
             routing_time = (time.time() - routing_start) * 1000  # ms
             
@@ -9894,10 +9897,12 @@ class UnifiedPathFinder:
         rec = self.edge_store[edge_key]
         current_iter = getattr(self, 'current_iteration', 0)
 
-        # CAPACITY CHECK: Edge already owned by different net?
-        if rec.owner_net is not None and rec.owner_net != net_id:
-            # Hard capacity blocking - multiple nets cannot share same physical segment
-            return float('inf')
+        # PathFinder: Price congestion instead of hard blocking
+        # Calculate present cost based on current + hypothetical usage
+        edge_capacity = getattr(self, '_edge_capacity', 1)
+        extra = max(0, rec.usage + 1 - edge_capacity)  # +1 for this net's hypothetical claim
+        pres_fac = getattr(self, '_pres_mult', 1.0)
+        congestion_cost = pres_fac * extra
 
         # TABOO CHECK: Net forbidden from reclaiming this edge?
         if rec.taboo_until_iter > current_iter:
@@ -9914,8 +9919,8 @@ class UnifiedPathFinder:
             if not self._edge_is_clear_realtime(net_id, layer_id, x1, y1, x2, y2):
                 return float('inf')
 
-        # PathFinder negotiation cost = base + historical congestion
-        return base_cost + rec.historical_cost
+        # PathFinder negotiation cost = base + historical + present congestion
+        return base_cost + rec.hist_cost + congestion_cost
 
     def commit_net_path(self, net_id: str, path_node_indices: list):
         """
@@ -10043,6 +10048,35 @@ class UnifiedPathFinder:
             logger.info(f"[RIPUP] top offenders: {ordered[:10]}")
 
         return queue
+
+    def _select_offenders_for_ripup(self, routing_queue: List[str]) -> List[str]:
+        """Select subset of nets to rip up based on congestion blame"""
+        offenders = {}
+
+        # Calculate blame score for each net based on overfull edges they use
+        for key, rec in self._edge_store.items():
+            extra = rec.usage - self._edge_capacity
+            if extra > 0:  # Overfull edge
+                for owner in rec.owners:
+                    offenders[owner] = offenders.get(owner, 0) + extra
+
+        # Add failed nets from last iteration (high priority)
+        for net_id in self._failed_nets_last_iter:
+            offenders[net_id] = offenders.get(net_id, 0) + 10
+
+        # Select top offenders (e.g., worst 30% or at least top 10)
+        if not offenders:
+            return []
+
+        sorted_offenders = sorted(offenders.items(), key=lambda x: -x[1])
+        ripup_fraction = 0.3  # Rip up worst 30%
+        min_ripup = 5  # But at least 5 nets if available
+        max_ripup = 50  # But not more than 50 to avoid thrash
+
+        num_to_rip = max(min_ripup, min(max_ripup, int(len(routing_queue) * ripup_fraction)))
+        num_to_rip = min(num_to_rip, len(sorted_offenders))
+
+        return [net_id for net_id, score in sorted_offenders[:num_to_rip]]
 
     def _get_adaptive_roi_margin(self, net_id: str, base_margin_mm: float = 10.0) -> float:
         """Get adaptive ROI margin based on net failure history"""
