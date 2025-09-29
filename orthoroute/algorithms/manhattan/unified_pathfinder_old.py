@@ -168,12 +168,6 @@ class EdgeRec:
         self.historical_cost = 0.0
 
 @dataclass
-class Geometry:
-    """Geometry container for routing results."""
-    tracks: list = field(default_factory=list)
-    vias: list = field(default_factory=list)
-
-@dataclass
 class PathFinderConfig:
     """Configuration for PathFinder routing algorithm - uses centralized constants."""
     batch_size: int = BATCH_SIZE
@@ -195,9 +189,6 @@ class PathFinderConfig:
     strict_capacity: bool = STRICT_CAPACITY
     reroute_only_offenders: bool = REROUTE_ONLY_OFFENDERS
     layer_count: int = LAYER_COUNT
-    # Layer shortfall estimation tuning
-    layer_shortfall_percentile: float = 95.0  # Percentile for congested channel estimation
-    layer_shortfall_cap: int = 16            # Maximum layers to suggest
     enable_profiling: bool = ENABLE_PROFILING
     enable_instrumentation: bool = ENABLE_INSTRUMENTATION
     stagnation_patience: int = STAGNATION_PATIENCE
@@ -476,173 +467,44 @@ class UnifiedPathFinder:
 
     def _finalize_insufficient_layers(self):
         """Handle routing failure due to insufficient layer count."""
-        # Rebuild present usage from store for consistent numbers
-        self._refresh_present_usage_from_store()
         over_sum, over_edges = self._compute_overuse_stats_present()
         failed_nets = len([net for net in self.routed_nets.keys() if not self.routed_nets[net]])
 
-        # Compute overuse array for robust shortfall estimation
+        shortfall = self._estimate_layer_shortfall()
+
+        logger.warning(
+            "[INSUFFICIENT-LAYERS] Unrouted=%d, overuse_edges=%d, over_sum=%d. "
+            "Estimated additional layers needed: %d. "
+            "Increase layer count or relax design rules.",
+            failed_nets, over_edges, over_sum, shortfall
+        )
+        return {
+            'success': False,
+            'needs_more_layers': True,
+            'unrouted': failed_nets,
+            'overuse_edges': over_edges,
+            'layer_shortfall': shortfall
+        }
+
+    def _estimate_layer_shortfall(self):
+        """Estimate additional layers needed based on congestion."""
+        if not hasattr(self, 'edge_present_usage') or not hasattr(self, 'edge_capacity'):
+            return 1
         import numpy as np
         cap = self.edge_capacity
         usage = self.edge_present_usage
         if hasattr(cap, 'get'): cap = cap.get()
         if hasattr(usage, 'get'): usage = usage.get()
-        over_array = np.maximum(0, usage - cap)
-
-        analysis = self._estimate_layer_shortfall(over_array)
-
-        shortfall = analysis["shortfall"]
-        error_code = analysis["error_code"]
-        via_edges = analysis["via_overuse_edges"]
-        hv_edges = analysis["hv_overuse_edges"]
-        via_frac = analysis["via_overuse_frac"]
-
-        # Clear logging of what we're analyzing
-        logger.info("[CAP-ANALYZE] over_edges=%d via_edges=%d (%.1f%%) hv_edges=%d (%.1f%%) pairs_est=%d layers=%d",
-                    int(over_edges), via_edges, via_frac * 100, hv_edges, (1 - via_frac) * 100,
-                    analysis["pairs_est"], shortfall)
-
-        # Generate appropriate message based on analysis
-        if error_code == "VIA-BOTTLENECK":
-            message = ("Routing failed due to via congestion; adding layers won't help. "
-                      f"Via bottleneck: {via_edges} overfull vias vs {hv_edges} routing segments. "
-                      "Consider smaller drills/annular rings, microvias/HDI, or relaxing via-to-via clearances.")
-        elif error_code == "INSUFFICIENT-LAYERS":
-            message = (f"[INSUFFICIENT-LAYERS] Unrouted={failed_nets}, "
-                      f"overuse_edges={int(over_edges)}, over_sum={int(over_sum)}. "
-                      f"Estimated additional layers needed: {shortfall}. "
-                      f"Increase layer count or relax design rules.")
-        else:
-            message = f"Routing failed. Unrouted={failed_nets}, overuse_edges={int(over_edges)}, over_sum={int(over_sum)}."
-
-        rr = {
-            "success": False,
-            "error_code": error_code or "ROUTING-FAILED",
-            "message": message,
-            "unrouted": failed_nets,
-            "overuse_edges": int(over_edges),
-            "overuse_sum": int(over_sum),
-            "layer_shortfall": shortfall,
-            "via_overuse_edges": via_edges,
-            "hv_overuse_edges": hv_edges,
-            "via_overuse_frac": via_frac,
-            "h_need": analysis["h_need"],
-            "v_need": analysis["v_need"]
-        }
-
-        logger.warning(rr["message"])
-        self._routing_result = rr
-        return rr
-
-    def _estimate_layer_shortfall(self, over_array):
-        """
-        Aggregate overuse per spatial channel across all layers, count vias separately,
-        detect via bottlenecks vs layer congestion, return analysis breakdown.
-
-        Returns: dict with shortfall analysis and error classification
-        """
-        import numpy as np
-        from collections import defaultdict
-
-        # Configurable knobs
-        pct   = getattr(self.config, "layer_shortfall_percentile", 95)  # 90, 95, …
-        cap_n = getattr(self.config, "layer_shortfall_cap", 16)         # hard cap
-
-        over = over_array.get() if hasattr(over_array, "get") else np.asarray(over_array)
-        if over.size == 0 or np.count_nonzero(over) == 0:
-            return {"shortfall": 0, "error_code": None, "via_overuse_edges": 0, "hv_overuse_edges": 0}
-
-        indptr  = getattr(self, 'indptr_cpu', None)
-        indices = getattr(self, 'indices_cpu', None)
-
-        if indptr is None or indices is None:
-            logger.warning("[SHORTFALL] CSR arrays not available, using fallback estimate")
-            return {"shortfall": 2, "error_code": "INSUFFICIENT-LAYERS", "via_overuse_edges": 0, "hv_overuse_edges": 0}
-
-        # Precompute source row for each edge index once if available
-        edge_src = getattr(self, "edge_src_cpu", None)
-        if edge_src is None or len(edge_src) != len(indices):
-            edge_src = np.repeat(np.arange(len(indptr) - 1, dtype=np.int32),
-                                 np.diff(indptr).astype(np.int32))
-            self.edge_src_cpu = edge_src
-
-        totals_H = defaultdict(int)
-        totals_V = defaultdict(int)
-        via_overuse_edges = 0
-        hv_overuse_edges = 0
-
-        nz_idx = np.nonzero(over)[0]
-        for eidx in nz_idx:
-            u = int(edge_src[eidx])
-            v = int(indices[eidx])
-
-            # Undirected dedupe: process each physical segment once
-            if u > v:
-                continue
-
-            x1, y1, z1 = self._idx_to_coord(u)
-            x2, y2, z2 = self._idx_to_coord(v)
-
-            val = int(over[eidx])
-
-            # Count via vs H/V breakdown
-            if z1 != z2:
-                via_overuse_edges += 1
-                continue  # Skip vias for layer capacity analysis
-            else:
-                hv_overuse_edges += 1
-
-            if y1 == y2 and x1 != x2:          # Horizontal
-                a = (min(x1, x2), y1)
-                b = (max(x1, x2), y1)
-                totals_H[(a, b)] += val
-            elif x1 == x2 and y1 != y2:        # Vertical
-                a = (x1, min(y1, y2))
-                b = (x1, max(y1, y2))
-                totals_V[(a, b)] += val
-
-        def need_from_totals(totals: dict) -> int:
-            if not totals:
-                return 0
-            arr = np.fromiter(totals.values(), dtype=np.int32)
-            return int(np.ceil(np.percentile(arr, pct)))
-
-        need_H = need_from_totals(totals_H)
-        need_V = need_from_totals(totals_V)
-
-        pairs = max(need_H, need_V)
-        extra_layers = 2 * pairs if pairs > 0 else 0
-        extra_layers = int(np.clip(extra_layers, 0, cap_n))
-
-        # Determine error classification
-        total_overuse = via_overuse_edges + hv_overuse_edges
-        via_overuse_frac = via_overuse_edges / max(1, total_overuse)
-
-        if hv_overuse_edges == 0 and via_overuse_edges > 0:
-            error_code = "VIA-BOTTLENECK"
-            shortfall = 0
-        elif via_overuse_frac > 0.9:  # >90% via bottleneck
-            error_code = "VIA-BOTTLENECK"
-            shortfall = 0
-        else:
-            error_code = "INSUFFICIENT-LAYERS" if extra_layers > 0 else None
-            shortfall = extra_layers
-
-        return {
-            "shortfall": shortfall,
-            "error_code": error_code,
-            "via_overuse_edges": via_overuse_edges,
-            "hv_overuse_edges": hv_overuse_edges,
-            "via_overuse_frac": via_overuse_frac,
-            "h_need": need_H,
-            "v_need": need_V,
-            "pairs_est": pairs
-        }
+        over = np.maximum(usage - cap, 0)
+        if over.sum() == 0:
+            return 0
+        # Simple heuristic: max overuse per edge suggests needed layers
+        max_over = over.max()
+        return max(1, int(np.ceil(max_over)))
 
     def _finalize_success(self):
         """Handle successful routing completion."""
         logger.info("[NEGOTIATE] Converged: all nets routed with legal usage.")
-        self._routing_result = {'success': True, 'needs_more_layers': False}
         return self.routed_nets
 
     def _count_failed_nets_last_iter(self):
@@ -2686,19 +2548,11 @@ class UnifiedPathFinder:
 
         # PathFinder negotiation with congestion
         result = self._pathfinder_negotiation(valid_nets, _pc, total)
-        self._routing_result = result
 
-        # Failure: return the structured result; don't count keys like "paths"
-        if isinstance(result, dict) and not result.get("success", True):
-            logger.warning(f"[PF-RETURN] failed: {result.get('message','routing failed')}")
-            return result
-
-        # Success: count actual net paths
-        npaths = sum(
-            1 for p in getattr(self, "_net_paths", {}).values()
-            if p is not None and (len(p) if hasattr(p, "__len__") else 0) > 1
-        )
-        logger.info(f"[PF-RETURN] paths={npaths}")
+        # TRIPWIRE D: Assert we got something from PF
+        logger.info(f"[PF-RETURN] paths={len(result)}")
+        if not result:
+            raise RuntimeError("[PF-RETURN] negotiation produced no paths")
         self._committed_paths = result  # Single source of truth
 
         # Portal usage fingerprint at end of routing
@@ -2799,12 +2653,7 @@ class UnifiedPathFinder:
             self.current_iteration = it
 
             # Track path changes for stagnation detection
-            import numpy as np
-            old_paths = {
-                net_id: (np.asarray(path, dtype=np.int64).copy()
-                         if path is not None else np.empty(0, dtype=np.int64))
-                for net_id, path in self._net_paths.items()
-            }
+            old_paths = {net_id: path.copy() if path else [] for net_id, path in self._net_paths.items()}
 
             # 1) Pull last iteration's result into PRESENT
             mapped = self._refresh_present_usage_from_store()    # logs how many entries mapped
@@ -2824,19 +2673,10 @@ class UnifiedPathFinder:
             routed_ct, failed_ct = self._route_all_nets_cpu_in_batches_with_metrics(valid_nets, progress_cb)
 
             # Calculate how many nets changed paths this iteration
-            def _as_array_path(p):
-                if p is None:
-                    return np.empty(0, dtype=np.int64)
-                # already an array?
-                if isinstance(p, np.ndarray):
-                    return p.astype(np.int64, copy=True)
-                # list/tuple
-                return np.asarray(p, dtype=np.int64).copy()
-
             routes_changed = 0
             for net_id in valid_nets:
-                old_path = old_paths.get(net_id, np.empty(0, dtype=np.int64))
-                new_path = _as_array_path(self._net_paths.get(net_id, []))
+                old_path = old_paths.get(net_id, [])
+                new_path = self._net_paths.get(net_id, [])
                 if not np.array_equal(old_path, new_path):
                     routes_changed += 1
 
@@ -2859,6 +2699,7 @@ class UnifiedPathFinder:
             if failed_ct == 0 and over_edges == 0:
                 logger.info("[NEGOTIATE] Converged: all nets routed with legal usage.")
                 result = self._finalize_success()
+                self._routing_result = {'success': True, 'needs_more_layers': False}
                 return result
 
             # Track "no progress" to avoid spinning forever
@@ -3261,12 +3102,6 @@ class UnifiedPathFinder:
             total[over_mask] = np.inf
 
         self.edge_total_cost = total
-
-        # 🚫 Do NOT mutate ownership/present usage here by default
-        if getattr(self.config, "peel_in_cost", False):
-            # If this flag is enabled, peeling logic would go here
-            # Currently disabled to prevent cost update side effects
-            pass
 
     def _apply_capacity_limit_after_negotiation(self) -> None:
         """Apply capacity limits to edge usage after PathFinder negotiation completes.
@@ -9549,18 +9384,9 @@ class UnifiedPathFinder:
             raise RuntimeError("EMIT-TRIPWIRE: PathFinder bypass detected (Dijkstra fast-path).")
 
         # Check if routing failed due to insufficient layers
-        rr = getattr(self, "_routing_result", None)
-        if isinstance(rr, dict) and not rr.get("success", True):
-            msg = rr.get('message') or \
-                  f"[INSUFFICIENT-LAYERS] Need {rr.get('layer_shortfall', 1)} more layers."
-            class GeometryPayload:
-                def __init__(self, tracks, vias):
-                    self.tracks = tracks
-                    self.vias = vias
-            self._last_geometry_payload = GeometryPayload([], [])
-            self._last_failure = msg
-            logger.warning("[EMIT-GUARD] %s", msg)
-            return (0, 0)
+        if hasattr(self, '_routing_result') and self._routing_result.get('needs_more_layers', False):
+            logger.warning("[EMIT-GUARD] Routing failed: insufficient layers. Not emitting copper.")
+            raise RuntimeError(f"[INSUFFICIENT-LAYERS] Cannot emit geometry: {self._routing_result.get('layer_shortfall', 1)} additional layers needed")
 
         # Recompute usage/overuse just-in-time
         self._refresh_present_usage_from_store()
@@ -10426,21 +10252,7 @@ class UnifiedPathFinder:
             if len(normalized_tracks) > 1:
                 logger.info(f"[CONVERT] Sample track 2: {normalized_tracks[1]}")
 
-        # Store geometry payload for internal use and return tuple for GUI
-        class GeometryPayload:
-            def __init__(self, tracks, vias):
-                self.tracks = tracks
-                self.vias = vias
-        self._last_geometry_payload = GeometryPayload(normalized_tracks, normalized_vias)
-        return (len(normalized_tracks), len(normalized_vias))
-
-    def get_last_failure_message(self):
-        """Get the last failure message for GUI display."""
-        return getattr(self, "_last_failure", None)
-
-    def get_routing_result(self):
-        """Get the structured routing result for GUI access."""
-        return getattr(self, "_routing_result", None)
+        return GeometryPayload(normalized_tracks, normalized_vias)
 
     def _check_clearance_violations_rtree(self, intents):
         """Check clearance violations using R-tree spatial indexing."""

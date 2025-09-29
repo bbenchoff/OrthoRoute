@@ -11,7 +11,10 @@
       "Bash(git checkout:*)",
       "Bash(cp:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Read(//c/Users/Benchoff/**)",
+      "Read(//tmp/**)",
+      "Read(//c//**)"
     ],
     "deny": [],
     "ask": [],
