@@ -175,7 +175,7 @@ class Geometry:
 
 @dataclass
 class PathFinderConfig:
-    """Configuration for PathFinder routing algorithm - uses centralized constants."""
+    """Configuration for PathFinder routing algorithm - uses centralized constants """
     batch_size: int = BATCH_SIZE
     max_iters: int = MAX_ITERATIONS
     max_iterations: int = MAX_ITERATIONS  # Alias for compatibility
