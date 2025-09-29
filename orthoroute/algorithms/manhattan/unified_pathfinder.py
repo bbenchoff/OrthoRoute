@@ -413,6 +413,132 @@ class UnifiedPathFinder:
     # - Batch deltas staged during routing, merged on commit
 
     # --- UPF helper anchors: authoritative contracts (non-invasive) ---
+
+    def _is_empty_path(self, path) -> bool:
+        if path is None:
+            return True
+        if isinstance(path, (list, tuple, dict)):
+            return len(path) == 0
+        if isinstance(path, np.ndarray):
+            return path.size == 0
+        return False
+
+    def _normalize_path_to_edge_ids(self, path):
+        """
+        Accepts a path that may be:
+          - sequence of edge IDs
+          - sequence of node IDs
+          - numpy array (either of the above)
+        Returns: list[int] of edge IDs (possibly empty).
+        """
+        if path is None:
+            return []
+
+        # Convert arrays to vanilla list
+        if isinstance(path, np.ndarray):
+            path = path.tolist()
+
+        if not path:
+            return []
+
+        # If it already looks like edge indices, keep it.
+        # (Heuristic: ints and within live edge range.)
+        first = path[0]
+        if isinstance(first, (int, np.integer)):
+            # If most values appear within [0, E_live), assume edge-id form.
+            # Fast check on a small sample to avoid O(n) max:
+            sample = path if len(path) <= 8 else path[:4] + path[-4:]
+            if all(isinstance(v, (int, np.integer)) and 0 <= v < self.E_live for v in sample):
+                return list(path)
+
+        # Otherwise, assume it's a node path → convert to edges using the edge lookup
+        # Find the lookup that was built in the CSR-LOOKUP phase. Adjust the name if needed.
+        # Common names in this file have been: self.edge_lookup or self._edge_lookup.
+        edge_lookup = getattr(self, "edge_lookup", None) or getattr(self, "_edge_lookup", None)
+        if edge_lookup is None:
+            # Fallback: no lookup? return empty and let caller skip scoring
+            return []
+
+        edges = []
+        for u, v in zip(path[:-1], path[1:]):
+            eid = edge_lookup.get((u, v))
+            if eid is not None:
+                edges.append(eid)
+        return edges
+
+    def _log_top_congested_nets(self, k=20):
+        if not getattr(self, "_net_paths", None):
+            return
+        cap = int(getattr(self, "_edge_capacity", 1)) or 1
+        pressure = []
+        for net_id, path in self._net_paths.items():
+            if self._is_empty_path(path):
+                continue
+            over_sum = 0
+            for (u, v) in path:
+                idx = self.edge_lookup.get((u, v)) or self.edge_lookup.get((v, u))
+                if idx is not None:
+                    over = max(0, int(self.edge_present_usage[idx]) - cap)
+                    over_sum += over
+            if over_sum:
+                pressure.append((over_sum, net_id))
+        pressure.sort(reverse=True)
+        top = pressure[:k]
+        if top:
+            logger.info("[HOT-NETS] top=%d: %s", len(top), ", ".join(f"{n}:{s}" for s, n in top))
+
+    def _owner_add(self, edge_idx: int, net_id: str) -> None:
+        s = self.edge_owners.get(edge_idx)
+        if s is None:
+            self.edge_owners[edge_idx] = {net_id}
+            return
+        if isinstance(s, set):
+            s.add(net_id)
+            return
+        # convert foreign types (str/list/tuple/etc.) once
+        try:
+            s = {s} if isinstance(s, str) else set(s)
+        except TypeError:
+            s = {str(s)}
+        s.add(net_id)
+        self.edge_owners[edge_idx] = s
+
+    def _owner_remove(self, edge_idx: int, net_id: str) -> None:
+        s = self.edge_owners.get(edge_idx)
+        if not s:
+            return
+        if isinstance(s, set):
+            s.discard(net_id)
+            if not s:
+                self.edge_owners.pop(edge_idx, None)
+            return
+        # convert once, then remove
+        try:
+            s = {s} if isinstance(s, str) else set(s)
+        except TypeError:
+            s = {str(s)}
+        s.discard(net_id)
+        if s:
+            self.edge_owners[edge_idx] = s
+        else:
+            self.edge_owners.pop(edge_idx, None)
+
+    def _normalize_owner_types(self) -> None:
+        """Ensure edge_owners maps edge_idx -> set(str)."""
+        if not hasattr(self, "edge_owners") or self.edge_owners is None:
+            self.edge_owners = {}
+            return
+        for k, v in list(self.edge_owners.items()):
+            if isinstance(v, set):
+                continue
+            if v is None:
+                self.edge_owners.pop(k, None)
+                continue
+            try:
+                self.edge_owners[k] = {v} if isinstance(v, str) else set(v)
+            except TypeError:
+                self.edge_owners[k] = {str(v)}
+
     def _csr_smoke_check(self):
         """Validate CSR adjacency matrix structure and dimensions."""
         try:
@@ -2481,6 +2607,9 @@ class UnifiedPathFinder:
         """
         logger.info(f"[UPF] instance=%s enter %s", getattr(self, "_instance_tag", "NO_TAG"), "route_multiple_nets")
 
+        # Normalize edge owner types to prevent crashes
+        self._normalize_owner_types()
+
         # Progress-callback shim: prefer 3-arg GUI signature, fallback to 5 if needed
         def _pc(done, total, msg, paths=None, vias=None):
             """Progress-callback shim: prefer 3-arg GUI signature, fallback to 5 if needed."""
@@ -2853,6 +2982,10 @@ class UnifiedPathFinder:
 
             logger.info("[ITER-RESULT] routed=%d failed=%d overuse_edges=%d over_sum=%d changed=%s",
                         routed_ct, failed_ct, over_edges, over_sum, bool(changed))
+
+            # Log top congested nets for diagnostic purposes
+            if over_edges > 0:
+                self._log_top_congested_nets(k=20)
 
             # ---- Termination logic ----
             # Success: no overuse and no failures
