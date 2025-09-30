@@ -502,32 +502,60 @@ class UnifiedPathFinder:
                 logger.info(f"  {net_id}: {overuse} overuse")
 
     def _order_nets_by_congestion(self, net_list):
-        """Order nets by congestion impact for next iteration."""
-        net_scores = {}
+        """Order nets by strict congestion ranking: overuse_sum DESC, overuse_edges DESC, bbox ASC, jitter.
+
+        This ensures the most congested nets are routed first, breaking ties
+        deterministically to avoid routing order randomness.
+        """
+        import numpy as np
+
+        net_scores = []
+        cap = self.edge_capacity
+        if hasattr(cap, 'get'):
+            cap = cap.get()
+
         for net_id in net_list:
             # Score by overuse touching this net's path
-            overuse = 0
+            overuse_sum = 0
+            overuse_edges = 0
+            path_length = 0
+
             if net_id in self._net_paths:
                 path = self._net_paths[net_id]
                 # Handle path as array of edge indices
-                import numpy as np
                 if isinstance(path, np.ndarray):
                     path_edges = path.tolist()
+                    path_length = len(path)
                 elif isinstance(path, list):
                     path_edges = path
+                    path_length = len(path)
                 else:
                     path_edges = []
 
                 for edge_idx in path_edges:
                     if hasattr(self, 'edge_owners') and edge_idx in self.edge_owners:
                         usage = len(self.edge_owners.get(edge_idx, set()))
-                        cap = 1  # Default capacity
-                        overuse += max(0, usage - cap)
-            net_scores[net_id] = overuse
+                        edge_cap = cap[edge_idx] if edge_idx < len(cap) else 1
+                        overuse = max(0, usage - edge_cap)
+                        if overuse > 0:
+                            overuse_sum += overuse
+                            overuse_edges += 1
 
-        # Sort by score descending, with jitter for ties
-        import random
-        return sorted(net_list, key=lambda n: (net_scores.get(n, 0), random.random()), reverse=True)
+            # Calculate bounding box (approximate heuristic)
+            bbox = path_length  # Use path length as proxy
+
+            # Deterministic jitter for tie-breaking
+            it = getattr(self, 'current_iteration', 1)
+            seed = getattr(self, '_routing_seed', 42)
+            jitter = hash((net_id, seed, it)) % 1000 / 1000.0
+
+            net_scores.append((net_id, overuse_sum, overuse_edges, bbox, jitter))
+
+        # Sort by: overuse_sum DESC, overuse_edges DESC, bbox ASC, jitter
+        sorted_nets = sorted(net_scores,
+                            key=lambda x: (-x[1], -x[2], x[3], x[4]))
+
+        return [n[0] for n in sorted_nets]
 
     def _owner_add(self, edge_idx: int, net_id: str) -> None:
         """Add net_id as owner of edge_idx. edge_owners[edge_idx] is always a set."""
@@ -2932,6 +2960,85 @@ class UnifiedPathFinder:
         if unreachable > 0:
             logger.warning(f"[REACHABILITY-TRIPWIRE] {unreachable}/{len(valid_nets)} terminals unreachable - routing will fail")
 
+    def _detect_bus_groups(self, net_list):
+        """Detect bus groups by name pattern (e.g., B10B14_*, B11B15_*).
+
+        Returns dict mapping bus prefix to list of member net IDs.
+        Only returns buses with 5+ members.
+        """
+        from collections import defaultdict
+        buses = defaultdict(list)
+
+        for net_id in net_list:
+            # Extract bus prefix (everything before last underscore + number)
+            parts = net_id.rsplit('_', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                bus_prefix = parts[0]
+                buses[bus_prefix].append(net_id)
+
+        # Filter to only buses with 5+ members
+        return {prefix: nets for prefix, nets in buses.items() if len(nets) >= 5}
+
+    def _assign_preferred_layers(self, bus_groups):
+        """Assign preferred layers to bus members (round-robin across inner layers).
+
+        Distributes bus members across inner layers to reduce congestion.
+        Skips outer layers (F.Cu and B.Cu) if possible.
+        """
+        if not hasattr(self, '_net_preferred_layer'):
+            self._net_preferred_layer = {}
+
+        if not hasattr(self, 'geometry') or self.geometry is None:
+            return
+
+        layer_count = self.geometry.layer_count
+
+        for bus_prefix, members in bus_groups.items():
+            # Distribute across inner layers (skip F.Cu=0 and B.Cu=last)
+            if layer_count > 2:
+                inner_layers = list(range(1, layer_count - 1))
+            else:
+                inner_layers = list(range(layer_count))
+
+            if not inner_layers:
+                continue
+
+            for i, net_id in enumerate(members):
+                preferred_layer = inner_layers[i % len(inner_layers)]
+                self._net_preferred_layer[net_id] = preferred_layer
+
+            logger.info(f"[BUS-LAYER] Assigned {len(members)} nets in bus '{bus_prefix}' across {len(inner_layers)} inner layers")
+
+    def _build_hotset_from_overuse(self) -> set:
+        """Return set of net IDs that touch any overused edge.
+
+        Critical for convergence: ensures all nets contributing to congestion
+        are re-routed each iteration until overuse is resolved.
+        """
+        hotset = set()
+
+        if not hasattr(self, 'edge_owners') or not hasattr(self, 'edge_capacity'):
+            return hotset
+
+        import numpy as np
+        cap = self.edge_capacity
+        if hasattr(cap, 'get'):
+            cap = cap.get()
+
+        # Find all nets touching overused edges
+        for edge_idx, owners in self.edge_owners.items():
+            if not isinstance(owners, set):
+                continue
+
+            usage = len(owners)
+            edge_cap = cap[edge_idx] if edge_idx < len(cap) else 1
+
+            if usage > edge_cap:
+                # This edge is overused - add all owners to hotset
+                hotset.update(owners)
+
+        return hotset
+
     def _pathfinder_negotiation(self, valid_nets: Dict[str, Tuple[int, int]], progress_cb=None, total=0) -> Dict[str, List[int]]:
         """PathFinder negotiation loop with proper 4-phase iteration: refresh → cost update → route → commit"""
         cfg = self.config
@@ -2949,6 +3056,19 @@ class UnifiedPathFinder:
 
         self.routed_nets.clear()
         total_nets = len(valid_nets)
+
+        # Detect bus groups and assign preferred layers for spreading
+        bus_groups = self._detect_bus_groups(list(valid_nets.keys()))
+        if bus_groups:
+            logger.info(f"[BUS-DETECT] Found {len(bus_groups)} bus groups")
+            self._assign_preferred_layers(bus_groups)
+
+        # Track stagnation with overuse metrics
+        prev_overuse = (None, None)
+        stagnation_mode = False
+
+        # Mark as not converged (no hard-locks until overuse=0)
+        self._converged = False
 
         for it in range(1, cfg.max_iterations + 1):
             logger.info("[NEGOTIATE] iter=%d pres_fac=%.2f", it, pres_fac)
@@ -2976,8 +3096,49 @@ class UnifiedPathFinder:
             over_sum, over_edges = self._compute_overuse_stats_present()  # must not raise
             self._update_edge_total_costs(pres_fac)
 
-            # 3) Route all nets against current costs (must not throw on single-net failure)
-            routed_ct, failed_ct = self._route_all_nets_cpu_in_batches_with_metrics(valid_nets, progress_cb)
+            # 2a) CRITICAL: Build hotset - nets that MUST be re-routed
+            if over_sum > 0:
+                hotset = self._build_hotset_from_overuse()
+                logger.info(f"[HOTSET] {len(hotset)} nets touching overused edges (must re-route)")
+
+                # Build nets_to_route dict with only hotset members
+                nets_to_route = {net_id: valid_nets[net_id] for net_id in hotset if net_id in valid_nets}
+
+                # Order by congestion impact
+                ordered_net_ids = self._order_nets_by_congestion(list(nets_to_route.keys()))
+                nets_to_route_ordered = {net_id: nets_to_route[net_id] for net_id in ordered_net_ids}
+            else:
+                # No overuse: route only failed nets
+                nets_to_route_ordered = valid_nets
+                logger.info(f"[HOTSET] No overuse - routing all {len(nets_to_route_ordered)} nets")
+
+            # 2b) Detect stagnation and apply adaptive measures
+            current_overuse = (over_sum, over_edges)
+            if current_overuse == prev_overuse and over_sum > 0:
+                if not stagnation_mode:
+                    logger.warning(f"[STAGNATION] Entering stagnation mode at iter {it} (overuse={over_sum}, edges={over_edges})")
+                    stagnation_mode = True
+
+                # Emit mid-run capacity diagnostics
+                if it % 5 == 0 or it == 3:  # Emit at iter 3 and every 5 iters
+                    self._emit_midrun_capacity_analysis()
+
+                # Adaptive measures:
+                # 1) Increase pressure faster
+                pres_fac *= (cfg.pres_fac_mult * 1.5)  # 1.5x faster growth
+                logger.info(f"[STAGNATION-ADAPT] Increasing pres_fac faster: {pres_fac:.2f}")
+
+                # 2) Widen ROI for hotset nets (via multiplier)
+                self._hotset_roi_multiplier = getattr(self, '_hotset_roi_multiplier', 1.0) * 1.3
+                logger.info(f"[STAGNATION-ADAPT] ROI multiplier: {self._hotset_roi_multiplier:.2f}")
+            else:
+                stagnation_mode = False
+                self._hotset_roi_multiplier = 1.0
+
+            prev_overuse = current_overuse
+
+            # 3) Route hotset nets against current costs (must not throw on single-net failure)
+            routed_ct, failed_ct = self._route_all_nets_cpu_in_batches_with_metrics(nets_to_route_ordered, progress_cb)
 
             # Calculate how many nets changed paths this iteration
             def _as_array_path(p):
@@ -3010,6 +3171,11 @@ class UnifiedPathFinder:
             logger.info("[ITER-RESULT] routed=%d failed=%d overuse_edges=%d over_sum=%d changed=%s",
                         routed_ct, failed_ct, over_edges, over_sum, bool(changed))
 
+            # Mark dirty nets: all nets touching overused edges must be re-routed next iteration
+            if over_edges > 0:
+                dirty_nets = self._build_hotset_from_overuse()
+                logger.info(f"[DIRTY-PROPAGATE] {len(dirty_nets)} nets marked for next iteration re-route")
+
             # Log top congested nets for diagnostic purposes
             if over_edges > 0:
                 self._log_top_congested_nets(k=20)
@@ -3018,6 +3184,7 @@ class UnifiedPathFinder:
             # Success: BOTH no overuse AND no failures
             if failed_ct == 0 and over_sum == 0:
                 logger.info("[SUCCESS] All nets routed with zero overuse")
+                self._converged = True  # Mark convergence achieved
                 result = self._finalize_success()
                 return result
 
@@ -3043,6 +3210,52 @@ class UnifiedPathFinder:
         result = self._finalize_insufficient_layers()
         self._routing_result = result  # Store for GUI emission check
         return result
+
+    def _emit_midrun_capacity_analysis(self):
+        """Emit capacity diagnostics during stagnation for troubleshooting."""
+        logger.info("[CAP-ANALYZE] === Mid-Run Capacity Analysis ===")
+
+        if not hasattr(self, 'edge_owners') or not hasattr(self, 'edge_capacity'):
+            logger.warning("[CAP-ANALYZE] No edge data available")
+            return
+
+        import numpy as np
+        cap = self.edge_capacity
+        if hasattr(cap, 'get'):
+            cap = cap.get()
+
+        # Analyze overuse by edge type (simplified - tracks all edges together)
+        total_overuse = 0
+        overused_edges = 0
+        max_overuse = 0
+
+        for edge_idx, owners in self.edge_owners.items():
+            if not isinstance(owners, set):
+                continue
+
+            usage = len(owners)
+            edge_cap = cap[edge_idx] if edge_idx < len(cap) else 1
+            overuse = max(0, usage - edge_cap)
+
+            if overuse > 0:
+                total_overuse += overuse
+                overused_edges += 1
+                max_overuse = max(max_overuse, overuse)
+
+        logger.info(f"  Overused edges: {overused_edges}")
+        logger.info(f"  Total overuse: {total_overuse}")
+        logger.info(f"  Max overuse on single edge: {max_overuse}")
+
+        # Estimate extra layers needed
+        if overused_edges > 0:
+            avg_overuse = total_overuse / overused_edges
+            # Conservative estimate: need enough layers to spread the overuse
+            extra_layers = min(16, int(avg_overuse) + 1)
+            logger.info(f"  Estimated extra layers needed: {extra_layers}")
+        else:
+            logger.info(f"  No overuse detected")
+
+        logger.info("[CAP-ANALYZE] === End Analysis ===")
 
     def _emit_capacity_analysis(self, successful: int, total_nets: int, overuse_count: int, failed_nets: int):
         """Emit honest capacity analysis when routing is capacity-limited"""
@@ -6770,10 +6983,15 @@ class UnifiedPathFinder:
             return float('inf')  # Edge doesn't exist
 
         # Check capacity constraints in HARD phase
-        if hasattr(self, 'current_iteration') and self.current_iteration >= self.config.phase_block_after:
+        # CRITICAL: Only hard-lock AFTER convergence (when overuse == 0)
+        # During negotiation with overuse, allow temporary sharing via cost penalties
+        converged = getattr(self, '_converged', False)
+        if (hasattr(self, 'current_iteration') and
+            self.current_iteration >= self.config.phase_block_after and
+            converged):
             current_owners = self.edge_owners.get(edge_idx, set())
             if current_owners and net_id not in current_owners:
-                return float('inf')  # HARD blocked by another net
+                return float('inf')  # HARD blocked by another net (post-convergence only)
 
         # Check taboo in HARD phase
         if (hasattr(self, 'current_iteration') and self.current_iteration >= self._phase_block_after and
@@ -11421,7 +11639,12 @@ class UnifiedPathFinder:
                 self.edge_history[key] = min(self.edge_history[key] + hist_inc * extra, hist_cap)
 
     def _get_adaptive_roi_margin(self, net_id: str, base_margin_mm: float = 10.0) -> float:
-        """Get adaptive ROI margin based on net failure history"""
+        """Get adaptive ROI margin based on net failure history and hotset membership.
+
+        Widens search area for:
+        - Nets with repeated failures (bounded growth)
+        - Nets in hotset during stagnation (temporary expansion)
+        """
         failure_count = self._net_failure_count.get(net_id, 0)
 
         # Start with base margin, expand by 1-2 grid cells per failure
@@ -11431,11 +11654,20 @@ class UnifiedPathFinder:
         # Calculate new margin with expansion
         new_margin = base_margin_mm + expansion
 
+        # Apply hotset multiplier during stagnation (1.0 = no effect, >1.0 = wider)
+        hotset_multiplier = getattr(self, '_hotset_roi_multiplier', 1.0)
+        if hotset_multiplier > 1.0:
+            new_margin *= hotset_multiplier
+
+        # Apply failure multiplier (bounded: max 3x from failures)
+        failure_multiplier = 1.0 + min(failure_count * 0.2, 2.0)  # Max 3x total
+        new_margin *= failure_multiplier
+
         # Store the new margin for this net
         self._net_roi_margin[net_id] = new_margin
 
-        if expansion > 0:
-            logger.info(f"[ROI++] net={net_id} expand={new_margin:.1f}mm fail={failure_count}")
+        if expansion > 0 or hotset_multiplier > 1.0:
+            logger.debug(f"[ROI-MARGIN] {net_id}: base={base_margin_mm:.1f} failures={failure_count} hotset={hotset_multiplier:.2f} final={new_margin:.1f}mm")
 
         return new_margin
 
