@@ -51,6 +51,7 @@ def fetch_board_and_drc():
 
         # Layers / stackup
         layer_cnt = board.get_copper_layer_count()
+        logger.info(f"[LAYER-DETECT] board.get_copper_layer_count() returned: {layer_cnt}")
         stackup = board.get_stackup() if hasattr(board, 'get_stackup') else None
 
         # Nets and classes
@@ -569,10 +570,12 @@ class RichKiCadInterface:
         try:
             layer_count = _ipc_retry(board.get_copper_layer_count, "get_copper_layer_count", max_retries=3, sleep_s=0.5)
             if layer_count and layer_count > 0:
-                logger.info(f"Got layer count from IPC API: {layer_count}")
+                logger.info(f"Got layer count from IPC API: {layer_count} copper layers")
                 return layer_count
+            else:
+                logger.warning(f"Method 2 returned invalid layer count: {layer_count}")
         except Exception as e:
-            logger.debug(f"Method 1 failed - IPC copper layer count: {e}")
+            logger.warning(f"Method 2 failed - IPC copper layer count: {e}")
 
         # Method 2: Try to get layer stack
         try:
@@ -631,24 +634,11 @@ class RichKiCadInterface:
         except Exception as e:
             logger.debug(f"Method 4 failed - layer probing: {e}")
         
-        # Method 5: For typical high-layer-count boards, make educated guess
-        # If we have thousands of pads, it's likely a high layer count board
-        try:
-            pads = _ipc_retry(board.get_pads, "get_pads", max_retries=3, sleep_s=0.5)
-            pad_count = len(pads) if pads else 0
-            
-            if pad_count > 10000:
-                logger.info(f"Large board detected ({pad_count} pads) - assuming 12 layers")
-                return 12  # Common high-density board layer count
-            elif pad_count > 1000:
-                logger.info(f"Medium board detected ({pad_count} pads) - assuming 6 layers")
-                return 6   # Common medium complexity board
-            elif pad_count > 100:
-                logger.info(f"Small board detected ({pad_count} pads) - assuming 4 layers")
-                return 4   # Common 4-layer board
-                
-        except Exception as e:
-            logger.debug(f"Method 5 failed - pad count heuristic: {e}")
+        # Method 5: DISABLED - Do not use pad count heuristics (unreliable)
+        # Instead, fail loudly so we know the API detection isn't working
+        logger.error("CRITICAL: All layer count detection methods failed!")
+        logger.error("This means board.get_copper_layer_count() is not working")
+        logger.error("Check KiCad version (requires 9.0.5+) and IPC API connection")
         
         # Fallback: Default to 2 layers but log the issue
         logger.warning("Could not detect layer count using any method - defaulting to 2 layers")
