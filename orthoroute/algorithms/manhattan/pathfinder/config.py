@@ -97,7 +97,7 @@ class PathFinderConfig:
     pres_fac_max: float = PRES_FAC_MAX
     hist_accum_gain: float = HIST_ACCUM_GAIN
     overuse_eps: float = OVERUSE_EPS
-    mode: str = "delta_stepping"
+    mode: str = "near_far"  # Use fast GPU ROI pathfinding with actual CUDA kernels
     roi_parallel: bool = False
     per_net_budget_s: float = PER_NET_BUDGET_S
     max_roi_nodes: int = MAX_ROI_NODES
