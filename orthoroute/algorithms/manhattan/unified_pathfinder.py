@@ -3178,8 +3178,10 @@ class UnifiedPathFinder:
             h_edges = v_edges = z_edges = 0
             if over_edges > 0 and hasattr(self, 'indptr_cpu') and hasattr(self, 'indices_cpu'):
                 import numpy as np
-                over_array = usage.get() if hasattr(usage, 'get') else usage
-                over_idx = np.nonzero(over_array > cap.get() if hasattr(cap, 'get') else cap)[0]
+                # Get usage array from edge_present_usage
+                usage_array = self.edge_present_usage.get() if hasattr(self.edge_present_usage, 'get') else self.edge_present_usage
+                cap_array = self.edge_capacity.get() if hasattr(self.edge_capacity, 'get') else self.edge_capacity
+                over_idx = np.nonzero(usage_array > cap_array)[0]
                 edge_src = getattr(self, "edge_src_cpu", None)
                 if edge_src is None or len(edge_src) != len(self.indices_cpu):
                     edge_src = np.repeat(np.arange(len(self.indptr_cpu) - 1, dtype=np.int32),
