@@ -2243,25 +2243,19 @@ class UnifiedPathFinder:
         via_cost = 0.2 * self.geometry.pitch  # Small positive cost to prevent via stacking
         self.edges.extend([(stub_end_idx, via_idx, via_cost), (via_idx, stub_end_idx, via_cost)])
         
-        # 5. Connect via into routing lattice
-        # FAST PATH: Directly snap to lattice node instead of searching
+        # 5. Connect via into routing lattice on PAD'S LAYER ONLY
+        # FAST PATH: Directly snap to lattice node at via's layer
         lattice_x_idx, lattice_y_idx = self.geometry.world_to_lattice(grid_x, grid_y)
 
-        # Connect to multiple layers for via (Z-edges)
-        connected_count = 0
-        for layer in range(min(3, self.geometry.layer_count)):  # Connect to first 3 layers
-            lattice_node_idx = self.geometry.node_index(lattice_x_idx, lattice_y_idx, layer)
-            via_cost = 0.2 * self.geometry.pitch
-            self.edges.extend([(via_idx, lattice_node_idx, via_cost),
-                             (lattice_node_idx, via_idx, via_cost)])
-            connected_count += 1
+        # Connect ONLY to the via's layer (which matches pad layer via escape stub)
+        # Layer transitions happen through lattice Z-edges (adjacent-layer vias)
+        lattice_node_idx = self.geometry.node_index(lattice_x_idx, lattice_y_idx, via_layer)
+        via_edge_cost = max(VIA_COST, 0.2 * self.geometry.pitch)  # Ensure non-zero
+        self.edges.extend([(via_idx, lattice_node_idx, via_edge_cost),
+                         (lattice_node_idx, via_idx, via_edge_cost)])
 
-        if connected_count > 0:
-            logger.debug(f"Escape created: {net_name} → via at ({grid_x:.1f}, {grid_y:.1f}) connected to {connected_count} layers")
-            return True
-        else:
-            logger.warning(f"Via {via_node_id} could not connect to lattice")
-            return False
+        logger.debug(f"Escape created: {net_name} → via at ({grid_x:.1f}, {grid_y:.1f}) layer={via_layer}")
+        return True
     
     def _connect_via_to_lattice(self, via_idx: int, grid_x: float, grid_y: float) -> bool:
         """Connect escape via to routing lattice at grid coordinates"""
@@ -11256,15 +11250,15 @@ class UnifiedPathFinder:
         return hv
 
     def _derive_allowed_layer_pairs(self, layer_count: int) -> set:
-        """Build legal layer transition pairs from KiCad stackup rules"""
+        """Build legal layer transition pairs - ADJACENT LAYERS ONLY for realistic routing."""
         pairs = set()
 
-        # For now, implement full blind/buried via support (all-to-all)
-        # In production, this would query KiCad's stackup rules
-        for from_layer in range(layer_count):
-            for to_layer in range(layer_count):
-                if from_layer != to_layer:
-                    pairs.add((from_layer, to_layer))
+        # CRITICAL FIX: Only allow adjacent-layer transitions (i ↔ i+1)
+        # This prevents unlimited Z-axis "teleportation" and enforces realistic via stacking
+        # For 12 layers: 0↔1, 1↔2, 2↔3, ..., 10↔11 = 22 bidirectional pairs
+        for i in range(layer_count - 1):
+            pairs.add((i, i + 1))      # Forward: L0→L1, L1→L2, ...
+            pairs.add((i + 1, i))      # Reverse: L1→L0, L2→L1, ...
 
         # Could add restrictions like:
         # - Adjacent layers only: pairs = {(i, i+1), (i+1, i) for i in range(layer_count-1)}
