@@ -3372,7 +3372,7 @@ class UnifiedPathFinder:
         if hasattr(cap, 'get'):
             cap = cap.get()
 
-        # Analyze overuse by edge type (simplified - tracks all edges together)
+        # Analyze overuse by edge type (simplified - tracks all edges together) 
         total_overuse = 0
         overused_edges = 0
         max_overuse = 0
