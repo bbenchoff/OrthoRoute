@@ -1472,10 +1472,21 @@ class UnifiedPathFinder:
         return (uniq[0], uniq[1]) if len(uniq) == 2 else (None, None)
 
     def _get_all_pads(self, board):
-        """Get all pads from all components in the board."""
+        """Get pads from board, filtering for only those with nets (skip unconnected)."""
         all_pads = []
+        connected_pads = 0
+        unconnected_pads = 0
+
         for component in board.components:
-            all_pads.extend(component.pads)
+            for pad in component.pads:
+                net_name = self._get_pad_net_name(pad)
+                if net_name and net_name != "unconnected" and net_name.strip():
+                    all_pads.append(pad)
+                    connected_pads += 1
+                else:
+                    unconnected_pads += 1
+
+        logger.info(f"[PAD-FILTER] {connected_pads} pads with nets, {unconnected_pads} unconnected (skipped)")
 
         # Store for stub emission
         self._all_pads = all_pads
@@ -2544,6 +2555,7 @@ class UnifiedPathFinder:
         
         # Initialize PathFinder state - DEVICE ARRAYS (GPU/CPU mode-aware)
         num_edges = len(self.edges)
+        self.E_live = num_edges  # Track for CSR rebuild guard
         if self.use_gpu:
             # Device arrays for GPU ∆-stepping
             self.edge_capacity = cp.ones(num_edges, dtype=cp.float32)  # Capacity = 1 per edge
