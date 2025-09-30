@@ -857,9 +857,14 @@ class UnifiedPathFinder:
                         # fallback: build indices from path nodes
                         # (u,v) → edge_idx via self.edge_lookup
                         csr_idx = self._edge_indices_from_node_path(res.node_path)
-                    # PRESENT += 1 at these edges (CuPy requires int32/uint32 for .at())
+                    # PRESENT += 1 at these edges (detect GPU vs CPU)
                     if isinstance(csr_idx, np.ndarray):
-                        np.add.at(self.edge_present_usage, csr_idx.astype(np.int32, copy=False), 1)
+                        if hasattr(self.edge_present_usage, 'get'):  # CuPy array
+                            import cupy as cp
+                            csr_idx_gpu = cp.asarray(csr_idx, dtype=cp.int32)
+                            cp.add.at(self.edge_present_usage, csr_idx_gpu, 1)
+                        else:  # NumPy array
+                            np.add.at(self.edge_present_usage, csr_idx.astype(np.int32, copy=False), 1)
                     else:
                         for e in csr_idx:
                             self.edge_present_usage[int(e)] += 1
@@ -882,9 +887,15 @@ class UnifiedPathFinder:
         if prev is None or len(prev) == 0:
             return None
         import numpy as np
-        # CuPy requires int32/uint32 for .at() operations
-        idx = np.asarray(prev, dtype=np.int32)
-        np.subtract.at(self.edge_present_usage, idx, 1)
+        # Detect if using GPU arrays (CuPy)
+        if hasattr(self.edge_present_usage, 'get'):  # CuPy array
+            import cupy as cp
+            # CuPy requires int32/uint32 for .at() operations
+            idx = cp.asarray(prev, dtype=cp.int32)
+            cp.subtract.at(self.edge_present_usage, idx, 1)
+        else:  # NumPy array
+            idx = np.asarray(prev, dtype=np.int32)
+            np.subtract.at(self.edge_present_usage, idx, 1)
         # if you maintain owners, free them for this net:
         if hasattr(self, "edge_owners"):
             for e in idx.tolist():
@@ -895,7 +906,16 @@ class UnifiedPathFinder:
         if prev_idx is None:
             return
         import numpy as np
-        np.add.at(self.edge_present_usage, prev_idx, 1)
+        # Detect if using GPU arrays (CuPy)
+        if hasattr(self.edge_present_usage, 'get'):  # CuPy array
+            import cupy as cp
+            if not hasattr(prev_idx, 'get'):  # Convert to CuPy if needed
+                prev_idx = cp.asarray(prev_idx, dtype=cp.int32)
+            cp.add.at(self.edge_present_usage, prev_idx, 1)
+        else:  # NumPy array
+            if not isinstance(prev_idx, np.ndarray):
+                prev_idx = np.asarray(prev_idx, dtype=np.int32)
+            np.add.at(self.edge_present_usage, prev_idx, 1)
         if hasattr(self, "edge_owners"):
             for e in prev_idx.tolist():
                 self._owner_add(e, net_id)
@@ -915,9 +935,14 @@ class UnifiedPathFinder:
             res = self._route_single_net_cpu(net_id, src, dst)  # your existing call
             if res.success:
                 csr_idx = res.csr_edge_indices or self._edge_indices_from_node_path(res.node_path)
-                # CuPy requires int32/uint32 for .at() operations
-                csr_idx = np.asarray(csr_idx, dtype=np.int32)
-                np.add.at(self.edge_present_usage, csr_idx, 1)
+                # Detect GPU vs CPU and use appropriate library
+                if hasattr(self.edge_present_usage, 'get'):  # CuPy array
+                    import cupy as cp
+                    csr_idx = cp.asarray(csr_idx, dtype=cp.int32)
+                    cp.add.at(self.edge_present_usage, csr_idx, 1)
+                else:  # NumPy array
+                    csr_idx = np.asarray(csr_idx, dtype=np.int32)
+                    np.add.at(self.edge_present_usage, csr_idx, 1)
                 self._net_paths[net_id] = csr_idx
                 if hasattr(self, "edge_owners"):
                     for e in csr_idx.tolist():
