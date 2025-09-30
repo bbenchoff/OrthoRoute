@@ -857,9 +857,9 @@ class UnifiedPathFinder:
                         # fallback: build indices from path nodes
                         # (u,v) → edge_idx via self.edge_lookup
                         csr_idx = self._edge_indices_from_node_path(res.node_path)
-                    # PRESENT += 1 at these edges
+                    # PRESENT += 1 at these edges (CuPy requires int32/uint32 for .at())
                     if isinstance(csr_idx, np.ndarray):
-                        np.add.at(self.edge_present_usage, csr_idx, 1)
+                        np.add.at(self.edge_present_usage, csr_idx.astype(np.int32, copy=False), 1)
                     else:
                         for e in csr_idx:
                             self.edge_present_usage[int(e)] += 1
@@ -882,7 +882,8 @@ class UnifiedPathFinder:
         if prev is None or len(prev) == 0:
             return None
         import numpy as np
-        idx = np.asarray(prev, dtype=np.int64)
+        # CuPy requires int32/uint32 for .at() operations
+        idx = np.asarray(prev, dtype=np.int32)
         np.subtract.at(self.edge_present_usage, idx, 1)
         # if you maintain owners, free them for this net:
         if hasattr(self, "edge_owners"):
@@ -914,7 +915,8 @@ class UnifiedPathFinder:
             res = self._route_single_net_cpu(net_id, src, dst)  # your existing call
             if res.success:
                 csr_idx = res.csr_edge_indices or self._edge_indices_from_node_path(res.node_path)
-                csr_idx = np.asarray(csr_idx, dtype=np.int64)
+                # CuPy requires int32/uint32 for .at() operations
+                csr_idx = np.asarray(csr_idx, dtype=np.int32)
                 np.add.at(self.edge_present_usage, csr_idx, 1)
                 self._net_paths[net_id] = csr_idx
                 if hasattr(self, "edge_owners"):
@@ -1175,17 +1177,17 @@ class UnifiedPathFinder:
         E = int(getattr(self, 'E_live', 0) or len(getattr(self, 'indices_cpu', [])) or len(getattr(self, 'edge_present_usage', []) or []))
         if not hasattr(self, '_batch_deltas') or self._batch_deltas is None:
             self._batch_deltas = {}
-        # Clamp and cast indices
+        # Clamp and cast indices (CuPy requires int32/uint32 for .at())
         idxs = [int(e) for e in csr_edge_indices if 0 <= int(e) < E]
         if not idxs:
             return 0
         xp = getattr(self, 'xp', None) or (cp if (getattr(self, 'use_gpu', False) and cp is not None) else __import__('numpy'))
         try:
             if xp.__name__ == 'numpy':
-                xp.add.at(self.edge_present_usage, idxs, 1)
+                xp.add.at(self.edge_present_usage, xp.asarray(idxs, dtype=xp.int32), 1)
             else:
                 import cupy as _cp
-                _cp.add.at(self.edge_present_usage, _cp.asarray(idxs), 1)
+                _cp.add.at(self.edge_present_usage, _cp.asarray(idxs, dtype=_cp.int32), 1)
         except Exception:
             # Fallback per-index if add.at fails
             for e in idxs:
@@ -1227,7 +1229,9 @@ class UnifiedPathFinder:
             if bad:
                 setattr(self, name, xp.zeros(E, dtype=dtype))
         # accommodate both naming variants present in this module
-        _ensure('edge_present_usage', xp.float32)
+        # Use int32 for GPU mode (CuPy .at() requirement), float32 for CPU
+        usage_dtype = xp.int32 if (getattr(self, 'use_gpu', False) and cp is not None) else xp.float32
+        _ensure('edge_present_usage', usage_dtype)
         _ensure('edge_history', xp.float32)
         _ensure('edge_capacity', xp.float32)
         _ensure('edge_base_cost', xp.float32) if hasattr(self, 'edge_base_cost') else None
@@ -2371,8 +2375,8 @@ class UnifiedPathFinder:
         ensure("edge_dir_mask", np.uint8   if not self.use_gpu else cp.uint8,   1)
         ensure("edge_bottleneck_penalty", np.float32 if not self.use_gpu else cp.float32, 0.0)
 
-        # Also refresh edge state arrays
-        ensure("edge_present_usage", np.float32 if not self.use_gpu else cp.float32, 0.0)
+        # Also refresh edge state arrays (int32 for GPU CuPy .at() compatibility)
+        ensure("edge_present_usage", np.float32 if not self.use_gpu else cp.int32, 0.0)
         ensure("edge_history", np.float32 if not self.use_gpu else cp.float32, 0.0)
         ensure("edge_capacity", np.float32 if not self.use_gpu else cp.float32, 1.0)
         ensure("edge_total_cost", np.float32 if not self.use_gpu else cp.float32, 0.0)
@@ -2565,7 +2569,7 @@ class UnifiedPathFinder:
         if self.use_gpu:
             # Device arrays for GPU ∆-stepping
             self.edge_capacity = cp.ones(num_edges, dtype=cp.float32)  # Capacity = 1 per edge
-            self.edge_present_usage = cp.zeros(num_edges, dtype=cp.float32)  # Current iteration usage
+            self.edge_present_usage = cp.zeros(num_edges, dtype=cp.int32)  # Current iteration usage (int32 for CuPy .at())
             self.edge_history = cp.zeros(num_edges, dtype=cp.float32)  # Historical congestion
             
             # DEVICE-ONLY ROI EXTRACTION: Persistent scratch arrays for global→local mapping
