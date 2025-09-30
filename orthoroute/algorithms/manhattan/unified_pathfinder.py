@@ -2244,10 +2244,20 @@ class UnifiedPathFinder:
         self.edges.extend([(stub_end_idx, via_idx, via_cost), (via_idx, stub_end_idx, via_cost)])
         
         # 5. Connect via into routing lattice
-        lattice_connected = self._connect_via_to_lattice(via_idx, grid_x, grid_y)
-        
-        if lattice_connected:
-            logger.debug(f"Escape created: {net_name} → via at ({grid_x:.1f}, {grid_y:.1f})")
+        # FAST PATH: Directly snap to lattice node instead of searching
+        lattice_x_idx, lattice_y_idx = self.geometry.world_to_lattice(grid_x, grid_y)
+
+        # Connect to multiple layers for via (Z-edges)
+        connected_count = 0
+        for layer in range(min(3, self.geometry.layer_count)):  # Connect to first 3 layers
+            lattice_node_idx = self.geometry.node_index(lattice_x_idx, lattice_y_idx, layer)
+            via_cost = 0.2 * self.geometry.pitch
+            self.edges.extend([(via_idx, lattice_node_idx, via_cost),
+                             (lattice_node_idx, via_idx, via_cost)])
+            connected_count += 1
+
+        if connected_count > 0:
+            logger.debug(f"Escape created: {net_name} → via at ({grid_x:.1f}, {grid_y:.1f}) connected to {connected_count} layers")
             return True
         else:
             logger.warning(f"Via {via_node_id} could not connect to lattice")
