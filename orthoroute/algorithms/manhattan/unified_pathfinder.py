@@ -3096,6 +3096,11 @@ class UnifiedPathFinder:
             over_sum, over_edges = self._compute_overuse_stats_present()  # must not raise
             self._update_edge_total_costs(pres_fac)
 
+            # CRITICAL: Log cost refresh to verify solver is seeing updated costs
+            changed_edges = int((self.edge_total_cost != self.edge_base_cost).sum()) if hasattr(self, 'edge_base_cost') else 0
+            total_edges = len(self.edge_total_cost) if hasattr(self, 'edge_total_cost') else 0
+            logger.info(f"[COST-REFRESH] device_weights=updated E={total_edges} pres={pres_fac:.2f} hist=1.00 changed={changed_edges}")
+
             # 2a) CRITICAL: Build hotset - nets that MUST be re-routed
             if over_sum > 0:
                 hotset = self._build_hotset_from_overuse()
@@ -3168,8 +3173,39 @@ class UnifiedPathFinder:
                         len(self._edge_store),
                         int((self.edge_present_usage > 0).sum()))
 
-            logger.info("[ITER-RESULT] routed=%d failed=%d overuse_edges=%d over_sum=%d changed=%s",
-                        routed_ct, failed_ct, over_edges, over_sum, bool(changed))
+            # ENHANCED: Add H/V/Z breakdown for diagnostic clarity
+            h_over = v_over = z_over = 0
+            h_edges = v_edges = z_edges = 0
+            if over_edges > 0 and hasattr(self, 'indptr_cpu') and hasattr(self, 'indices_cpu'):
+                import numpy as np
+                over_array = usage.get() if hasattr(usage, 'get') else usage
+                over_idx = np.nonzero(over_array > cap.get() if hasattr(cap, 'get') else cap)[0]
+                edge_src = getattr(self, "edge_src_cpu", None)
+                if edge_src is None or len(edge_src) != len(self.indices_cpu):
+                    edge_src = np.repeat(np.arange(len(self.indptr_cpu) - 1, dtype=np.int32),
+                                        np.diff(self.indptr_cpu).astype(np.int32))
+                    self.edge_src_cpu = edge_src
+
+                for eidx in over_idx:
+                    u = int(edge_src[eidx])
+                    v = int(self.indices_cpu[eidx])
+                    x1, y1, z1 = self._idx_to_coord(u) or (0, 0, 0)
+                    x2, y2, z2 = self._idx_to_coord(v) or (0, 0, 0)
+                    over_val = float(over_array[eidx] - (cap.get() if hasattr(cap, 'get') else cap)[eidx])
+
+                    if z1 != z2:  # Via
+                        z_over += over_val
+                        z_edges += 1
+                    elif y1 == y2:  # Horizontal
+                        h_over += over_val
+                        h_edges += 1
+                    else:  # Vertical
+                        v_over += over_val
+                        v_edges += 1
+
+            logger.info("[ITER-RESULT] routed=%d failed=%d overuse_edges=%d over_sum=%d changed=%s | H=%d(%.0f) V=%d(%.0f) Z=%d(%.0f)",
+                        routed_ct, failed_ct, over_edges, over_sum, bool(changed),
+                        h_edges, h_over, v_edges, v_over, z_edges, z_over)
 
             # Mark dirty nets: all nets touching overused edges must be re-routed next iteration
             if over_edges > 0:
@@ -3538,6 +3574,7 @@ class UnifiedPathFinder:
                 self._refresh_present_usage_from_store()   # rebuild usage vector
                 pres_fac = getattr(self, '_current_pres_fac', 2.0)  # get current pres_fac
                 self._update_edge_total_costs(pres_fac)         # raise costs on used edges
+                logger.debug(f"[COST-REFRESH] net={net_id} pres={pres_fac:.2f} (incremental update)")
                 # Accumulate edge usage on device
                 self._accumulate_edge_usage_gpu(path)
         
@@ -3650,7 +3687,12 @@ class UnifiedPathFinder:
             over_mask = usage > cap
             total[over_mask] = np.inf
 
-        self.edge_total_cost = total
+        # CRITICAL FIX: Convert to GPU array if using GPU mode
+        if self.use_gpu and CUPY_AVAILABLE:
+            import cupy as cp
+            self.edge_total_cost = cp.asarray(total, dtype=cp.float32)
+        else:
+            self.edge_total_cost = total
 
         # 🚫 Do NOT mutate ownership/present usage here by default
         if getattr(self.config, "peel_in_cost", False):
@@ -4077,6 +4119,12 @@ class UnifiedPathFinder:
         roi_weights = []
         roi_row_ptr = [0]
 
+        # CRITICAL FIX: Get CPU version of edge_total_cost (includes pres_fac penalties)
+        if hasattr(self.edge_total_cost, 'get'):
+            edge_costs_cpu = self.edge_total_cost.get()
+        else:
+            edge_costs_cpu = self.edge_total_cost
+
         for local_src_idx, global_src_idx in enumerate(roi_nodes):
             # Get edges for this source node from CSR
             edge_start = self.csr_indptr[global_src_idx]
@@ -4089,7 +4137,8 @@ class UnifiedPathFinder:
                     # Both source and destination are in ROI
                     local_dst_idx = global_to_local[global_dst_idx]
                     roi_edges.append(local_dst_idx)
-                    roi_weights.append(self.csr_weights[edge_idx])
+                    # CRITICAL FIX: Use live edge_total_cost, not base csr_weights
+                    roi_weights.append(float(edge_costs_cpu[edge_idx]))
                     local_edges_count += 1
 
             roi_row_ptr.append(roi_row_ptr[-1] + local_edges_count)
@@ -4564,7 +4613,8 @@ class UnifiedPathFinder:
         
         # 4) Gather destinations & costs directly from the CuPy CSR arrays (device)
         dst_global = adj.indices[csr_pos].astype(cp.int32)     # (total,)
-        costs      = adj.data[csr_pos].astype(cp.float32)      # (total,)
+        # CRITICAL FIX: Use live edge_total_cost (includes pres_fac penalties) not base adj.data
+        costs      = self.edge_total_cost[csr_pos].astype(cp.float32)  # (total,)
         
         # 5) Filter to keep only edges staying inside the ROI via global->local map
         # CRITICAL PERFORMANCE FIX: Replace slow dictionary lookups with GPU-native sparse mapping
@@ -4711,7 +4761,8 @@ class UnifiedPathFinder:
         
         # 4) Device-only edge data gathering (zero host transfers)
         dst_global_ids = adj.indices[csr_absolute_pos].astype(cp.int32)
-        edge_costs = adj.data[csr_absolute_pos].astype(cp.float32)
+        # CRITICAL FIX: Use live edge_total_cost (includes pres_fac penalties) not base adj.data
+        edge_costs = self.edge_total_cost[csr_absolute_pos].astype(cp.float32)
         
         # 5) Device-only global→local mapping using persistent g2l_scratch array
         # CRITICAL PERFORMANCE WIN: Use scatter lookup instead of dictionary
