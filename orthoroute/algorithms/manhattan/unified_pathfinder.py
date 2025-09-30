@@ -10375,7 +10375,7 @@ class UnifiedPathFinder:
             else:
                 # ESCAPE NODE: Use legacy coordinate array system
                 if not hasattr(self, '_logged_escape_nodes'):
-                    logger.info(f"[COORD-DEBUG] ESCAPE node_idx={node_idx} >= lattice_size={lattice_size}")
+                    logger.debug(f"[COORD-DEBUG] ESCAPE node_idx={node_idx} >= lattice_size={lattice_size}")
                     self._logged_escape_nodes = True
 
                 if self.node_coordinates is None:
@@ -10393,7 +10393,7 @@ class UnifiedPathFinder:
 
                 # DEBUG: Log escape node coordinate conversion
                 if node_idx < lattice_size + 10:  # Only first 10 escape nodes
-                    logger.info(f"[COORD-DEBUG] ESCAPE node_idx={node_idx} -> coords=({coords[0]:.1f},{coords[1]:.1f},{coords[2]:.0f})")
+                    logger.debug(f"[COORD-DEBUG] ESCAPE node_idx={node_idx} -> coords=({coords[0]:.1f},{coords[1]:.1f},{coords[2]:.0f})")
 
                 return tuple(float(c) for c in coords)
 
