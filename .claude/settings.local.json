@@ -18,7 +18,8 @@
       "Bash(mkdir:*)",
       "Bash(awk:*)",
       "WebFetch(domain:docs.kicad.org)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(tee:*)"
     ],
     "deny": [],
     "ask": [],

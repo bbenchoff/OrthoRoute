@@ -3137,9 +3137,16 @@ class UnifiedPathFinder:
 
             # Track path changes for stagnation detection
             import numpy as np
+            def _to_numpy_path(path):
+                if path is None:
+                    return np.empty(0, dtype=np.int64)
+                # CuPy array? Convert to NumPy first
+                if hasattr(path, 'get'):
+                    path = path.get()
+                return np.asarray(path, dtype=np.int64).copy()
+
             old_paths = {
-                net_id: (np.asarray(path, dtype=np.int64).copy()
-                         if path is not None else np.empty(0, dtype=np.int64))
+                net_id: _to_numpy_path(path)
                 for net_id, path in self._net_paths.items()
             }
 
@@ -3210,6 +3217,9 @@ class UnifiedPathFinder:
             def _as_array_path(p):
                 if p is None:
                     return np.empty(0, dtype=np.int64)
+                # CuPy array? Convert to NumPy first
+                if hasattr(p, 'get'):
+                    p = p.get()
                 # already an array?
                 if isinstance(p, np.ndarray):
                     return p.astype(np.int64, copy=True)
