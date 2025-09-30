@@ -842,6 +842,36 @@ class UnifiedPathFinder:
             return 0
         return len([net for net, path in self.routed_nets.items() if not path])
 
+    def _route_all_nets_gpu_in_batches_with_metrics(self, nets, progress_cb):
+        """Route all nets using GPU acceleration in batches."""
+        routed_total = 0
+        failed_total = 0
+
+        # Convert dict to list of tuples
+        batch_list = list(nets.items())
+
+        logger.info(f"[GPU-ROUTING] Processing {len(batch_list)} nets using GPU pathfinding")
+
+        # Route in batches using GPU
+        for i in range(0, len(batch_list), self.config.batch_size):
+            batch = batch_list[i:i+self.config.batch_size]
+            results, metrics = self._route_batch_gpu_with_metrics(batch)
+
+            # Results is a list of paths
+            for j, path in enumerate(results):
+                if path and len(path) > 1:
+                    routed_total += 1
+                    # Store path
+                    net_id = batch[j][0]
+                    self._net_paths[net_id] = path
+                    self.routed_nets[net_id] = path
+                else:
+                    failed_total += 1
+
+            logger.info(f"[BATCH] routed={routed_total} failed={failed_total}")
+
+        return routed_total, failed_total
+
     def _route_all_nets_cpu_in_batches_with_metrics(self, nets, progress_ctx):
         routed_ct = 0
         failed_ct = 0
