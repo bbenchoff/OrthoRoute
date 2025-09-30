@@ -2629,9 +2629,9 @@ class UnifiedPathFinder:
             self.congestion = self.edge_present_usage
             self.history_cost = self.edge_history
         else:
-            # CPU fallback
-            self.edge_capacity = np.ones(num_edges, dtype=np.float32)
-            self.edge_present_usage = np.zeros(num_edges, dtype=np.float32)
+            # CPU fallback - use int32 for usage to match GPU (for .at() operations)
+            self.edge_capacity = np.ones(num_edges, dtype=np.int32)
+            self.edge_present_usage = np.zeros(num_edges, dtype=np.int32)
             self.edge_history = np.zeros(num_edges, dtype=np.float32)
             self.edge_bottleneck_penalty = np.zeros(num_edges, dtype=np.float32)
             self.edge_dir_mask = np.ones(num_edges, dtype=np.uint8)  # Legal by default
@@ -3696,9 +3696,11 @@ class UnifiedPathFinder:
         self._sync_edge_arrays_to_live_csr()
         E = self._live_edge_count()
         if getattr(self, 'edge_present_usage', None) is None or len(self.edge_present_usage) != E:
-            self.edge_present_usage = np.zeros(E, dtype=np.float32)
+            # Use int32 for consistency with .at() operations
+            dtype = cp.int32 if self.use_gpu else np.int32
+            self.edge_present_usage = (cp.zeros if self.use_gpu else np.zeros)(E, dtype=dtype)
         else:
-            self.edge_present_usage.fill(0.0)
+            self.edge_present_usage.fill(0)
 
         store = getattr(self, "_edge_store", None) or getattr(self, 'edge_store', None) or {}
         mapped = 0
