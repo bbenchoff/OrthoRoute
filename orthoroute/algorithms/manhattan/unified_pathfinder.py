@@ -119,7 +119,7 @@ ENABLE_INSTRUMENTATION = False     # Enable detailed instrumentation
 
 # Negotiation Parameters
 STAGNATION_PATIENCE = 5            # Iterations without improvement before stopping
-STRICT_OVERUSE_BLOCK = True        # Block overused edges with infinite cost
+STRICT_OVERUSE_BLOCK = False       # Block overused edges with infinite cost (disabled - use cost penalties instead)
 HIST_COST_WEIGHT = 1.0             # Weight for historical cost component
 
 # Legacy compatibility - keep original constant names for existing code
