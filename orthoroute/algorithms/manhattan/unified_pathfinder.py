@@ -71,9 +71,9 @@ LAYER_COUNT = 6                     # Number of copper layers
 # PathFinder Algorithm Parameters
 BATCH_SIZE = 32                     # Number of nets processed per batch
 MAX_ITERATIONS = 30                 # Maximum PathFinder negotiation iterations
-MAX_SEARCH_NODES = 50000             # Maximum nodes explored per net
-PER_NET_BUDGET_S = 0.5             # Time budget per net in seconds
-MAX_ROI_NODES = 20000              # Maximum nodes in Region of Interest
+MAX_SEARCH_NODES = 500000           # Maximum nodes explored per net (increased for large graphs)
+PER_NET_BUDGET_S = 5.0              # Time budget per net in seconds (increased for complex routing)
+MAX_ROI_NODES = 100000              # Maximum nodes in Region of Interest (increased for large boards)
 
 # PathFinder Cost Parameters
 PRES_FAC_INIT = 1.0                # Initial present factor for congestion
