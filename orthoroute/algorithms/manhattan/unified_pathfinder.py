@@ -476,18 +476,22 @@ class UnifiedPathFinder:
 
     def _log_top_congested_nets(self, k=20):
         """Report top K nets by overuse contribution, robust to None/arrays."""
-        if not hasattr(self, 'edge_owners'):
+        if not hasattr(self, 'edge_owners') or not hasattr(self, 'edge_capacity'):
             return
 
         net_overuse = {}
-        cap = int(getattr(self, '_edge_capacity', 1)) or 1
+
+        # Get capacity as numpy array for proper indexing
+        cap_np = self.edge_capacity.get() if hasattr(self.edge_capacity, 'get') else self.edge_capacity
+        cap_np = np.asarray(cap_np, dtype=np.int32)
 
         # Score each net by overuse contribution
         for edge_idx, owners in self.edge_owners.items():
-            if not isinstance(owners, set):
+            if not isinstance(owners, set) or edge_idx >= len(cap_np):
                 continue
             usage = len(owners)
-            overuse = max(0, usage - cap)
+            cap_val = int(cap_np[edge_idx])
+            overuse = max(0, usage - cap_val)
             if overuse > 0:
                 for net_id in owners:
                     net_overuse[net_id] = net_overuse.get(net_id, 0) + overuse
@@ -614,6 +618,16 @@ class UnifiedPathFinder:
             self.edge_store_usage = np.zeros(E, dtype=np.float32)
         elif len(self.edge_store_usage) != E:
             self.edge_store_usage = np.zeros(E, dtype=np.float32)
+
+    def _present_usage_np(self):
+        """Get edge_present_usage as CPU NumPy array (device-agnostic accessor)."""
+        if not hasattr(self, 'edge_present_usage') or self.edge_present_usage is None:
+            return np.array([], dtype=np.int32)
+        # If GPU array, transfer to CPU
+        if hasattr(self.edge_present_usage, 'get'):
+            return self.edge_present_usage.get()
+        # Already CPU array
+        return np.asarray(self.edge_present_usage, dtype=np.int32)
 
     def _reset_present_usage(self):
         """Zero the per-iteration usage vector (length = E_live)."""
@@ -3178,10 +3192,11 @@ class UnifiedPathFinder:
             h_edges = v_edges = z_edges = 0
             if over_edges > 0 and hasattr(self, 'indptr_cpu') and hasattr(self, 'indices_cpu'):
                 import numpy as np
-                # Get usage array from edge_present_usage
-                usage_array = self.edge_present_usage.get() if hasattr(self.edge_present_usage, 'get') else self.edge_present_usage
-                cap_array = self.edge_capacity.get() if hasattr(self.edge_capacity, 'get') else self.edge_capacity
-                over_idx = np.nonzero(usage_array > cap_array)[0]
+                # Use standard accessor for device-agnostic array access
+                usage_np = self._present_usage_np()
+                cap_np = self.edge_capacity.get() if hasattr(self.edge_capacity, 'get') else self.edge_capacity
+                cap_np = np.asarray(cap_np, dtype=np.int32)
+                over_idx = np.nonzero(usage_np > cap_np)[0]
                 edge_src = getattr(self, "edge_src_cpu", None)
                 if edge_src is None or len(edge_src) != len(self.indices_cpu):
                     edge_src = np.repeat(np.arange(len(self.indptr_cpu) - 1, dtype=np.int32),
@@ -3193,7 +3208,7 @@ class UnifiedPathFinder:
                     v = int(self.indices_cpu[eidx])
                     x1, y1, z1 = self._idx_to_coord(u) or (0, 0, 0)
                     x2, y2, z2 = self._idx_to_coord(v) or (0, 0, 0)
-                    over_val = float(over_array[eidx] - (cap.get() if hasattr(cap, 'get') else cap)[eidx])
+                    over_val = float(usage_np[eidx] - cap_np[eidx])
 
                     if z1 != z2:  # Via
                         z_over += over_val
@@ -6980,9 +6995,12 @@ class UnifiedPathFinder:
             - Eliminates numerical precision issues in coordinate-based lookups
             - Critical for maintaining graph consistency during routing
         """
-        # Gating: skip if already built
-        if self._graph_built:
-            logger.debug("[CSR-LOOKUP] Already built, skipping")
+        # Idempotent guard: skip if already built for this E_live
+        current_E = getattr(self, 'E_live', 0)
+        last_built_E = getattr(self, '_edge_lookup_E_live', -1)
+
+        if current_E > 0 and current_E == last_built_E and hasattr(self, 'edge_lookup'):
+            logger.debug(f"[CSR-LOOKUP] Already built for E_live={current_E}, skipping rebuild")
             return
 
         import numpy as np
@@ -7020,10 +7038,11 @@ class UnifiedPathFinder:
 
                 edge_count += 1
 
-        # Track size for consistency checks
+        # Track size for consistency checks and idempotent rebuilds
         self._edge_lookup_size = self.edge_present_usage.shape[0]
+        self._edge_lookup_E_live = current_E  # Remember what E_live this was built for
         self._graph_built = True
-        logger.info(f"[CSR-LOOKUP] Built edge lookup: {len(self.edge_lookup)} (E_live={self._edge_lookup_size})")
+        logger.info(f"[CSR-LOOKUP] Built edge lookup: {len(self.edge_lookup)} entries for E_live={current_E}")
         logger.info(f"[CSR-LOOKUP] Initialized {len(self.edge_owners)} edge ownership records")
 
     def _pf_cost_for_edge(self, u: int, v: int, net_id: int) -> float:
