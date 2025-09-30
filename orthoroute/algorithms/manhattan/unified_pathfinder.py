@@ -3210,8 +3210,13 @@ class UnifiedPathFinder:
 
             prev_overuse = current_overuse
 
-            # 3) Route hotset nets against current costs (must not throw on single-net failure)
-            routed_ct, failed_ct = self._route_all_nets_cpu_in_batches_with_metrics(nets_to_route_ordered, progress_cb)
+            # 3) Route hotset nets against current costs (use GPU if available)
+            if self.use_gpu and self.config.mode == "delta_stepping":
+                # Use GPU delta-stepping for batch routing
+                routed_ct, failed_ct = self._route_all_nets_gpu_in_batches_with_metrics(nets_to_route_ordered, progress_cb)
+            else:
+                # CPU fallback
+                routed_ct, failed_ct = self._route_all_nets_cpu_in_batches_with_metrics(nets_to_route_ordered, progress_cb)
 
             # Calculate how many nets changed paths this iteration
             def _as_array_path(p):
