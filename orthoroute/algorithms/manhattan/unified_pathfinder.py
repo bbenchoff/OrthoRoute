@@ -1685,9 +1685,8 @@ class UnifiedPathFinder:
             - Performs comprehensive sanity checks and parameter validation
             - Foundation for all subsequent pathfinding operations
         """
-        # Initialize KiCad-based geometry system with dynamic layer count
-        self.geometry = KiCadGeometry(bounds, self.config.grid_pitch)
-        self.geometry.layer_count = layers
+        # Initialize KiCad-based geometry system with dynamic layer count from board
+        self.geometry = KiCadGeometry(bounds, self.config.grid_pitch, layer_count=layers)
 
         # Set up HV polarity with F.Cu vertical by requirement
         self.geometry.layer_directions = self._make_hv_polarity(self.config.layer_names)

@@ -76,7 +76,7 @@ Module Exports:
 from .config import (
     # Grid parameters
     GRID_PITCH,
-    LAYER_COUNT,
+    # LAYER_COUNT removed - use board.layer_count instead
 
     # Algorithm parameters
     BATCH_SIZE,
@@ -157,7 +157,7 @@ __all__ = [
     # Configuration
     'PathFinderConfig',
     'GRID_PITCH',
-    'LAYER_COUNT',
+    # 'LAYER_COUNT' removed - use board.layer_count instead
     'BATCH_SIZE',
     'MAX_ITERATIONS',
     'MAX_SEARCH_NODES',

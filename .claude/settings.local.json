@@ -14,7 +14,10 @@
       "Bash(git commit:*)",
       "Read(//c/Users/Benchoff/**)",
       "Read(//tmp/**)",
-      "Read(//c//**)"
+      "Read(//c//**)",
+      "Bash(mkdir:*)",
+      "Bash(awk:*)",
+      "WebFetch(domain:docs.kicad.org)"
     ],
     "deny": [],
     "ask": [],

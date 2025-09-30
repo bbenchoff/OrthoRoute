@@ -6,18 +6,19 @@ Handles lattice-to-world coordinate transformations and layer direction rules.
 """
 
 from typing import Tuple
-from .config import DEFAULT_GRID_PITCH, LAYER_COUNT
+from .config import DEFAULT_GRID_PITCH
 
 
 class KiCadGeometry:
     """Single source of truth for all coordinate conversions based on KiCad board"""
 
-    def __init__(self, kicad_bounds: Tuple[float, float, float, float], pitch: float = DEFAULT_GRID_PITCH):
+    def __init__(self, kicad_bounds: Tuple[float, float, float, float], pitch: float = DEFAULT_GRID_PITCH, layer_count: int = 2):
         """Initialize KiCad geometry system with bounds and grid pitch.
 
         Args:
             kicad_bounds: Tuple of (min_x, min_y, max_x, max_y) in mm
             pitch: Grid pitch in mm for routing lattice alignment
+            layer_count: Number of copper layers from KiCad board (default: 2 for minimal boards)
         """
         self.min_x, self.min_y, self.max_x, self.max_y = kicad_bounds
         self.pitch = pitch
@@ -32,9 +33,9 @@ class KiCadGeometry:
         self.x_steps = int((self.grid_max_x - self.grid_min_x) / pitch) + 1
         self.y_steps = int((self.grid_max_y - self.grid_min_y) / pitch) + 1
 
-        # Layer configuration - will be updated dynamically
-        self.layer_count = LAYER_COUNT  # Default, will be updated from board
-        self.layer_directions = ['h', 'v', 'h', 'v', 'h', 'v']  # Will be expanded for more layers
+        # Layer configuration - set from board.layer_count
+        self.layer_count = layer_count
+        self.layer_directions = ['h' if i % 2 == 0 else 'v' for i in range(layer_count)]
 
     def lattice_to_world(self, x_idx: int, y_idx: int) -> Tuple[float, float]:
         """Convert lattice indices to world coordinates"""

@@ -13,7 +13,8 @@ from dataclasses import dataclass
 
 # Grid and Geometry Parameters
 GRID_PITCH = 0.4                    # Grid pitch in mm for routing lattice
-LAYER_COUNT = 6                     # Number of copper layers
+# Note: LAYER_COUNT removed - use board.layer_count from KiCad API instead
+# See: board.get_copper_layer_count() or board.layer_count property
 
 # PathFinder Algorithm Parameters
 BATCH_SIZE = 32                     # Number of nets processed per batch
@@ -105,7 +106,7 @@ class PathFinderConfig:
     adaptive_delta: bool = ADAPTIVE_DELTA
     strict_capacity: bool = STRICT_CAPACITY
     reroute_only_offenders: bool = REROUTE_ONLY_OFFENDERS
-    layer_count: int = LAYER_COUNT
+    layer_count: int = 0  # Will be set from board.layer_count; 0 = uninitialized
     # Layer shortfall estimation tuning
     layer_shortfall_percentile: float = 95.0  # Percentile for congested channel estimation
     layer_shortfall_cap: int = 16            # Maximum layers to suggest
