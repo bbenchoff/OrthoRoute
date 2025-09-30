@@ -3240,10 +3240,13 @@ class UnifiedPathFinder:
 
             prev_overuse = current_overuse
 
-            # 3) Route hotset nets against current costs
-            # NOTE: GPU pathfinding exists but has performance issues (5min/net vs 0.3s/net CPU)
-            # For now, use CPU pathfinding which is proven fast and correct
-            routed_ct, failed_ct = self._route_all_nets_cpu_in_batches_with_metrics(nets_to_route_ordered, progress_cb)
+            # 3) Route hotset nets against current costs (GPU if available and mode supports it)
+            if self.use_gpu and self.config.mode in ["near_far", "multi_roi", "multi_roi_bidirectional"]:
+                # Use GPU pathfinding with real CUDA kernels
+                routed_ct, failed_ct = self._route_all_nets_gpu_in_batches_with_metrics(nets_to_route_ordered, progress_cb)
+            else:
+                # CPU fallback (or delta_stepping mode which is slow)
+                routed_ct, failed_ct = self._route_all_nets_cpu_in_batches_with_metrics(nets_to_route_ordered, progress_cb)
 
             # Calculate how many nets changed paths this iteration
             def _as_array_path(p):
