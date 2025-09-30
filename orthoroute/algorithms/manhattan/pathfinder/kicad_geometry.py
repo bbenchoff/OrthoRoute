@@ -35,15 +35,13 @@ class KiCadGeometry:
 
         # Layer configuration - set from board.layer_count
         self.layer_count = layer_count
-        # F.Cu (layer 0) and B.Cu (last layer) must be vertical per requirement
-        # Inner layers alternate: v, h, v, h, ...
+        # F.Cu (layer 0) must be vertical per requirement
+        # All other layers alternate: v, h, v, h, ...
         self.layer_directions = []
         for i in range(layer_count):
-            if i == 0:  # F.Cu
+            if i == 0:  # F.Cu always vertical
                 self.layer_directions.append('v')
-            elif i == layer_count - 1:  # B.Cu
-                self.layer_directions.append('v')
-            else:  # Inner layers: alternate starting with 'h'
+            else:  # All other layers alternate (including B.Cu)
                 self.layer_directions.append('h' if (i % 2) == 1 else 'v')
 
     def lattice_to_world(self, x_idx: int, y_idx: int) -> Tuple[float, float]:
