@@ -467,61 +467,76 @@ class UnifiedPathFinder:
         return edges
 
     def _log_top_congested_nets(self, k=20):
-        if not getattr(self, "_net_paths", None):
+        """Report top K nets by overuse contribution, robust to None/arrays."""
+        if not hasattr(self, 'edge_owners'):
             return
-        cap = int(getattr(self, "_edge_capacity", 1)) or 1
-        pressure = []
-        for net_id, path in self._net_paths.items():
-            if self._is_empty_path(path):
+
+        net_overuse = {}
+        cap = int(getattr(self, '_edge_capacity', 1)) or 1
+
+        # Score each net by overuse contribution
+        for edge_idx, owners in self.edge_owners.items():
+            if not isinstance(owners, set):
                 continue
-            over_sum = 0
-            for (u, v) in path:
-                idx = self.edge_lookup.get((u, v)) or self.edge_lookup.get((v, u))
-                if idx is not None:
-                    over = max(0, int(self.edge_present_usage[idx]) - cap)
-                    over_sum += over
-            if over_sum:
-                pressure.append((over_sum, net_id))
-        pressure.sort(reverse=True)
-        top = pressure[:k]
-        if top:
-            logger.info("[HOT-NETS] top=%d: %s", len(top), ", ".join(f"{n}:{s}" for s, n in top))
+            usage = len(owners)
+            overuse = max(0, usage - cap)
+            if overuse > 0:
+                for net_id in owners:
+                    net_overuse[net_id] = net_overuse.get(net_id, 0) + overuse
+
+        # Sort by overuse descending
+        ranked = sorted(net_overuse.items(), key=lambda x: x[1], reverse=True)
+        top_k = ranked[:k]
+
+        if top_k:
+            logger.info(f"[TOP-CONGESTED] Top {len(top_k)} nets by overuse:")
+            for net_id, overuse in top_k:
+                logger.info(f"  {net_id}: {overuse} overuse")
+
+    def _order_nets_by_congestion(self, net_list):
+        """Order nets by congestion impact for next iteration."""
+        net_scores = {}
+        for net_id in net_list:
+            # Score by overuse touching this net's path
+            overuse = 0
+            if net_id in self._net_paths:
+                path = self._net_paths[net_id]
+                # Handle path as array of edge indices
+                import numpy as np
+                if isinstance(path, np.ndarray):
+                    path_edges = path.tolist()
+                elif isinstance(path, list):
+                    path_edges = path
+                else:
+                    path_edges = []
+
+                for edge_idx in path_edges:
+                    if hasattr(self, 'edge_owners') and edge_idx in self.edge_owners:
+                        usage = len(self.edge_owners.get(edge_idx, set()))
+                        cap = 1  # Default capacity
+                        overuse += max(0, usage - cap)
+            net_scores[net_id] = overuse
+
+        # Sort by score descending, with jitter for ties
+        import random
+        return sorted(net_list, key=lambda n: (net_scores.get(n, 0), random.random()), reverse=True)
 
     def _owner_add(self, edge_idx: int, net_id: str) -> None:
-        s = self.edge_owners.get(edge_idx)
-        if s is None:
-            self.edge_owners[edge_idx] = {net_id}
-            return
-        if isinstance(s, set):
-            s.add(net_id)
-            return
-        # convert foreign types (str/list/tuple/etc.) once
-        try:
-            s = {s} if isinstance(s, str) else set(s)
-        except TypeError:
-            s = {str(s)}
-        s.add(net_id)
-        self.edge_owners[edge_idx] = s
+        """Add net_id as owner of edge_idx. edge_owners[edge_idx] is always a set."""
+        if edge_idx not in self.edge_owners:
+            self.edge_owners[edge_idx] = set()
+        self.edge_owners[edge_idx].add(net_id)
 
     def _owner_remove(self, edge_idx: int, net_id: str) -> None:
-        s = self.edge_owners.get(edge_idx)
-        if not s:
-            return
-        if isinstance(s, set):
-            s.discard(net_id)
-            if not s:
-                self.edge_owners.pop(edge_idx, None)
-            return
-        # convert once, then remove
-        try:
-            s = {s} if isinstance(s, str) else set(s)
-        except TypeError:
-            s = {str(s)}
-        s.discard(net_id)
-        if s:
-            self.edge_owners[edge_idx] = s
-        else:
-            self.edge_owners.pop(edge_idx, None)
+        """Remove net_id from owners of edge_idx. Clean up empty sets."""
+        if edge_idx in self.edge_owners:
+            self.edge_owners[edge_idx].discard(net_id)
+            if not self.edge_owners[edge_idx]:
+                del self.edge_owners[edge_idx]
+
+    def _get_edge_usage(self, edge_idx: int) -> int:
+        """Get number of nets using this edge."""
+        return len(self.edge_owners.get(edge_idx, set()))
 
     def _normalize_owner_types(self) -> None:
         """Ensure edge_owners maps edge_idx -> set(str)."""
@@ -822,8 +837,7 @@ class UnifiedPathFinder:
         # if you maintain owners, free them for this net:
         if hasattr(self, "edge_owners"):
             for e in idx.tolist():
-                if self.edge_owners.get(e) == net_id:
-                    del self.edge_owners[e]
+                self._owner_remove(e, net_id)
         return idx  # return so we can restore on failure
 
     def _restore_net_after_failed_reroute(self, net_id, prev_idx):
@@ -833,7 +847,7 @@ class UnifiedPathFinder:
         np.add.at(self.edge_present_usage, prev_idx, 1)
         if hasattr(self, "edge_owners"):
             for e in prev_idx.tolist():
-                self.edge_owners[e] = net_id
+                self._owner_add(e, net_id)
 
     def _route_batch_cpu_with_metrics(self, batch, progress_cb):
         """Route a batch of nets with rip-up/search/restore-on-fail logic."""
@@ -855,7 +869,7 @@ class UnifiedPathFinder:
                 self._net_paths[net_id] = csr_idx
                 if hasattr(self, "edge_owners"):
                     for e in csr_idx.tolist():
-                        self.edge_owners[e] = net_id
+                        self._owner_add(e, net_id)
                 routed_ct += 1
 
                 result = type('RouteResult', (), {
@@ -1265,12 +1279,18 @@ class UnifiedPathFinder:
 
         # CANONICAL EDGE STORE - Single source of truth for edge ownership/accounting
         self._edge_store = {}  # type: Dict[int, int]  # CSR index -> usage count
+        self.edge_owners = {}  # type: Dict[int, Set[str]]  # edge_idx -> set[net_id]
+        self.edge_usage = {}   # type: Dict[int, int]  # edge_idx -> int (derived from len(owners))
         self.net_edge_paths = {}  # type: Dict[str, List[tuple]]  # net_id -> list of edge keys
 
         # NEW: back-compat alias so any legacy _edge_store references hit the same dict
         # NEW: make routed/committed containers explicit for type checkers
         self.routed_nets = {}  # type: Dict[str, List[int]]
         self.committed_paths = {}  # type: Dict[str, List[int]]
+
+        # Graph rebuild gating flags
+        self._graph_built = False
+        self._masks_applied = False
 
         # Intent buffers built before emit; safe to clear on rip-up
         self._intent_tracks = []  # type: List[dict]
@@ -2987,14 +3007,15 @@ class UnifiedPathFinder:
                 self._log_top_congested_nets(k=20)
 
             # ---- Termination logic ----
-            # Success: no overuse and no failures
-            if failed_ct == 0 and over_edges == 0:
-                logger.info("[NEGOTIATE] Converged: all nets routed with legal usage.")
+            # Success: BOTH no overuse AND no failures
+            if failed_ct == 0 and over_sum == 0:
+                logger.info("[SUCCESS] All nets routed with zero overuse")
                 result = self._finalize_success()
                 return result
 
             # Track "no progress" to avoid spinning forever
-            cur_unrouted = failed_ct + (1 if over_edges > 0 else 0)
+            # Use over_sum for more precise tracking
+            cur_unrouted = failed_ct + over_sum
             if best_unrouted is None or cur_unrouted < best_unrouted:
                 best_unrouted = cur_unrouted
                 stagnant_iters = 0
@@ -3003,8 +3024,8 @@ class UnifiedPathFinder:
 
             # Optional early stop on stagnation
             if stagnant_iters >= cfg.stagnation_patience:
-                logger.warning("[NEGOTIATE] Stagnated for %d iters (best_unrouted=%d).",
-                               stagnant_iters, best_unrouted)
+                logger.warning(f"[STAGNATION] No improvement for {stagnant_iters} iters")
+                self._print_capacity_analysis(over_edges, over_sum)
                 break
 
             # Increase present-cost pressure and loop
@@ -3089,6 +3110,22 @@ class UnifiedPathFinder:
             usage = layer_usage.get(layer, 0)
             layer_name = self._map_layer_for_gui(layer)
             logger.info(f"  {layer_name} ({direction}): {usage} segments")
+
+    def _print_capacity_analysis(self, overuse_edges: int, overuse_sum: int):
+        """Print capacity breakdown for diagnostics."""
+        total_edges = len(self.edge_owners) if hasattr(self, 'edge_owners') else 0
+        pct_overused = (overuse_edges / max(1, total_edges)) * 100 if total_edges > 0 else 0
+
+        logger.info("[CAPACITY-ANALYSIS]")
+        logger.info(f"  Total edges: {total_edges}")
+        logger.info(f"  Overused edges: {overuse_edges} ({pct_overused:.1f}%)")
+        logger.info(f"  Total overuse: {overuse_sum}")
+
+        # Estimate extra layers needed
+        if overuse_edges > 0:
+            max_overuse_per_edge = overuse_sum // max(1, overuse_edges)
+            extra_layers = min(16, max_overuse_per_edge)
+            logger.info(f"  Estimated extra layers needed: {extra_layers}")
 
     def _dump_repro_bundle(self, successful: int, total_nets: int, failed_nets: int):
         """Dump small repro bundle for debugging failed routing"""
@@ -6669,6 +6706,11 @@ class UnifiedPathFinder:
             - Eliminates numerical precision issues in coordinate-based lookups
             - Critical for maintaining graph consistency during routing
         """
+        # Gating: skip if already built
+        if self._graph_built:
+            logger.debug("[CSR-LOOKUP] Already built, skipping")
+            return
+
         import numpy as np
 
         logger.info("[CSR-LOOKUP] Building edge lookup from CSR arrays...")
@@ -6678,9 +6720,10 @@ class UnifiedPathFinder:
             logger.warning("[CSR-LOOKUP] CSR arrays not available, skipping edge lookup build")
             return
 
-        # Initialize edge lookup and ownership tracking
+        # Initialize edge lookup (but preserve edge_owners if already exists)
         self.edge_lookup = {}  # (u,v) -> edge_index
-        self.edge_owners = {}  # edge_index -> Set[str] (current owners)
+        if not hasattr(self, 'edge_owners') or self.edge_owners is None:
+            self.edge_owners = {}  # edge_index -> Set[str] (current owners)
         self.edge_usage_count = {}  # edge_index -> usage count
 
         # Build lookup from CSR structure (using correct attribute names)
@@ -6696,14 +6739,16 @@ class UnifiedPathFinder:
                 self.edge_lookup[(u, v)] = edge_idx
                 self.edge_lookup[(v, u)] = edge_idx  # Symmetric access
 
-                # Initialize edge accounting
-                self.edge_owners[edge_idx] = set()  # No current owner(s) yet
+                # Initialize edge accounting only if not already set
+                if edge_idx not in self.edge_owners:
+                    self.edge_owners[edge_idx] = set()  # No current owner(s) yet
                 self.edge_usage_count[edge_idx] = 0  # No current usage
 
                 edge_count += 1
 
         # Track size for consistency checks
         self._edge_lookup_size = self.edge_present_usage.shape[0]
+        self._graph_built = True
         logger.info(f"[CSR-LOOKUP] Built edge lookup: {len(self.edge_lookup)} (E_live={self._edge_lookup_size})")
         logger.info(f"[CSR-LOOKUP] Initialized {len(self.edge_owners)} edge ownership records")
 
@@ -6718,8 +6763,8 @@ class UnifiedPathFinder:
 
         # Check capacity constraints in HARD phase
         if hasattr(self, 'current_iteration') and self.current_iteration >= self.config.phase_block_after:
-            current_owner = self.edge_owners.get(edge_idx)
-            if current_owner is not None and current_owner != net_id:
+            current_owners = self.edge_owners.get(edge_idx, set())
+            if current_owners and net_id not in current_owners:
                 return float('inf')  # HARD blocked by another net
 
         # Check taboo in HARD phase
@@ -6766,13 +6811,13 @@ class UnifiedPathFinder:
             return False  # Edge doesn't exist
 
         # Check if already owned by this net
-        current_owner = self.edge_owners.get(edge_idx)
-        if current_owner == net_id:
+        current_owners = self.edge_owners.get(edge_idx, set())
+        if net_id in current_owners:
             return True  # Net already owns this edge
 
         # Check capacity in HARD phase
         if hasattr(self, 'current_iteration') and self.current_iteration >= self.config.phase_block_after:
-            if current_owner is not None:
+            if current_owners:
                 return False  # Hard blocked by another net
 
         # Check taboo
@@ -6804,12 +6849,12 @@ class UnifiedPathFinder:
             logger.warning(f"[CSR-COMMIT] Edge ({u},{v}) not found in lookup")
             return
 
-        # Update ownership
-        old_owner = self.edge_owners.get(edge_idx)
-        if old_owner != net_id:
-            self.edge_owners[edge_idx] = net_id
-            if old_owner is not None:
-                logger.debug(f"[CSR-COMMIT] Edge {edge_idx} transferred from net {old_owner} to {net_id}")
+        # Update ownership using set-based model
+        old_owners = self.edge_owners.get(edge_idx, set()).copy()
+        if net_id not in old_owners:
+            self._owner_add(edge_idx, net_id)
+            if old_owners:
+                logger.debug(f"[CSR-COMMIT] Edge {edge_idx} now shared by {old_owners | {net_id}}")
 
         # Update usage count
         self.edge_usage_count[edge_idx] = self.edge_usage_count.get(edge_idx, 0) + 1
@@ -6823,8 +6868,9 @@ class UnifiedPathFinder:
             return
 
         # Remove ownership if this net owns it
-        if self.edge_owners.get(edge_idx) == net_id:
-            self.edge_owners[edge_idx] = None
+        current_owners = self.edge_owners.get(edge_idx, set())
+        if net_id in current_owners:
+            self._owner_remove(edge_idx, net_id)
             self.edge_usage_count[edge_idx] = max(0, self.edge_usage_count.get(edge_idx, 1) - 1)
 
             # Add to taboo for HARD phase blocking
