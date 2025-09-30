@@ -3203,6 +3203,9 @@ class UnifiedPathFinder:
                         len(self._edge_store),
                         int((self.edge_present_usage > 0).sum()))
 
+            # CRITICAL FIX: Recompute overuse AFTER routing to get accurate metrics
+            over_sum, over_edges = self._compute_overuse_stats_present()
+
             # ENHANCED: Add H/V/Z breakdown for diagnostic clarity
             h_over = v_over = z_over = 0
             h_edges = v_edges = z_edges = 0
