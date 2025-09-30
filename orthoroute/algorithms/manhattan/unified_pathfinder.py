@@ -945,6 +945,8 @@ class UnifiedPathFinder:
     def _route_single_net_cpu(self, net_id, src, dst):
         """Route a single net and return result with success info."""
         try:
+            # Track current net for debug logging
+            self._current_routing_net = net_id
             path = self._cpu_dijkstra_fallback(src, dst)
             if path and len(path) > 1:
                 csr_edges = self._path_nodes_to_csr_edges(path)
@@ -7412,15 +7414,17 @@ class UnifiedPathFinder:
         pq = [(0.0, source_idx)]
         
         nodes_processed = 0
+        net_id = getattr(self, '_current_routing_net', 'unknown')
+
         while pq and nodes_processed < self.config.max_search_nodes:
             current_dist, current_idx = heapq.heappop(pq)
-            
+
             if current_idx in visited:
                 continue
-                
+
             visited.add(current_idx)
             nodes_processed += 1
-            
+
             if current_idx == sink_idx:
                 # Reconstruct path
                 path = []
@@ -7428,6 +7432,7 @@ class UnifiedPathFinder:
                 while curr is not None:
                     path.append(curr)
                     curr = parent.get(curr)
+                logger.info(f"[PATH-FOUND] net={net_id} nodes_explored={nodes_processed} path_length={len(path)} cost={current_dist:.1f}")
                 return list(reversed(path))
             
             # Expand neighbors using precomputed costs
@@ -7445,7 +7450,16 @@ class UnifiedPathFinder:
                         distances[neighbor_idx] = new_dist
                         parent[neighbor_idx] = current_idx
                         heapq.heappush(pq, (new_dist, neighbor_idx))
-        
+
+        # Search failed - log why
+        if nodes_processed >= self.config.max_search_nodes:
+            sink_reached = sink_idx in visited
+            logger.warning(f"[SEARCH-BUDGET-HIT] net={net_id} explored={nodes_processed}/{self.config.max_search_nodes} sink_reached={sink_reached} pq_size={len(pq)}")
+        elif len(pq) == 0:
+            logger.warning(f"[NO-PATH-EXISTS] net={net_id} explored={nodes_processed} pq_exhausted=True (all reachable nodes visited, sink not found)")
+        else:
+            logger.warning(f"[SEARCH-FAILED] net={net_id} explored={nodes_processed} pq_size={len(pq)}")
+
         return None
     
     def _calculate_adaptive_roi_margin(self, source_idx: int, sink_idx: int, base_margin_mm: float) -> float:
