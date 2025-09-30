@@ -17,7 +17,8 @@
       "Read(//c//**)",
       "Bash(mkdir:*)",
       "Bash(awk:*)",
-      "WebFetch(domain:docs.kicad.org)"
+      "WebFetch(domain:docs.kicad.org)",
+      "Bash(find:*)"
     ],
     "deny": [],
     "ask": [],

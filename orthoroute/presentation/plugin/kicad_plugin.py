@@ -109,7 +109,7 @@ class KiCadPlugin:
                 logger.info("[ROUTER SELECTION] Loading UnifiedPathFinder (improved coordinate handling)")
                 config = PathFinderConfig()
                 config.strict_drc = True  # Force strict DRC for acceptance testing
-                self.pf = UnifiedPathFinder(config=config, use_gpu=False)  # Single instance - FORCE CPU-ONLY
+                self.pf = UnifiedPathFinder(config=config, use_gpu=True)  # Enable GPU acceleration
 
                 # Assert strict DRC is enabled
                 assert getattr(self.pf.config, "strict_drc", False), "strict_drc must be True for acceptance."

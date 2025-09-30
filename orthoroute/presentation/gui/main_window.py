@@ -88,7 +88,7 @@ class RoutingThread(QThread):
                     pf_config.strict_drc = True
 
                     # Create UnifiedPathFinder instance (not legacy ManhattanRRG)
-                    self.router = UnifiedPathFinder(config=pf_config, use_gpu=False)  # FORCE CPU-ONLY
+                    self.router = UnifiedPathFinder(config=pf_config, use_gpu=True)  # Enable GPU acceleration
                     logger.info(f"[GUI-ROUTER-WIRE] Created new {self.router.__class__.__name__} with instance_tag={getattr(self.router, '_instance_tag', 'NO_TAG')}")
 
                 # STEP 1c: Add guard assert to prove UnifiedPathFinder is used

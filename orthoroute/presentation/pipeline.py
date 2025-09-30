@@ -62,7 +62,7 @@ def run_pipeline(board, router):
     return results
 
 
-def create_unified_router(engine_type="unified_pathfinder", use_gpu=False):
+def create_unified_router(engine_type="unified_pathfinder", use_gpu=True):
     """DEPRECATED: Create a routing engine with fallback disabled during development.
     
     This function is deprecated. UnifiedPathFinder instances should ONLY be created

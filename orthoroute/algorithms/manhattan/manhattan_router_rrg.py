@@ -129,7 +129,7 @@ class ManhattanRRGRoutingEngine(RoutingEngine):
                     log_roi_statistics=True        # Log ROI batch statistics
                 )
                 
-                self.pathfinder = UnifiedPathFinder(config=config, use_gpu=False)  # FORCE CPU-ONLY
+                self.pathfinder = UnifiedPathFinder(config=config, use_gpu=True)  # Enable GPU acceleration
             else:
                 logger.info(f"Using pre-created UnifiedPathFinder instance: {getattr(self.pathfinder, '_instance_tag', 'NO_TAG')}")
             
