@@ -1605,6 +1605,37 @@ class OrthoRouteMainWindow(QMainWindow):
 
             self.log_to_gui("✓ Pad mapping complete", "SUCCESS")
 
+            # PRECOMPUTE PAD ESCAPES (for debugging, before routing)
+            self.log_to_gui("[DEBUG] Precomputing pad escapes...", "INFO")
+
+            # Attach GUI pad data to board for DRC
+            board._gui_pads = self.board_data.get('pads', [])
+            logger.info(f"Attached {len(board._gui_pads)} GUI pads to board for DRC")
+
+            escape_tracks, escape_vias = pf.precompute_all_pad_escapes(board)
+
+            # Push escape geometry to preview
+            if escape_tracks or escape_vias:
+                if 'tracks' not in self.board_data:
+                    self.board_data['tracks'] = []
+                if 'vias' not in self.board_data:
+                    self.board_data['vias'] = []
+
+                self.board_data['tracks'].extend(escape_tracks)
+                self.board_data['vias'].extend(escape_vias)
+
+                if hasattr(self.pcb_viewer, 'update_routing'):
+                    self.pcb_viewer.update_routing(self.board_data.get('tracks', []),
+                                                   self.board_data.get('vias', []))
+                    self.pcb_viewer.update()
+
+                self.log_to_gui(f"✓ Precomputed {len(escape_tracks)} escape stubs, {len(escape_vias)} vias", "SUCCESS")
+
+            # STOP HERE for debugging - don't continue to routing
+            self.log_to_gui("[DEBUG] Pad escapes visualization complete. Stopping before routing.", "INFO")
+            self._set_ui_busy(False)
+            return
+
             self.log_to_gui("[PIPELINE] Step 3: Preparing routing runtime...", "INFO")
             pf.prepare_routing_runtime()
             self.log_to_gui("✓ Runtime preparation complete", "SUCCESS")

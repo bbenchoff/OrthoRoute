@@ -19,7 +19,8 @@
       "Bash(awk:*)",
       "WebFetch(domain:docs.kicad.org)",
       "Bash(find:*)",
-      "Bash(tee:*)"
+      "Bash(tee:*)",
+      "WebSearch"
     ],
     "deny": [],
     "ask": [],
