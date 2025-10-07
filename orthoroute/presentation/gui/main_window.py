@@ -34,7 +34,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont, QPixmap, QPalette,
     QAction, QIcon, QPolygonF, QTransform, QWheelEvent, QMouseEvent,
-    QPaintEvent, QResizeEvent
+    QPaintEvent, QResizeEvent, QImage
 )
 
 from .kicad_colors import KiCadColorScheme
@@ -394,12 +394,6 @@ class PCBViewer(QWidget):
         painter.translate(self.width() / 2, self.height() / 2)
         painter.scale(self.zoom_factor, self.zoom_factor)
         painter.translate(-self.pan_x, -self.pan_y)
-
-        # Center the board in the viewport
-        bounds = self.board_data.get('bounds', (0, 0, 100, 100))
-        board_center_x = (bounds[0] + bounds[2]) / 2
-        board_center_y = (bounds[1] + bounds[3]) / 2
-        painter.translate(-board_center_x, -board_center_y)
         
         # Skip artificial board outline - real boards should use Edge.Cuts layer
         # self._draw_board_outline(painter)
@@ -922,33 +916,56 @@ class PCBViewer(QWidget):
             self.is_panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
     
-    def debug_screenshot(self, filename_prefix: str = "debug_routing"):
-        """Capture screenshot of the PCB viewer for debugging"""
+    def debug_screenshot(self, filename_prefix: str = "debug_routing", scale_factor: int = 1, output_dir: str = None):
+        """Capture screenshot of the PCB viewer for debugging with optional high-res rendering"""
         try:
             import os
             from datetime import datetime
-            
-            # Create debug output directory
-            debug_dir = "debug_output"
-            os.makedirs(debug_dir, exist_ok=True)
-            
+
+            # Determine output directory
+            if output_dir is None:
+                debug_dir = "debug_output"
+                os.makedirs(debug_dir, exist_ok=True)
+            else:
+                debug_dir = output_dir
+                os.makedirs(debug_dir, exist_ok=True)
+
             # Generate filename with timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
             filename = f"{debug_dir}/{filename_prefix}_{timestamp}.png"
-            
-            # Capture the widget as a pixmap
-            pixmap = self.grab()
-            
-            # Save the screenshot
-            success = pixmap.save(filename, "PNG")
-            
+
+            # Capture the widget at specified resolution
+            if scale_factor > 1:
+                # High-res rendering
+                widget_size = self.size()
+                scaled_size = widget_size * scale_factor
+
+                # Create high-res image
+                image = QImage(scaled_size, QImage.Format.Format_ARGB32)
+                image.fill(Qt.GlobalColor.transparent)
+
+                # Render widget to image with scaling
+                painter = QPainter(image)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                painter.scale(scale_factor, scale_factor)
+                self.render(painter)
+                painter.end()
+
+                # Save the image
+                success = image.save(filename, "PNG")
+            else:
+                # Standard resolution
+                pixmap = self.grab()
+                success = pixmap.save(filename, "PNG")
+
             if success:
-                print(f"DEBUG: Screenshot saved to {filename}")
+                print(f"DEBUG: Screenshot saved to {filename} (scale={scale_factor}x)")
                 return filename
             else:
                 print(f"DEBUG: Failed to save screenshot to {filename}")
                 return None
-                
+
         except Exception as e:
             print(f"DEBUG: Screenshot error: {e}")
             return None
@@ -1571,13 +1588,64 @@ class OrthoRouteMainWindow(QMainWindow):
         self.clear_routing_log()
         self.log_to_gui(f"[START] Starting unified autorouting pipeline", "SUCCESS")
 
-        # DEBUG: Screenshot before routing starts
-        if self.pcb_viewer:
-            self.pcb_viewer.debug_screenshot("before_routing")
-            self.log_to_gui("📸 Captured pre-routing screenshot", "DEBUG")
+        # Create timestamped run folder for screenshots
+        import os
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_folder = f"debug_output/run_{timestamp}"
+        os.makedirs(run_folder, exist_ok=True)
+        self.log_to_gui(f"📁 Created screenshot folder: {run_folder}", "DEBUG")
+
+        # Store run folder for later use
+        self._current_run_folder = run_folder
 
         self._set_ui_busy(True, "Autorouting…")
 
+        # Take initial screenshots synchronously before routing starts
+        self._take_initial_screenshots()
+
+        # Start routing immediately after screenshots
+        self._continue_autorouting()
+
+    def _take_initial_screenshots(self):
+        """Take screenshots 1 & 2 synchronously at the start of routing"""
+        if not self.pcb_viewer:
+            return
+
+        # Screenshot 1: Board with airwires
+        self.pcb_viewer.show_airwires = True
+        self.pcb_viewer.fit_to_view()
+        self.pcb_viewer.update()
+        QApplication.processEvents()  # Force render
+        self.pcb_viewer.debug_screenshot("01_board_with_airwires", scale_factor=8, output_dir=self._current_run_folder)
+        self.log_to_gui("📸 Screenshot 1/3: Board with airwires (8x)", "DEBUG")
+
+        # Screenshot 2: Board without airwires or escapes
+        self.pcb_viewer.show_airwires = False
+
+        # Temporarily clear tracks and vias for clean board screenshot
+        old_tracks = self.board_data.get('tracks', [])
+        old_vias = self.board_data.get('vias', [])
+        self.board_data['tracks'] = []
+        self.board_data['vias'] = []
+
+        if hasattr(self.pcb_viewer, 'update_routing'):
+            self.pcb_viewer.update_routing([], [])
+
+        self.pcb_viewer.update()
+        QApplication.processEvents()  # Force render
+        self.pcb_viewer.debug_screenshot("02_board_no_airwires", scale_factor=8, output_dir=self._current_run_folder)
+        self.log_to_gui("📸 Screenshot 2/3: Board without airwires or escapes (8x)", "DEBUG")
+
+        # Restore tracks/vias
+        self.board_data['tracks'] = old_tracks
+        self.board_data['vias'] = old_vias
+        if hasattr(self.pcb_viewer, 'update_routing'):
+            self.pcb_viewer.update_routing(old_tracks, old_vias)
+        self.pcb_viewer.update()
+
+    def _continue_autorouting(self):
+        """Continue autorouting after screenshots are taken"""
         try:
             # Get pathfinder and board from plugin
             pf = self.plugin.get_pathfinder()
@@ -1630,6 +1698,18 @@ class OrthoRouteMainWindow(QMainWindow):
                     self.pcb_viewer.update()
 
                 self.log_to_gui(f"✓ Precomputed {len(escape_tracks)} escape stubs, {len(escape_vias)} vias", "SUCCESS")
+
+                # Screenshot 3: Board with escape planning (no airwires) - taken synchronously
+                self.pcb_viewer.show_airwires = False
+                self.pcb_viewer.fit_to_view()
+                self.pcb_viewer.update()
+                QApplication.processEvents()  # Force render
+                self.pcb_viewer.debug_screenshot("03_board_with_escapes", scale_factor=8, output_dir=self._current_run_folder)
+                self.log_to_gui("📸 Screenshot 3/3: Board with escape planning (8x)", "SUCCESS")
+
+                # Re-enable airwires for normal viewing
+                self.pcb_viewer.show_airwires = True
+                self.pcb_viewer.update()
 
             # STOP HERE for debugging - don't continue to routing
             self.log_to_gui("[DEBUG] Pad escapes visualization complete. Stopping before routing.", "INFO")
