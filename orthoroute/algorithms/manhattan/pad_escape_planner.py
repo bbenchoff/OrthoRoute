@@ -8,11 +8,11 @@ Before any pathfinding begins, we generate escape stubs and vias for all SMD
 pads, distributing traffic across horizontal routing layers.
 
 KEY FEATURES:
-- Checkerboard direction pattern: (x + y) % 2 → even=UP, odd=DOWN (strict enforcement)
-- Random escape lengths (1.2mm - 4.8mm / 3-12 grid steps)
-- Column overlap prevention (tracks existing Y-ranges per column)
-- Smart conflict resolution: iterations 1-10 shorten overlapping blockers (2→4→6→8...), after 10 remove blocker
-- Only considers blockers that overlap with target escape range (correct by construction)
+- Column-based processing: Group pads by x_idx, process entire columns atomically
+- Distance-based direction: Choose direction based on nearest neighbor distance
+- Inverted checkerboard fallback: (x + y) % 2 → even=DOWN, odd=UP (at board edges)
+- Greedy pair-wise collision resolution: Alternately shorten escapes by 2 steps until no overlap
+- Escape lengths: 3-12 grid steps (1.2mm - 4.8mm @ 0.4mm pitch), min 3 steps
 - DRC checking against existing pads (0.15mm clearance)
 - Vertical + 45-degree routing geometry
 
@@ -61,21 +61,25 @@ class PadEscapePlanner:
         self.config = config
         self.pad_to_node = pad_to_node
         self.portals: Dict[str, Portal] = {}  # pad_id -> Portal
-        self.column_ranges: Dict[int, List[Tuple[int, int, str]]] = {}  # x_idx -> [(y_min, y_max, pad_id), ...]
 
     def precompute_all_pad_escapes(self, board, nets_to_route: List = None) -> Tuple[List, List]:
         """
-        Precompute escape routing for SMD pads attached to nets we want to route.
+        Precompute escape routing for SMD pads using column-based processing.
 
-        For each SMD pad on a routable net:
-        1. Snap X to nearest grid column (±½ pitch allowed)
-        2. Pick direction via checkerboard: (x_idx + y_idx) % 2 → even=UP, odd=DOWN
-        3. Pick random vertical length d ∈ {3..12} grid steps (1.2mm - 4.8mm @ 0.4mm pitch)
-        4. Check overlap with existing escapes on same column
-        5. If blocked, progressively shorten longest blocker (2→4→6→8 steps, min 3)
-        6. DRC check: ensure stub and via maintain clearance from other pads
-        7. Compute stub tip (xg, yg±d) on F.Cu
-        8. Place via to random horizontal layer (odd index: In1, In3, ..., B.Cu)
+        Algorithm:
+        1. Collect all routable pads and snap to grid columns
+        2. Group pads by column (x_idx)
+        3. For each column, sort pads by y_idx
+        4. Determine direction for each pad:
+           - Find nearest neighbor above/below in same column
+           - Choose direction with most distance
+           - At board edges (no neighbor), use inverted checkerboard
+        5. Start all escapes at max length (12 steps)
+        6. Greedy collision resolution:
+           - Check pairs of escapes in column for Y-range overlap
+           - If collision, alternately shorten by 2 steps until resolved
+           - Min length = 3 steps
+        7. DRC check and emit geometry
 
         Args:
             board: Board with components and pads
@@ -120,12 +124,7 @@ class PadEscapePlanner:
 
             logger.info(f"Mapped {len(pad_geometries)} pad geometries from GUI data")
 
-        # Debug: log sample pad geometries
-        sample_pads = list(pad_geometries.items())[:5]
-        for pad_id, geom in sample_pads:
-            logger.info(f"  Sample pad {pad_id}: pos=({geom['x']:.3f}, {geom['y']:.3f}), size=({geom['width']:.3f} × {geom['height']:.3f})")
-
-        # Parse nets from board directly (since net_pad_ids isn't populated yet)
+        # Parse nets from board directly
         if nets_to_route is None:
             nets_to_route = [net for net in getattr(board, 'nets', [])]
 
@@ -158,13 +157,12 @@ class PadEscapePlanner:
 
         logger.info(f"Found {len(routable_pad_ids)} pads attached to {len(net_pad_mapping)} routable nets")
 
-        # Clear existing portals and plan ONLY for routable pads
+        # Clear existing portals
         self.portals.clear()
-        self.column_ranges.clear()
 
-        # Plan portals only for routable pads
-        portal_count = 0
-        drc_failures_logged = 0
+        # STEP 1: Collect all routable pads with grid positions
+        pad_list = []  # [(pad_obj, pad_id, x_idx, y_idx, pad_x, pad_y, pad_layer), ...]
+
         for comp in getattr(board, "components", []):
             for pad in getattr(comp, "pads", []):
                 # Skip through-hole pads
@@ -176,13 +174,23 @@ class PadEscapePlanner:
                 if pad_id not in routable_pad_ids:
                     continue
 
-                portal = self._plan_random_portal_for_pad_with_drc(pad, pad_id, pad_geometries,
-                                                                     debug=(drc_failures_logged < 3))
-                if portal:
-                    self.portals[pad_id] = portal
-                    portal_count += 1
-                else:
-                    drc_failures_logged += 1
+                pad_x, pad_y = pad.position.x, pad.position.y
+                pad_layer = self._get_pad_layer(pad)
+
+                # Snap to grid
+                x_idx_nearest, y_idx_nearest = self.lattice.world_to_lattice(pad_x, pad_y)
+                x_idx_nearest = max(0, min(x_idx_nearest, self.lattice.x_steps - 1))
+                y_idx_nearest = max(0, min(y_idx_nearest, self.lattice.y_steps - 1))
+
+                # Check snap tolerance
+                x_mm_snapped, _ = self.lattice.geom.lattice_to_world(x_idx_nearest, 0)
+                x_snap_dist_steps = abs(pad_x - x_mm_snapped) / self.config.grid_pitch
+
+                if x_snap_dist_steps > self.config.portal_x_snap_max:
+                    logger.debug(f"Pad {pad_id}: x-snap {x_snap_dist_steps:.2f} exceeds max")
+                    continue
+
+                pad_list.append((pad, pad_id, x_idx_nearest, y_idx_nearest, pad_x, pad_y, pad_layer))
 
         # Board-level pads
         for pad in getattr(board, "pads", []):
@@ -191,18 +199,47 @@ class PadEscapePlanner:
                 continue
 
             pad_id = self._pad_key(pad, comp=None)
-            if pad_id not in routable_pad_ids or pad_id in self.portals:
+            if pad_id not in routable_pad_ids:
                 continue
 
-            portal = self._plan_random_portal_for_pad_with_drc(pad, pad_id, pad_geometries,
-                                                                 debug=(drc_failures_logged < 3))
-            if portal:
-                self.portals[pad_id] = portal
-                portal_count += 1
-            else:
-                drc_failures_logged += 1
+            pad_x, pad_y = pad.position.x, pad.position.y
+            pad_layer = self._get_pad_layer(pad)
 
-        logger.info(f"Planned {portal_count} portals for routable nets (using checkerboard pattern)")
+            # Snap to grid
+            x_idx_nearest, y_idx_nearest = self.lattice.world_to_lattice(pad_x, pad_y)
+            x_idx_nearest = max(0, min(x_idx_nearest, self.lattice.x_steps - 1))
+            y_idx_nearest = max(0, min(y_idx_nearest, self.lattice.y_steps - 1))
+
+            # Check snap tolerance
+            x_mm_snapped, _ = self.lattice.geom.lattice_to_world(x_idx_nearest, 0)
+            x_snap_dist_steps = abs(pad_x - x_mm_snapped) / self.config.grid_pitch
+
+            if x_snap_dist_steps > self.config.portal_x_snap_max:
+                logger.debug(f"Pad {pad_id}: x-snap {x_snap_dist_steps:.2f} exceeds max")
+                continue
+
+            pad_list.append((pad, pad_id, x_idx_nearest, y_idx_nearest, pad_x, pad_y, pad_layer))
+
+        logger.info(f"Collected {len(pad_list)} pads for escape planning")
+
+        # STEP 2: Group by column (x_idx)
+        columns = {}  # x_idx -> [(pad_obj, pad_id, y_idx, pad_x, pad_y, pad_layer), ...]
+        for pad, pad_id, x_idx, y_idx, pad_x, pad_y, pad_layer in pad_list:
+            if x_idx not in columns:
+                columns[x_idx] = []
+            columns[x_idx].append((pad, pad_id, y_idx, pad_x, pad_y, pad_layer))
+
+        # STEP 3: Process each column
+        portal_count = 0
+        for x_idx, column_pads in columns.items():
+            # Sort by y_idx
+            column_pads.sort(key=lambda p: p[2])  # Sort by y_idx
+
+            # Plan portals for this column
+            portals_created = self._plan_column_escapes(x_idx, column_pads, pad_geometries)
+            portal_count += portals_created
+
+        logger.info(f"Planned {portal_count} portals using column-based approach")
 
         # Build reverse lookup: pad_id -> net_id
         pad_to_net = {}
@@ -234,73 +271,7 @@ class PadEscapePlanner:
 
             portal_geometry[pad_id] = (portal_tracks, portal_vias, portal, entry_layer)
 
-        logger.info(f"First pass: generated {len(portal_geometry)} escape geometries")
-
-        # SECOND PASS: Check for conflicts and retry
-        max_retries = 3
-        for retry_iteration in range(max_retries):
-            conflicts = self._check_escape_conflicts(portal_geometry, pad_geometries)
-
-            if not conflicts:
-                logger.info(f"Second pass (iteration {retry_iteration + 1}): No conflicts detected!")
-                break
-
-            logger.info(f"Second pass (iteration {retry_iteration + 1}): Found {len(conflicts)} conflicts, regenerating...")
-
-            # Retry conflicting portals
-            for pad_id in conflicts:
-                # Get the pad object to regenerate portal
-                pad_obj = None
-                for comp in getattr(board, "components", []):
-                    for pad in getattr(comp, "pads", []):
-                        if self._pad_key(pad, comp) == pad_id:
-                            pad_obj = pad
-                            break
-                    if pad_obj:
-                        break
-
-                if not pad_obj:
-                    for pad in getattr(board, "pads", []):
-                        if self._pad_key(pad, comp=None) == pad_id:
-                            pad_obj = pad
-                            break
-
-                if not pad_obj:
-                    logger.warning(f"Could not find pad object for {pad_id}, skipping retry")
-                    continue
-
-                # Remove old portal's range from column_ranges before regenerating
-                if pad_id in self.portals:
-                    old_portal = self.portals[pad_id]
-                    old_x_idx = old_portal.x_idx
-                    if old_x_idx in self.column_ranges:
-                        self.column_ranges[old_x_idx] = [
-                            (y_min, y_max, pid) for (y_min, y_max, pid) in self.column_ranges[old_x_idx]
-                            if pid != pad_id
-                        ]
-
-                # Regenerate portal
-                new_portal = self._plan_random_portal_for_pad_with_drc(pad_obj, pad_id, pad_geometries, debug=False)
-
-                if new_portal:
-                    net_id = pad_to_net.get(pad_id, f"PAD_{pad_id}")
-                    odd_layers = [i for i in range(1, self.lattice.layers, 2)]
-                    if not odd_layers:
-                        odd_layers = [1]
-                    entry_layer = random.choice(odd_layers)
-
-                    geometry = self._emit_portal_escape_geometry(net_id, pad_id, new_portal, entry_layer)
-
-                    portal_tracks = []
-                    portal_vias = []
-                    for item in geometry:
-                        if 'x1' in item and 'y1' in item:
-                            portal_tracks.append(item)
-                        elif 'x' in item and 'y' in item:
-                            portal_vias.append(item)
-
-                    portal_geometry[pad_id] = (portal_tracks, portal_vias, new_portal, entry_layer)
-                    logger.debug(f"Regenerated escape for {pad_id}")
+        logger.info(f"Generated {len(portal_geometry)} escape geometries")
 
         # Collect all final geometry
         for pad_id, (portal_tracks, portal_vias, portal, entry_layer) in portal_geometry.items():
@@ -309,6 +280,197 @@ class PadEscapePlanner:
 
         logger.info(f"Final: {len(tracks)} escape stubs and {len(vias)} portal vias")
         return (tracks, vias)
+
+    def _plan_column_escapes(self, x_idx: int, column_pads: List, pad_geometries: Dict) -> int:
+        """
+        Plan escapes for all pads in a single column using greedy collision resolution.
+
+        Args:
+            x_idx: Column index
+            column_pads: List of (pad_obj, pad_id, y_idx, pad_x, pad_y, pad_layer) sorted by y_idx
+            pad_geometries: Dict of pad geometries for DRC
+
+        Returns:
+            Number of portals successfully created
+        """
+        min_steps = 3
+        max_steps = 12
+
+        # STEP 1: Determine direction for each pad
+        # [(pad_id, y_idx, direction, delta_steps, pad_x, pad_y, pad_layer), ...]
+        planned_escapes = []
+
+        for i, (pad, pad_id, y_idx, pad_x, pad_y, pad_layer) in enumerate(column_pads):
+            # Find nearest neighbor above and below
+            dist_above = None
+            dist_below = None
+
+            if i > 0:
+                _, _, y_below, _, _, _ = column_pads[i - 1]
+                dist_below = y_idx - y_below
+
+            if i < len(column_pads) - 1:
+                _, _, y_above, _, _, _ = column_pads[i + 1]
+                dist_above = y_above - y_idx
+
+            # Choose direction based on distance
+            if dist_above is not None and dist_below is not None:
+                # Both neighbors exist - choose direction with more space
+                direction = +1 if dist_above > dist_below else -1
+            elif dist_above is not None:
+                # Only neighbor above - go up
+                direction = +1
+            elif dist_below is not None:
+                # Only neighbor below - go down
+                direction = -1
+            else:
+                # No neighbors - use inverted checkerboard (even=DOWN, odd=UP)
+                checkerboard_value = (x_idx + y_idx) % 2
+                direction = -1 if checkerboard_value == 0 else +1
+
+            # Calculate max possible length based on board bounds
+            if direction > 0:
+                max_possible = self.lattice.y_steps - 1 - y_idx
+            else:
+                max_possible = y_idx
+
+            # Calculate available space based on neighbor in escape direction
+            # This prevents regular horizontal lines by constraining randomness to local density
+            if direction > 0 and dist_above is not None:
+                # Going up - limit based on distance to pad above
+                # Leave buffer space (use half the gap)
+                available_space = dist_above // 2
+            elif direction < 0 and dist_below is not None:
+                # Going down - limit based on distance to pad below
+                available_space = dist_below // 2
+            else:
+                # No neighbor in escape direction - use full range
+                available_space = max_steps
+
+            # Combine all constraints
+            safe_max = min(max_steps, available_space, max_possible)
+            safe_max = max(safe_max, min_steps)  # Ensure at least min_steps
+
+            # Pick random length within safe range for variety
+            delta_steps = random.randint(min_steps, safe_max)
+
+            planned_escapes.append((pad_id, y_idx, direction, delta_steps, pad_x, pad_y, pad_layer))
+
+        # STEP 2: Greedy collision resolution - check all pairs and shorten as needed
+        max_iterations = 100
+        for iteration in range(max_iterations):
+            collision_found = False
+
+            # Check all pairs for Y-range overlap
+            for i in range(len(planned_escapes)):
+                for j in range(i + 1, len(planned_escapes)):
+                    pad_id_a, y_idx_a, dir_a, delta_a, pad_x_a, pad_y_a, layer_a = planned_escapes[i]
+                    pad_id_b, y_idx_b, dir_b, delta_b, pad_x_b, pad_y_b, layer_b = planned_escapes[j]
+
+                    # Calculate Y-ranges
+                    y_portal_a = y_idx_a + dir_a * delta_a
+                    y_min_a = min(y_idx_a, y_portal_a)
+                    y_max_a = max(y_idx_a, y_portal_a)
+
+                    y_portal_b = y_idx_b + dir_b * delta_b
+                    y_min_b = min(y_idx_b, y_portal_b)
+                    y_max_b = max(y_idx_b, y_portal_b)
+
+                    # Check overlap (with 1-step buffer)
+                    if not (y_max_a + 1 < y_min_b or y_max_b + 1 < y_min_a):
+                        # Collision! Shorten one alternately
+                        collision_found = True
+
+                        # Alternate which one to shorten based on iteration
+                        if iteration % 2 == 0:
+                            # Shorten A
+                            if delta_a > min_steps:
+                                new_delta_a = max(min_steps, delta_a - 2)
+                                planned_escapes[i] = (pad_id_a, y_idx_a, dir_a, new_delta_a, pad_x_a, pad_y_a, layer_a)
+                        else:
+                            # Shorten B
+                            if delta_b > min_steps:
+                                new_delta_b = max(min_steps, delta_b - 2)
+                                planned_escapes[j] = (pad_id_b, y_idx_b, dir_b, new_delta_b, pad_x_b, pad_y_b, layer_b)
+
+            if not collision_found:
+                break
+
+        # STEP 3: DRC check and create portals with fallback
+        portal_count = 0
+        for pad_id, y_idx, direction, delta_steps, pad_x, pad_y, pad_layer in planned_escapes:
+            # Try progressively shorter lengths, then opposite direction
+            portal = None
+
+            # First try: current direction, progressively shorter
+            for try_delta in range(delta_steps, min_steps - 1, -1):
+                portal = self._try_create_portal(x_idx, y_idx, direction, try_delta,
+                                                  pad_id, pad_x, pad_y, pad_layer, pad_geometries)
+                if portal:
+                    break
+
+            # Second try: opposite direction if first failed
+            if not portal:
+                opposite_direction = -direction
+                # Calculate max possible in opposite direction
+                if opposite_direction > 0:
+                    max_opposite = self.lattice.y_steps - 1 - y_idx
+                else:
+                    max_opposite = y_idx
+                max_opposite = min(max_steps, max_opposite)
+
+                # Try opposite direction from min to max
+                for try_delta in range(min_steps, max_opposite + 1):
+                    portal = self._try_create_portal(x_idx, y_idx, opposite_direction, try_delta,
+                                                      pad_id, pad_x, pad_y, pad_layer, pad_geometries)
+                    if portal:
+                        break
+
+            if portal:
+                self.portals[pad_id] = portal
+                portal_count += 1
+            else:
+                logger.warning(f"Pad {pad_id}: could not find valid escape in any direction")
+
+        return portal_count
+
+    def _try_create_portal(self, x_idx: int, y_idx: int, direction: int, delta_steps: int,
+                           pad_id: str, pad_x: float, pad_y: float, pad_layer: int,
+                           pad_geometries: Dict) -> Optional[Portal]:
+        """
+        Try to create a portal with given parameters, return None if DRC fails.
+        Uses LOCAL DRC checking (only nearby pads).
+        """
+        y_idx_portal = y_idx + direction * delta_steps
+
+        # Convert portal to world coordinates
+        portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(x_idx, y_idx_portal)
+
+        # DRC check: portal via clearance (LOCAL only - within 3mm radius)
+        if not self._check_clearance_to_pads(portal_x_mm, portal_y_mm, pad_id, pad_geometries,
+                                              check_radius=3.0):
+            return None
+
+        # DRC check: stub path (LOCAL only)
+        for t in [0.25, 0.5, 0.75]:
+            stub_x = pad_x + t * (portal_x_mm - pad_x)
+            stub_y = pad_y + t * (portal_y_mm - pad_y)
+            if not self._check_clearance_to_pads(stub_x, stub_y, pad_id, pad_geometries,
+                                                   check_radius=3.0):
+                return None
+
+        # DRC passed! Create portal
+        return Portal(
+            x_idx=x_idx,
+            y_idx=y_idx_portal,
+            pad_layer=pad_layer,
+            delta_steps=delta_steps,
+            direction=direction,
+            pad_x=pad_x,
+            pad_y=pad_y,
+            score=0.0,
+            retarget_count=0
+        )
 
     def _pad_key(self, pad, comp=None):
         """Generate unique pad key with coordinates for orphaned pads"""
@@ -375,9 +537,13 @@ class PadEscapePlanner:
 
     def _check_clearance_to_pads(self, x: float, y: float, current_pad_id: str,
                                   pad_geometries: Dict, clearance_mm: float = None,
-                                  debug: bool = False) -> bool:
+                                  debug: bool = False, check_radius: float = None) -> bool:
         """
-        Check if point (x, y) maintains clearance_mm from all other pads.
+        Check if point (x, y) maintains clearance_mm from other pads.
+
+        Args:
+            check_radius: If specified, only check pads within this radius (mm) for performance.
+                         If None, check all pads (slower but thorough).
 
         Returns True if clearance is OK, False if violation.
         """
@@ -390,9 +556,17 @@ class PadEscapePlanner:
             if pad_id == current_pad_id:
                 continue  # Skip self
 
-            # Calculate distance from point to pad bounding box
             pad_x = geom['x']
             pad_y = geom['y']
+
+            # Quick radius check for performance
+            if check_radius is not None:
+                dx = abs(x - pad_x)
+                dy = abs(y - pad_y)
+                if dx > check_radius or dy > check_radius:
+                    continue  # Skip distant pads
+
+            # Calculate distance from point to pad bounding box
             pad_w = geom['width']
             pad_h = geom['height']
 
@@ -421,312 +595,6 @@ class PadEscapePlanner:
             return False
 
         return len(violations) == 0
-
-    def _plan_random_portal_for_pad_with_drc(self, pad, pad_id: str,
-                                              pad_geometries: Dict, debug: bool = False) -> Optional[Portal]:
-        """
-        Plan portal escape with CHECKERBOARD direction and random length.
-
-        Direction: (x_idx + y_idx) % 2 → even=UP, odd=DOWN (strict)
-        Length: Random 3-12 grid steps, avoiding overlaps on same column
-        Blocked: Shorten longest blocker by 4 steps (min 3), retry
-        DRC: Ensure clearance from all other pads
-        """
-        # Get pad position and layer
-        pad_x, pad_y = pad.position.x, pad.position.y
-        pad_layer = self._get_pad_layer(pad)
-
-        # Snap pad x to nearest lattice column
-        x_idx_nearest, _ = self.lattice.world_to_lattice(pad_x, pad_y)
-        x_idx_nearest = max(0, min(x_idx_nearest, self.lattice.x_steps - 1))
-
-        # Check if snap is within tolerance
-        x_mm_snapped, _ = self.lattice.geom.lattice_to_world(x_idx_nearest, 0)
-        x_snap_dist_steps = abs(pad_x - x_mm_snapped) / self.config.grid_pitch
-
-        if x_snap_dist_steps > self.config.portal_x_snap_max:
-            logger.debug(f"Pad {pad_id}: x-snap {x_snap_dist_steps:.2f} exceeds max")
-            return None
-
-        x_idx = x_idx_nearest
-
-        # Get pad y index
-        _, y_idx_pad = self.lattice.world_to_lattice(pad_x, pad_y)
-        y_idx_pad = max(0, min(y_idx_pad, self.lattice.y_steps - 1))
-
-        # STEP 1: Checkerboard direction - (x + y) % 2 determines UP or DOWN (STRICT)
-        checkerboard_value = (x_idx + y_idx_pad) % 2
-        direction = +1 if checkerboard_value == 0 else -1  # Even=UP, Odd=DOWN
-
-        # STEP 2: Find valid length range in checkerboard direction
-        min_steps = 3
-        max_steps = 12
-
-        # Calculate max possible steps in checkerboard direction
-        if direction > 0:
-            max_possible = self.lattice.y_steps - 1 - y_idx_pad
-        else:
-            max_possible = y_idx_pad
-
-        # Clamp max_steps to what's physically possible
-        max_steps_bounded = min(max_steps, max_possible)
-
-        if max_steps_bounded < min_steps:
-            logger.debug(f"Pad {pad_id}: insufficient space in checkerboard direction")
-            return None
-
-        # STEP 3: Try multiple random lengths in the checkerboard direction
-        max_attempts = 20
-        blocking_ranges = []
-
-        for attempt in range(max_attempts):
-            # Random length within valid range
-            delta_steps = random.randint(min_steps, max_steps_bounded)
-
-            # Calculate portal position
-            y_idx_portal = y_idx_pad + direction * delta_steps
-
-            # Check for overlap with existing escapes on same column
-            y_min = min(y_idx_pad, y_idx_portal)
-            y_max = max(y_idx_pad, y_idx_portal)
-
-            if x_idx in self.column_ranges:
-                overlaps = False
-                for (existing_y_min, existing_y_max, existing_pad_id) in self.column_ranges[x_idx]:
-                    # Check if ranges overlap (with 1-step buffer)
-                    if not (y_max + 1 < existing_y_min or y_min - 1 > existing_y_max):
-                        overlaps = True
-                        blocking_ranges.append((existing_y_min, existing_y_max, existing_pad_id))
-                        break
-
-                if overlaps:
-                    continue  # Try different random length
-
-            # Convert portal to world coordinates for DRC check
-            portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(x_idx, y_idx_portal)
-
-            # DRC check: verify portal via position maintains clearance
-            if not self._check_clearance_to_pads(portal_x_mm, portal_y_mm, pad_id, pad_geometries):
-                if attempt == 0 and debug:
-                    logger.info(f"Pad {pad_id}: portal at ({portal_x_mm:.2f}, {portal_y_mm:.2f}) violates clearance:")
-                    self._check_clearance_to_pads(portal_x_mm, portal_y_mm, pad_id,
-                                                   pad_geometries, debug=True)
-                continue
-
-            # DRC check: verify stub path
-            stub_clear = True
-            for t in [0.25, 0.5, 0.75]:
-                stub_x = pad_x + t * (portal_x_mm - pad_x)
-                stub_y = pad_y + t * (portal_y_mm - pad_y)
-                if not self._check_clearance_to_pads(stub_x, stub_y, pad_id, pad_geometries):
-                    stub_clear = False
-                    break
-
-            if not stub_clear:
-                logger.debug(f"Pad {pad_id}: stub path violates clearance")
-                continue
-
-            # DRC passed! Record the Y-range for this column
-            if x_idx not in self.column_ranges:
-                self.column_ranges[x_idx] = []
-            self.column_ranges[x_idx].append((y_min, y_max, pad_id))
-
-            return Portal(
-                x_idx=x_idx,
-                y_idx=y_idx_portal,
-                pad_layer=pad_layer,
-                delta_steps=delta_steps,
-                direction=direction,
-                pad_x=pad_x,
-                pad_y=pad_y,
-                score=0.0,
-                retarget_count=0
-            )
-
-        # All attempts failed - try to shorten blocking escapes
-        if blocking_ranges:
-            logger.info(f"Pad {pad_id}: blocked by {len(set(blocking_ranges))} escapes, attempting to shorten one")
-            return self._shorten_blocker_and_retry(pad, pad_id, pad_geometries, x_idx, y_idx_pad, direction)
-
-        # All attempts failed DRC
-        logger.warning(f"Pad {pad_id}: failed to find DRC-clean portal after {max_attempts} attempts")
-        return None
-
-    def _shorten_blocker_and_retry(self, pad, pad_id: str, pad_geometries: Dict,
-                                     x_idx: int, y_idx_pad: int, direction: int) -> Optional[Portal]:
-        """
-        Shorten a blocking escape and retry current pad.
-        Strategy: Try shortening for first 10 iterations, then switch to removal.
-        Only considers blockers that overlap with our target escape range.
-        """
-        # Find blocking pads from column_ranges
-        if x_idx not in self.column_ranges or not self.column_ranges[x_idx]:
-            return None
-
-        # Find the NEAREST blocking pad in our direction
-        # We need to find the blocker that's actually preventing us from escaping
-        min_steps = 3
-        max_steps = 12
-
-        # Calculate the range we're trying to escape into
-        if direction > 0:
-            target_y_min = y_idx_pad + min_steps
-            target_y_max = y_idx_pad + min(max_steps, self.lattice.y_steps - 1 - y_idx_pad)
-        else:
-            target_y_min = max(0, y_idx_pad - max_steps)
-            target_y_max = y_idx_pad - min_steps
-
-        # Find blockers that OVERLAP with our target escape range
-        blocking_candidates = []
-        for (existing_y_min, existing_y_max, existing_pad_id) in self.column_ranges[x_idx]:
-            # Skip self
-            if existing_pad_id == pad_id:
-                continue
-
-            # Check if this range overlaps with our target range (with buffer)
-            if not (target_y_max + 1 < existing_y_min or target_y_min - 1 > existing_y_max):
-                blocking_candidates.append(existing_pad_id)
-
-        if not blocking_candidates:
-            return None
-
-        # Check current recursion depth
-        if not hasattr(self, '_shorten_depth'):
-            self._shorten_depth = 0
-
-        # OPTION 3: After 10 iterations, switch from shortening to complete removal
-        if self._shorten_depth >= 10:
-            # Column is too dense - remove one blocker completely
-            victim_pad_id = blocking_candidates[0]
-            logger.info(f"Pad {pad_id}: depth={self._shorten_depth}, column too dense, removing {victim_pad_id} completely")
-
-            # Remove victim's portal
-            if victim_pad_id in self.portals:
-                del self.portals[victim_pad_id]
-
-                # Add to replan queue
-                if not hasattr(self, 'pads_needing_replan'):
-                    self.pads_needing_replan = set()
-                self.pads_needing_replan.add(victim_pad_id)
-
-                # Remove from column_ranges
-                if x_idx in self.column_ranges:
-                    self.column_ranges[x_idx] = [
-                        (y_min, y_max, pid) for (y_min, y_max, pid) in self.column_ranges[x_idx]
-                        if pid != victim_pad_id
-                    ]
-
-                # Retry current pad recursively
-                if self._shorten_depth < 15:  # Higher limit for removal mode
-                    self._shorten_depth += 1
-                    result = self._plan_random_portal_for_pad_with_drc(pad, pad_id, pad_geometries, debug=False)
-                    self._shorten_depth -= 1
-                    return result
-
-            logger.debug(f"Pad {pad_id}: could not remove victim")
-            return None
-
-        # SHORTENING MODE (depth < 10): Pick the blocker with the LONGEST escape
-        best_blocker = None
-        best_length = 0
-        for candidate_id in blocking_candidates:
-            if candidate_id in self.portals:
-                candidate_portal = self.portals[candidate_id]
-                if candidate_portal.delta_steps > best_length and candidate_portal.delta_steps > 3:
-                    best_blocker = candidate_id
-                    best_length = candidate_portal.delta_steps
-
-        # If no blocker can be shortened, completely remove one
-        if not best_blocker:
-            # All blockers are at minimum - pick any one to completely remove
-            if blocking_candidates:
-                victim_pad_id = blocking_candidates[0]
-                logger.info(f"Pad {pad_id}: all blockers at minimum, removing {victim_pad_id} completely for replanning")
-
-                # Remove victim's portal
-                if victim_pad_id in self.portals:
-                    del self.portals[victim_pad_id]
-
-                    # Add to replan queue
-                    if not hasattr(self, 'pads_needing_replan'):
-                        self.pads_needing_replan = set()
-                    self.pads_needing_replan.add(victim_pad_id)
-
-                    # Remove from column_ranges
-                    if x_idx in self.column_ranges:
-                        self.column_ranges[x_idx] = [
-                            (y_min, y_max, pid) for (y_min, y_max, pid) in self.column_ranges[x_idx]
-                            if pid != victim_pad_id
-                        ]
-
-                    # Retry current pad recursively
-                    if self._shorten_depth < 20:
-                        self._shorten_depth += 1
-                        result = self._plan_random_portal_for_pad_with_drc(pad, pad_id, pad_geometries, debug=False)
-                        self._shorten_depth -= 1
-                        return result
-
-            logger.debug(f"Pad {pad_id}: no blockers to remove")
-            return None
-
-        # Get the blocking portal
-        blocker_portal = self.portals[best_blocker]
-
-        # Try progressively larger shortening amounts: 2, 4, 6, ...
-        # Track how many times we've shortened (to know which amount to try)
-        if not hasattr(self, '_shorten_attempts'):
-            self._shorten_attempts = {}
-
-        blocker_key = (x_idx, best_blocker)
-        shorten_attempt = self._shorten_attempts.get(blocker_key, 0)
-        shorten_amount = 2 + (shorten_attempt * 2)  # 2, 4, 6, 8, ...
-
-        self._shorten_attempts[blocker_key] = shorten_attempt + 1
-
-        # Shorten it by moving it back
-        new_delta_steps = max(3, blocker_portal.delta_steps - shorten_amount)
-
-        if new_delta_steps >= blocker_portal.delta_steps:
-            # Can't shorten anymore
-            logger.debug(f"Pad {pad_id}: can't shorten blocker {best_blocker} (already at {blocker_portal.delta_steps})")
-            return None
-
-        logger.info(f"Pad {pad_id}: shortening blocker {best_blocker} from {blocker_portal.delta_steps} to {new_delta_steps} steps (attempt {shorten_attempt + 1}, amount={shorten_amount})")
-
-        # Recalculate blocker's portal position with new shorter length
-        _, blocker_y_idx_pad = self.lattice.world_to_lattice(blocker_portal.pad_x, blocker_portal.pad_y)
-        new_y_idx_portal = blocker_y_idx_pad + blocker_portal.direction * new_delta_steps
-
-        # Update the blocker's portal
-        blocker_portal.delta_steps = new_delta_steps
-        blocker_portal.y_idx = new_y_idx_portal
-
-        # Rebuild column_ranges for this column (remove old blocker range)
-        self.column_ranges[x_idx] = [
-            (y_min, y_max, pid) for (y_min, y_max, pid) in self.column_ranges[x_idx]
-            if pid != best_blocker
-        ]
-
-        # Re-add shortened blocker's range
-        new_y_min = min(blocker_y_idx_pad, new_y_idx_portal)
-        new_y_max = max(blocker_y_idx_pad, new_y_idx_portal)
-        self.column_ranges[x_idx].append((new_y_min, new_y_max, best_blocker))
-
-        # Retry current pad recursively
-        if self._shorten_depth < 20:  # Higher limit to allow removal mode
-            self._shorten_depth += 1
-            result = self._plan_random_portal_for_pad_with_drc(pad, pad_id, pad_geometries, debug=False)
-            self._shorten_depth -= 1
-
-            # If successful, clean up the shorten_attempts for this blocker
-            if result:
-                if blocker_key in self._shorten_attempts:
-                    del self._shorten_attempts[blocker_key]
-
-            return result
-
-        logger.warning(f"Pad {pad_id}: hit recursion limit of 20, giving up")
-        return None
 
     def _emit_portal_escape_geometry(self, net_id: str, pad_id: str, portal: Portal, entry_layer: int):
         """Emit vertical + 45-degree escape stub and portal via for a pad"""
@@ -804,78 +672,3 @@ class PadEscapePlanner:
             })
 
         return geometry
-
-    def _check_escape_conflicts(self, portal_geometry: Dict, pad_geometries: Dict) -> List[str]:
-        """
-        Check for DRC conflicts between escape geometries.
-
-        Returns list of pad_ids that have conflicts and need to be regenerated.
-        """
-        conflicts = set()
-
-        # Check via-to-via conflicts
-        all_vias = []
-        for pad_id, (tracks, vias, portal, entry_layer) in portal_geometry.items():
-            for via in vias:
-                all_vias.append((pad_id, via))
-
-        # Check each via against all other vias
-        for i, (pad_id_a, via_a) in enumerate(all_vias):
-            for j, (pad_id_b, via_b) in enumerate(all_vias):
-                if i >= j:
-                    continue
-
-                # Calculate distance between vias
-                dx = via_a['x'] - via_b['x']
-                dy = via_a['y'] - via_b['y']
-                distance = (dx * dx + dy * dy) ** 0.5
-
-                # Via clearance: diameter/2 + diameter/2 + clearance
-                via_radius = via_a.get('diameter', 0.25) / 2.0
-                required_clearance = 2 * via_radius + PAD_CLEARANCE_MM
-
-                if distance < required_clearance:
-                    conflicts.add(pad_id_a)
-                    conflicts.add(pad_id_b)
-                    logger.debug(f"Via conflict: {pad_id_a} <-> {pad_id_b}, distance={distance:.3f}mm < {required_clearance:.3f}mm")
-
-        # Check track-to-via conflicts
-        for pad_id_track, (tracks, _, _, _) in portal_geometry.items():
-            for track in tracks:
-                tx1, ty1 = track['x1'], track['y1']
-                tx2, ty2 = track['x2'], track['y2']
-
-                for pad_id_via, (_, vias, _, _) in portal_geometry.items():
-                    if pad_id_track == pad_id_via:
-                        continue
-
-                    for via in vias:
-                        vx, vy = via['x'], via['y']
-                        via_radius = via.get('diameter', 0.25) / 2.0
-
-                        # Calculate distance from via to track
-                        dist = self._point_to_segment_distance(vx, vy, tx1, ty1, tx2, ty2)
-
-                        required_clearance = via_radius + PAD_CLEARANCE_MM
-
-                        if dist < required_clearance:
-                            conflicts.add(pad_id_track)
-                            conflicts.add(pad_id_via)
-                            logger.debug(f"Track-via conflict: {pad_id_track} <-> {pad_id_via}, distance={dist:.3f}mm")
-
-        return list(conflicts)
-
-    def _point_to_segment_distance(self, px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
-        """Calculate minimum distance from point (px, py) to line segment (x1,y1)-(x2,y2)"""
-        dx = x2 - x1
-        dy = y2 - y1
-        length_sq = dx * dx + dy * dy
-
-        if length_sq == 0:
-            return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
-
-        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / length_sq))
-        closest_x = x1 + t * dx
-        closest_y = y1 + t * dy
-
-        return ((px - closest_x) ** 2 + (py - closest_y) ** 2) ** 0.5
