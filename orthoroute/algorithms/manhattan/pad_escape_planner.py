@@ -8,11 +8,13 @@ Before any pathfinding begins, we generate escape stubs and vias for all SMD
 pads, distributing traffic across horizontal routing layers.
 
 KEY FEATURES:
-- Random escape lengths (1.2mm - 5mm) and directions (±Y)
+- Checkerboard direction pattern: (x + y) % 2 → even=UP, odd=DOWN (strict enforcement)
+- Random escape lengths (1.2mm - 4.8mm / 3-12 grid steps)
+- Column overlap prevention (tracks existing Y-ranges per column)
+- Smart conflict resolution: iterations 1-10 shorten overlapping blockers (2→4→6→8...), after 10 remove blocker
+- Only considers blockers that overlap with target escape range (correct by construction)
 - DRC checking against existing pads (0.15mm clearance)
-- Via-to-via conflict resolution (0.4mm clearance)
-- Track-to-via conflict resolution (0.275mm clearance)
-- Iterative retry logic for conflicting escapes
+- Vertical + 45-degree routing geometry
 
 USAGE:
     planner = PadEscapePlanner(lattice, config, pad_to_node)
@@ -59,6 +61,7 @@ class PadEscapePlanner:
         self.config = config
         self.pad_to_node = pad_to_node
         self.portals: Dict[str, Portal] = {}  # pad_id -> Portal
+        self.column_ranges: Dict[int, List[Tuple[int, int, str]]] = {}  # x_idx -> [(y_min, y_max, pad_id), ...]
 
     def precompute_all_pad_escapes(self, board, nets_to_route: List = None) -> Tuple[List, List]:
         """
@@ -66,11 +69,13 @@ class PadEscapePlanner:
 
         For each SMD pad on a routable net:
         1. Snap X to nearest grid column (±½ pitch allowed)
-        2. Pick random vertical length d ∈ {3..12} grid steps (1.2mm - 4.8mm @ 0.4mm pitch)
-        3. Pick random direction (EITHER up OR down), clamped to board bounds
-        4. DRC check: ensure stub and via maintain clearance from other pads
-        5. Compute stub tip (xg, yg±d) on F.Cu
-        6. Place via to random horizontal layer (odd index: In1, In3, ..., B.Cu)
+        2. Pick direction via checkerboard: (x_idx + y_idx) % 2 → even=UP, odd=DOWN
+        3. Pick random vertical length d ∈ {3..12} grid steps (1.2mm - 4.8mm @ 0.4mm pitch)
+        4. Check overlap with existing escapes on same column
+        5. If blocked, progressively shorten longest blocker (2→4→6→8 steps, min 3)
+        6. DRC check: ensure stub and via maintain clearance from other pads
+        7. Compute stub tip (xg, yg±d) on F.Cu
+        8. Place via to random horizontal layer (odd index: In1, In3, ..., B.Cu)
 
         Args:
             board: Board with components and pads
@@ -155,6 +160,7 @@ class PadEscapePlanner:
 
         # Clear existing portals and plan ONLY for routable pads
         self.portals.clear()
+        self.column_ranges.clear()
 
         # Plan portals only for routable pads
         portal_count = 0
@@ -196,7 +202,7 @@ class PadEscapePlanner:
             else:
                 drc_failures_logged += 1
 
-        logger.info(f"Planned {portal_count} portals for routable nets (using RANDOM direction and 1.2-5mm length)")
+        logger.info(f"Planned {portal_count} portals for routable nets (using checkerboard pattern)")
 
         # Build reverse lookup: pad_id -> net_id
         pad_to_net = {}
@@ -262,6 +268,16 @@ class PadEscapePlanner:
                 if not pad_obj:
                     logger.warning(f"Could not find pad object for {pad_id}, skipping retry")
                     continue
+
+                # Remove old portal's range from column_ranges before regenerating
+                if pad_id in self.portals:
+                    old_portal = self.portals[pad_id]
+                    old_x_idx = old_portal.x_idx
+                    if old_x_idx in self.column_ranges:
+                        self.column_ranges[old_x_idx] = [
+                            (y_min, y_max, pid) for (y_min, y_max, pid) in self.column_ranges[old_x_idx]
+                            if pid != pad_id
+                        ]
 
                 # Regenerate portal
                 new_portal = self._plan_random_portal_for_pad_with_drc(pad_obj, pad_id, pad_geometries, debug=False)
@@ -409,10 +425,11 @@ class PadEscapePlanner:
     def _plan_random_portal_for_pad_with_drc(self, pad, pad_id: str,
                                               pad_geometries: Dict, debug: bool = False) -> Optional[Portal]:
         """
-        Plan portal escape with RANDOM direction and offset, WITH DRC checking.
+        Plan portal escape with CHECKERBOARD direction and random length.
 
-        Length: 1.2mm - 5mm (3-12 grid steps @ 0.4mm pitch)
-        Direction: Pick EITHER +1 (up) or -1 (down) randomly
+        Direction: (x_idx + y_idx) % 2 → even=UP, odd=DOWN (strict)
+        Length: Random 3-12 grid steps, avoiding overlaps on same column
+        Blocked: Shorten longest blocker by 4 steps (min 3), retry
         DRC: Ensure clearance from all other pads
         """
         # Get pad position and layer
@@ -437,14 +454,15 @@ class PadEscapePlanner:
         _, y_idx_pad = self.lattice.world_to_lattice(pad_x, pad_y)
         y_idx_pad = max(0, min(y_idx_pad, self.lattice.y_steps - 1))
 
-        # STEP 1: Pick direction FIRST (up or down)
-        direction = random.choice([+1, -1])
+        # STEP 1: Checkerboard direction - (x + y) % 2 determines UP or DOWN (STRICT)
+        checkerboard_value = (x_idx + y_idx_pad) % 2
+        direction = +1 if checkerboard_value == 0 else -1  # Even=UP, Odd=DOWN
 
-        # STEP 2: Find valid length range in chosen direction
+        # STEP 2: Find valid length range in checkerboard direction
         min_steps = 3
         max_steps = 12
 
-        # Calculate max possible steps in chosen direction before hitting board edge
+        # Calculate max possible steps in checkerboard direction
         if direction > 0:
             max_possible = self.lattice.y_steps - 1 - y_idx_pad
         else:
@@ -454,26 +472,35 @@ class PadEscapePlanner:
         max_steps_bounded = min(max_steps, max_possible)
 
         if max_steps_bounded < min_steps:
-            # Not enough space in this direction, try opposite
-            direction = -direction
-            if direction > 0:
-                max_possible = self.lattice.y_steps - 1 - y_idx_pad
-            else:
-                max_possible = y_idx_pad
-            max_steps_bounded = min(max_steps, max_possible)
+            logger.debug(f"Pad {pad_id}: insufficient space in checkerboard direction")
+            return None
 
-            if max_steps_bounded < min_steps:
-                logger.debug(f"Pad {pad_id}: insufficient space in either direction")
-                return None
+        # STEP 3: Try multiple random lengths in the checkerboard direction
+        max_attempts = 20
+        blocking_ranges = []
 
-        # STEP 3: Try multiple random lengths in the chosen direction with DRC
-        max_attempts = 10
         for attempt in range(max_attempts):
-            # Random length within valid range for chosen direction
+            # Random length within valid range
             delta_steps = random.randint(min_steps, max_steps_bounded)
 
-            # Calculate portal position in chosen direction
+            # Calculate portal position
             y_idx_portal = y_idx_pad + direction * delta_steps
+
+            # Check for overlap with existing escapes on same column
+            y_min = min(y_idx_pad, y_idx_portal)
+            y_max = max(y_idx_pad, y_idx_portal)
+
+            if x_idx in self.column_ranges:
+                overlaps = False
+                for (existing_y_min, existing_y_max, existing_pad_id) in self.column_ranges[x_idx]:
+                    # Check if ranges overlap (with 1-step buffer)
+                    if not (y_max + 1 < existing_y_min or y_min - 1 > existing_y_max):
+                        overlaps = True
+                        blocking_ranges.append((existing_y_min, existing_y_max, existing_pad_id))
+                        break
+
+                if overlaps:
+                    continue  # Try different random length
 
             # Convert portal to world coordinates for DRC check
             portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(x_idx, y_idx_portal)
@@ -499,7 +526,11 @@ class PadEscapePlanner:
                 logger.debug(f"Pad {pad_id}: stub path violates clearance")
                 continue
 
-            # DRC passed!
+            # DRC passed! Record the Y-range for this column
+            if x_idx not in self.column_ranges:
+                self.column_ranges[x_idx] = []
+            self.column_ranges[x_idx].append((y_min, y_max, pad_id))
+
             return Portal(
                 x_idx=x_idx,
                 y_idx=y_idx_portal,
@@ -512,30 +543,251 @@ class PadEscapePlanner:
                 retarget_count=0
             )
 
+        # All attempts failed - try to shorten blocking escapes
+        if blocking_ranges:
+            logger.info(f"Pad {pad_id}: blocked by {len(set(blocking_ranges))} escapes, attempting to shorten one")
+            return self._shorten_blocker_and_retry(pad, pad_id, pad_geometries, x_idx, y_idx_pad, direction)
+
         # All attempts failed DRC
         logger.warning(f"Pad {pad_id}: failed to find DRC-clean portal after {max_attempts} attempts")
         return None
 
+    def _shorten_blocker_and_retry(self, pad, pad_id: str, pad_geometries: Dict,
+                                     x_idx: int, y_idx_pad: int, direction: int) -> Optional[Portal]:
+        """
+        Shorten a blocking escape and retry current pad.
+        Strategy: Try shortening for first 10 iterations, then switch to removal.
+        Only considers blockers that overlap with our target escape range.
+        """
+        # Find blocking pads from column_ranges
+        if x_idx not in self.column_ranges or not self.column_ranges[x_idx]:
+            return None
+
+        # Find the NEAREST blocking pad in our direction
+        # We need to find the blocker that's actually preventing us from escaping
+        min_steps = 3
+        max_steps = 12
+
+        # Calculate the range we're trying to escape into
+        if direction > 0:
+            target_y_min = y_idx_pad + min_steps
+            target_y_max = y_idx_pad + min(max_steps, self.lattice.y_steps - 1 - y_idx_pad)
+        else:
+            target_y_min = max(0, y_idx_pad - max_steps)
+            target_y_max = y_idx_pad - min_steps
+
+        # Find blockers that OVERLAP with our target escape range
+        blocking_candidates = []
+        for (existing_y_min, existing_y_max, existing_pad_id) in self.column_ranges[x_idx]:
+            # Skip self
+            if existing_pad_id == pad_id:
+                continue
+
+            # Check if this range overlaps with our target range (with buffer)
+            if not (target_y_max + 1 < existing_y_min or target_y_min - 1 > existing_y_max):
+                blocking_candidates.append(existing_pad_id)
+
+        if not blocking_candidates:
+            return None
+
+        # Check current recursion depth
+        if not hasattr(self, '_shorten_depth'):
+            self._shorten_depth = 0
+
+        # OPTION 3: After 10 iterations, switch from shortening to complete removal
+        if self._shorten_depth >= 10:
+            # Column is too dense - remove one blocker completely
+            victim_pad_id = blocking_candidates[0]
+            logger.info(f"Pad {pad_id}: depth={self._shorten_depth}, column too dense, removing {victim_pad_id} completely")
+
+            # Remove victim's portal
+            if victim_pad_id in self.portals:
+                del self.portals[victim_pad_id]
+
+                # Add to replan queue
+                if not hasattr(self, 'pads_needing_replan'):
+                    self.pads_needing_replan = set()
+                self.pads_needing_replan.add(victim_pad_id)
+
+                # Remove from column_ranges
+                if x_idx in self.column_ranges:
+                    self.column_ranges[x_idx] = [
+                        (y_min, y_max, pid) for (y_min, y_max, pid) in self.column_ranges[x_idx]
+                        if pid != victim_pad_id
+                    ]
+
+                # Retry current pad recursively
+                if self._shorten_depth < 15:  # Higher limit for removal mode
+                    self._shorten_depth += 1
+                    result = self._plan_random_portal_for_pad_with_drc(pad, pad_id, pad_geometries, debug=False)
+                    self._shorten_depth -= 1
+                    return result
+
+            logger.debug(f"Pad {pad_id}: could not remove victim")
+            return None
+
+        # SHORTENING MODE (depth < 10): Pick the blocker with the LONGEST escape
+        best_blocker = None
+        best_length = 0
+        for candidate_id in blocking_candidates:
+            if candidate_id in self.portals:
+                candidate_portal = self.portals[candidate_id]
+                if candidate_portal.delta_steps > best_length and candidate_portal.delta_steps > 3:
+                    best_blocker = candidate_id
+                    best_length = candidate_portal.delta_steps
+
+        # If no blocker can be shortened, completely remove one
+        if not best_blocker:
+            # All blockers are at minimum - pick any one to completely remove
+            if blocking_candidates:
+                victim_pad_id = blocking_candidates[0]
+                logger.info(f"Pad {pad_id}: all blockers at minimum, removing {victim_pad_id} completely for replanning")
+
+                # Remove victim's portal
+                if victim_pad_id in self.portals:
+                    del self.portals[victim_pad_id]
+
+                    # Add to replan queue
+                    if not hasattr(self, 'pads_needing_replan'):
+                        self.pads_needing_replan = set()
+                    self.pads_needing_replan.add(victim_pad_id)
+
+                    # Remove from column_ranges
+                    if x_idx in self.column_ranges:
+                        self.column_ranges[x_idx] = [
+                            (y_min, y_max, pid) for (y_min, y_max, pid) in self.column_ranges[x_idx]
+                            if pid != victim_pad_id
+                        ]
+
+                    # Retry current pad recursively
+                    if self._shorten_depth < 20:
+                        self._shorten_depth += 1
+                        result = self._plan_random_portal_for_pad_with_drc(pad, pad_id, pad_geometries, debug=False)
+                        self._shorten_depth -= 1
+                        return result
+
+            logger.debug(f"Pad {pad_id}: no blockers to remove")
+            return None
+
+        # Get the blocking portal
+        blocker_portal = self.portals[best_blocker]
+
+        # Try progressively larger shortening amounts: 2, 4, 6, ...
+        # Track how many times we've shortened (to know which amount to try)
+        if not hasattr(self, '_shorten_attempts'):
+            self._shorten_attempts = {}
+
+        blocker_key = (x_idx, best_blocker)
+        shorten_attempt = self._shorten_attempts.get(blocker_key, 0)
+        shorten_amount = 2 + (shorten_attempt * 2)  # 2, 4, 6, 8, ...
+
+        self._shorten_attempts[blocker_key] = shorten_attempt + 1
+
+        # Shorten it by moving it back
+        new_delta_steps = max(3, blocker_portal.delta_steps - shorten_amount)
+
+        if new_delta_steps >= blocker_portal.delta_steps:
+            # Can't shorten anymore
+            logger.debug(f"Pad {pad_id}: can't shorten blocker {best_blocker} (already at {blocker_portal.delta_steps})")
+            return None
+
+        logger.info(f"Pad {pad_id}: shortening blocker {best_blocker} from {blocker_portal.delta_steps} to {new_delta_steps} steps (attempt {shorten_attempt + 1}, amount={shorten_amount})")
+
+        # Recalculate blocker's portal position with new shorter length
+        _, blocker_y_idx_pad = self.lattice.world_to_lattice(blocker_portal.pad_x, blocker_portal.pad_y)
+        new_y_idx_portal = blocker_y_idx_pad + blocker_portal.direction * new_delta_steps
+
+        # Update the blocker's portal
+        blocker_portal.delta_steps = new_delta_steps
+        blocker_portal.y_idx = new_y_idx_portal
+
+        # Rebuild column_ranges for this column (remove old blocker range)
+        self.column_ranges[x_idx] = [
+            (y_min, y_max, pid) for (y_min, y_max, pid) in self.column_ranges[x_idx]
+            if pid != best_blocker
+        ]
+
+        # Re-add shortened blocker's range
+        new_y_min = min(blocker_y_idx_pad, new_y_idx_portal)
+        new_y_max = max(blocker_y_idx_pad, new_y_idx_portal)
+        self.column_ranges[x_idx].append((new_y_min, new_y_max, best_blocker))
+
+        # Retry current pad recursively
+        if self._shorten_depth < 20:  # Higher limit to allow removal mode
+            self._shorten_depth += 1
+            result = self._plan_random_portal_for_pad_with_drc(pad, pad_id, pad_geometries, debug=False)
+            self._shorten_depth -= 1
+
+            # If successful, clean up the shorten_attempts for this blocker
+            if result:
+                if blocker_key in self._shorten_attempts:
+                    del self._shorten_attempts[blocker_key]
+
+            return result
+
+        logger.warning(f"Pad {pad_id}: hit recursion limit of 20, giving up")
+        return None
+
     def _emit_portal_escape_geometry(self, net_id: str, pad_id: str, portal: Portal, entry_layer: int):
-        """Emit vertical escape stub and portal via for a pad"""
+        """Emit vertical + 45-degree escape stub and portal via for a pad"""
         geometry = []
 
-        # 1. Vertical escape stub on pad layer (F.Cu) from pad to portal
+        # 1. Escape routing: vertical segment + 45-degree segment to portal via
         pad_layer_name = self.config.layer_names[portal.pad_layer] if portal.pad_layer < len(self.config.layer_names) else f"L{portal.pad_layer}"
 
         # Get portal mm coordinates
         portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(portal.x_idx, portal.y_idx)
 
-        # Vertical stub from pad to portal on pad layer
-        geometry.append({
-            'net': net_id,
-            'layer': pad_layer_name,
-            'x1': portal.pad_x,
-            'y1': portal.pad_y,
-            'x2': portal_x_mm,
-            'y2': portal_y_mm,
-            'width': self.config.grid_pitch * 0.6,
-        })
+        # Calculate escape geometry: mostly vertical, then 45-degree to via
+        dx = portal_x_mm - portal.pad_x
+        dy = portal_y_mm - portal.pad_y
+
+        # For 45-degree segment, we need dx == dy_45
+        # If there's any horizontal offset, we'll use a 45-degree segment at the end
+        if abs(dx) > 0.01:  # More than 0.01mm horizontal offset
+            # Intermediate point: vertical from pad, then 45-degree to via
+            # The 45-degree segment covers |dx| in both X and Y
+            sign_y = 1 if dy > 0 else -1
+            dy_45 = sign_y * abs(dx)  # 45-degree segment Y component (same magnitude as dx)
+            dy_vertical = dy - dy_45   # Remaining Y distance covered by vertical segment
+
+            # Intermediate point at end of vertical segment
+            intermediate_x = portal.pad_x
+            intermediate_y = portal.pad_y + dy_vertical
+
+            # Vertical segment from pad to intermediate point
+            if abs(dy_vertical) > 0.01:  # Only create segment if length > 0.01mm
+                geometry.append({
+                    'net': net_id,
+                    'layer': pad_layer_name,
+                    'x1': portal.pad_x,
+                    'y1': portal.pad_y,
+                    'x2': intermediate_x,
+                    'y2': intermediate_y,
+                    'width': self.config.grid_pitch * 0.6,
+                })
+
+            # 45-degree segment from intermediate point to portal via
+            geometry.append({
+                'net': net_id,
+                'layer': pad_layer_name,
+                'x1': intermediate_x,
+                'y1': intermediate_y,
+                'x2': portal_x_mm,
+                'y2': portal_y_mm,
+                'width': self.config.grid_pitch * 0.6,
+            })
+        else:
+            # Pure vertical escape (no horizontal offset)
+            geometry.append({
+                'net': net_id,
+                'layer': pad_layer_name,
+                'x1': portal.pad_x,
+                'y1': portal.pad_y,
+                'x2': portal_x_mm,
+                'y2': portal_y_mm,
+                'width': self.config.grid_pitch * 0.6,
+            })
 
         # 2. Portal via stack (minimal: only from pad_layer to entry_layer)
         if portal.pad_layer != entry_layer:
