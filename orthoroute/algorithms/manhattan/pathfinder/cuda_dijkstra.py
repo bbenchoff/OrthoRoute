@@ -149,10 +149,13 @@ class CUDADijkstra:
 
         try:
             # Prepare batched GPU arrays
+            logger.info(f"[DEBUG-GPU] Preparing batch data for {K} ROIs")
             batch_data = self._prepare_batch(roi_batch)
+            logger.info(f"[DEBUG-GPU] Batch data prepared, starting Near-Far algorithm")
 
             # Run Near-Far algorithm on GPU
             paths = self._run_near_far(batch_data, K, roi_batch)
+            logger.info(f"[DEBUG-GPU] Near-Far algorithm completed")
 
             found = sum(1 for p in paths if p)
             logger.info(f"[CUDA-ROI] Complete: {found}/{K} paths found using GPU")
@@ -382,10 +385,12 @@ class CUDADijkstra:
         """
         import time
 
+        logger.info(f"[DEBUG-GPU] _run_near_far started for {K} ROIs")
         max_iterations = 10000
         start_time = time.perf_counter()
 
         # DIAGNOSTIC: Check if destinations are reachable
+        logger.info(f"[DEBUG-GPU] Validating ROI sources and destinations")
         invalid_rois = []
         for roi_idx in range(K):
             src = data['sources'][roi_idx]
@@ -421,10 +426,18 @@ class CUDADijkstra:
             # Return None for all paths (don't attempt pathfinding)
             return [None] * K
 
+        logger.info(f"[DEBUG-GPU] Starting Near-Far iteration loop (max {max_iterations})")
         for iteration in range(max_iterations):
             # Check termination: any Near bucket has work?
             if not data['near_mask'].any():
+                logger.info(f"[DEBUG-GPU] Near-Far terminated: no work in Near bucket")
                 break
+
+            # Log every 10 iterations for first 100, then every 100
+            if iteration < 100 and iteration % 10 == 0:
+                logger.info(f"[DEBUG-GPU] Near-Far iteration {iteration}")
+            elif iteration % 100 == 0:
+                logger.info(f"[DEBUG-GPU] Near-Far iteration {iteration}")
 
             # Step 1: Relax Near bucket (parallel edge relaxation)
             self._relax_near_bucket_gpu(data, K)
@@ -477,7 +490,10 @@ class CUDADijkstra:
         logger.info(f"[CUDA-NF] Near-Far complete in {iteration+1} iterations, {elapsed_ms:.1f}ms")
 
         # Reconstruct paths
-        return self._reconstruct_paths(data, K)
+        logger.info(f"[DEBUG-GPU] Reconstructing paths for {K} ROIs")
+        paths = self._reconstruct_paths(data, K)
+        logger.info(f"[DEBUG-GPU] Path reconstruction complete")
+        return paths
 
     def _relax_near_bucket_gpu(self, data: dict, K: int):
         """

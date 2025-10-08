@@ -1711,11 +1711,6 @@ class OrthoRouteMainWindow(QMainWindow):
                 self.pcb_viewer.show_airwires = True
                 self.pcb_viewer.update()
 
-            # STOP HERE for debugging - don't continue to routing
-            self.log_to_gui("[DEBUG] Pad escapes visualization complete. Stopping before routing.", "INFO")
-            self._set_ui_busy(False)
-            return
-
             self.log_to_gui("[PIPELINE] Step 3: Preparing routing runtime...", "INFO")
             pf.prepare_routing_runtime()
             self.log_to_gui("✓ Runtime preparation complete", "SUCCESS")
@@ -1740,7 +1735,38 @@ class OrthoRouteMainWindow(QMainWindow):
 
                     self.progress_bar.setFormat(f"{done}/{total} nets{eta_text}")
 
-            pf.route_multiple_nets(board.nets, progress_cb=progress_cb)
+            # Store count of escape geometry before routing starts
+            escape_track_count = len([t for t in self.board_data.get('tracks', []) if t])
+            escape_via_count = len([v for v in self.board_data.get('vias', []) if v])
+            escape_tracks_list = self.board_data.get('tracks', [])[:escape_track_count]
+            escape_vias_list = self.board_data.get('vias', [])[:escape_via_count]
+
+            def iteration_cb(iteration, routing_tracks, routing_vias):
+                """Iteration callback: update board_data and capture screenshot"""
+                try:
+                    # Combine escape geometry with provisional routing geometry
+                    self.board_data['tracks'] = escape_tracks_list + routing_tracks
+                    self.board_data['vias'] = escape_vias_list + routing_vias
+
+                    # Update viewer
+                    if hasattr(self.pcb_viewer, 'update_routing'):
+                        self.pcb_viewer.update_routing(self.board_data['tracks'], self.board_data['vias'])
+                        self.pcb_viewer.update()
+                        QApplication.processEvents()
+
+                    # Capture screenshot with KiCad colors
+                    screenshot_name = f"{iteration+3:02d}_iteration_{iteration:02d}"
+                    self.pcb_viewer.show_airwires = False  # Hide airwires for clarity
+                    self.pcb_viewer.fit_to_view()
+                    self.pcb_viewer.update()
+                    QApplication.processEvents()
+                    self.pcb_viewer.debug_screenshot(screenshot_name, scale_factor=8, output_dir=self._current_run_folder)
+
+                    logger.info(f"📸 Iteration {iteration}: screenshot captured ({len(routing_tracks)} routing tracks, {len(routing_vias)} routing vias)")
+                except Exception as e:
+                    logger.warning(f"Iteration callback failed: {e}")
+
+            pf.route_multiple_nets(board.nets, progress_cb=progress_cb, iteration_cb=iteration_cb)
             self.log_to_gui("✓ Net routing complete", "SUCCESS")
 
             # 3) Emit geometry -> update viewer

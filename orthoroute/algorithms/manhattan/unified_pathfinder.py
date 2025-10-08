@@ -485,6 +485,7 @@ PORTAL METHODS (TO BE IMPLEMENTED):
 # Standard library
 import logging
 import time
+import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
@@ -531,7 +532,7 @@ class GeometryPayload:
 @dataclass
 class PathFinderConfig:
     """PathFinder algorithm parameters - LOCKED CONFIG FOR STABILITY"""
-    max_iterations: int = 30
+    max_iterations: int = 10  # Reduced for speed testing
     # LOCKED CONFIGURATION (DO NOT MODIFY):
     pres_fac_init: float = 1.0
     pres_fac_mult: float = 1.8
@@ -1527,24 +1528,34 @@ class PathFinderRouter:
             # Get node index at portal for this layer
             node_idx = self.lattice.node_idx(portal.x_idx, portal.y_idx, layer)
 
-            # Calculate discounted via cost from pad layer to this layer
-            if layer == portal.pad_layer:
-                # Same layer - small epsilon to avoid zero-cost traps
-                # Still prefer pad layer slightly, but allow economic choice
+            # Calculate via cost from entry_layer (where escape via connects)
+            if layer == portal.entry_layer:
+                # Same as entry layer - no via needed, minimal cost
                 cost = 0.1
             else:
-                # Via cost with span penalty and portal discount
-                span = abs(layer - portal.pad_layer)
+                # Via cost from entry_layer to this layer
+                span = abs(layer - portal.entry_layer)
                 base_via_cost = cfg.via_cost * (1.0 + cfg.span_alpha * (span - 1))
-                # Portal discount makes escape vias cheap but not free
+                # Portal discount makes entry-layer vias cheap
                 cost = base_via_cost * cfg.portal_via_discount
 
             seeds.append((node_idx, cost))
 
         return seeds
 
-    def route_multiple_nets(self, requests: List, progress_cb=None) -> Dict:
-        """Main entry"""
+    def route_multiple_nets(self, requests: List, progress_cb=None, iteration_cb=None) -> Dict:
+        """
+        Main entry for routing multiple nets.
+
+        Args:
+            requests: List of net routing requests
+            progress_cb: Callback(done, total, eta) called after each net routed
+            iteration_cb: Callback(iteration, tracks, vias) called after each pathfinder iteration
+                         Used for screenshot capture and progress visualization
+
+        Returns:
+            Dict of routing results
+        """
         logger.info(f"=== Route {len(requests)} nets ===")
 
         tasks = self._parse_requests(requests)
@@ -1553,7 +1564,7 @@ class PathFinderRouter:
             self._negotiation_ran = True
             return {}
 
-        result = self._pathfinder_negotiation(tasks, progress_cb)
+        result = self._pathfinder_negotiation(tasks, progress_cb, iteration_cb)
 
         return result
 
@@ -1581,17 +1592,37 @@ class PathFinderRouter:
                 p2_id = self._pad_key(p2)
 
                 if p1_id in self.pad_to_node and p2_id in self.pad_to_node:
-                    src = self.pad_to_node[p1_id]
-                    dst = self.pad_to_node[p2_id]
-                    if src != dst:
-                        tasks[net_name] = (src, dst)
-                        self.net_pad_ids[net_name] = (p1_id, p2_id)  # Track pad IDs for portal lookup
-                        kept += 1
+                    # Route from PORTAL positions (escape vias), not from pads
+                    # Portals are pre-computed and stored in self.portals
+                    if p1_id in self.portals and p2_id in self.portals:
+                        p1_portal = self.portals[p1_id]
+                        p2_portal = self.portals[p2_id]
+
+                        # Use the entry_layer stored in each portal (chosen during escape planning)
+                        # This ensures routing starts from the actual escape via layer
+                        entry_layer = p1_portal.entry_layer
+                        exit_layer = p2_portal.entry_layer
+
+                        # Convert portal positions to node indices
+                        src = self.lattice.node_idx(p1_portal.x_idx, p1_portal.y_idx, entry_layer)
+                        dst = self.lattice.node_idx(p2_portal.x_idx, p2_portal.y_idx, exit_layer)
+
+                        if src != dst:
+                            tasks[net_name] = (src, dst)
+                            self.net_pad_ids[net_name] = (p1_id, p2_id)  # Track pad IDs
+                            self.net_portal_layers[net_name] = (entry_layer, exit_layer)  # Track layers
+                            kept += 1
+                        else:
+                            same_cell_trivial += 1
+                            self.net_paths[net_name] = [src]
+                            logger.debug(f"Net {net_name}: trivial route (portals at same position)")
                     else:
-                        same_cell_trivial += 1
-                        # Mark as trivially routed (zero-length path)
-                        self.net_paths[net_name] = [src]
-                        logger.debug(f"Net {net_name}: trivial route at cell {src}")
+                        # Portals not found - skip this net
+                        if p1_id not in self.portals:
+                            logger.debug(f"Net {net_name}: no portal for {p1_id}")
+                        if p2_id not in self.portals:
+                            logger.debug(f"Net {net_name}: no portal for {p2_id}")
+                        unmapped_pads += 1
                 else:
                     unmapped_pads += 1
                     if unmapped_pads <= 3:  # Log first 3 examples
@@ -1619,7 +1650,7 @@ class PathFinderRouter:
 
         return tasks
 
-    def _pathfinder_negotiation(self, tasks: Dict[str, Tuple[int, int]], progress_cb=None) -> Dict:
+    def _pathfinder_negotiation(self, tasks: Dict[str, Tuple[int, int]], progress_cb=None, iteration_cb=None) -> Dict:
         """CORE PATHFINDER ALGORITHM"""
         cfg = self.config
         pres_fac = cfg.pres_fac_init
@@ -1734,6 +1765,15 @@ class PathFinderRouter:
                     progress_cb(it, cfg.max_iterations, f"Iteration {it}")
                 except:
                     pass
+
+            # Iteration callback for screenshots (generate provisional geometry)
+            if iteration_cb:
+                try:
+                    # Generate current routing state for visualization
+                    provisional_tracks, provisional_vias = self._generate_geometry_from_paths()
+                    iteration_cb(it, provisional_tracks, provisional_vias)
+                except Exception as e:
+                    logger.warning(f"[ITER {it}] Iteration callback failed: {e}")
 
             # STEP 6: Terminate?
             if failed == 0 and over_sum == 0:
@@ -1890,8 +1930,9 @@ class PathFinderRouter:
 
             # Congestion: average overuse along prior path (if exists)
             congestion = 0.0
-            if net_id in self.net_paths and self.net_paths[net_id]:
-                edges = self._path_to_edges(self.net_paths[net_id])
+            if net_id in self._net_to_edges:
+                # Use cached edge mapping (O(1) lookup) instead of recomputing (O(M) scan)
+                edges = self._net_to_edges[net_id]
                 congestion = sum(float(over[ei]) for ei in edges) / max(1, len(edges))
 
             difficulty = distance * (pin_degree + 1) * (congestion + 1)
@@ -1980,9 +2021,9 @@ class PathFinderRouter:
                     src_seeds = self._get_portal_seeds(src_portal)
                     dst_targets = self._get_portal_seeds(dst_portal)
 
-                    # Extract ROI centered on PORTAL nodes (not pad nodes) for portal routing
-                    src_portal_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.pad_layer)
-                    dst_portal_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.pad_layer)
+                    # Extract ROI centered on PORTAL nodes on their entry layers (not pad layer!)
+                    src_portal_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.entry_layer)
+                    dst_portal_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.entry_layer)
 
                     roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
                         src_portal_node, dst_portal_node, initial_radius=adaptive_radius, stagnation_bonus=roi_margin_bonus
@@ -2091,7 +2132,7 @@ class PathFinderRouter:
         import numpy as np
 
         cfg = self.config
-        batch_size = min(cfg.batch_size, 16)  # Cap at 16 for memory
+        batch_size = min(cfg.batch_size, 64)  # Increased for speed
         total = len(ordered_nets)
 
         routed_this_pass = 0
@@ -2110,6 +2151,7 @@ class PathFinderRouter:
             batch_metadata = []  # Track (net_id, use_portals, src, dst)
 
             for net_id in batch_nets:
+                logger.info(f"[DEBUG] Extracting ROI for net {net_id}")
                 src, dst = tasks[net_id]
 
                 # Clear old path
@@ -2136,8 +2178,9 @@ class PathFinderRouter:
                     dst_portal = self.portals.get(dst_pad_id)
 
                     if src_portal and dst_portal:
-                        src_portal_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.pad_layer)
-                        dst_portal_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.pad_layer)
+                        # Use entry_layer (routing layer) not pad_layer (F.Cu)!
+                        src_portal_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.entry_layer)
+                        dst_portal_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.entry_layer)
                         roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
                             src_portal_node, dst_portal_node, initial_radius=adaptive_radius, stagnation_bonus=roi_margin_bonus
                         )
@@ -2153,6 +2196,7 @@ class PathFinderRouter:
 
                 # Build ROI CSR for this net
                 roi_size = len(roi_nodes)
+                logger.info(f"[DEBUG] ROI extracted for net {net_id}: {roi_size} nodes")
                 roi_src = int(global_to_roi[src])
                 roi_dst = int(global_to_roi[dst])
 
@@ -2172,11 +2216,14 @@ class PathFinderRouter:
 
             # Route entire batch on GPU in parallel
             if roi_batch:
+                logger.info(f"[DEBUG] Starting GPU solve for batch of {len(roi_batch)} nets")
                 paths = self.solver.gpu_solver.find_paths_on_rois(roi_batch)
+                logger.info(f"[DEBUG] GPU solve complete, processing {len(paths)} results")
 
                 # Process results
                 for i, (net_id, use_portals, roi_nodes_arr, src, dst) in enumerate(batch_metadata):
                     if roi_nodes_arr is None or i >= len(paths):
+                        logger.info(f"[DEBUG] Net {net_id}: FAILED (no ROI or path)")
                         failed_this_pass += 1
                         self.net_paths[net_id] = []
                         continue
@@ -2192,8 +2239,10 @@ class PathFinderRouter:
                         self.accounting.commit_path(edge_indices)
                         self.net_paths[net_id] = global_path
                         self._update_net_edge_tracking(net_id, edge_indices)
+                        logger.info(f"[DEBUG] Net {net_id}: path length {len(global_path)}")
                         routed_this_pass += 1
                     else:
+                        logger.info(f"[DEBUG] Net {net_id}: FAILED (no path found)")
                         failed_this_pass += 1
                         self.net_paths[net_id] = []
                         self._clear_net_edge_tracking(net_id)
@@ -2371,9 +2420,8 @@ class PathFinderRouter:
                 edge_type = "VIA" if uz != vz else "TRACK"
                 layer_info = f"L{uz}" if uz == vz else f"L{uz}→L{vz}"
 
-                # Count nets using this edge
-                nets_on_edge = sum(1 for path in self.net_paths.values()
-                                   if path and ei in self._path_to_edges(path))
+                # Count nets using this edge (use cached reverse lookup)
+                nets_on_edge = len(self._edge_to_nets.get(ei, set()))
 
                 logger.info(f"  {rank:2d}. {edge_type:5s} {layer_info:6s} "
                            f"({ux_mm:6.2f},{uy_mm:6.2f})→({vx_mm:6.2f},{vy_mm:6.2f}) "
@@ -2503,43 +2551,6 @@ class PathFinderRouter:
             'width': self.config.grid_pitch * 0.6,
         }
 
-    def _emit_portal_escape_geometry(self, net_id: str, pad_id: str, portal: Portal, entry_layer: int):
-        """Emit vertical escape stub and portal via for a pad"""
-        geometry = []
-
-        # 1. Vertical escape stub on pad layer (F.Cu) from pad to portal
-        pad_layer_name = self.config.layer_names[portal.pad_layer] if portal.pad_layer < len(self.config.layer_names) else f"L{portal.pad_layer}"
-
-        # Get portal mm coordinates
-        portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(portal.x_idx, portal.y_idx)
-
-        # Vertical stub from pad to portal on pad layer
-        geometry.append({
-            'net': net_id,
-            'layer': pad_layer_name,
-            'x1': portal.pad_x,
-            'y1': portal.pad_y,
-            'x2': portal_x_mm,
-            'y2': portal_y_mm,
-            'width': self.config.grid_pitch * 0.6,
-        })
-
-        # 2. Portal via stack (minimal: only from pad_layer to entry_layer)
-        if portal.pad_layer != entry_layer:
-            entry_layer_name = self.config.layer_names[entry_layer] if entry_layer < len(self.config.layer_names) else f"L{entry_layer}"
-
-            geometry.append({
-                'net': net_id,
-                'x': portal_x_mm,
-                'y': portal_y_mm,
-                'from_layer': pad_layer_name,
-                'to_layer': entry_layer_name,
-                'diameter': 0.25,  # hole (0.15) + 2×annular (0.05) = 0.25mm
-                'drill': 0.15,     # hole diameter
-            })
-
-        return geometry
-
     def precompute_all_pad_escapes(self, board: Board, nets_to_route: List = None) -> Tuple[List, List]:
         """
         Delegate to PadEscapePlanner for precomputing all pad escapes.
@@ -2550,7 +2561,14 @@ class PathFinderRouter:
             logger.error("Escape planner not initialized! Call initialize_graph first.")
             return ([], [])
 
-        return self.escape_planner.precompute_all_pad_escapes(board, nets_to_route)
+        result = self.escape_planner.precompute_all_pad_escapes(board, nets_to_route)
+
+        # CRITICAL: Copy portals from escape_planner to self.portals
+        # The pathfinder needs these to route from portal positions, not pad positions
+        self.portals = self.escape_planner.portals.copy()
+        logger.info(f"Copied {len(self.portals)} portals from escape planner to pathfinder")
+
+        return result
 
     def _via_world(self, at_idx: int, net: str, from_layer: int, to_layer: int):
         x, y, _ = self.lattice.idx_to_coord(at_idx)
@@ -2595,30 +2613,8 @@ class PathFinderRouter:
             if not path:
                 continue
 
-            # Emit portal escape geometry if this net used portals
-            if net_id in self.net_portal_layers and net_id in self.net_pad_ids:
-                entry_layer, exit_layer = self.net_portal_layers[net_id]
-                src_pad_id, dst_pad_id = self.net_pad_ids[net_id]
-
-                # Emit source portal escape
-                src_portal = self.portals.get(src_pad_id)
-                if src_portal:
-                    portal_geom = self._emit_portal_escape_geometry(net_id, src_pad_id, src_portal, entry_layer)
-                    for item in portal_geom:
-                        if 'x1' in item:
-                            tracks.append(item)
-                        else:
-                            vias.append(item)
-
-                # Emit destination portal escape
-                dst_portal = self.portals.get(dst_pad_id)
-                if dst_portal:
-                    portal_geom = self._emit_portal_escape_geometry(net_id, dst_pad_id, dst_portal, exit_layer)
-                    for item in portal_geom:
-                        if 'x1' in item:
-                            tracks.append(item)
-                        else:
-                            vias.append(item)
+            # NOTE: Escape geometry is pre-computed by PadEscapePlanner and already
+            # added to board_data in main_window.py. No need to emit it here.
 
             # Generate tracks/vias from main path
             run_start = path[0]

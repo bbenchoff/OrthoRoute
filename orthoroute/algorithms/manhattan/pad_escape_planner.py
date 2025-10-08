@@ -63,6 +63,7 @@ class Portal:
         direction: Escape direction (+1 = up/north, -1 = down/south)
         pad_x: Original pad center X in mm (not snapped)
         pad_y: Original pad center Y in mm (not snapped)
+        entry_layer: Routing layer the escape via connects to (1-11, for pathfinding)
         score: Quality score (unused, legacy field)
         retarget_count: Number of retargets (unused, legacy field)
     """
@@ -73,6 +74,7 @@ class Portal:
     direction: int
     pad_x: float
     pad_y: float
+    entry_layer: int = 1  # Which horizontal layer this escape via connects to
     score: float = 0.0
     retarget_count: int = 0
 
@@ -305,18 +307,13 @@ class PadEscapePlanner:
             pad_to_net[dst_pad_id] = net_id
 
         # FIRST PASS: Generate all escape geometry
-        portal_geometry = {}  # pad_id -> (tracks, vias, portal, entry_layer)
+        portal_geometry = {}  # pad_id -> (tracks, vias)
         for pad_id, portal in self.portals.items():
             net_id = pad_to_net.get(pad_id, f"PAD_{pad_id}")
 
-            # Pick a random horizontal layer (odd indices)
-            odd_layers = [i for i in range(1, self.lattice.layers, 2)]
-            if not odd_layers:
-                odd_layers = [1]
-            entry_layer = random.choice(odd_layers)
-
             # Generate escape geometry (stub + via)
-            geometry = self._emit_portal_escape_geometry(net_id, pad_id, portal, entry_layer)
+            # Portal already has entry_layer stored from _plan_column_escapes
+            geometry = self._emit_portal_escape_geometry(net_id, pad_id, portal, portal.entry_layer)
 
             portal_tracks = []
             portal_vias = []
@@ -326,12 +323,12 @@ class PadEscapePlanner:
                 elif 'x' in item and 'y' in item:  # It's a via
                     portal_vias.append(item)
 
-            portal_geometry[pad_id] = (portal_tracks, portal_vias, portal, entry_layer)
+            portal_geometry[pad_id] = (portal_tracks, portal_vias)
 
         logger.info(f"Generated {len(portal_geometry)} escape geometries")
 
         # Collect all final geometry
-        for pad_id, (portal_tracks, portal_vias, portal, entry_layer) in portal_geometry.items():
+        for pad_id, (portal_tracks, portal_vias) in portal_geometry.items():
             tracks.extend(portal_tracks)
             vias.extend(portal_vias)
 
@@ -486,13 +483,19 @@ class PadEscapePlanner:
         # STEP 3: DRC check and create portals with fallback
         portal_count = 0
         for pad_id, y_idx, direction, delta_steps, pad_x, pad_y, pad_layer in planned_escapes:
+            # Pick random horizontal routing layer for this escape via (any layer except F.Cu)
+            valid_layers = list(range(1, self.lattice.layers))
+            if not valid_layers:
+                valid_layers = [1]
+            entry_layer = random.choice(valid_layers)
+
             # Try progressively shorter lengths, then opposite direction
             portal = None
 
             # First try: current direction, progressively shorter
             for try_delta in range(delta_steps, min_steps - 1, -1):
                 portal = self._try_create_portal(x_idx, y_idx, direction, try_delta,
-                                                  pad_id, pad_x, pad_y, pad_layer, pad_geometries)
+                                                  pad_id, pad_x, pad_y, pad_layer, entry_layer, pad_geometries)
                 if portal:
                     break
 
@@ -509,7 +512,7 @@ class PadEscapePlanner:
                 # Try opposite direction from min to max
                 for try_delta in range(min_steps, max_opposite + 1):
                     portal = self._try_create_portal(x_idx, y_idx, opposite_direction, try_delta,
-                                                      pad_id, pad_x, pad_y, pad_layer, pad_geometries)
+                                                      pad_id, pad_x, pad_y, pad_layer, entry_layer, pad_geometries)
                     if portal:
                         break
 
@@ -522,7 +525,7 @@ class PadEscapePlanner:
         return portal_count
 
     def _try_create_portal(self, x_idx: int, y_idx: int, direction: int, delta_steps: int,
-                           pad_id: str, pad_x: float, pad_y: float, pad_layer: int,
+                           pad_id: str, pad_x: float, pad_y: float, pad_layer: int, entry_layer: int,
                            pad_geometries: Dict) -> Optional[Portal]:
         """
         Try to create a portal with given parameters, return None if DRC fails.
@@ -546,6 +549,7 @@ class PadEscapePlanner:
             pad_x: Pad center X in mm
             pad_y: Pad center Y in mm
             pad_layer: Pad layer index (typically 0 for F.Cu)
+            entry_layer: Horizontal routing layer the escape via connects to (1-11)
             pad_geometries: Dict[pad_id -> {x, y, width, height}]
 
         Returns:
@@ -578,6 +582,7 @@ class PadEscapePlanner:
             direction=direction,
             pad_x=pad_x,
             pad_y=pad_y,
+            entry_layer=entry_layer,
             score=0.0,
             retarget_count=0
         )
