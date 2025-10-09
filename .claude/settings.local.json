@@ -20,7 +20,12 @@
       "WebFetch(domain:docs.kicad.org)",
       "Bash(find:*)",
       "Bash(tee:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(echo $ORTHO_CPU_ONLY)",
+      "Bash(xargs -r kill -9)",
+      "Bash(pkill:*)",
+      "Bash(tasklist)",
+      "Bash(taskkill:*)"
     ],
     "deny": [],
     "ask": [],

@@ -620,22 +620,53 @@ class CSRGraph:
 
     def finalize(self, num_nodes: int):
         """Build CSR from edge list (memory-efficient)"""
+        import time
+        start = time.time()
+
         if self._use_array:
             # Already in numpy array (pre-allocated)
             E = self._edge_idx
             edge_array = self._edge_array[:E]  # Trim to actual size
+            logger.info(f"Finalizing CSR: {E:,} edges from pre-allocated array")
         else:
             if not self._edges:
                 raise ValueError("No edges")
             E = len(self._edges)
 
             # Convert to numpy array for memory-efficient sorting
+            logger.info(f"Converting {E:,} edges to numpy array...")
             edge_array = np.array(self._edges, dtype=[('src', 'i4'), ('dst', 'i4'), ('cost', 'f4')])
             # Free memory immediately
             self._edges.clear()
 
-        # Sort by source node (in-place, memory efficient)
-        edge_array.sort(order='src')
+        # Sort by source node - GPU accelerated if available!
+        logger.info(f"Sorting {E:,} edges by source node...")
+        sort_start = time.time()
+
+        # OPTIMIZATION: Use GPU sort if available (8-10× faster for large arrays)
+        if self.use_gpu and GPU_AVAILABLE:
+            try:
+                logger.info(f"[GPU-SORT] Using CuPy GPU radix sort (expected ~3-5s for 54M edges)")
+                # Transfer to GPU
+                edge_array_gpu = cp.asarray(edge_array)
+                # GPU radix sort (much faster than CPU quicksort/mergesort)
+                sorted_idx = cp.argsort(edge_array_gpu['src'], kind='stable')
+                edge_array_gpu = edge_array_gpu[sorted_idx]
+                # Transfer back to CPU for CSR construction
+                edge_array = edge_array_gpu.get()
+                sort_time = time.time() - sort_start
+                logger.info(f"[GPU-SORT] GPU sort completed in {sort_time:.1f} seconds ({E/sort_time/1e6:.1f}M edges/sec)")
+            except Exception as e:
+                logger.warning(f"[GPU-SORT] GPU sort failed: {e}, falling back to CPU")
+                # CPU fallback
+                edge_array.sort(order='src', kind='mergesort')
+                sort_time = time.time() - sort_start
+                logger.info(f"[CPU-SORT] CPU sort completed in {sort_time:.1f} seconds")
+        else:
+            # CPU sort (stable mergesort)
+            edge_array.sort(order='src', kind='mergesort')
+            sort_time = time.time() - sort_start
+            logger.info(f"[CPU-SORT] Sort completed in {sort_time:.1f} seconds")
 
         # Extract components
         indices = edge_array['dst'].astype(np.int32)
@@ -912,14 +943,166 @@ class Lattice3D:
 class ROIExtractor:
     """Extract Region of Interest subgraph using GPU-vectorized BFS"""
 
-    def __init__(self, graph: CSRGraph, use_gpu: bool = False):
+    def __init__(self, graph: CSRGraph, use_gpu: bool = False, lattice=None):
         self.graph = graph
         self.xp = graph.xp
         self.N = len(graph.indptr) - 1
+        self.lattice = lattice  # Need lattice for geometric ROI
 
-    def extract_roi(self, src: int, dst: int, initial_radius: int = 40, stagnation_bonus: float = 0.0) -> tuple:
+    def extract_roi_geometric(self, src: int, dst: int, corridor_buffer: int = 30, layer_margin: int = 3, portal_seeds: list = None) -> tuple:
+        """
+        Geometric bounding box ROI extraction for long nets.
+        Much more efficient than BFS for point-to-point routing over long distances.
+
+        Strategy:
+        1. Calculate 3D bounding box between src and dst
+        2. Add corridor buffer perpendicular to the main routing direction
+        3. Limit vertical layers to ±layer_margin from entry/exit layers
+
+        Args:
+            src: Source node index
+            dst: Destination node index
+            corridor_buffer: Perpendicular buffer in grid steps (default: 30 steps = 12mm @ 0.4mm pitch)
+            layer_margin: Vertical layer margin from entry/exit layers (default: ±3 layers)
+
+        Returns: (roi_nodes, global_to_roi)
+        """
+        import numpy as np
+
+        if not self.lattice:
+            # Fallback to BFS if no lattice available
+            logger.warning("Geometric ROI requires lattice, falling back to BFS")
+            return self.extract_roi_bfs(src, dst, initial_radius=40)
+
+        # Get 3D coordinates
+        src_x, src_y, src_z = self.lattice.idx_to_coord(src)
+        dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
+
+        # Calculate axis-aligned bounding box
+        min_x = min(src_x, dst_x)
+        max_x = max(src_x, dst_x)
+        min_y = min(src_y, dst_y)
+        max_y = max(src_y, dst_y)
+        min_z = min(src_z, dst_z)
+        max_z = max(src_z, dst_z)
+
+        # Add corridor buffer perpendicular to main direction
+        min_x = max(0, min_x - corridor_buffer)
+        max_x = min(self.lattice.x_steps - 1, max_x + corridor_buffer)
+        min_y = max(0, min_y - corridor_buffer)
+        max_y = min(self.lattice.y_steps - 1, max_y + corridor_buffer)
+
+        # Add layer margin (but don't exceed board layer limits)
+        min_z = max(0, min_z - layer_margin)
+        max_z = min(self.lattice.layers - 1, max_z + layer_margin)
+
+        # Generate L-shaped corridor using SET for O(1) deduplication
+        x_steps = self.lattice.x_steps
+        y_steps = self.lattice.y_steps
+        plane_size = x_steps * y_steps
+
+        roi_nodes_set = set()  # Use set for O(1) lookups
+
+        # Horizontal segment: from src.x to dst.x (at src.y with buffer)
+        horiz_min_y = max(0, src_y - corridor_buffer)
+        horiz_max_y = min(y_steps - 1, src_y + corridor_buffer)
+
+        for z in range(min_z, max_z + 1):
+            for y in range(horiz_min_y, horiz_max_y + 1):
+                for x in range(min_x, max_x + 1):
+                    node_idx = z * plane_size + y * x_steps + x
+                    roi_nodes_set.add(node_idx)
+
+        # Vertical segment: from src.y to dst.y (at dst.x with buffer)
+        vert_min_x = max(0, dst_x - corridor_buffer)
+        vert_max_x = min(x_steps - 1, dst_x + corridor_buffer)
+
+        for z in range(min_z, max_z + 1):
+            for y in range(min_y, max_y + 1):
+                for x in range(vert_min_x, vert_max_x + 1):
+                    node_idx = z * plane_size + y * x_steps + x
+                    roi_nodes_set.add(node_idx)  # Set automatically handles duplicates
+
+        roi_nodes = np.array(list(roi_nodes_set), dtype=np.int32)
+        logger.info(f"L-corridor ROI: {len(roi_nodes):,} nodes (horiz: X {min_x}-{max_x} @ Y {horiz_min_y}-{horiz_max_y}, vert: X {vert_min_x}-{vert_max_x} @ Y {min_y}-{max_y}, Z {min_z}-{max_z})")
+
+        # CRITICAL: Ensure src, dst, AND all portal seeds are in ROI BEFORE truncation
+        must_keep_nodes = [src, dst]
+        if portal_seeds:
+            # Add all portal seed node IDs to must-keep list
+            for node_id, _ in portal_seeds:
+                if node_id not in must_keep_nodes:
+                    must_keep_nodes.append(node_id)
+
+        # Add any missing must-keep nodes
+        for node in must_keep_nodes:
+            if node not in roi_nodes_set:
+                roi_nodes_set.add(node)
+
+        roi_nodes = np.array(list(roi_nodes_set), dtype=np.int32)
+
+        # Cap ROI size if enormous (100K is ~2.4% of a 4M node graph)
+        max_nodes = getattr(self, "max_roi_nodes", 1_000_000)  # Increased from 100k to 1M
+        if roi_nodes.size > max_nodes:
+            logger.warning(f"Geometric ROI {roi_nodes.size:,} > {max_nodes:,}, truncating to {max_nodes} (keeping {len(must_keep_nodes)} critical nodes)")
+
+            # FIXED: Move ALL must-keep nodes to the beginning (not just those beyond boundary)
+            # Convert must_keep_nodes to set for O(1) lookup
+            must_keep_set = set(must_keep_nodes)
+
+            # Partition: must-keep nodes first, then others
+            kept_nodes = []
+            other_nodes = []
+            for node in roi_nodes:
+                if node in must_keep_set:
+                    kept_nodes.append(node)
+                else:
+                    other_nodes.append(node)
+
+            # Verify we found all must-keep nodes
+            if len(kept_nodes) != len(must_keep_nodes):
+                logger.error(f"BUG: Found {len(kept_nodes)}/{len(must_keep_nodes)} must-keep nodes in ROI")
+
+            # Reconstruct array: must-keep first, then fill with others
+            num_kept = len(kept_nodes)
+            num_others = min(max_nodes - num_kept, len(other_nodes))
+            roi_nodes = np.array(kept_nodes + other_nodes[:num_others], dtype=np.int32)
+
+            logger.info(f"After truncation: preserved {num_kept} critical nodes + {num_others} other nodes = {len(roi_nodes)} total")
+
+        # Build global_to_roi mapping
+        global_to_roi = np.full(self.N, -1, dtype=np.int32)
+        global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
+
+        # Log statistics
+        x_span = max_x - min_x + 1
+        y_span = max_y - min_y + 1
+        z_span = max_z - min_z + 1
+        logger.debug(f"Geometric ROI: {len(roi_nodes):,} nodes ({x_span}×{y_span}×{z_span} box, buffer={corridor_buffer}, layer_margin={layer_margin})")
+
+        return roi_nodes, global_to_roi
+
+    def extract_roi(self, src: int, dst: int, initial_radius: int = 40, stagnation_bonus: float = 0.0, portal_seeds: list = None) -> tuple:
+        """BFS ROI extraction with adaptive radius"""
+        import numpy as np
+
+        # Calculate radius based on Manhattan distance (70% from each end = 140% coverage)
+        if self.lattice:
+            src_x, src_y, src_z = self.lattice.idx_to_coord(src)
+            dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
+            manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
+            # Ensure radius covers full path length for wavefront to succeed
+            radius = max(60, int(manhattan_dist * 0.75 + stagnation_bonus * 2.0))
+            logger.debug(f"BFS ROI: dist={manhattan_dist}, radius={radius}")
+        else:
+            radius = initial_radius
+
+        return self.extract_roi_bfs(src, dst, initial_radius=radius, stagnation_bonus=stagnation_bonus, portal_seeds=portal_seeds)
+
+    def extract_roi_bfs(self, src: int, dst: int, initial_radius: int = 40, stagnation_bonus: float = 0.0, portal_seeds: list = None) -> tuple:
         """
         Bidirectional BFS ROI extraction - expands until both src and dst are covered.
+        Good for short/medium nets with complex obstacle navigation.
         Returns: (roi_nodes, global_to_roi)
         """
         import numpy as np
@@ -935,8 +1118,17 @@ class ROIExtractor:
 
         depth = 0
         # Apply stagnation bonus: +0.6mm per stagnation mark (grid_pitch=0.4mm → ~1.5 steps)
-        max_depth = int(initial_radius + stagnation_bonus * 1.5)
+        # CRITICAL: Limit max_depth to prevent full-board expansion
+        # With radius=60, max_depth=80 gives ~32mm radius (covers most routes)
+        # Board is 244×227mm, so depth=800 would cover ENTIRE board!
+        max_depth = min(int(initial_radius + stagnation_bonus * 2.0), 80)
         met = False
+
+        # Limit ROI size for efficiency - smaller ROIs converge MUCH faster on GPU!
+        # 50K nodes = ~60×60×12 region (24mm × 24mm × 12 layers @ 0.4mm pitch)
+        # This is large enough for most routes but small enough for fast wavefront expansion
+        # Target: <50 iterations instead of 500+ on full graph
+        max_nodes = getattr(self, "max_roi_nodes", 50_000)
 
         while depth < max_depth and (q_src or q_dst) and not met:
             def step(queue, mark):
@@ -964,14 +1156,43 @@ class ROIExtractor:
                     met = True
             depth += 1
 
+            # Early stop if ROI exceeds max size (will be truncated anyway)
+            if (seen > 0).sum() > max_nodes * 1.5:
+                logger.debug(f"BFS early stop at depth {depth}: ROI size {(seen > 0).sum():,} exceeds {max_nodes * 1.5:,.0f}")
+                break
+
         roi_mask = seen > 0
         roi_nodes = np.where(roi_mask)[0]
 
-        # Cap ROI size if enormous
-        max_nodes = getattr(self, "max_roi_nodes", 100_000)
+        # CRITICAL: Ensure src, dst, AND all portal seeds are in ROI BEFORE truncation
+        must_keep_nodes = [src, dst]
+        if portal_seeds:
+            for node_id, _ in portal_seeds:
+                if node_id not in must_keep_nodes:
+                    must_keep_nodes.append(node_id)
+
+        # Add any missing must-keep nodes
+        missing_nodes = [n for n in must_keep_nodes if n not in roi_nodes]
+        if missing_nodes:
+            roi_nodes = np.append(roi_nodes, missing_nodes)
+
+        # Truncate if needed (max_nodes defined above)
         if roi_nodes.size > max_nodes:
-            logger.debug(f"ROI {roi_nodes.size} > {max_nodes}, truncating")
+            logger.warning(f"BFS ROI {roi_nodes.size:,} > {max_nodes:,}, truncating (preserving {len(must_keep_nodes)} critical nodes)")
+
+            # Move ALL must-keep nodes to beginning
+            kept_indices = []
+            for i, node in enumerate(roi_nodes):
+                if node in must_keep_nodes:
+                    kept_indices.append(i)
+
+            # Swap to front
+            for swap_pos, kept_idx in enumerate(kept_indices):
+                if kept_idx >= max_nodes:
+                    roi_nodes[kept_idx], roi_nodes[swap_pos] = roi_nodes[swap_pos], roi_nodes[kept_idx]
+
             roi_nodes = roi_nodes[:max_nodes]
+            logger.info(f"Verified {sum(1 for n in must_keep_nodes if n in roi_nodes)}/{len(must_keep_nodes)} critical nodes preserved")
 
         global_to_roi = np.full(N, -1, dtype=np.int32)
         global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
@@ -1004,6 +1225,7 @@ class SimpleDijkstra:
         use_gpu = hasattr(self, 'gpu_solver') and self.gpu_solver and roi_size > 5000
 
         if use_gpu:
+            logger.info(f"[GPU] Using GPU pathfinding for ROI size={roi_size}")
             try:
                 path = self.gpu_solver.find_path_roi_gpu(src, dst, costs, roi_nodes, global_to_roi)
                 if path:
@@ -1277,6 +1499,9 @@ class PathFinderRouter:
         )
         self.graph.finalize(self.lattice.num_nodes)
 
+        # Set N for ROI checks (number of nodes in full graph)
+        self.N = self.lattice.num_nodes
+
         E = len(self.graph.indices)
         self.accounting = EdgeAccountant(E, use_gpu=self.config.use_gpu and GPU_AVAILABLE)
 
@@ -1284,16 +1509,34 @@ class PathFinderRouter:
 
         # Add GPU solver if available
         use_gpu_solver = self.config.use_gpu and GPU_AVAILABLE and CUDA_DIJKSTRA_AVAILABLE
+
+        # Enhanced debug logging
+        logger.info(f"[GPU-INIT] config.use_gpu={self.config.use_gpu}, GPU_AVAILABLE={GPU_AVAILABLE}, CUDA_DIJKSTRA_AVAILABLE={CUDA_DIJKSTRA_AVAILABLE}")
+        logger.info(f"[GPU-INIT] use_gpu_solver={use_gpu_solver}")
+
         if use_gpu_solver:
             try:
                 self.solver.gpu_solver = CUDADijkstra(self.graph)
                 logger.info("[GPU] CUDA Near-Far Dijkstra enabled (ROI > 5K nodes)")
+                # Log GPU details
+                device = cp.cuda.Device()
+                mem_free, mem_total = device.mem_info
+                logger.info(f"[GPU] GPU Compute Capability: {device.compute_capability}")
+                logger.info(f"[GPU] GPU Memory: {mem_free / 1e9:.1f} GB free / {mem_total / 1e9:.1f} GB total")
             except Exception as e:
                 logger.warning(f"[GPU] Failed to initialize CUDA Dijkstra: {e}")
                 self.solver.gpu_solver = None
         else:
             self.solver.gpu_solver = None
-        self.roi_extractor = ROIExtractor(self.graph, use_gpu=self.config.use_gpu and GPU_AVAILABLE)
+            reasons = []
+            if not self.config.use_gpu:
+                reasons.append("config.use_gpu=False")
+            if not GPU_AVAILABLE:
+                reasons.append("CuPy not installed")
+            if not CUDA_DIJKSTRA_AVAILABLE:
+                reasons.append("CUDADijkstra import failed")
+            logger.info(f"[GPU] CPU-only mode: {', '.join(reasons)}")
+        self.roi_extractor = ROIExtractor(self.graph, use_gpu=self.config.use_gpu and GPU_AVAILABLE, lattice=self.lattice)
 
         # Identify via edges for via-specific accounting
         self._identify_via_edges()
@@ -1301,10 +1544,15 @@ class PathFinderRouter:
         self._map_pads(board)
 
         # Initialize escape planner after pads are mapped
-        self.escape_planner = PadEscapePlanner(self.lattice, self.config, self.pad_to_node)
+        # Use deterministic random seed for reproducible escape planning (default: 42)
+        escape_seed = getattr(self.config, 'escape_random_seed', 42)
+        self.escape_planner = PadEscapePlanner(self.lattice, self.config, self.pad_to_node, random_seed=escape_seed)
 
-        # Plan portal escape points for each pad
-        self._plan_portals(board)
+        # NOTE: Portal planning is now done by PadEscapePlanner.precompute_all_pad_escapes()
+        # which is called from main_window.py AFTER initialization.
+        # The old _plan_portals() method is disabled in favor of the column-based algorithm.
+        # Portals will be copied from escape_planner in precompute_all_pad_escapes().
+        logger.info(f"Portal planning delegated to PadEscapePlanner (column-based, seed={escape_seed})")
 
         # Note: Portal discounts are applied at seed level in _get_portal_seeds()
         # No need for graph-level discount modification
@@ -1983,6 +2231,7 @@ class PathFinderRouter:
 
         # Fallback: Sequential routing (CPU or small batches)
         for idx, net_id in enumerate(ordered_nets):
+            net_start_time = time.time()
             src, dst = tasks[net_id]
             if idx % 50 == 0 and total > 50:
                 logger.info(f"  Routing net {idx+1}/{total}")
@@ -2003,8 +2252,11 @@ class PathFinderRouter:
             dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
             manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
 
-            # Adaptive radius: 120% of Manhattan distance
-            adaptive_radius = max(30, min(int(manhattan_dist * 1.2), 150))
+            # Adaptive radius: 120% of Manhattan distance + minimum 10-step buffer
+            # Increased max from 150 to 800 to handle full-board routes
+            adaptive_radius = max(40, min(int(manhattan_dist * 1.2) + 10, 800))
+            if manhattan_dist > 800:
+                logger.warning(f"Net {net_id}: manhattan_dist={manhattan_dist} exceeds max radius=800!")
 
             # Check if we have portals for this net
             use_portals = cfg.portal_enabled and net_id in self.net_pad_ids
@@ -2020,22 +2272,81 @@ class PathFinderRouter:
                     # Get multi-layer seeds at both portals
                     src_seeds = self._get_portal_seeds(src_portal)
                     dst_targets = self._get_portal_seeds(dst_portal)
-
-                    # Extract ROI centered on PORTAL nodes on their entry layers (not pad layer!)
-                    src_portal_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.entry_layer)
-                    dst_portal_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.entry_layer)
-
-                    roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
-                        src_portal_node, dst_portal_node, initial_radius=adaptive_radius, stagnation_bonus=roi_margin_bonus
-                    )
                 else:
                     use_portals = False
 
-            # If not using portals, extract ROI around pad nodes with adaptive sizing
-            if not use_portals:
+            # ═══════════════════════════════════════════════════════════════
+            # HYBRID ROI/FULL-GRAPH ROUTING (BACKPLANE-OPTIMIZED)
+            # ═══════════════════════════════════════════════════════════════
+            # Strategy:
+            # - SHORT NETS (<125 steps = 50mm): Use ROI → 10× faster, <50 iterations
+            # - LONG NETS (≥125 steps): Use full graph → necessary for board-spanning
+            # Rationale: Backplanes have power/ground/clock spanning entire board
+            roi_start = time.time()
+
+            # Distance threshold: 125 steps @ 0.4mm = 50mm
+            ROI_THRESHOLD_STEPS = 125
+            use_roi_extraction = manhattan_dist < ROI_THRESHOLD_STEPS
+
+            if use_roi_extraction:
+                # SHORT NET: Use focused ROI for fast routing
+                # Determine src/dst for ROI center
+                if use_portals and src_portal and dst_portal:
+                    roi_src_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.entry_layer)
+                    roi_dst_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.entry_layer)
+                else:
+                    roi_src_node = src
+                    roi_dst_node = dst
+
+                # Adaptive radius: 150% of distance for detours
+                adaptive_radius = max(40, int(manhattan_dist * 1.5) + 10)
+
+                # Extract ROI
                 roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
-                    src, dst, initial_radius=adaptive_radius, stagnation_bonus=roi_margin_bonus
+                    roi_src_node, roi_dst_node,
+                    initial_radius=adaptive_radius,
+                    stagnation_bonus=roi_margin_bonus
                 )
+
+                if idx % 100 == 0:
+                    logger.info(f"[HYBRID] Net {net_id}: SHORT ({manhattan_dist} steps) → ROI ({len(roi_nodes):,} nodes)")
+            else:
+                # LONG NET: Use full graph (board-spanning)
+                roi_nodes = np.arange(self.N, dtype=np.int32)
+                global_to_roi = np.arange(self.N, dtype=np.int32)
+
+                if idx % 100 == 0:
+                    logger.info(f"[HYBRID] Net {net_id}: LONG ({manhattan_dist} steps) → FULL GRAPH ({self.N:,} nodes)")
+
+            roi_time = time.time() - roi_start
+
+            # Ensure portal seeds are in ROI (important for multi-layer routing)
+            portal_setup_start = time.time()
+            nodes_to_add = []
+
+            # Add portal seed nodes if they're not already in ROI
+            if use_portals and src_seeds and dst_targets:
+                for global_node, _ in src_seeds:
+                    if global_to_roi[global_node] < 0:
+                        nodes_to_add.append(global_node)
+                for global_node, _ in dst_targets:
+                    if global_to_roi[global_node] < 0:
+                        nodes_to_add.append(global_node)
+
+            # Add missing portal nodes to ROI
+            if nodes_to_add:
+                roi_nodes = np.append(roi_nodes, nodes_to_add)
+                # Rebuild mapping to include new nodes
+                global_to_roi = np.full(len(costs), -1, dtype=np.int32)
+                global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
+
+            # Final sanity check
+            if global_to_roi[src] < 0:
+                logger.error(f"BUG: src {src} not in ROI after all additions!")
+            if global_to_roi[dst] < 0:
+                logger.error(f"BUG: dst {dst} not in ROI after all additions!")
+
+            portal_setup_time = time.time() - portal_setup_start
 
             # Log ROI sizes periodically
             if idx % 50 == 0:
@@ -2051,6 +2362,7 @@ class PathFinderRouter:
             path = None
             entry_layer = exit_layer = None
 
+            pathfinding_start = time.time()
             if use_portals:
                 # Route with multi-source/multi-sink using portal seeds
                 result = self.solver.find_path_multisource_multisink(
@@ -2064,6 +2376,7 @@ class PathFinderRouter:
                 if idx == 0 and use_portals:
                     logger.info(f"[DEBUG] Portal routing failed, falling back to normal routing")
                 path = self.solver.find_path_roi(src, dst, costs, roi_nodes, global_to_roi)
+            pathfinding_time = time.time() - pathfinding_start
 
             # If ROI fails and we haven't exhausted fallback quota, try larger ROI
             if (not path or len(path) <= 1) and self.full_graph_fallback_count < 5:
@@ -2120,6 +2433,11 @@ class PathFinderRouter:
                         self._retarget_portals_for_net(net_id)
                         self.net_portal_failures[net_id] = 0  # Reset counter
 
+            # Log timing for first net and periodically thereafter
+            net_total_time = time.time() - net_start_time
+            if idx == 0 or (idx < 10) or (idx % 50 == 0):
+                logger.info(f"[TIMING] Net {idx+1}/{total} ({net_id}): ROI={roi_time:.3f}s (size={len(roi_nodes)}), Portal={portal_setup_time:.3f}s, Path={pathfinding_time:.3f}s, Total={net_total_time:.3f}s")
+
         # Count total routed/failed across all nets
         total_routed = sum(1 for path in self.net_paths.values() if path)
         total_failed = len(all_tasks) - total_routed
@@ -2132,26 +2450,91 @@ class PathFinderRouter:
         import numpy as np
 
         cfg = self.config
-        batch_size = min(cfg.batch_size, 64)  # Increased for speed
+
+        # DYNAMIC BATCH SIZING based on graph size and iteration
+        # Memory model: batch_size × N nodes × 4 bytes per array × ~4 arrays = total GPU memory
+        # 16GB GPU = 14.5GB available after overhead
         total = len(ordered_nets)
+
+        if self.iteration == 1:
+            # ITERATION 1: Full graph (4.2M nodes), greedy routing
+            # Formula: batch_size = available_memory / (N × 4 bytes × 4 arrays × safety_margin)
+            available_gb = 14.5
+            node_count = self.N
+            bytes_per_node_per_net = 4 * 4  # 4 arrays × 4 bytes each
+            safety_margin = 1.5
+            max_batch_for_memory = int((available_gb * 1e9) / (node_count * bytes_per_node_per_net * safety_margin))
+
+            # Also consider compute: RTX 4090 has 16,384 CUDA cores, optimal batch = cores / 32 (warp size)
+            optimal_compute_batch = 512
+
+            effective_batch_size = min(max_batch_for_memory, optimal_compute_batch, total)
+            logger.info(f"[ITER-1-BATCH] Full graph routing: N={self.N:,} nodes")
+            logger.info(f"[ITER-1-BATCH] Memory limit: {max_batch_for_memory} nets, Compute optimal: {optimal_compute_batch}")
+            logger.info(f"[ITER-1-BATCH] Using batch_size={effective_batch_size} for {total} nets")
+        else:
+            # ITERATION 2+: ROI-based routing (smaller graphs ~500K nodes)
+            # Can use larger batches since each net works on smaller subgraph
+            effective_batch_size = min(cfg.batch_size, 64, total)
+            logger.info(f"[ITER-{self.iteration}-BATCH] ROI-based routing: using batch_size={effective_batch_size}")
 
         routed_this_pass = 0
         failed_this_pass = 0
 
-        # Process nets in batches
-        for batch_start in range(0, total, batch_size):
-            batch_end = min(batch_start + batch_size, total)
+        logger.info(f"[GPU-BATCH] Routing {total} nets in batches of {effective_batch_size}")
+
+        # CRITICAL FIX: Copy CSR arrays ONCE before batch loop (not per-net!)
+        # This prevents 206 MB × 1024 = 211 GB memory duplication
+        shared_indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
+        shared_indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
+        shared_weights = costs.get() if hasattr(costs, 'get') else costs
+        logger.info(f"[MEMORY-FIX] Copied CSR once: indptr={len(shared_indptr)}, indices={len(shared_indices)}, weights={len(shared_weights)}")
+
+        # CRITICAL FIX: Separate nets into SHORT and LONG groups for homogeneous batching
+        # Mixed batches cause GPU OOM (allocates for max_roi_size across all nets)
+        ROI_THRESHOLD_STEPS = 125
+        short_nets = []
+        long_nets = []
+
+        for net_id in ordered_nets:
+            src, dst = tasks[net_id]
+            src_x, src_y, _ = self.lattice.idx_to_coord(src)
+            dst_x, dst_y, _ = self.lattice.idx_to_coord(dst)
+            manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
+
+            if manhattan_dist < ROI_THRESHOLD_STEPS:
+                short_nets.append(net_id)
+            else:
+                long_nets.append(net_id)
+
+        logger.info(f"[HYBRID-BATCH] Separated into {len(short_nets)} SHORT nets (<50mm) and {len(long_nets)} LONG nets (≥50mm)")
+        logger.info(f"[HYBRID-BATCH] Will route SHORT nets first (fast ROI), then LONG nets (full graph)")
+
+        # Reorder: SHORT nets first, then LONG nets
+        ordered_nets = short_nets + long_nets
+
+        # Process nets in large batches
+        batch_num = 0
+        overall_start = time.time()
+
+        for batch_start in range(0, total, effective_batch_size):
+            batch_num += 1
+            batch_end = min(batch_start + effective_batch_size, total)
             batch_nets = ordered_nets[batch_start:batch_end]
+            batch_size_actual = len(batch_nets)
 
-            if batch_start % 50 == 0:
-                logger.info(f"  Routing nets {batch_start+1}-{batch_end}/{total} (batch of {len(batch_nets)})")
+            batch_start_time = time.time()
+            logger.info(f"[BATCH-{batch_num}] Processing nets {batch_start+1}-{batch_end}/{total} ({batch_size_actual} nets in parallel)")
 
-            # Prepare ROI batch
             roi_batch = []
-            batch_metadata = []  # Track (net_id, use_portals, src, dst)
+            batch_metadata = []
 
+            # Timing breakdowns
+            roi_extract_time = 0.0
+            csr_build_time = 0.0
+
+            # Prepare all nets in batch (use full graph for all - skip ROI extraction!)
             for net_id in batch_nets:
-                logger.info(f"[DEBUG] Extracting ROI for net {net_id}")
                 src, dst = tasks[net_id]
 
                 # Clear old path
@@ -2163,40 +2546,53 @@ class PathFinderRouter:
                     self.accounting.clear_path(old_edges)
                     self._clear_net_edge_tracking(net_id)
 
-                # Calculate adaptive ROI
+                # ITERATION-AWARE ROI EXTRACTION
+                roi_start = time.time()
                 src_x, src_y, src_z = self.lattice.idx_to_coord(src)
                 dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
                 manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
-                adaptive_radius = max(30, min(int(manhattan_dist * 1.2), 150))
 
-                # Extract ROI (portal or normal)
-                use_portals = cfg.portal_enabled and net_id in self.net_pad_ids
+                # HYBRID ROI/FULL-GRAPH (same for all iterations)
+                ROI_THRESHOLD_STEPS = 125  # 50mm @ 0.4mm pitch
+                use_roi_extraction = manhattan_dist < ROI_THRESHOLD_STEPS
 
-                if use_portals:
-                    src_pad_id, dst_pad_id = self.net_pad_ids[net_id]
-                    src_portal = self.portals.get(src_pad_id)
-                    dst_portal = self.portals.get(dst_pad_id)
+                if use_roi_extraction:
+                    # SHORT NET: Use ROI for fast routing (<50 iterations)
+                    adaptive_radius = max(40, int(manhattan_dist * 1.5) + 10)
+                    roi_nodes, global_to_roi = self.roi_extractor.extract_roi(src, dst, initial_radius=adaptive_radius)
 
-                    if src_portal and dst_portal:
-                        # Use entry_layer (routing layer) not pad_layer (F.Cu)!
-                        src_portal_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.entry_layer)
-                        dst_portal_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.entry_layer)
-                        roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
-                            src_portal_node, dst_portal_node, initial_radius=adaptive_radius, stagnation_bonus=roi_margin_bonus
-                        )
-                    else:
-                        use_portals = False
-                        roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
-                            src, dst, initial_radius=adaptive_radius, stagnation_bonus=roi_margin_bonus
-                        )
+                    if batch_num == 0:  # Log first batch only
+                        logger.info(f"[HYBRID] Net {net_id}: SHORT ({manhattan_dist} steps) → ROI ({len(roi_nodes):,} nodes)")
                 else:
-                    roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
-                        src, dst, initial_radius=adaptive_radius, stagnation_bonus=roi_margin_bonus
-                    )
+                    # LONG NET: Use full graph for board-spanning routes
+                    roi_nodes = np.arange(self.N, dtype=np.int32)
+                    global_to_roi = np.arange(self.N, dtype=np.int32)
+
+                    if batch_num == 0:  # Log first batch only
+                        logger.info(f"[HYBRID] Net {net_id}: LONG ({manhattan_dist} steps) → FULL GRAPH")
+
+                # Keep iteration 2+ logic for reference
+                if False and self.iteration == 1:
+                    pass  # Disabled: now use hybrid for all iterations
+                elif False:
+                    # ITERATION 2+: Congestion-aware routing, ROI helps avoid processing blocked regions
+                    # Adaptive radius: 120% of Manhattan distance + minimum buffer
+                    # Target ROI size: ~500K nodes (fast CSR extraction, large enough for detours)
+                    adaptive_radius = max(40, min(int(manhattan_dist * 1.2) + 10, 800))
+
+                    # For very long nets (>800 steps), use full graph to guarantee connectivity
+                    if manhattan_dist > 800 or adaptive_radius >= 800:
+                        roi_nodes = np.arange(self.N, dtype=np.int32)
+                        global_to_roi = np.arange(self.N, dtype=np.int32)
+                    else:
+                        # Extract ROI using BFS
+                        roi_nodes, global_to_roi = self.extract_roi_bfs(src, dst, initial_radius=adaptive_radius)
+
+                roi_extract_time += time.time() - roi_start
 
                 # Build ROI CSR for this net
+                csr_start = time.time()
                 roi_size = len(roi_nodes)
-                logger.info(f"[DEBUG] ROI extracted for net {net_id}: {roi_size} nodes")
                 roi_src = int(global_to_roi[src])
                 roi_dst = int(global_to_roi[dst])
 
@@ -2204,27 +2600,54 @@ class PathFinderRouter:
                     batch_metadata.append((net_id, False, None, None, None))
                     continue
 
-                # Extract ROI CSR subgraph
-                roi_indptr, roi_indices, roi_weights = self.solver.gpu_solver._extract_roi_csr(
-                    roi_nodes.get() if hasattr(roi_nodes, 'get') else roi_nodes,
-                    global_to_roi.get() if hasattr(global_to_roi, 'get') else global_to_roi,
-                    costs
-                )
+                # PERFORMANCE FIX: Use full graph CSR directly (already on GPU)
+                # Skip CPU-based CSR extraction - this was the 3-second bottleneck!
+                full_graph_size = len(self.graph.indptr) - 1
+                if roi_size == full_graph_size:
+                    # Full graph: use SHARED CSR structure (copied once before batch loop)
+                    roi_indptr = shared_indptr
+                    roi_indices = shared_indices
+                    roi_weights = shared_weights
+                    # CRITICAL FIX: For full graph, use GLOBAL indices (not ROI-local)
+                    # The CSR arrays are the full graph, so src/dst must be global node IDs
+                    actual_roi_src = src  # Use global src
+                    actual_roi_dst = dst  # Use global dst
+                    logger.info(f"[DEBUG] Net {net_id}: Using shared CSR (no copy), src={src}, dst={dst}")
+                else:
+                    # ROI subgraph: extract CSR (fallback for small nets if needed)
+                    # Use shared_weights instead of copying costs again
+                    roi_indptr, roi_indices, roi_weights = self.solver.gpu_solver._extract_roi_csr(
+                        roi_nodes.get() if hasattr(roi_nodes, 'get') else roi_nodes,
+                        global_to_roi.get() if hasattr(global_to_roi, 'get') else global_to_roi,
+                        shared_weights
+                    )
+                    # For ROI subgraph, use local indices
+                    actual_roi_src = roi_src
+                    actual_roi_dst = roi_dst
+                    logger.info(f"[DEBUG] Net {net_id}: Extracted ROI CSR subgraph")
 
-                roi_batch.append((roi_src, roi_dst, roi_indptr, roi_indices, roi_weights, roi_size))
-                batch_metadata.append((net_id, use_portals, roi_nodes, src, dst))
+                # Single-source routing: src/dst are portal nodes from escape planner
+                roi_batch.append((actual_roi_src, actual_roi_dst, roi_indptr, roi_indices, roi_weights, roi_size))
+                batch_metadata.append((net_id, False, roi_nodes, src, dst))
+                csr_build_time += time.time() - csr_start
 
             # Route entire batch on GPU in parallel
             if roi_batch:
-                logger.info(f"[DEBUG] Starting GPU solve for batch of {len(roi_batch)} nets")
+                prep_time = time.time() - batch_start_time
+                logger.info(f"[BATCH-{batch_num}] Prep complete: ROI={roi_extract_time:.2f}s, CSR={csr_build_time:.2f}s, Total={prep_time:.2f}s")
+
+                gpu_start = time.time()
                 paths = self.solver.gpu_solver.find_paths_on_rois(roi_batch)
-                logger.info(f"[DEBUG] GPU solve complete, processing {len(paths)} results")
+                gpu_time = time.time() - gpu_start
+                logger.info(f"[BATCH-{batch_num}] GPU routing complete: {gpu_time:.2f}s ({batch_size_actual} nets)")
 
                 # Process results
+                batch_routed = 0
+                batch_failed = 0
                 for i, (net_id, use_portals, roi_nodes_arr, src, dst) in enumerate(batch_metadata):
                     if roi_nodes_arr is None or i >= len(paths):
-                        logger.info(f"[DEBUG] Net {net_id}: FAILED (no ROI or path)")
                         failed_this_pass += 1
+                        batch_failed += 1
                         self.net_paths[net_id] = []
                         continue
 
@@ -2239,17 +2662,45 @@ class PathFinderRouter:
                         self.accounting.commit_path(edge_indices)
                         self.net_paths[net_id] = global_path
                         self._update_net_edge_tracking(net_id, edge_indices)
-                        logger.info(f"[DEBUG] Net {net_id}: path length {len(global_path)}")
                         routed_this_pass += 1
+                        batch_routed += 1
                     else:
-                        logger.info(f"[DEBUG] Net {net_id}: FAILED (no path found)")
                         failed_this_pass += 1
+                        batch_failed += 1
                         self.net_paths[net_id] = []
                         self._clear_net_edge_tracking(net_id)
 
-        # Count total
+                # Batch summary
+                batch_total_time = time.time() - batch_start_time
+                nets_per_sec = batch_size_actual / batch_total_time if batch_total_time > 0 else 0
+                success_rate = (batch_routed / batch_size_actual * 100) if batch_size_actual > 0 else 0
+                logger.info(f"[BATCH-{batch_num}] Complete: {batch_routed}/{batch_size_actual} routed ({success_rate:.1f}%), "
+                          f"{batch_total_time:.2f}s total, {nets_per_sec:.1f} nets/sec")
+
+        # Overall summary
+        overall_time = time.time() - overall_start
         total_routed = sum(1 for path in self.net_paths.values() if path)
         total_failed = len(all_tasks) - total_routed
+        overall_nets_per_sec = total / overall_time if overall_time > 0 else 0
+        overall_success_rate = (total_routed / total * 100) if total > 0 else 0
+
+        logger.info(f"[GPU-BATCH-SUMMARY] Iteration {self.iteration} complete:")
+        logger.info(f"  Total time: {overall_time:.2f}s for {total} nets = {overall_nets_per_sec:.1f} nets/sec")
+        logger.info(f"  Success rate: {total_routed}/{total} ({overall_success_rate:.1f}%)")
+        logger.info(f"  Batch size used: {effective_batch_size} nets/batch")
+
+        # GPU memory usage (if available)
+        try:
+            if GPU_AVAILABLE:
+                import cupy as cp
+                mempool = cp.get_default_memory_pool()
+                used_bytes = mempool.used_bytes()
+                total_bytes = mempool.total_bytes()
+                used_gb = used_bytes / 1e9
+                total_gb = total_bytes / 1e9
+                logger.info(f"  GPU Memory: {used_gb:.2f}GB used / {total_gb:.2f}GB allocated")
+        except Exception as e:
+            logger.debug(f"Could not query GPU memory: {e}")
 
         return total_routed, total_failed
 
