@@ -1,0 +1,52 @@
+Traceback (most recent call last):
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\main.py", line 20, in <module>
+    from orthoroute.shared.configuration import initialize_config, get_config
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\__init__.py", line 21, in <module>
+    from .presentation.plugin.kicad_plugin import KiCadPlugin
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\presentation\__init__.py", line 3, in <module>
+    from .gui.main_window import OrthoRouteMainWindow
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\presentation\gui\__init__.py", line 2, in <module>
+    from .main_window import OrthoRouteMainWindow, PCBViewer
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\presentation\gui\main_window.py", line 42, in <module>
+    from ...algorithms.manhattan.manhattan_router_rrg import ManhattanRRGRoutingEngine
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\algorithms\manhattan\__init__.py", line 8, in <module>
+    from .manhattan_router_rrg import ManhattanRouterRRG, ManhattanRRGRoutingEngine
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\algorithms\manhattan\manhattan_router_rrg.py", line 19, in <module>
+    from .unified_pathfinder import UnifiedPathFinder, PathFinderConfig
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\algorithms\manhattan\unified_pathfinder.py", line 498, in <module>
+    from .pathfinder.config import PAD_CLEARANCE_MM
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\algorithms\manhattan\pathfinder\__init__.py", line 145, in <module>
+    from .lattice_builder_mixin import LatticeBuilderMixin
+  File "C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\algorithms\manhattan\pathfinder\lattice_builder_mixin.py", line 14, in <module>
+    import cupy as cp
+  File "C:\Users\Benchoff\AppData\Roaming\Python\Python312\site-packages\cupy\__init__.py", line 6, in <module>
+    from cupy import _environment
+  File "C:\Users\Benchoff\AppData\Roaming\Python\Python312\site-packages\cupy\_environment.py", line 6, in <module>
+    import importlib.metadata
+  File "C:\Python312\Lib\importlib\metadata\__init__.py", line 152, in <module>
+    class EntryPoint(DeprecatedTuple):
+  File "C:\Python312\Lib\importlib\metadata\__init__.py", line 169, in EntryPoint
+    pattern = re.compile(
+              ^^^^^^^^^^^
+  File "C:\Python312\Lib\re\__init__.py", line 228, in compile
+    return _compile(pattern, flags)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\re\__init__.py", line 307, in _compile
+    p = _compiler.compile(pattern, flags)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\re\_compiler.py", line 745, in compile
+    p = _parser.parse(p, flags)
+        ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\re\_parser.py", line 979, in parse
+    p = _parse_sub(source, state, flags & SRE_FLAG_VERBOSE, 0)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\re\_parser.py", line 460, in _parse_sub
+    itemsappend(_parse(source, state, verbose, nested + 1,
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\re\_parser.py", line 862, in _parse
+    p = _parse_sub(source, state, sub_verbose, nested + 1)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\re\_parser.py", line 460, in _parse_sub
+    itemsappend(_parse(source, state, verbose, nested + 1,
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+MemoryError

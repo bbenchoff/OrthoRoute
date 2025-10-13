@@ -176,39 +176,42 @@ class LatticeBuilderMixin:
             logger.info(f"[BOUNDS] Using airwire bounds + {ROUTING_MARGIN}mm margin: ({min_x:.1f}, {min_y:.1f}, {max_x:.1f}, {max_y:.1f})")
             return (min_x, min_y, max_x, max_y)
 
-        # Fallback: Use exact same bounds as GUI to ensure coordinate system alignment
-        if hasattr(board, '_kicad_bounds'):
-            kicad_bounds = board._kicad_bounds
-            min_x, min_y, max_x, max_y = kicad_bounds
-            logger.info(f"[BOUNDS] Using GUI KiCad bounds: ({min_x}, {min_y}, {max_x}, {max_y})")
-            return (min_x, min_y, max_x, max_y)
-
-        if hasattr(board, 'get_bounds') and callable(board.get_bounds):
-            try:
-                bounds = board.get_bounds()
-                min_x, min_y = bounds.min_x, bounds.min_y
-                max_x, max_y = bounds.max_x, bounds.max_y
-                logger.info(f"[BOUNDS] Using board.get_bounds(): ({min_x}, {min_y}, {max_x}, {max_y})")
-            except Exception:
-                # Fallback to pad-based bounds
-                all_pads = self._get_all_pads(board)
+        # PRIORITY: Use pad-based bounds (tighter) over full board bounds
+        # Try to calculate from actual pad positions first
+        try:
+            all_pads = self._get_all_pads(board)
+            if all_pads and len(all_pads) > 0:
                 all_x = [self._get_pad_coordinates(pad)[0] for pad in all_pads]
                 all_y = [self._get_pad_coordinates(pad)[1] for pad in all_pads]
                 min_x, max_x = min(all_x), max(all_x)
                 min_y, max_y = min(all_y), max(all_y)
-                logger.info(f"[BOUNDS] Using pad-based fallback: ({min_x}, {min_y}, {max_x}, {max_y})")
-        else:
-            # Pad-based bounds
-            all_pads = self._get_all_pads(board)
-            all_x = [self._get_pad_coordinates(pad)[0] for pad in all_pads]
-            all_y = [self._get_pad_coordinates(pad)[1] for pad in all_pads]
-            min_x, max_x = min(all_x), max(all_x)
-            min_y, max_y = min(all_y), max(all_y)
-            logger.info(f"[BOUNDS] Using pad-based bounds: ({min_x}, {min_y}, {max_x}, {max_y})")
+                # Add routing margin
+                min_x -= ROUTING_MARGIN
+                min_y -= ROUTING_MARGIN
+                max_x += ROUTING_MARGIN
+                max_y += ROUTING_MARGIN
+                logger.info(f"[BOUNDS] Using pad-based bounds + {ROUTING_MARGIN}mm margin: ({min_x:.1f}, {min_y:.1f}, {max_x:.1f}, {max_y:.1f})")
+                logger.info(f"[BOUNDS] Covers {len(all_pads)} pads (tighter than full board bounds)")
+                return (min_x, min_y, max_x, max_y)
+        except Exception as e:
+            logger.warning(f"[BOUNDS] Pad-based calculation failed: {e}")
         
-        # Add routing margin
-        margin = 3.0
-        return (min_x - margin, min_y - margin, max_x + margin, max_y + margin)
+        # Fallback: Use KiCad bounds only if pads unavailable
+        if hasattr(board, '_kicad_bounds'):
+            kicad_bounds = board._kicad_bounds
+            min_x, min_y, max_x, max_y = kicad_bounds
+            # Add routing margin around KiCad bounds
+            min_x -= ROUTING_MARGIN  
+            min_y -= ROUTING_MARGIN
+            max_x += ROUTING_MARGIN
+            max_y += ROUTING_MARGIN
+            logger.warning(f"[BOUNDS] Using FULL BOARD KiCad bounds + {ROUTING_MARGIN}mm margin (fallback): ({min_x:.1f}, {min_y:.1f}, {max_x:.1f}, {max_y:.1f})")
+            logger.warning(f"[BOUNDS] WARNING: Grid will cover entire board, not just routing area!")
+            return (min_x, min_y, max_x, max_y)
+
+        # Final fallback
+        logger.error(f"[BOUNDS] All bounds calculation methods failed, using default")
+        return (0, 0, 100, 100)
     
 
     def _build_3d_lattice(self, bounds: Tuple[float, float, float, float], layers: int):

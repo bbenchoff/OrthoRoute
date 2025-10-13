@@ -1,0 +1,59 @@
+2025-10-11 17:38:34,526 - __main__ - INFO - ================================================================================
+2025-10-11 17:38:34,526 - __main__ - INFO - TESTING PERSISTENT KERNEL BUG FIX
+2025-10-11 17:38:34,526 - __main__ - INFO - ================================================================================
+2025-10-11 17:38:34,568 - orthoroute.presentation.plugin.kicad_plugin - INFO - pcbnew not available - plugin can only run in standalone mode
+2025-10-11 17:38:34,599 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - PathFinder loaded (GPU=YES)
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled parallel edge relaxation kernel
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled FULLY PARALLEL wavefront expansion kernel
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled ACTIVE-LIST kernel (2-3× faster than one-block-per-ROI!)
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled PROCEDURAL NEIGHBOR kernel (P1-8: ditches CSR, pure arithmetic!)
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled DELTA-STEPPING bucket assignment kernel (P1-7: replaces Python loop!)
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled PERSISTENT KERNEL (P1-6: device-side queues, eliminates launch overhead!)
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled COMPACTION KERNEL (P3: GPU-side frontier compaction, no host sync!)
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled ACCOUNTANT KERNEL (Phase 5: GPU-side history/present/cost updates!)
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [CUDA] Compiled GPU BACKTRACE KERNEL (eliminates 256 MB parent/dist CPU transfers!)
+2025-10-11 17:38:34,605 - __main__ - INFO - Created grid graph: 100 nodes, 360 edges
+2025-10-11 17:38:34,605 - __main__ - INFO - CSR: indptr size=101, indices size=360
+2025-10-11 17:38:34,605 - __main__ - INFO - Created batch of 8 routing problems:
+2025-10-11 17:38:34,605 - __main__ - INFO -   Net 0: 0 -> 99
+2025-10-11 17:38:34,605 - __main__ - INFO -   Net 1: 0 -> 9
+2025-10-11 17:38:34,605 - __main__ - INFO -   Net 2: 90 -> 99
+2025-10-11 17:38:34,605 - __main__ - INFO -   Net 3: 0 -> 90
+2025-10-11 17:38:34,605 - __main__ - INFO -   Net 4: 5 -> 94
+2025-10-11 17:38:34,605 - __main__ - INFO -   Net 5: 22 -> 77
+2025-10-11 17:38:34,605 - __main__ - INFO -   Net 6: 11 -> 88
+2025-10-11 17:38:34,605 - __main__ - INFO -   Net 7: 33 -> 66
+2025-10-11 17:38:34,605 - __main__ - INFO - 
+Calling route_batch_persistent...
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Routing 8 nets with single-launch persistent kernel
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [INDIVIDUAL-CSR-DETECT] Nets have varying sizes - using individual CSR mode
+2025-10-11 17:38:34,605 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [SHARED-CSR] All 8 nets share same CSR - no duplication!
+2025-10-11 17:38:34,863 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [STAMP-POOL] Allocated device pools: K=256, N=5000000
+2025-10-11 17:38:34,863 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [SHARED-CSR-FIX] Using as_strided for zero-copy broadcast
+2025-10-11 17:38:34,863 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [SHARED-CSR-FIX] batch_indptr: shape=(8, 101), strides=(0, 4)
+2025-10-11 17:38:34,863 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [SHARED-CSR-FIX] batch_weights: shape=(8, 360), strides=(0, 4)
+2025-10-11 17:38:34,863 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [SHARED-CSR] Memory saved: 7 × 0.0 GB = 0.0 GB
+2025-10-11 17:38:35,287 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Initialized queue with 8 source nodes
+2025-10-11 17:38:35,287 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Using shared CSR (stride=0)
+2025-10-11 17:38:35,287 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Using stamped kernel with device-side backtrace
+2025-10-11 17:38:35,287 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Initialized 8 source nodes with generation 1
+2025-10-11 17:38:35,288 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Launching stamped kernel: 256 blocks × 256 threads
+2025-10-11 17:38:35,314 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Completed in 0.50 ms (19 iterations)
+2025-10-11 17:38:35,314 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Found paths: 8/8
+2025-10-11 17:38:35,314 - orthoroute.algorithms.manhattan.pathfinder.cuda_dijkstra - INFO - [AGENT-B1-PERSISTENT] Launch overhead saved: ~0.13 ms
+2025-10-11 17:38:35,314 - __main__ - INFO - 
+================================================================================
+2025-10-11 17:38:35,314 - __main__ - INFO - RESULTS:
+2025-10-11 17:38:35,314 - __main__ - INFO - ================================================================================
+2025-10-11 17:38:35,314 - __main__ - INFO - Found paths: 8/8
+2025-10-11 17:38:35,314 - __main__ - INFO -   Net 0 (0->99): \u2705 Found path with 19 nodes
+2025-10-11 17:38:35,314 - __main__ - INFO -   Net 1 (0->9): \u2705 Found path with 10 nodes
+2025-10-11 17:38:35,314 - __main__ - INFO -   Net 2 (90->99): \u2705 Found path with 10 nodes
+2025-10-11 17:38:35,314 - __main__ - INFO -   Net 3 (0->90): \u2705 Found path with 10 nodes
+2025-10-11 17:38:35,314 - __main__ - INFO -   Net 4 (5->94): \u2705 Found path with 11 nodes
+2025-10-11 17:38:35,314 - __main__ - INFO -   Net 5 (22->77): \u2705 Found path with 11 nodes
+2025-10-11 17:38:35,314 - __main__ - INFO -   Net 6 (11->88): \u2705 Found path with 15 nodes
+2025-10-11 17:38:35,314 - __main__ - INFO -   Net 7 (33->66): \u2705 Found path with 7 nodes
+2025-10-11 17:38:35,314 - __main__ - INFO - 
+\u2705 SUCCESS: All paths found!
+2025-10-11 17:38:35,314 - __main__ - INFO - BUG FIX VERIFIED - PERSISTENT KERNEL WORKS

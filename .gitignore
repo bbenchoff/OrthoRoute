@@ -141,3 +141,20 @@ _autosave*
 # System files
 .DS_Store
 Thumbs.db
+
+# Additional test and experiment outputs
+test_*.txt
+exp_*.txt
+*_test.txt
+*_output.txt
+iteration_*.txt
+iteration_*.md
+
+# Temporary documentation from sessions
+*_ANALYSIS.md
+*_REPORT.md
+*_PLAN.md
+
+# Additional log files
+orthoroute.log.*
+orthoroute_debug.log

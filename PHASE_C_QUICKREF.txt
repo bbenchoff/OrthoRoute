@@ -1,0 +1,65 @@
+====================================================================================================
+PHASE C: DYNAMIC K_POOL - QUICK REFERENCE
+====================================================================================================
+
+STATUS: ✓ COMPLETE (2025-10-11)
+
+WHAT WAS DONE:
+  Replaced hardcoded K_pool=256 with dynamic calculation based on available GPU memory.
+
+FILES MODIFIED:
+  • orthoroute/algorithms/manhattan/pathfinder/cuda_dijkstra.py
+    - Line 55: K_pool = None (was 256)
+    - Lines 1481-1509: Dynamic calculation (shared CSR mode)
+    - Lines 1570-1598: Dynamic calculation (individual CSR mode)
+
+KEY IMPLEMENTATION:
+  1. Query GPU memory: cp.cuda.Device().mem_info
+  2. Calculate bytes per net: 70 MB (with Phase A uint16 stamps)
+  3. Reserve overhead: 500 MB for CSR
+  4. Apply safety factor: 70% of free memory
+  5. Enforce bounds: min=8, max=256
+
+EXPECTED K_POOL VALUES:
+  4GB GPU  (2GB free)  → K_pool = 16
+  8GB GPU  (4GB free)  → K_pool = 37
+  12GB GPU (6GB free)  → K_pool = 59
+  16GB GPU (8GB free)  → K_pool = 80
+  24GB GPU (12GB free) → K_pool = 123
+  40GB GPU (20GB free) → K_pool = 209
+  80GB GPU (50GB free) → K_pool = 256 (capped)
+
+VALIDATION:
+  ✓ Syntax check passed
+  ✓ Calculation logic tested (test_k_pool_calculation.py)
+  ✓ Edge cases verified (min/max bounds)
+  ✓ Both code paths updated (shared/individual CSR)
+
+WHAT TO LOOK FOR ON FIRST RUN:
+  [MEMORY-AWARE] GPU memory: X.XX GB free, Y.YY GB total
+  [MEMORY-AWARE] Calculated K_pool: ZZ (allows ZZ nets in parallel)
+  [MEMORY-AWARE] Per-net memory: 70.0 MB
+  [MEMORY-AWARE] Total pool memory: W.WW GB
+  [STAMP-POOL] Allocated device pools: K=ZZ, N=5000000
+  [PHASE-A] Using uint16 stamps (16 MB memory savings per net)
+
+TESTING:
+  # Verify calculation without running main.py:
+  python test_k_pool_calculation.py
+
+  # Check GPU memory:
+  python -c "import cupy as cp; f,t = cp.cuda.Device().mem_info; print(f'{f/1e9:.2f}GB free')"
+
+IMPORTANT NOTES:
+  • K_pool calculated ONCE on first _prepare_batch call (cached thereafter)
+  • Uses 70% of free GPU memory (30% safety margin)
+  • Accounts for Phase A optimizations (uint16 stamps = 8 MB savings/net)
+  • Future Phase D (bitsets) will save another 8 MB/net, increasing K_pool by ~10-15%
+  • No manual configuration needed - fully automatic
+
+NEXT PHASES:
+  Phase D: Convert near/far masks to bitsets (8 MB savings/net)
+  Phase E: Persistent kernel mode
+  Phase F: Dynamic batch size adjustment
+
+====================================================================================================

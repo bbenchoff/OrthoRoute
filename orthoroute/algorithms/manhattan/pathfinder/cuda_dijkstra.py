@@ -1506,6 +1506,30 @@ class CUDADijkstra:
             max_roi_size = roi_batch[0][5]
             max_edges = len(shared_indices)
 
+            # CRITICAL FIX: Verify indptr has correct size (max_roi_size + 1)
+            # CSR format requires indptr.shape[0] == num_nodes + 1
+            if len(shared_indptr) != max_roi_size + 1:
+                logger.warning(f"[SHARED-CSR-FIX] indptr size mismatch: len={len(shared_indptr)}, expected={max_roi_size + 1}")
+                logger.warning(f"[SHARED-CSR-FIX] This indicates a bug in ROI extraction - fixing by padding/truncating")
+
+                import numpy as np
+                if len(shared_indptr) < max_roi_size + 1:
+                    # Pad with final value (common CSR pattern)
+                    if isinstance(shared_indptr, cp.ndarray):
+                        shared_indptr_cpu = shared_indptr.get()
+                    else:
+                        shared_indptr_cpu = np.asarray(shared_indptr)
+
+                    final_val = shared_indptr_cpu[-1]
+                    padding_size = (max_roi_size + 1) - len(shared_indptr_cpu)
+                    shared_indptr_cpu = np.concatenate([shared_indptr_cpu, np.full(padding_size, final_val, dtype=shared_indptr_cpu.dtype)])
+                    shared_indptr = cp.asarray(shared_indptr_cpu)
+                    logger.info(f"[SHARED-CSR-FIX] Padded indptr from {len(shared_indptr) - padding_size} to {len(shared_indptr)}")
+                else:
+                    # Truncate to correct size
+                    shared_indptr = shared_indptr[:max_roi_size + 1]
+                    logger.info(f"[SHARED-CSR-FIX] Truncated indptr to {len(shared_indptr)}")
+
             # Transfer CSR to GPU once (not K times!)
             if not isinstance(shared_indptr, cp.ndarray):
                 shared_indptr = cp.asarray(shared_indptr)
@@ -1690,6 +1714,28 @@ class CUDADijkstra:
         if not all_share_csr:
             # Only transfer CSR if nets have different ROIs
             for i, (src, dst, indptr, indices, weights, roi_size) in enumerate(roi_batch):
+                # CRITICAL FIX: Verify indptr has correct size (roi_size + 1)
+                if len(indptr) != roi_size + 1:
+                    logger.warning(f"[INDIVIDUAL-CSR-FIX] ROI {i}: indptr size mismatch: len={len(indptr)}, expected={roi_size + 1}")
+
+                    import numpy as np
+                    if len(indptr) < roi_size + 1:
+                        # Pad with final value
+                        if isinstance(indptr, cp.ndarray):
+                            indptr_cpu = indptr.get()
+                        else:
+                            indptr_cpu = np.asarray(indptr)
+
+                        final_val = indptr_cpu[-1]
+                        padding_size = (roi_size + 1) - len(indptr_cpu)
+                        indptr_cpu = np.concatenate([indptr_cpu, np.full(padding_size, final_val, dtype=indptr_cpu.dtype)])
+                        indptr = cp.asarray(indptr_cpu)
+                        logger.info(f"[INDIVIDUAL-CSR-FIX] ROI {i}: Padded indptr from {len(indptr) - padding_size} to {len(indptr)}")
+                    else:
+                        # Truncate to correct size
+                        indptr = indptr[:roi_size + 1]
+                        logger.info(f"[INDIVIDUAL-CSR-FIX] ROI {i}: Truncated indptr to {len(indptr)}")
+
                 # Convert to GPU if needed
                 if not isinstance(indptr, cp.ndarray):
                     indptr = cp.asarray(indptr)

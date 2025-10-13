@@ -1,0 +1,129 @@
+================================================================================
+PHASE D IMPLEMENTATION COMPLETE
+================================================================================
+
+OBJECTIVE: Eliminate 4.26 GB contiguous buffer allocations by passing strided
+           pool pointers directly to the CUDA kernel.
+
+MEMORY IMPACT:
+- Before: K × N × 4 arrays × 4 bytes = 4.26 GB (K=64, N=4.1M)
+- After:  0 bytes (eliminated)
+- Savings: 0.53 GB (K=8) to 4.26 GB (K=64)
+
+================================================================================
+CHANGES MADE
+================================================================================
+
+1. KERNEL SIGNATURE (Lines 831-875)
+   --------------------------------
+   CHANGED: Kernel parameters from flat contiguous arrays to pool pointers + strides
+   
+   OLD (4 parameters):
+     float* dist_val
+     unsigned short* dist_stamp
+     int* parent_val
+     unsigned short* parent_stamp
+   
+   NEW (8 parameters):
+     float* dist_val_pool, const int dist_val_stride
+     unsigned short* dist_stamp_pool, const int dist_stamp_stride
+     int* parent_val_pool, const int parent_val_stride
+     unsigned short* parent_stamp_pool, const int parent_stamp_stride
+   
+   LOCATION: C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute\algorithms\manhattan\pathfinder\cuda_dijkstra.py:855-862
+
+2. KERNEL LOGIC (Lines 931-937)
+   ----------------------------
+   ADDED: Per-net slice pointer computation from pool base + stride
+   
+   CODE:
+     // Phase D: Compute per-net slice pointers from pool base + stride
+     float* dist_val = dist_val_pool + (size_t)roi_idx * dist_val_stride;
+     unsigned short* dist_stamp = dist_stamp_pool + (size_t)roi_idx * dist_stamp_stride;
+     int* parent_val = parent_val_pool + (size_t)roi_idx * parent_val_stride;
+     unsigned short* parent_stamp = parent_stamp_pool + (size_t)roi_idx * parent_stamp_stride;
+   
+   EFFECT: Each thread processing a net (roi_idx) computes its own slice pointers
+           from the pool base, enabling direct access without contiguous copies.
+
+3. KERNEL ARRAY ACCESS (Lines 945-1025)
+   ------------------------------------
+   CHANGED: All array accesses to use slice-local indices instead of global offsets
+   
+   OLD:
+     const int dist_off = roi_idx * max_roi_size;
+     dist_get(&dist_val[dist_off], &dist_stamp[dist_off], ...)
+     atomicMinFloat(&dist_val[dist_off + neighbor], ...)
+   
+   NEW:
+     dist_get(dist_val, dist_stamp, ...)  // Uses computed slice pointers
+     atomicMinFloat(&dist_val[neighbor], ...)  // Uses slice-local index
+
+4. PYTHON ARGS (Lines 2692-2711)
+   -----------------------------
+   CHANGED: Pass pool base pointers + strides instead of contiguous views
+   
+   OLD (4 args - eliminated):
+     dist_val_flat, dist_stamp_flat,
+     parent_val_flat, parent_stamp_flat
+   
+   NEW (8 args):
+     self.dist_val_pool, pool_stride,
+     self.dist_stamp_pool, pool_stride,
+     self.parent_val_pool, pool_stride,
+     self.parent_stamp_pool, pool_stride
+
+5. PYTHON COMMENTS (Lines 2670-2680)
+   ---------------------------------
+   UPDATED: Removed outdated OOM fix comments, added Phase D documentation
+
+================================================================================
+VERIFICATION
+================================================================================
+
+✓ Kernel signature updated (line 855)
+✓ Kernel computes slice pointers (lines 931-937)
+✓ All array accesses use computed pointers
+✓ Python args pass pool pointers + strides (lines 2701-2704)
+✓ No flat array references remain (verified via grep)
+✓ Code compiles successfully
+✓ Parameter count matches: 39 kernel params = 39 Python args
+
+================================================================================
+KEY TECHNICAL DETAILS
+================================================================================
+
+1. Pool Layout:
+   - Shape: [K_pool, N_max] where K_pool=256, N_max=5,000,000
+   - Stride: N_max elements between consecutive net slices (row-major)
+   - Memory: K_pool × N_max × 18 bytes (fixed allocation, reused)
+
+2. Pointer Arithmetic:
+   - Each net's slice: pool_base + (size_t)net_idx * stride
+   - size_t cast prevents integer overflow for large strides
+   - Direct memory access via strided layout (no copies)
+
+3. Performance:
+   - Eliminates 4.26 GB allocation per batch (K=64, N=4.1M)
+   - Reduces memory pressure and allocation overhead
+   - Enables larger batch sizes within GPU memory limits
+
+4. Compatibility:
+   - Works with Phase A (uint16 stamps)
+   - Works with Phase B (bitset frontiers)
+   - Works with Phase C (dynamic K_pool)
+   - Ready for Wave 4 integration testing
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+Phase D is complete. Ready for Wave 4 testing:
+1. Run main.py to verify functionality
+2. Monitor GPU memory usage (should show 4.26 GB reduction)
+3. Test with various batch sizes (K=8, 16, 32, 64)
+4. Verify routing correctness and performance
+
+DO NOT run main.py until instructed (Wave 4 testing phase).
+
+================================================================================

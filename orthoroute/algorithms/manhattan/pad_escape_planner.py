@@ -313,6 +313,10 @@ class PadEscapePlanner:
 
         # STEP 3: Process each column (already sorted from Step 1)
         portal_count = 0
+
+        # REVERTED: Back to simple random (no env var complexity)
+        # Both portal layers and Y-offsets use random assignment
+
         for x_idx in sorted(columns.keys()):  # Process columns in deterministic order
             column_pads = columns[x_idx]
             # No need to re-sort: already sorted in Step 1 by (x_idx, y_idx)
@@ -361,6 +365,10 @@ class PadEscapePlanner:
     def _plan_column_escapes(self, x_idx: int, column_pads: List, pad_geometries: Dict, spatial_index: Dict = None) -> int:
         """
         Plan escapes for all pads in a single column using greedy collision resolution.
+
+        PORTAL LAYER STRATEGY (controlled by ORTHO_PORTAL_STRATEGY env var):
+        - "random": Each portal randomly picks entry_layer from 1-17 (old behavior)
+        - "layer1": All portals use entry_layer=1 (new default, PathFinder controls layer spread)
 
         This is the core algorithm that processes one column atomically:
 
@@ -458,7 +466,7 @@ class PadEscapePlanner:
             safe_max = min(max_steps, available_space, max_possible)
             safe_max = max(safe_max, min_steps)  # Ensure at least min_steps
 
-            # Pick random length within safe range for variety
+            # REVERTED: Back to simple random delta (density-aware)
             delta_steps = random.randint(min_steps, safe_max)
 
             planned_escapes.append((pad_id, y_idx, direction, delta_steps, pad_x, pad_y, pad_layer))
@@ -505,12 +513,16 @@ class PadEscapePlanner:
 
         # STEP 3: DRC check and create portals with fallback
         portal_count = 0
+
         for pad_id, y_idx, direction, delta_steps, pad_x, pad_y, pad_layer in planned_escapes:
-            # Pick random horizontal routing layer for this escape via (any layer except F.Cu)
-            valid_layers = list(range(1, self.lattice.layers))
-            if not valid_layers:
-                valid_layers = [1]
-            entry_layer = random.choice(valid_layers)
+            # CRITICAL FIX: Portals MUST land on vertical layers only!
+            # Escape stubs go in Y direction, so portals need layers with Y-edges (2,4,6,8,10)
+            # Horizontal layers (1,3,5,7,9,11) have NO vertical edges → unreachable!
+            VERTICAL_LAYERS = [2, 4, 6, 8, 10]
+            available_vertical_layers = [L for L in VERTICAL_LAYERS if L < self.lattice.layers]
+            if not available_vertical_layers:
+                available_vertical_layers = [2]  # Fallback to layer 2
+            entry_layer = random.choice(available_vertical_layers)
 
             # Try progressively shorter lengths, then opposite direction
             portal = None

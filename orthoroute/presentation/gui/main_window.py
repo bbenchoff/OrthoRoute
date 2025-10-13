@@ -80,15 +80,16 @@ class RoutingThread(QThread):
                     # STEP 1b: Fallback - create new instance with warning
                     logger.warning("[GUI-ROUTER-WIRE] No plugin router provided, creating new UnifiedPathFinder (split-brain risk)")
 
-                    # Import UnifiedPathFinder
-                    from ...algorithms.manhattan.unified_pathfinder import UnifiedPathFinder, PathFinderConfig
+                    # Import UnifiedPathFinder and GPUConfig
+                    from ...algorithms.manhattan.unified_pathfinder import UnifiedPathFinder, PathFinderConfig, GPUConfig
 
                     # Create PathFinder config with strict DRC
                     pf_config = PathFinderConfig()
                     pf_config.strict_drc = True
 
                     # Create UnifiedPathFinder instance (not legacy ManhattanRRG)
-                    self.router = UnifiedPathFinder(config=pf_config, use_gpu=True)  # Enable GPU acceleration
+                    # GPU mode is controlled by GPUConfig.GPU_MODE (hardcoded, no env vars)
+                    self.router = UnifiedPathFinder(config=pf_config, use_gpu=GPUConfig.GPU_MODE)
                     logger.info(f"[GUI-ROUTER-WIRE] Created new {self.router.__class__.__name__} with instance_tag={getattr(self.router, '_instance_tag', 'NO_TAG')}")
 
                 # STEP 1c: Add guard assert to prove UnifiedPathFinder is used
@@ -1128,13 +1129,15 @@ class OrthoRouteMainWindow(QMainWindow):
 
         # GPU acceleration checkbox (beta feature)
         self.gpu_checkbox = QCheckBox("Enable GPU acceleration (beta)")
-        self.gpu_checkbox.setChecked(False)  # Default to CPU for safety
-        self.gpu_checkbox.setToolTip("Enable CUDA GPU acceleration for routing (experimental)")
 
-        # Check if GPU is available and set initial state
-        import os
-        if os.environ.get('ORTHO_GPU', '0') == '1':
-            self.gpu_checkbox.setChecked(True)
+        # GPU mode is hardcoded via GPUConfig (no env vars for KiCad plugin compatibility)
+        try:
+            from ...algorithms.manhattan.unified_pathfinder import GPUConfig
+            self.gpu_checkbox.setChecked(GPUConfig.GPU_MODE)
+        except ImportError:
+            self.gpu_checkbox.setChecked(False)  # Fallback if import fails
+
+        self.gpu_checkbox.setToolTip("Enable CUDA GPU acceleration for routing (experimental)")
 
         # Disable if no GPU detected
         if hasattr(self, 'gpu_status') and not self.gpu_status.get('available', False):
@@ -1752,15 +1755,23 @@ class OrthoRouteMainWindow(QMainWindow):
                         self.pcb_viewer.update()
                         QApplication.processEvents()
 
-                    # Capture screenshot with KiCad colors
-                    screenshot_name = f"{iteration+3:02d}_iteration_{iteration:02d}"
-                    self.pcb_viewer.show_airwires = False  # Hide airwires for clarity
-                    self.pcb_viewer.fit_to_view()
-                    self.pcb_viewer.update()
-                    QApplication.processEvents()
-                    self.pcb_viewer.debug_screenshot(screenshot_name, scale_factor=8, output_dir=self._current_run_folder)
+                    # Memory-efficient screenshot controls
+                    import os
+                    disable_screenshots = os.environ.get('ORTHO_NO_SCREENSHOTS', '0') == '1'
+                    screenshot_freq = int(os.environ.get('ORTHO_SCREENSHOT_FREQ', '1'))
+                    screenshot_scale = int(os.environ.get('ORTHO_SCREENSHOT_SCALE', '2'))
 
-                    logger.info(f"📸 Iteration {iteration}: screenshot captured ({len(routing_tracks)} routing tracks, {len(routing_vias)} routing vias)")
+                    # Only capture screenshots if enabled and at appropriate frequency
+                    if not disable_screenshots and (iteration % screenshot_freq == 0):
+                        screenshot_name = f"{iteration+3:02d}_iteration_{iteration:02d}"
+                        self.pcb_viewer.show_airwires = False  # Hide airwires for clarity
+                        self.pcb_viewer.fit_to_view()
+                        self.pcb_viewer.update()
+                        QApplication.processEvents()
+                        self.pcb_viewer.debug_screenshot(screenshot_name, scale_factor=screenshot_scale, output_dir=self._current_run_folder)
+                        logger.info(f"📸 Iteration {iteration}: screenshot captured ({len(routing_tracks)} routing tracks, {len(routing_vias)} routing vias)")
+                    else:
+                        logger.info(f"⏩ Iteration {iteration}: {len(routing_tracks)} routing tracks, {len(routing_vias)} routing vias (screenshot skipped)")
                 except Exception as e:
                     logger.warning(f"Iteration callback failed: {e}")
 
@@ -3055,10 +3066,18 @@ def _export_demo_artifacts(self, result):
 
         # Generate run summary
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Get GPU status from GPUConfig (hardcoded, no env vars)
+        try:
+            from ...algorithms.manhattan.unified_pathfinder import GPUConfig
+            gpu_enabled = GPUConfig.GPU_MODE
+        except ImportError:
+            gpu_enabled = False
+
         run_summary = {
             "timestamp": timestamp,
             "routing_engine": "UnifiedPathFinder",
-            "gpu_enabled": os.environ.get('ORTHO_GPU', '0') == '1',
+            "gpu_enabled": gpu_enabled,
             "total_nets": getattr(result, 'total_nets', 0),
             "successful_nets": getattr(result, 'successful_nets', 0),
             "failed_nets": getattr(result, 'failed_nets', 0),
