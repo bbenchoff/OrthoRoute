@@ -529,7 +529,22 @@ class GeometryPayload:
         self.tracks = tracks
         self.vias = vias
 
-@dataclass
+
+class GPUConfig:
+    """GPU pathfinding algorithm configuration"""
+    GPU_MODE = True  # Enable GPU acceleration (set to False for CPU-only)
+    DEBUG_INVARIANTS = True
+    USE_PERSISTENT_KERNEL = False
+    USE_GPU_COMPACTION = True
+    USE_DELTA_STEPPING = True  # Use proper Δ-stepping bucket-based priority queue (instead of BFS wavefront)
+    DELTA_VALUE = 0.5  # Bucket width in mm (0.5mm ≈ 1.25 × 0.4mm grid pitch)
+    # Recommended delta values:
+    # - 0.4: Same as grid pitch (many buckets, high precision)
+    # - 0.5: 1.25× grid pitch (good balance) ← DEFAULT
+    # - 0.8: 2× grid pitch (fewer buckets, faster but less precise)
+    # - 1.6: 4× grid pitch (degenerates toward Dijkstra)
+
+
 class PathFinderConfig:
     """PathFinder algorithm parameters - LOCKED CONFIG FOR STABILITY"""
     max_iterations: int = 10  # Reduced for speed testing
@@ -647,13 +662,16 @@ class CSRGraph:
         if self.use_gpu and GPU_AVAILABLE:
             try:
                 logger.info(f"[GPU-SORT] Using CuPy GPU radix sort (expected ~3-5s for 54M edges)")
-                # Transfer to GPU
-                edge_array_gpu = cp.asarray(edge_array)
-                # GPU radix sort (much faster than CPU quicksort/mergesort)
-                sorted_idx = cp.argsort(edge_array_gpu['src'], kind='stable')
-                edge_array_gpu = edge_array_gpu[sorted_idx]
-                # Transfer back to CPU for CSR construction
-                edge_array = edge_array_gpu.get()
+                # Extract 'src' field as contiguous array (CuPy doesn't support structured arrays)
+                src_keys = edge_array['src'].copy()
+                # Transfer just the sort keys to GPU
+                src_keys_gpu = cp.asarray(src_keys)
+                # GPU radix sort to get indices (much faster than CPU quicksort/mergesort)
+                sorted_idx = cp.argsort(src_keys_gpu, kind='stable')
+                # Transfer indices back to CPU
+                sorted_idx_cpu = sorted_idx.get()
+                # Reorder the structured array using GPU-computed indices
+                edge_array = edge_array[sorted_idx_cpu]
                 sort_time = time.time() - sort_start
                 logger.info(f"[GPU-SORT] GPU sort completed in {sort_time:.1f} seconds ({E/sort_time/1e6:.1f}M edges/sec)")
             except Exception as e:
@@ -831,12 +849,14 @@ class Lattice3D:
         logger.info(f"Lattice: {self.x_steps}×{self.y_steps}×{layers} = {self.num_nodes:,} nodes")
 
     def _assign_directions(self) -> List[str]:
-        """F.Cu=V, alternating"""
+        """F.Cu=V (vertical escape routing), internal layers alternate H/V"""
         dirs = []
         for z in range(self.layers):
             if z == 0:
+                # F.Cu has vertical routing for escape stubs
                 dirs.append('v')
             else:
+                # Internal layers alternate: In1.Cu=H, In2.Cu=V, In3.Cu=H, etc.
                 dirs.append('h' if z % 2 == 1 else 'v')
         return dirs
 
@@ -870,7 +890,7 @@ class Lattice3D:
         for z in range(self.layers):
             if self.layer_dir[z] == 'h':
                 edge_count += 2 * self.y_steps * (self.x_steps - 1)
-            else:
+            else:  # 'v'
                 edge_count += 2 * self.x_steps * (self.y_steps - 1)
 
         # Count via edges
@@ -896,7 +916,7 @@ class Lattice3D:
                         v = self.node_idx(x+1, y, z)
                         graph.add_edge(u, v, self.pitch)
                         graph.add_edge(v, u, self.pitch)
-            else:
+            else:  # direction == 'v'
                 for x in range(self.x_steps):
                     for y in range(self.y_steps - 1):
                         u = self.node_idx(x, y, z)
@@ -1003,28 +1023,52 @@ class ROIExtractor:
 
         roi_nodes_set = set()  # Use set for O(1) lookups
 
+        # SYMMETRIC L-CORRIDOR: Include BOTH possible L-paths to avoid directional bias
+
+        # L-Path 1: Horizontal first, then vertical (src → (dst.x, src.y) → dst)
         # Horizontal segment: from src.x to dst.x (at src.y with buffer)
-        horiz_min_y = max(0, src_y - corridor_buffer)
-        horiz_max_y = min(y_steps - 1, src_y + corridor_buffer)
+        horiz1_min_y = max(0, src_y - corridor_buffer)
+        horiz1_max_y = min(y_steps - 1, src_y + corridor_buffer)
 
         for z in range(min_z, max_z + 1):
-            for y in range(horiz_min_y, horiz_max_y + 1):
+            for y in range(horiz1_min_y, horiz1_max_y + 1):
                 for x in range(min_x, max_x + 1):
                     node_idx = z * plane_size + y * x_steps + x
                     roi_nodes_set.add(node_idx)
 
         # Vertical segment: from src.y to dst.y (at dst.x with buffer)
-        vert_min_x = max(0, dst_x - corridor_buffer)
-        vert_max_x = min(x_steps - 1, dst_x + corridor_buffer)
+        vert1_min_x = max(0, dst_x - corridor_buffer)
+        vert1_max_x = min(x_steps - 1, dst_x + corridor_buffer)
 
         for z in range(min_z, max_z + 1):
             for y in range(min_y, max_y + 1):
-                for x in range(vert_min_x, vert_max_x + 1):
+                for x in range(vert1_min_x, vert1_max_x + 1):
                     node_idx = z * plane_size + y * x_steps + x
-                    roi_nodes_set.add(node_idx)  # Set automatically handles duplicates
+                    roi_nodes_set.add(node_idx)
+
+        # L-Path 2: Vertical first, then horizontal (src → (src.x, dst.y) → dst)
+        # Vertical segment: from src.y to dst.y (at src.x with buffer)
+        vert2_min_x = max(0, src_x - corridor_buffer)
+        vert2_max_x = min(x_steps - 1, src_x + corridor_buffer)
+
+        for z in range(min_z, max_z + 1):
+            for y in range(min_y, max_y + 1):
+                for x in range(vert2_min_x, vert2_max_x + 1):
+                    node_idx = z * plane_size + y * x_steps + x
+                    roi_nodes_set.add(node_idx)
+
+        # Horizontal segment: from src.x to dst.x (at dst.y with buffer)
+        horiz2_min_y = max(0, dst_y - corridor_buffer)
+        horiz2_max_y = min(y_steps - 1, dst_y + corridor_buffer)
+
+        for z in range(min_z, max_z + 1):
+            for y in range(horiz2_min_y, horiz2_max_y + 1):
+                for x in range(min_x, max_x + 1):
+                    node_idx = z * plane_size + y * x_steps + x
+                    roi_nodes_set.add(node_idx)
 
         roi_nodes = np.array(list(roi_nodes_set), dtype=np.int32)
-        logger.info(f"L-corridor ROI: {len(roi_nodes):,} nodes (horiz: X {min_x}-{max_x} @ Y {horiz_min_y}-{horiz_max_y}, vert: X {vert_min_x}-{vert_max_x} @ Y {min_y}-{max_y}, Z {min_z}-{max_z})")
+        logger.info(f"Symmetric L-corridor ROI: {len(roi_nodes):,} nodes (both L-paths included), Z {min_z}-{max_z}")
 
         # CRITICAL: Ensure src, dst, AND all portal seeds are in ROI BEFORE truncation
         must_keep_nodes = [src, dst]
@@ -1482,7 +1526,14 @@ class PathFinderRouter:
         self.config.layer_count = int(layers_from_board)
 
         # Ensure we have enough layer names
-        if not getattr(self.config, "layer_names", None) or len(self.config.layer_names) < self.config.layer_count:
+        existing_names = getattr(self.config, "layer_names", None)
+        # Handle dataclass Field objects
+        if hasattr(existing_names, '__len__'):
+            has_enough_layers = len(existing_names) >= self.config.layer_count
+        else:
+            has_enough_layers = False
+
+        if not existing_names or not has_enough_layers:
             self.config.layer_names = (
                 getattr(board, "layers", None)
                 or (["F.Cu"] + [f"In{i}.Cu" for i in range(1, self.config.layer_count-1)] + ["B.Cu"])
@@ -1561,24 +1612,58 @@ class PathFinderRouter:
         return True
 
     def _calc_bounds(self, board: Board) -> Tuple[float, float, float, float]:
-        """Board bbox - prefer KiCad-provided bounds"""
+        """
+        Compute routing grid bounds from pads extracted via board.nets.
+
+        This is called during initialize_graph() BEFORE escape planning,
+        so we extract pads from board.nets (which IS available) rather than
+        board.components (which may be incomplete).
+        """
+        pads_with_nets = []
+        ROUTING_MARGIN = 3.0  # mm
+
+        # Extract pads from board.nets (reliable during initialization)
+        try:
+            if hasattr(board, 'nets') and board.nets:
+                for net in board.nets:
+                    # Only consider nets with 2+ pads (routable nets)
+                    if hasattr(net, 'pads') and len(net.pads) >= 2:
+                        for pad in net.pads:
+                            if hasattr(pad, 'position') and pad.position is not None:
+                                pads_with_nets.append(pad)
+
+                if pads_with_nets:
+                    xs = [p.position.x for p in pads_with_nets]
+                    ys = [p.position.y for p in pads_with_nets]
+                    min_x, max_x = min(xs), max(xs)
+                    min_y, max_y = min(ys), max(ys)
+
+                    logger.info(f"[BOUNDS] Extracted {len(pads_with_nets)} pads from {len(board.nets)} nets")
+                    logger.info(f"[BOUNDS] Pad area: ({min_x:.1f}, {min_y:.1f}) to ({max_x:.1f}, {max_y:.1f})")
+
+                    # Add routing margin
+                    bounds = (
+                        min_x - ROUTING_MARGIN,
+                        min_y - ROUTING_MARGIN,
+                        max_x + ROUTING_MARGIN,
+                        max_y + ROUTING_MARGIN
+                    )
+                    logger.info(f"[BOUNDS] Final with {ROUTING_MARGIN}mm margin: ({bounds[0]:.1f}, {bounds[1]:.1f}) to ({bounds[2]:.1f}, {bounds[3]:.1f})")
+                    return bounds
+
+        except Exception as e:
+            logger.warning(f"[BOUNDS] Failed to extract pads from board.nets: {e}")
+
+        # Fallback: Use full board bounds + margin (suboptimal but safe)
+        logger.warning(f"[BOUNDS] No pads found via board.nets, falling back to board._kicad_bounds + {ROUTING_MARGIN}mm")
         if hasattr(board, "_kicad_bounds"):
-            x0, y0, x1, y1 = board._kicad_bounds
-            return (x0, y0, x1, y1)
+            b = board._kicad_bounds
+            return (b[0] - ROUTING_MARGIN, b[1] - ROUTING_MARGIN,
+                    b[2] + ROUTING_MARGIN, b[3] + ROUTING_MARGIN)
 
-        pads = []
-        for comp in board.components:
-            pads.extend(comp.pads)
-
-        if not pads:
-            return (0, 0, 100, 100)
-
-        # Pads have position.x and position.y
-        xs = [p.position.x for p in pads]
-        ys = [p.position.y for p in pads]
-
-        margin = 3.0
-        return (min(xs)-margin, min(ys)-margin, max(xs)+margin, max(ys)+margin)
+        # Ultimate fallback
+        logger.error("[BOUNDS] No bounds available, using default 100x100mm")
+        return (0, 0, 100, 100)
 
     def _pad_key(self, pad, comp=None):
         """Generate unique pad key with coordinates for orphaned pads"""
@@ -1846,10 +1931,11 @@ class PathFinderRouter:
                         p1_portal = self.portals[p1_id]
                         p2_portal = self.portals[p2_id]
 
-                        # Use the entry_layer stored in each portal (chosen during escape planning)
-                        # This ensures routing starts from the actual escape via layer
-                        entry_layer = p1_portal.entry_layer
-                        exit_layer = p2_portal.entry_layer
+                        # CRITICAL FIX: Route on F.Cu (layer 0) where the escape vias are located!
+                        # The escape stubs connect pads to vias on F.Cu, so routing must happen on F.Cu
+                        # The pathfinder will automatically use internal layers via vias when needed
+                        entry_layer = 0  # F.Cu
+                        exit_layer = 0   # F.Cu
 
                         # Convert portal positions to node indices
                         src = self.lattice.node_idx(p1_portal.x_idx, p1_portal.y_idx, entry_layer)
@@ -2552,24 +2638,22 @@ class PathFinderRouter:
                 dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
                 manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
 
-                # HYBRID ROI/FULL-GRAPH (same for all iterations)
-                ROI_THRESHOLD_STEPS = 125  # 50mm @ 0.4mm pitch
-                use_roi_extraction = manhattan_dist < ROI_THRESHOLD_STEPS
-
-                if use_roi_extraction:
-                    # SHORT NET: Use ROI for fast routing (<50 iterations)
-                    adaptive_radius = max(40, int(manhattan_dist * 1.5) + 10)
-                    roi_nodes, global_to_roi = self.roi_extractor.extract_roi(src, dst, initial_radius=adaptive_radius)
-
-                    if batch_num == 0:  # Log first batch only
-                        logger.info(f"[HYBRID] Net {net_id}: SHORT ({manhattan_dist} steps) → ROI ({len(roi_nodes):,} nodes)")
+                # ALWAYS use GEOMETRIC ROI to avoid GPU OOM (adaptive corridor based on net length)
+                # Short nets: smaller corridor (12mm)
+                # Long nets: larger corridor (24-40mm) but still bounded
+                if manhattan_dist < 125:
+                    corridor_buffer = 30  # 12mm @ 0.4mm pitch
+                    layer_margin = 3
                 else:
-                    # LONG NET: Use full graph for board-spanning routes
-                    roi_nodes = np.arange(self.N, dtype=np.int32)
-                    global_to_roi = np.arange(self.N, dtype=np.int32)
+                    # Long nets: increase corridor proportionally but cap at 100 steps (40mm)
+                    corridor_buffer = min(100, int(manhattan_dist * 0.4) + 30)
+                    layer_margin = 5  # More layers for long nets
 
-                    if batch_num == 0:  # Log first batch only
-                        logger.info(f"[HYBRID] Net {net_id}: LONG ({manhattan_dist} steps) → FULL GRAPH")
+                roi_nodes, global_to_roi = self.roi_extractor.extract_roi_geometric(src, dst, corridor_buffer=corridor_buffer, layer_margin=layer_margin)
+
+                if batch_num == 0:  # Log first batch only
+                    net_type = "SHORT" if manhattan_dist < 125 else "LONG"
+                    logger.info(f"[GEOMETRIC-ROI] Net {net_id}: {net_type} ({manhattan_dist} steps, buffer={corridor_buffer}) → ROI ({len(roi_nodes):,} nodes)")
 
                 # Keep iteration 2+ logic for reference
                 if False and self.iteration == 1:

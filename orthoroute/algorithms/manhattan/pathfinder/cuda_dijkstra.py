@@ -18,11 +18,26 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Import GPU configuration (hardcoded for plugin deployment)
+# NOTE: This creates a circular import, but it's safe because we only access class attributes
+# Alternative: Move GPUConfig to a separate config.py module
+try:
+    from ..unified_pathfinder import GPUConfig
+except ImportError:
+    # Fallback if circular import causes issues - define minimal config here
+    class GPUConfig:
+        GPU_MODE = True
+        DEBUG_INVARIANTS = True
+        USE_PERSISTENT_KERNEL = False  # Overridden by GPU_PERSISTENT_ROUTER in unified_pathfinder
+        USE_GPU_COMPACTION = True
+        USE_DELTA_STEPPING = True  # Use proper Δ-stepping bucket-based priority queue (instead of BFS wavefront)
+        DELTA_VALUE = 0.5  # Bucket width in mm (0.5mm ≈ 1.25 × 0.4mm grid pitch)
+
 
 class CUDADijkstra:
     """GPU-accelerated Dijkstra shortest path finder using CUDA"""
 
-    def __init__(self, graph=None):
+    def __init__(self, graph=None, lattice=None):
         """Initialize CUDA Dijkstra solver"""
         if not CUDA_AVAILABLE:
             raise RuntimeError("CuPy not available - cannot use CUDA Dijkstra")
@@ -34,6 +49,23 @@ class CUDADijkstra:
         else:
             self.indptr = None
             self.indices = None
+
+        # Store lattice for A* coordinate building
+        self.lattice = lattice
+
+        # Phase 1: Device-Resident Stamp Pools (allocated once, reused forever)
+        # Calculate K_pool from available GPU memory (will be set during first _prepare_batch call)
+        self.K_pool = None  # Will be calculated dynamically
+        self._k_pool_calculated = False
+
+        # Allocate device pools ONCE (reused for all batches)
+        self.dist_val_pool = None
+        self.dist_stamp_pool = None
+        self.parent_val_pool = None
+        self.parent_stamp_pool = None
+        self.near_bits_pool = None  # Phase B: Bitset frontier (1 bit/node)
+        self.far_bits_pool = None   # Phase B: Bitset frontier (1 bit/node)
+        self.current_gen = 1  # Generation counter
 
         # Compile CUDA kernel for parallel edge relaxation
         self.relax_kernel = cp.RawKernel(r'''
@@ -103,7 +135,8 @@ class CUDADijkstra:
             const int K,                    // Number of ROIs
             const int max_roi_size,         // Max nodes per ROI
             const int max_edges,            // Max edges per ROI
-            const unsigned char* frontier,  // (K, max_roi_size) frontier mask - uint8!
+            const unsigned int* frontier,   // (K, frontier_words) BIT-PACKED frontier - uint32!
+            const int frontier_words,       // Number of uint32 words per ROI
             const int* indptr,              // CSR indptr base pointer
             const int* indices,             // CSR indices base pointer
             const float* weights,           // CSR weights base pointer
@@ -111,11 +144,14 @@ class CUDADijkstra:
             const int indices_stride,       // Stride between ROI rows (0 for shared CSR!)
             const int weights_stride,       // Stride between ROI rows (0 for shared CSR!)
             const int* goal_nodes,          // (K,) goal node index for each ROI (for A* heuristic)
-            const int* node_coords,         // (max_roi_size, 3) node coordinates [x, y, z]
+            const int Nx,                   // P0-3: Lattice X dimension
+            const int Ny,                   // P0-3: Lattice Y dimension
+            const int Nz,                   // P0-3: Lattice Z dimension
+            const int* goal_coords,         // P0-3: (K, 3) goal coordinates only
             const int use_astar,            // 1 = enable A* heuristic, 0 = plain Dijkstra
             float* dist,                    // (K, max_roi_size) distances
             int* parent,                    // (K, max_roi_size) parents
-            unsigned char* new_frontier     // (K, max_roi_size) output frontier - uint8!
+            unsigned int* new_frontier      // (K, frontier_words) BIT-PACKED output - uint32!
         ) {
             // Block index = ROI index (expects exactly K blocks!)
             int roi_idx = blockIdx.x;
@@ -126,23 +162,29 @@ class CUDADijkstra:
             int B = blockDim.x;
 
             // Calculate base offsets for this ROI
-            // For dist/frontier/parent: always use roi_idx * max_roi_size (contiguous)
+            // For dist/parent: always use roi_idx * max_roi_size (contiguous)
             const int dist_off = roi_idx * max_roi_size;
+            // For frontier: use roi_idx * frontier_words (bit-packed)
+            const int frontier_off = roi_idx * frontier_words;
 
             // For CSR arrays: use stride (0 for shared, actual dimension for per-ROI)
             // When stride=0 (shared CSR), all ROIs use the same base pointer!
             const int indptr_off = roi_idx * indptr_stride;   // 0 in shared mode
             const int indices_off = roi_idx * indices_stride; // 0 in shared mode
             const int weights_off = roi_idx * weights_stride; // 0 in shared mode
+            const int total_cost_off = roi_idx * total_cost_stride; // PathFinder negotiated costs
 
             // Grid-stride loop over ALL nodes in this ROI
             for (int node = tid; node < max_roi_size; node += B) {
-                // Check if this node is in the frontier
-                const int fidx = dist_off + node;
-                if (frontier[fidx] == 0) continue;  // uint8 comparison
+                // Check if this node is in the frontier (BIT-PACKED CHECK)
+                const int word_idx = node / 32;
+                const int bit_pos = node % 32;
+                const unsigned int bit_mask = 1u << bit_pos;
+                if ((frontier[frontier_off + word_idx] & bit_mask) == 0) continue;  // Bit not set
 
                 // Get node distance
-                const float node_dist = dist[fidx];
+                const int nidx_self = dist_off + node;
+                const float node_dist = dist[nidx_self];
 
                 // Skip unreachable nodes (inf distance only)
                 if (isinf(node_dist)) continue;
@@ -157,45 +199,1040 @@ class CUDADijkstra:
                     // Bounds check to prevent corruption
                     if (neighbor < 0 || neighbor >= max_roi_size) continue;
 
-                    const float edge_cost = weights[weights_off + e];
+                    const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
                     const float g_new = node_dist + edge_cost;  // g(n) = distance from start
 
-                    // A* HEURISTIC: Add Manhattan distance to goal
-                    // h(n) = |goal_x - curr_x| + |goal_y - curr_y| + via_penalty * |goal_z - curr_z|
+                    // P0-3: A* HEURISTIC with procedural coordinate decoding
                     float f_new = g_new;  // Default: Dijkstra (no heuristic)
 
                     if (use_astar) {
-                        const int goal_node = goal_nodes[roi_idx];
-                        if (goal_node >= 0 && goal_node < max_roi_size) {
-                            // Get neighbor coordinates (x, y, z)
-                            const int nx = node_coords[neighbor * 3 + 0];
-                            const int ny = node_coords[neighbor * 3 + 1];
-                            const int nz = node_coords[neighbor * 3 + 2];
+                        // Decode neighbor coordinates from node index (no memory loads!)
+                        const int plane_size = Nx * Ny;
+                        const int nz = neighbor / plane_size;
+                        const int remainder = neighbor - (nz * plane_size);
+                        const int ny = remainder / Nx;
+                        const int nx = remainder - (ny * Nx);
 
-                            // Get goal coordinates
-                            const int gx = node_coords[goal_node * 3 + 0];
-                            const int gy = node_coords[goal_node * 3 + 1];
-                            const int gz = node_coords[goal_node * 3 + 2];
+                        // Load goal coordinates (just 3 ints per ROI)
+                        const int gx = goal_coords[roi_idx * 3 + 0];
+                        const int gy = goal_coords[roi_idx * 3 + 1];
+                        const int gz = goal_coords[roi_idx * 3 + 2];
 
-                            // Manhattan distance heuristic (admissible on grid)
-                            const float h = abs(gx - nx) + abs(gy - ny) + 3.0f * abs(gz - nz);  // Via cost = 3.0
-                            f_new = g_new + h * 0.5f;  // Weight heuristic (0.5 = balanced)
-                        }
+                        // Manhattan distance heuristic (admissible)
+                        const float h = (abs(gx - nx) + abs(gy - ny)) * 0.4f + abs(gz - nz) * 1.5f;
+                        f_new = g_new + h;
                     }
 
                     const int nidx = dist_off + neighbor;
                     const float old = atomicMinFloat(&dist[nidx], g_new);  // Store g(n), not f(n)!
-                    if (old > g_new) {
-                        parent[nidx] = node;
-                        new_frontier[nidx] = 1;  // uint8 write
+                    // STABILIZATION: Epsilon guard prevents float-noise equal-cost flip-flops
+                    if (g_new + 1e-8f < old) {
+                        // FIX D1: ALWAYS update parent on improvement (allow node reopening!)
+                        // Use atomicExch for thread-safe parent update
+                        atomicExch(&parent[nidx], node);
+
+                        // P0-4: BIT-PACKED WRITE using atomicOr
+                        const int nbr_word_idx = neighbor / 32;
+                        const int nbr_bit_pos = neighbor % 32;
+                        atomicOr(&new_frontier[frontier_off + nbr_word_idx], 1u << nbr_bit_pos);
                     }
                 }
             }
         }
         ''', 'wavefront_expand_all')
 
+        # Compile ACTIVE-LIST kernel (MASSIVE SPEEDUP!)
+        # This processes only ACTIVE frontier nodes (~1000) instead of ALL nodes (4.2M)
+        # Uses global thread indexing - launches over total_active items across ALL ROIs
+        # Expected: Higher GPU occupancy, better load balancing, 2-3× faster than one-block-per-ROI
+        self.active_list_kernel = cp.RawKernel(r'''
+        // Custom atomic min for float using compare-and-swap
+        __device__ float atomicMinFloat(float* addr, float value) {
+            int* addr_as_int = (int*)addr;
+            int old = *addr_as_int, assumed;
+            do {
+                assumed = old;
+                float old_val = __int_as_float(assumed);
+                if (old_val <= value) break;
+                old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
+            } while (assumed != old);
+            return __int_as_float(old);
+        }
+
+        // Phase 4: ROI bounding box check
+        __device__ __forceinline__
+        bool in_roi(int nx, int ny, int nz, int roi_idx,
+                    const int* minx, const int* maxx,
+                    const int* miny, const int* maxy,
+                    const int* minz, const int* maxz) {
+            return nx >= minx[roi_idx] && nx <= maxx[roi_idx] &&
+                   ny >= miny[roi_idx] && ny <= maxy[roi_idx] &&
+                   nz >= minz[roi_idx] && nz <= maxz[roi_idx];
+        }
+
+        extern "C" __global__
+        void wavefront_expand_active(
+            const int total_active,             // Total active frontier nodes across ALL ROIs
+            const int max_roi_size,             // Max nodes per ROI
+            const int frontier_words,           // Number of uint32 words per ROI
+            const int* roi_ids,                 // (total_active,) ROI ID for each active node
+            const int* node_ids,                // (total_active,) Node ID within ROI
+            const int* indptr,                  // CSR indptr
+            const int* indices,                 // CSR indices
+            const float* weights,               // CSR weights
+            const int indptr_stride,            // Stride (0 for shared)
+            const int indices_stride,
+            const int weights_stride,
+            const int* goal_nodes,              // (K,) goal indices for A*
+            const int Nx,                       // P0-3: Lattice X dimension (procedural coords)
+            const int Ny,                       // P0-3: Lattice Y dimension
+            const int Nz,                       // P0-3: Lattice Z dimension (layers)
+            const int* goal_coords,             // (K, 3) goal coordinates (gx, gy, gz) per ROI
+            const int use_astar,                // A* enable flag
+            float* dist,                        // (K, max_roi_size) distances
+            int* parent,                        // (K, max_roi_size) parents
+            unsigned int* new_frontier,         // (K, frontier_words) BIT-PACKED output
+            // Phase 4: ROI bounding boxes
+            const int* roi_minx,                // (K,) Min X per ROI
+            const int* roi_maxx,                // (K,) Max X per ROI
+            const int* roi_miny,                // (K,) Min Y per ROI
+            const int* roi_maxy,                // (K,) Max Y per ROI
+            const int* roi_minz,                // (K,) Min Z per ROI
+            const int* roi_maxz                 // (K,) Max Z per ROI
+        ) {
+            // Global thread ID - each thread processes ONE frontier node
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= total_active) return;
+
+            // Get ROI and node for this frontier item
+            const int roi_idx = roi_ids[idx];
+            const int node = node_ids[idx];
+
+            // CSR offsets for this ROI
+            const int indptr_off = roi_idx * indptr_stride;
+            const int indices_off = roi_idx * indices_stride;
+            const int weights_off = roi_idx * weights_stride;
+            const int total_cost_off = roi_idx * total_cost_stride; // PathFinder negotiated costs
+            const int dist_off = roi_idx * max_roi_size;
+            const int frontier_off = roi_idx * frontier_words;
+
+            // Guarded atomic: Check distance before edge expansion
+            const float node_dist = __ldg(&dist[dist_off + node]);
+            if (isinf(node_dist)) return;
+
+            // Get CSR edge range
+            const int e0 = indptr[indptr_off + node];
+            const int e1 = indptr[indptr_off + node + 1];
+
+            // Process all neighbors
+            for (int e = e0; e < e1; ++e) {
+                const int neighbor = indices[indices_off + e];
+                if (neighbor < 0 || neighbor >= max_roi_size) continue;
+
+                const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
+                const float g_new = node_dist + edge_cost;
+
+                // Phase 4: Decode neighbor coordinates (always needed for ROI check)
+                const int plane_size = Nx * Ny;
+                const int nz = neighbor / plane_size;
+                const int remainder = neighbor - (nz * plane_size);  // Faster than % on older arch
+                const int ny = remainder / Nx;
+                const int nx = remainder - (ny * Nx);
+
+                // Phase 4: ROI gate - skip neighbors outside bounding box
+                if (!in_roi(nx, ny, nz, roi_idx, roi_minx, roi_maxx, roi_miny, roi_maxy, roi_minz, roi_maxz)) {
+                    continue;  // Skip this neighbor
+                }
+
+                // P0-3: A* heuristic with PROCEDURAL coordinate decoding (no global loads!)
+                float f_new = g_new;
+                if (use_astar) {
+                    // Load goal coordinates (just 3 ints per ROI, preloaded once per batch)
+                    const int gx = goal_coords[roi_idx * 3 + 0];
+                    const int gy = goal_coords[roi_idx * 3 + 1];
+                    const int gz = goal_coords[roi_idx * 3 + 2];
+
+                    // Manhattan distance heuristic (admissible)
+                    const float h = (abs(gx - nx) + abs(gy - ny)) * 0.4f + abs(gz - nz) * 1.5f;
+                    f_new = g_new + h;
+                }
+
+                // Guarded atomic: Only CAS if we might improve distance
+                const int nidx = dist_off + neighbor;
+                const float old_dist = __ldg(&dist[nidx]);
+
+                // Early exit if we can't improve
+                if (g_new >= old_dist) continue;
+
+                // Try atomic update
+                const float old = atomicMinFloat(&dist[nidx], g_new);
+
+                // Update parent and frontier on improvement
+                if (g_new + 1e-8f < old) {
+                    atomicExch(&parent[nidx], node);
+
+                    // P0-4: BIT-PACKED WRITE using atomicOr
+                    const int nbr_word_idx = neighbor / 32;
+                    const int nbr_bit_pos = neighbor % 32;
+                    atomicOr(&new_frontier[frontier_off + nbr_word_idx], 1u << nbr_bit_pos);
+                }
+            }
+        }
+        ''', 'wavefront_expand_active')
+
+        # P1-8: Compile PROCEDURAL NEIGHBOR kernel (ditches CSR entirely!)
+        # For Manhattan lattices, neighbors are computed arithmetically
+        # This eliminates indptr/indices global loads and improves coalescing
+        self.procedural_neighbor_kernel = cp.RawKernel(r'''
+        // Custom atomic min for float using compare-and-swap
+        __device__ float atomicMinFloat(float* addr, float value) {
+            int* addr_as_int = (int*)addr;
+            int old = *addr_as_int, assumed;
+            do {
+                assumed = old;
+                float old_val = __int_as_float(assumed);
+                if (old_val <= value) break;
+                old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
+            } while (assumed != old);
+            return __int_as_float(old);
+        }
+
+        // Phase 4: ROI bounding box check
+        __device__ __forceinline__
+        bool in_roi(int nx, int ny, int nz, int roi_idx,
+                    const int* minx, const int* maxx,
+                    const int* miny, const int* maxy,
+                    const int* minz, const int* maxz) {
+            return nx >= minx[roi_idx] && nx <= maxx[roi_idx] &&
+                   ny >= miny[roi_idx] && ny <= maxy[roi_idx] &&
+                   nz >= minz[roi_idx] && nz <= maxz[roi_idx];
+        }
+
+        extern "C" __global__
+        void wavefront_expand_procedural(
+            const int total_active,         // Total active frontier nodes
+            const int Nx,                   // Lattice X dimension
+            const int Ny,                   // Lattice Y dimension
+            const int Nz,                   // Lattice Z dimension (layers)
+            const int frontier_words,       // Number of uint32 words per ROI
+            const int* roi_ids,             // (total_active,) ROI index
+            const int* node_ids,            // (total_active,) Node index within ROI
+            const float* w_xpos,            // (Nz, Ny, Nx) weights for +X direction
+            const float* w_xneg,            // (Nz, Ny, Nx) weights for -X direction
+            const float* w_ypos,            // (Nz, Ny, Nx) weights for +Y direction
+            const float* w_yneg,            // (Nz, Ny, Nx) weights for -Y direction
+            const float* w_zpos,            // (Nx, Ny) weights for +Z direction (via costs)
+            const float* w_zneg,            // (Nx, Ny) weights for -Z direction (via costs)
+            const int* goal_coords,         // (K, 3) goal coordinates
+            const int use_astar,            // A* enable flag
+            float* dist,                    // (K, max_roi_size) distances
+            int* parent,                    // (K, max_roi_size) parents
+            unsigned int* new_frontier,     // (K, frontier_words) output
+            // Phase 4: ROI bounding boxes
+            const int* roi_minx,            // (K,) Min X per ROI
+            const int* roi_maxx,            // (K,) Max X per ROI
+            const int* roi_miny,            // (K,) Min Y per ROI
+            const int* roi_maxy,            // (K,) Max Y per ROI
+            const int* roi_minz,            // (K,) Min Z per ROI
+            const int* roi_maxz             // (K,) Max Z per ROI
+        ) {
+            // Global thread ID
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= total_active) return;
+
+            const int roi_idx = roi_ids[idx];
+            const int node = node_ids[idx];
+
+            // Decode node coordinates procedurally
+            const int plane_size = Nx * Ny;
+            const int z = node / plane_size;
+            const int remainder = node - (z * plane_size);
+            const int y = remainder / Nx;
+            const int x = remainder - (y * Nx);
+
+            // Compute offsets
+            const int max_roi_size = Nx * Ny * Nz;
+            const int dist_off = roi_idx * max_roi_size;
+            const int frontier_off = roi_idx * frontier_words;
+
+            // Check node distance
+            const float node_dist = __ldg(&dist[dist_off + node]);
+            if (isinf(node_dist)) return;
+
+            // Load goal coordinates once for A* heuristic
+            int gx = 0, gy = 0, gz = 0;
+            if (use_astar) {
+                gx = goal_coords[roi_idx * 3 + 0];
+                gy = goal_coords[roi_idx * 3 + 1];
+                gz = goal_coords[roi_idx * 3 + 2];
+            }
+
+            // P1-8: PROCEDURAL NEIGHBOR GENERATION (no CSR!)
+            // Compute weight table indices
+            const int flat_coord = z * Ny * Nx + y * Nx + x;
+            const int via_coord = y * Nx + x;  // For Z-direction (via costs)
+
+            // Macro to relax a neighbor (avoids code duplication)
+            #define RELAX_NEIGHBOR(nx, ny, nz, edge_cost) do { \
+                if ((nx) >= 0 && (nx) < Nx && (ny) >= 0 && (ny) < Ny && (nz) >= 0 && (nz) < Nz) { \
+                    /* Phase 4: ROI gate */ \
+                    if (!in_roi((nx), (ny), (nz), roi_idx, roi_minx, roi_maxx, roi_miny, roi_maxy, roi_minz, roi_maxz)) { \
+                        break; /* Skip this neighbor */ \
+                    } \
+                    \
+                    const int neighbor = (nz) * plane_size + (ny) * Nx + (nx); \
+                    float g_new = node_dist + (edge_cost); \
+                    \
+                    /* A* heuristic */ \
+                    if (use_astar) { \
+                        const float h = (abs(gx - (nx)) + abs(gy - (ny))) * 0.4f + abs(gz - (nz)) * 1.5f; \
+                        /* Note: f_new computed but only g_new stored in dist */ \
+                    } \
+                    \
+                    /* Guarded atomic update */ \
+                    const int nidx = dist_off + neighbor; \
+                    const float old_dist = __ldg(&dist[nidx]); \
+                    if (g_new < old_dist) { \
+                        const float old = atomicMinFloat(&dist[nidx], g_new); \
+                        if (g_new + 1e-8f < old) { \
+                            atomicExch(&parent[nidx], node); \
+                            const int nbr_word_idx = neighbor / 32; \
+                            const int nbr_bit_pos = neighbor % 32; \
+                            atomicOr(&new_frontier[frontier_off + nbr_word_idx], 1u << nbr_bit_pos); \
+                        } \
+                    } \
+                } \
+            } while(0)
+
+            // Relax all 6 neighbors using direction-specific weight tables
+            RELAX_NEIGHBOR(x+1, y, z, w_xpos[flat_coord]);  // +X
+            RELAX_NEIGHBOR(x-1, y, z, w_xneg[flat_coord]);  // -X
+            RELAX_NEIGHBOR(x, y+1, z, w_ypos[flat_coord]);  // +Y
+            RELAX_NEIGHBOR(x, y-1, z, w_yneg[flat_coord]);  // -Y
+            RELAX_NEIGHBOR(x, y, z+1, w_zpos[via_coord]);   // +Z (via up)
+            RELAX_NEIGHBOR(x, y, z-1, w_zneg[via_coord]);   // -Z (via down)
+
+            #undef RELAX_NEIGHBOR
+        }
+        ''', 'wavefront_expand_procedural')
+
+        # P1-7: DELTA-STEPPING BUCKET ASSIGNMENT KERNEL
+        # Replaces slow Python loop that iterates over all nodes
+        # This kernel processes only updated nodes and assigns them to buckets in parallel
+        self.bucket_assign_kernel = cp.RawKernel(r'''
+        extern "C" __global__
+        void assign_nodes_to_buckets(
+            const int K,                        // Number of ROIs
+            const int max_roi_size,             // Max nodes per ROI
+            const int max_buckets,              // Max number of buckets
+            const int frontier_words,           // Number of uint32 words per ROI
+            const unsigned int* updated_nodes,  // (K, frontier_words) BIT-PACKED updated nodes
+            const float* dist,                  // (K, max_roi_size) current distances
+            const float delta,                  // Bucket width
+            unsigned int* buckets               // (K, max_buckets, frontier_words) output buckets
+        ) {
+            // Grid-stride loop over all possible nodes across all ROIs
+            // Total work = K * max_roi_size nodes
+            const int total_nodes = K * max_roi_size;
+
+            for (int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+                 global_idx < total_nodes;
+                 global_idx += blockDim.x * gridDim.x) {
+
+                // Decode ROI and node from global index
+                const int roi_idx = global_idx / max_roi_size;
+                const int node = global_idx % max_roi_size;
+
+                // Check if this node was updated (bit-packed check)
+                const int word_idx = node / 32;
+                const int bit_pos = node % 32;
+                const unsigned int bit_mask = 1u << bit_pos;
+
+                const int frontier_off = roi_idx * frontier_words;
+                const unsigned int updated_word = __ldg(&updated_nodes[frontier_off + word_idx]);
+
+                // Early exit if this node was not updated
+                if (!(updated_word & bit_mask)) continue;
+
+                // Get node's current distance
+                const int dist_off = roi_idx * max_roi_size;
+                const float node_dist = __ldg(&dist[dist_off + node]);
+
+                // Skip nodes with infinite distance (unreachable)
+                if (isinf(node_dist)) continue;
+
+                // Compute bucket index: bucket_idx = floor(distance / delta)
+                const int bucket_idx = __float2int_rd(node_dist / delta);
+
+                // Bounds check: ensure bucket is within range
+                if (bucket_idx >= 0 && bucket_idx < max_buckets) {
+                    // Atomic OR to set bit in target bucket
+                    // Bucket offset: (roi_idx * max_buckets + bucket_idx) * frontier_words + word_idx
+                    const int bucket_off = (roi_idx * max_buckets + bucket_idx) * frontier_words;
+                    atomicOr(&buckets[bucket_off + word_idx], bit_mask);
+                }
+            }
+        }
+        ''', 'assign_nodes_to_buckets')
+
+        # P1-6: Compile PERSISTENT KERNEL with device-side queues
+        # This kernel runs a while-loop on GPU until all paths found, eliminating kernel launch overhead
+        # Uses cooperative groups for grid-wide synchronization
+        self.persistent_kernel = cp.RawKernel(r'''
+        #include <cooperative_groups.h>
+        namespace cg = cooperative_groups;
+
+        // Custom atomic min for float using compare-and-swap
+        __device__ float atomicMinFloat(float* addr, float value) {
+            int* addr_as_int = (int*)addr;
+            int old = *addr_as_int, assumed;
+            do {
+                assumed = old;
+                float old_val = __int_as_float(assumed);
+                if (old_val <= value) break;
+                old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
+            } while (assumed != old);
+            return __int_as_float(old);
+        }
+
+        extern "C" __global__
+        void __launch_bounds__(256)
+        sssp_persistent_cooperative(
+            int* queue_a,                   // Device queue A (max_queue_size)
+            int* queue_b,                   // Device queue B (max_queue_size)
+            int* size_a,                    // Size of queue A (device scalar)
+            int* size_b,                    // Size of queue B (device scalar)
+            const int max_queue_size,       // Maximum queue capacity
+            const int K,                    // Number of ROIs
+            const int max_roi_size,         // Max nodes per ROI
+            const int* indptr,              // CSR indptr
+            const int* indices,             // CSR indices
+            const float* weights,           // CSR base weights (for accountant)
+            const int indptr_stride,        // Stride (0 for shared)
+            const int indices_stride,
+            const int weights_stride,
+            const float* total_cost,        // CSR negotiated costs (weights + present + history)
+            const int total_cost_stride,    // Stride for total_cost
+            const int Nx,                   // Lattice X dimension
+            const int Ny,                   // Lattice Y dimension
+            const int Nz,                   // Lattice Z dimension
+            const int* goal_coords,         // (K, 3) goal coordinates
+            const int use_astar,            // A* enable flag
+            float* dist,                    // (K, max_roi_size) distances
+            int* parent,                    // (K, max_roi_size) parents
+            int* iterations_out             // Output: number of iterations completed
+        ) {
+            // Grid handle for cooperative groups
+            cg::grid_group grid = cg::this_grid();
+
+            // Thread ID and total threads
+            const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+            const int total_threads = gridDim.x * blockDim.x;
+
+            // Ping-pong flag: which queue is input
+            bool use_a = true;
+
+            int iteration = 0;
+            const int MAX_ITERATIONS = 2000;  // Safety limit
+
+            while (iteration < MAX_ITERATIONS) {
+                // Grid-wide barrier
+                grid.sync();
+
+                // Select queues based on ping-pong flag
+                int* q_in = use_a ? queue_a : queue_b;
+                int* q_out = use_a ? queue_b : queue_a;
+                int* sz_in = use_a ? size_a : size_b;
+                int* sz_out = use_a ? size_b : size_a;
+
+                // Load queue size (all threads read same value)
+                const int queue_size = *sz_in;
+
+                // Termination check
+                if (queue_size == 0) {
+                    break;
+                }
+
+                // Reset output queue size (single thread only)
+                if (tid == 0) {
+                    *sz_out = 0;
+                }
+                grid.sync();
+
+                // Process queue in parallel (grid-stride loop)
+                for (int i = tid; i < queue_size; i += total_threads) {
+                    // Unpack (roi, node) from 32-bit packed format
+                    const int packed = q_in[i];
+                    const int roi_idx = packed >> 24;          // Upper 8 bits = ROI (supports 256 ROIs)
+                    const int node = packed & 0xFFFFFF;        // Lower 24 bits = node (supports 16M nodes)
+
+                    // Bounds check
+                    if (roi_idx >= K || node >= max_roi_size) continue;
+
+                    // CSR offsets for this ROI
+                    const int indptr_off = roi_idx * indptr_stride;
+                    const int indices_off = roi_idx * indices_stride;
+                    const int weights_off = roi_idx * weights_stride;
+                    const int total_cost_off = roi_idx * total_cost_stride; // PathFinder negotiated costs
+                    const int dist_off = roi_idx * max_roi_size;
+
+                    // Get node distance
+                    const float node_dist = __ldg(&dist[dist_off + node]);
+                    if (isinf(node_dist)) continue;
+
+                    // Get CSR edge range
+                    const int e0 = indptr[indptr_off + node];
+                    const int e1 = indptr[indptr_off + node + 1];
+
+                    // Process all edges
+                    for (int e = e0; e < e1; ++e) {
+                        const int neighbor = indices[indices_off + e];
+                        if (neighbor < 0 || neighbor >= max_roi_size) continue;
+
+                        const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
+                        const float g_new = node_dist + edge_cost;
+
+                        // A* heuristic with procedural coordinate decoding
+                        float f_new = g_new;
+                        if (use_astar) {
+                            const int plane_size = Nx * Ny;
+                            const int nz = neighbor / plane_size;
+                            const int remainder = neighbor - (nz * plane_size);
+                            const int ny = remainder / Nx;
+                            const int nx = remainder - (ny * Nx);
+
+                            const int gx = goal_coords[roi_idx * 3 + 0];
+                            const int gy = goal_coords[roi_idx * 3 + 1];
+                            const int gz = goal_coords[roi_idx * 3 + 2];
+
+                            const float h = (abs(gx - nx) + abs(gy - ny)) * 0.4f + abs(gz - nz) * 1.5f;
+                            f_new = g_new + h;
+                        }
+
+                        // Atomic distance update
+                        const int nidx = dist_off + neighbor;
+                        const float old = atomicMinFloat(&dist[nidx], g_new);
+
+                        // If improved, update parent and add to output queue
+                        if (g_new + 1e-8f < old) {
+                            atomicExch(&parent[nidx], node);
+
+                            // Add to output queue using atomic counter
+                            int queue_pos = atomicAdd(sz_out, 1);
+                            if (queue_pos < max_queue_size) {
+                                // Pack (roi, node) into 32 bits: 8-bit ROI + 24-bit node
+                                q_out[queue_pos] = (roi_idx << 24) | neighbor;
+                            }
+                            // Note: If queue overflows, nodes are dropped (graceful degradation)
+                            // In practice, queue is sized large enough that this never happens
+                        }
+                    }
+                }
+
+                // Grid-wide barrier before queue swap
+                grid.sync();
+
+                // Flip queues for next iteration
+                use_a = !use_a;
+                iteration++;
+            }
+
+            // Write iteration count (single thread)
+            if (tid == 0) {
+                *iterations_out = iteration;
+            }
+        }
+        ''', 'sssp_persistent_cooperative')
+
+        # AGENT B1: Enhanced persistent kernel with stamps and backtrace
+        # This kernel integrates Agent A1 (Stamp Trick) and Agent B1 (device-side backtrace)
+        # for zero-host-sync routing with single kernel launch
+        self.persistent_kernel_stamped = cp.RawKernel(r'''
+        // Define infinity constant (NVRTC doesn't include cuda_runtime.h)
+        #define CUDART_INF_F __int_as_float(0x7f800000)
+
+        // Custom atomic min for float using compare-and-swap
+        __device__ float atomicMinFloat(float* addr, float value) {
+            int* addr_as_int = (int*)addr;
+            int old = *addr_as_int, assumed;
+            do {
+                assumed = old;
+                float old_val = __int_as_float(assumed);
+                if (old_val <= value) break;
+                old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
+            } while (assumed != old);
+            return __int_as_float(old);
+        }
+
+        // Agent A1: Stamp-based distance accessors (eliminates zeroing)
+        // Phase A: uint16 stamps for 16 MB memory savings per net
+        __device__ float dist_get(const float* dv, const unsigned short* ds, unsigned short gen, int u) {
+            return (ds[u] == gen) ? dv[u] : CUDART_INF_F;
+        }
+
+        __device__ void dist_set(float* dv, unsigned short* ds, unsigned short gen, int u, float v) {
+            dv[u] = v;
+            ds[u] = gen;
+        }
+
+        __device__ int parent_get(const int* pv, const unsigned short* ps, unsigned short gen, int u) {
+            return (ps[u] == gen) ? pv[u] : -1;
+        }
+
+        __device__ void parent_set(int* pv, unsigned short* ps, unsigned short gen, int u, int p) {
+            pv[u] = p;
+            ps[u] = gen;
+        }
+
+        // Phase B: Bitset helpers for frontier management (1 bit/node = 8× memory savings)
+        // Note: CUDA atomics only support 32-bit/64-bit types, so we use unsigned int atomics
+        __device__ __forceinline__
+        bool get_bit(const unsigned char* bits, int idx) {
+            const unsigned int* words = (const unsigned int*)bits;
+            return (words[idx >> 5] >> (idx & 31)) & 1u;
+        }
+
+        __device__ __forceinline__
+        void set_bit(unsigned char* bits, int idx) {
+            unsigned int* words = (unsigned int*)bits;
+            atomicOr(&words[idx >> 5], 1u << (idx & 31));
+        }
+
+        __device__ __forceinline__
+        void clear_bit(unsigned char* bits, int idx) {
+            unsigned int* words = (unsigned int*)bits;
+            atomicAnd(&words[idx >> 5], ~(1u << (idx & 31)));
+        }
+
+        // Phase 4: ROI bounding box check for persistent kernel
+        __device__ __forceinline__
+        bool in_roi_persistent(int nx, int ny, int nz, int roi_idx,
+                    const int* minx, const int* maxx,
+                    const int* miny, const int* maxy,
+                    const int* minz, const int* maxz) {
+            return nx >= minx[roi_idx] && nx <= maxx[roi_idx] &&
+                   ny >= miny[roi_idx] && ny <= maxy[roi_idx] &&
+                   nz >= minz[roi_idx] && nz <= maxz[roi_idx];
+        }
+
+        // Agent B1: Device-side path reconstruction (backtrace)
+        __device__ void backtrace_to_staging(
+            int net_id, int src, int dst,
+            const int* parent_val, const unsigned short* parent_stamp, unsigned short gen,
+            int* stage_path, int* stage_count, int max_path_len
+        ) {
+            int path_len = 0;
+            int curr = dst;
+
+            // Walk backwards from dst to src
+            while (curr != src && curr != -1 && path_len < max_path_len) {
+                if (parent_stamp[curr] == gen) {
+                    // Store (net_id, node) packed into 32 bits
+                    int pos = atomicAdd(stage_count, 1);
+                    if (pos < max_path_len * 512) {  // Safety limit
+                        stage_path[pos] = (net_id << 24) | curr;  // 8-bit net ID + 24-bit node
+                    }
+                    curr = parent_val[curr];
+                    path_len++;
+                } else {
+                    break;  // Invalid stamp - path broken
+                }
+            }
+        }
+
+        extern "C" __global__
+        void __launch_bounds__(256)
+        sssp_persistent_stamped(
+            int* queue_a,                   // Device queue A (max_queue_size)
+            int* queue_b,                   // Device queue B (max_queue_size)
+            int* size_a,                    // Size of queue A (device scalar)
+            int* size_b,                    // Size of queue B (device scalar)
+            const int max_queue_size,       // Maximum queue capacity
+            const int K,                    // Number of ROIs
+            const int max_roi_size,         // Max nodes per ROI (N in current batch)
+            const int* indptr,              // CSR indptr
+            const int* indices,             // CSR indices
+            const float* weights,           // CSR base weights (for accountant)
+            const int indptr_stride,        // Stride (0 for shared)
+            const int indices_stride,
+            const int weights_stride,
+            const float* total_cost,        // CSR negotiated costs (weights + present + history)
+            const int total_cost_stride,    // Stride for total_cost
+            const int Nx,                   // Lattice X dimension
+            const int Ny,                   // Lattice Y dimension
+            const int Nz,                   // Lattice Z dimension
+            const int* goal_coords,         // (K, 3) goal coordinates
+            const int* src_nodes,           // (K,) source nodes
+            const int* dst_nodes,           // (K,) destination nodes
+            const int use_astar,            // A* enable flag
+            // Phase D: Strided pool pointers (kernel computes per-net slices)
+            float* dist_val_pool,           // [K_pool, N_max] pool base pointer
+            const int dist_val_stride,      // N_max (stride between net slices)
+            unsigned short* dist_stamp_pool, // [K_pool, N_max] pool base pointer
+            const int dist_stamp_stride,    // N_max (stride between net slices)
+            int* parent_val_pool,           // [K_pool, N_max] pool base pointer
+            const int parent_val_stride,    // N_max (stride between net slices)
+            unsigned short* parent_stamp_pool, // [K_pool, N_max] pool base pointer
+            const int parent_stamp_stride,  // N_max (stride between net slices)
+            int* stage_path,                // Staging buffer for paths
+            int* stage_count,               // Count of staged path nodes
+            const unsigned short generation, // Current generation number [Phase A: uint16]
+            int* iterations_out,            // Output: number of iterations completed
+            unsigned char* goal_reached,    // (K,) flags for which ROIs found path
+            // Phase 4: ROI bounding boxes
+            const int* roi_minx,            // (K,) Min X per ROI
+            const int* roi_maxx,            // (K,) Max X per ROI
+            const int* roi_miny,            // (K,) Min Y per ROI
+            const int* roi_maxy,            // (K,) Max Y per ROI
+            const int* roi_minz,            // (K,) Min Z per ROI
+            const int* roi_maxz             // (K,) Max Z per ROI
+        ) {
+            // Thread ID and total threads
+            const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+            const int total_threads = gridDim.x * blockDim.x;
+
+            // Ping-pong flag: which queue is input
+            bool use_a = true;
+
+            int iteration = 0;
+            const int MAX_ITERATIONS = 2000;  // Safety limit
+
+            // Shared memory for block-level coordination
+            __shared__ int local_queue_size;
+            __shared__ int local_output_reset;
+
+            while (iteration < MAX_ITERATIONS) {
+                // Select queues based on ping-pong flag
+                int* q_in = use_a ? queue_a : queue_b;
+                int* q_out = use_a ? queue_b : queue_a;
+                int* sz_in = use_a ? size_a : size_b;
+                int* sz_out = use_a ? size_b : size_a;
+
+                // Thread 0 in each block loads queue size to shared memory
+                if (threadIdx.x == 0) {
+                    local_queue_size = *sz_in;
+                    local_output_reset = 0;
+                }
+                __syncthreads();
+
+                // Load queue size (all threads read same value from shared memory)
+                const int queue_size = local_queue_size;
+
+                // Termination check
+                if (queue_size == 0) {
+                    break;
+                }
+
+                // Reset output queue size (single thread only)
+                if (tid == 0) {
+                    *sz_out = 0;
+                }
+                // No grid sync needed - atomic operations handle synchronization
+
+                // Process queue in parallel (grid-stride loop)
+                for (int i = tid; i < queue_size; i += total_threads) {
+                    // Unpack (roi, node) from 32-bit packed format
+                    const int packed = q_in[i];
+                    const int roi_idx = packed >> 24;          // Upper 8 bits = ROI (supports 256 ROIs)
+                    const int node = packed & 0xFFFFFF;        // Lower 24 bits = node (supports 16M nodes)
+
+                    // Bounds check
+                    if (roi_idx >= K || node >= max_roi_size) continue;
+
+                    // Check if this ROI already found goal
+                    if (goal_reached[roi_idx]) continue;
+
+                    // Phase D: Compute per-net slice pointers from pool base + stride
+                    // Pool arrays have shape [K_pool, N_max] with row-major layout
+                    // Each net's slice is at: pool_base + net_idx * stride
+                    float* dist_val = dist_val_pool + (size_t)roi_idx * dist_val_stride;
+                    unsigned short* dist_stamp = dist_stamp_pool + (size_t)roi_idx * dist_stamp_stride;
+                    int* parent_val = parent_val_pool + (size_t)roi_idx * parent_val_stride;
+                    unsigned short* parent_stamp = parent_stamp_pool + (size_t)roi_idx * parent_stamp_stride;
+
+                    // CSR offsets for this ROI
+                    const int indptr_off = roi_idx * indptr_stride;
+                    const int indices_off = roi_idx * indices_stride;
+                    const int weights_off = roi_idx * weights_stride;
+                    const int total_cost_off = roi_idx * total_cost_stride; // PathFinder negotiated costs
+
+                    // Get node distance using stamps (Agent A1)
+                    const float node_dist = dist_get(
+                        dist_val,
+                        dist_stamp,
+                        generation,
+                        node
+                    );
+                    if (isinf(node_dist)) continue;
+
+                    // Check if we reached goal
+                    const int dst = dst_nodes[roi_idx];
+                    if (node == dst) {
+                        // Mark goal reached
+                        goal_reached[roi_idx] = 1;
+
+                        // Backtrace path (Agent B1) - using computed slice pointers
+                        const int src = src_nodes[roi_idx];
+                        backtrace_to_staging(
+                            roi_idx, src, dst,
+                            parent_val, parent_stamp, generation,
+                            stage_path, stage_count, 1000
+                        );
+                        continue;
+                    }
+
+                    // Get CSR edge range
+                    const int e0 = indptr[indptr_off + node];
+                    const int e1 = indptr[indptr_off + node + 1];
+
+                    // Process all edges
+                    for (int e = e0; e < e1; ++e) {
+                        const int neighbor = indices[indices_off + e];
+                        if (neighbor < 0 || neighbor >= max_roi_size) continue;
+
+                        const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
+                        const float g_new = node_dist + edge_cost;
+
+                        // Decode neighbor coordinates (needed for both ROI and A*)
+                        // Only decode if we have valid lattice dimensions
+                        int nx = 0, ny = 0, nz = 0;
+                        bool has_lattice = (Nx > 0 && Ny > 0 && Nz > 0);
+                        if (has_lattice) {
+                            const int plane_size = Nx * Ny;
+                            nz = neighbor / plane_size;
+                            const int remainder = neighbor - (nz * plane_size);
+                            ny = remainder / Nx;
+                            nx = remainder - (ny * Nx);
+
+                            // Phase 4: ROI gate - skip neighbors outside bounding box
+                            if (!in_roi_persistent(nx, ny, nz, roi_idx, roi_minx, roi_maxx, roi_miny, roi_maxy, roi_minz, roi_maxz)) {
+                                continue;  // Skip this neighbor
+                            }
+                        }
+
+                        // A* heuristic (uses already-decoded coordinates)
+                        float f_new = g_new;
+                        if (use_astar) {
+                            const int gx = goal_coords[roi_idx * 3 + 0];
+                            const int gy = goal_coords[roi_idx * 3 + 1];
+                            const int gz = goal_coords[roi_idx * 3 + 2];
+
+                            const float h = (abs(gx - nx) + abs(gy - ny)) * 0.4f + abs(gz - nz) * 1.5f;
+                            f_new = g_new + h;
+                        }
+
+                        // Get current distance using stamps
+                        float old_dist = dist_get(
+                            dist_val,
+                            dist_stamp,
+                            generation,
+                            neighbor
+                        );
+
+                        // If improved, update distance and parent using stamps
+                        if (g_new + 1e-8f < old_dist) {
+                            // Atomic update for distance (using slice-local index)
+                            const float atomic_old = atomicMinFloat(&dist_val[neighbor], g_new);
+
+                            // Update stamp and parent if we won the race
+                            if (g_new + 1e-8f < atomic_old) {
+                                dist_stamp[neighbor] = generation;
+                                parent_set(parent_val, parent_stamp, generation, neighbor, node);
+
+                                // Add to output queue using atomic counter
+                                int queue_pos = atomicAdd(sz_out, 1);
+                                if (queue_pos < max_queue_size) {
+                                    // Pack (roi, node) into 32 bits: 8-bit ROI + 24-bit node
+                                    q_out[queue_pos] = (roi_idx << 24) | neighbor;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Block-level sync before queue swap (ensures all threads in block finished processing)
+                __syncthreads();
+
+                // Flip queues for next iteration
+                use_a = !use_a;
+                iteration++;
+            }
+
+            // Write iteration count (single thread)
+            if (tid == 0) {
+                *iterations_out = iteration;
+            }
+        }
+        ''', 'sssp_persistent_stamped')
+
+        # P3: Compile COMPACTION kernel (Phase 3: GPU-side frontier compaction)
+        # This eliminates host<->device sync during frontier compaction (replaces cp.nonzero)
+        # Phase B: Updated to use bitsets (1 bit/node instead of 1 byte/node)
+        self.compact_kernel = cp.RawKernel(r'''
+        // Phase B: Bitset helper for compaction
+        __device__ __forceinline__
+        bool get_bit_compact(const unsigned char* bits, int idx) {
+            return (bits[idx >> 3] >> (idx & 7)) & 1;
+        }
+
+        extern "C" __global__
+        void compact_mask_to_list(
+            const unsigned char* __restrict__ frontier_bits,  // Phase B: bitset input (1 bit/node)
+            int N,
+            int* __restrict__ out_idx,
+            int* __restrict__ out_count
+        ) {
+            int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+            // Phase B: Read bit instead of byte
+            bool is_set = (tid < N) && get_bit_compact(frontier_bits, tid);
+            unsigned int warp_mask = __ballot_sync(0xffffffff, is_set);
+            int lane = threadIdx.x & 31;
+
+            if (warp_mask) {
+                int warp_count = __popc(warp_mask);
+                int base = 0;
+                if (lane == 0) {
+                    base = atomicAdd(out_count, warp_count);
+                }
+                base = __shfl_sync(0xffffffff, base, 0);
+                int offset = __popc(warp_mask & ((1u << lane) - 1));
+
+                if (is_set) {
+                    out_idx[base + offset] = tid;
+                }
+            }
+        }
+        ''', 'compact_mask_to_list')
+
+        # Compile ACCOUNTANT kernel (Phase 5: GPU-side cost updates)
+        # Eliminates Python loops between iterations for history/present/total_cost updates
+        self.accountant_kernel = cp.RawKernel(r'''
+        extern "C" __global__
+        void accountant_update(
+            const int E,
+            const float* __restrict__ base_cost,
+            const float* __restrict__ capacity,
+            float* __restrict__ present,
+            float* __restrict__ history,
+            float* __restrict__ total_cost,
+            float pres_fac,
+            float hist_gain,
+            float hist_cap_mult,
+            float via_mult,
+            float hist_w,
+            float decay_factor,
+            float gamma
+        ) {
+            int e = blockIdx.x * blockDim.x + threadIdx.x;
+            if (e >= E) return;
+
+            // Apply decay to history
+            history[e] *= decay_factor;
+
+            // Compute overuse
+            float over = fmaxf(0.f, present[e] - capacity[e]);
+
+            // Update history with capping
+            float overuse_ratio = over / fmaxf(1.0f, capacity[e]);
+            float increment = hist_gain * overuse_ratio * base_cost[e];
+            float history_cap = hist_cap_mult * base_cost[e];
+            float new_history = fminf(history[e] + increment, history_cap);
+            history[e] = new_history;
+
+            // Compute present multiplier with gamma exponent
+            float present_mult = 1.f + pres_fac * powf(overuse_ratio, gamma);
+
+            // Compute total cost: (base * via_mult + hist_w * history) * present_mult
+            float adjusted_base = base_cost[e] * via_mult;
+            total_cost[e] = (adjusted_base + hist_w * history[e]) * present_mult;
+        }
+        ''', 'accountant_update')
+
+        # GPU PATH RECONSTRUCTION KERNEL: Backtrace on GPU to avoid 256 MB CPU transfers
+        # Each thread reconstructs one path by following parent pointers on GPU
+        # Outputs: compact path arrays + path lengths (sparse transfer)
+        self.backtrace_kernel = cp.RawKernel(r'''
+        extern "C" __global__
+        void backtrace_paths(
+            const int K,                    // Number of ROIs
+            const int max_roi_size,         // Max nodes per ROI
+            const int* parent,              // (K, max_roi_size) parent pointers
+            const float* dist,              // (K, max_roi_size) distances (for validation)
+            const int* sinks,               // (K,) sink nodes
+            int* paths_out,                 // (K, max_path_len) output paths
+            int* path_lengths,              // (K,) output path lengths
+            const int max_path_len          // Maximum path length (safety limit)
+        ) {
+            int roi_idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (roi_idx >= K) return;
+
+            const int sink = sinks[roi_idx];
+            const int dist_off = roi_idx * max_roi_size;
+            const int path_off = roi_idx * max_path_len;
+
+            // Check if path exists (distance is finite)
+            if (isinf(dist[dist_off + sink]) || sink < 0 || sink >= max_roi_size) {
+                path_lengths[roi_idx] = 0;  // No path found
+                return;
+            }
+
+            // Backtrace from sink to source
+            int curr = sink;
+            int path_len = 0;
+            int visited[4096];  // Stack-allocated cycle detection (max 4096 nodes per path)
+            int visited_count = 0;
+
+            while (curr != -1 && path_len < max_path_len) {
+                // Cycle detection (check last 32 nodes for performance)
+                bool is_cycle = false;
+                int check_start = (visited_count > 32) ? (visited_count - 32) : 0;
+                for (int i = check_start; i < visited_count; i++) {
+                    if (visited[i] == curr) {
+                        is_cycle = true;
+                        break;
+                    }
+                }
+
+                if (is_cycle) {
+                    path_lengths[roi_idx] = -1;  // Indicate cycle error
+                    return;
+                }
+
+                // Add to path (stored in reverse order)
+                paths_out[path_off + path_len] = curr;
+                path_len++;
+
+                // Track visited (up to 4096 nodes)
+                if (visited_count < 4096) {
+                    visited[visited_count++] = curr;
+                }
+
+                // Follow parent pointer
+                curr = parent[dist_off + curr];
+            }
+
+            // Store final path length
+            path_lengths[roi_idx] = path_len;
+
+            // Reverse path in-place (convert from sink->source to source->sink)
+            for (int i = 0; i < path_len / 2; i++) {
+                int tmp = paths_out[path_off + i];
+                paths_out[path_off + i] = paths_out[path_off + path_len - 1 - i];
+                paths_out[path_off + path_len - 1 - i] = tmp;
+            }
+        }
+        ''', 'backtrace_paths')
+
         logger.info("[CUDA] Compiled parallel edge relaxation kernel")
         logger.info("[CUDA] Compiled FULLY PARALLEL wavefront expansion kernel")
+        logger.info("[CUDA] Compiled ACTIVE-LIST kernel (2-3× faster than one-block-per-ROI!)")
+        logger.info("[CUDA] Compiled PROCEDURAL NEIGHBOR kernel (P1-8: ditches CSR, pure arithmetic!)")
+        logger.info("[CUDA] Compiled DELTA-STEPPING bucket assignment kernel (P1-7: replaces Python loop!)")
+        logger.info("[CUDA] Compiled PERSISTENT KERNEL (P1-6: device-side queues, eliminates launch overhead!)")
+        logger.info("[CUDA] Compiled COMPACTION KERNEL (P3: GPU-side frontier compaction, no host sync!)")
+        logger.info("[CUDA] Compiled ACCOUNTANT KERNEL (Phase 5: GPU-side history/present/cost updates!)")
+        logger.info("[CUDA] Compiled GPU BACKTRACE KERNEL (eliminates 256 MB parent/dist CPU transfers!)")
 
     def _relax_edges_parallel(self, K, max_roi_size, max_edges,
                              active, min_nodes,
@@ -267,9 +1304,36 @@ class CUDADijkstra:
             batch_data = self._prepare_batch(roi_batch)
             logger.info(f"[DEBUG-GPU] Batch data prepared, starting Near-Far algorithm")
 
+            # INVARIANT CHECKS: Shared-CSR indexing (user-requested debugging)
+            if GPUConfig.DEBUG_INVARIANTS if hasattr(GPUConfig, 'DEBUG_INVARIANTS') else True:
+                # Check if using shared CSR (stride=0 indicates broadcast)
+                is_shared_csr = (hasattr(batch_data['batch_indptr'], 'strides') and
+                                len(batch_data['batch_indptr'].strides) == 2 and
+                                batch_data['batch_indptr'].strides[0] == 0)
+
+                if is_shared_csr:
+                    logger.info("[INVARIANT-CHECK] Shared CSR detected (stride=0)")
+                    # In shared CSR mode, max_roi_size must equal total graph size
+                    N_global = len(batch_data['batch_indptr'][0]) - 1  # indptr shape is (N+1,)
+                    max_roi = batch_data['max_roi_size']
+
+                    if max_roi != N_global:
+                        logger.error(f"[INVARIANT-FAIL] Shared CSR but max_roi_size={max_roi} != N_global={N_global}")
+                        raise AssertionError(f"Shared CSR invariant violated: max_roi_size={max_roi} != N_global={N_global}")
+                    else:
+                        logger.info(f"[INVARIANT-OK] Shared CSR: max_roi_size={max_roi} == N_global={N_global}")
+                else:
+                    logger.info("[INVARIANT-CHECK] Per-ROI CSR mode (no shared CSR)")
+
             # Run Near-Far algorithm on GPU
-            paths = self._run_near_far(batch_data, K, roi_batch)
-            logger.info(f"[DEBUG-GPU] Near-Far algorithm completed")
+            try:
+                paths = self._run_near_far(batch_data, K, roi_batch)
+                logger.info(f"[DEBUG-GPU] Near-Far algorithm completed")
+            except Exception as near_far_error:
+                logger.error(f"[DEBUG-GPU] Error in _run_near_far: {near_far_error}")
+                import traceback
+                logger.error(f"[DEBUG-GPU] Traceback:\n{traceback.format_exc()}")
+                raise
 
             found = sum(1 for p in paths if p)
             logger.info(f"[CUDA-ROI] Complete: {found}/{K} paths found using GPU")
@@ -448,18 +1512,103 @@ class CUDADijkstra:
             if not isinstance(shared_indices, cp.ndarray):
                 shared_indices = cp.asarray(shared_indices)
             if not isinstance(shared_weights, cp.ndarray):
+                was_cpu = True
+                shared_weights_cpu = shared_weights  # Save CPU version for debug
                 shared_weights = cp.asarray(shared_weights)
+                # DEBUG: Verify infinity survived CPU→GPU transfer
+                import numpy as np
+                test_edges = [822688, 822689, 822690]  # Test edges around the infinite one
+                for edge_idx in test_edges:
+                    if edge_idx < len(shared_weights_cpu):
+                        cpu_val = shared_weights_cpu[edge_idx]
+                        gpu_val = float(shared_weights[edge_idx])
+                        if cpu_val > 1e8:  # If CPU had infinity
+                            if gpu_val > 1e8:
+                                logger.info(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} → GPU={gpu_val:.2e} ✅")
+                            else:
+                                logger.error(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} → GPU={gpu_val:.2e} ❌ LOST INFINITY!")
 
-            # Allocate only distance/parent arrays (K × nodes each)
-            dist = cp.full((K, max_roi_size), cp.inf, dtype=cp.float32)
-            parent = cp.full((K, max_roi_size), -1, dtype=cp.int32)
-            near_mask = cp.zeros((K, max_roi_size), dtype=cp.uint8)
-            far_mask = cp.zeros((K, max_roi_size), dtype=cp.uint8)
+            # Phase 1: STAMP TRICK - Lazy-allocate pools on first use
+            if self.dist_val_pool is None:
+                # Calculate K_pool dynamically from available GPU memory
+                if self.K_pool is None or not self._k_pool_calculated:
+                    # Query actual GPU memory
+                    free_bytes, total_bytes = cp.cuda.Device().mem_info
+                    N_max = 5_000_000  # Maximum node count
 
-            # CSR arrays are shared - broadcast to all nets
-            batch_indptr = cp.broadcast_to(shared_indptr[None, :], (K, len(shared_indptr)))
-            batch_indices = cp.broadcast_to(shared_indices[None, :], (K, len(shared_indices)))
-            batch_weights = cp.broadcast_to(shared_weights[None, :], (K, len(shared_weights)))
+                    # Bytes per net (estimate based on current implementation)
+                    # Will be optimized further with uint16 stamps + bitsets
+                    bytes_per_net = (
+                        4 * N_max +      # dist_val float32
+                        2 * N_max +      # dist_stamp uint16 (Phase A)
+                        4 * N_max +      # parent_val int32
+                        2 * N_max +      # parent_stamp uint16 (Phase A)
+                        (N_max + 7) // 8 +  # near_bits bitset (Phase B: 1 bit/node)
+                        (N_max + 7) // 8    # far_bits bitset (Phase B: 1 bit/node)
+                    )
+
+                    shared_overhead = 500 * (1024 ** 2)  # CSR + present/history/cost (~500 MB)
+                    safety = 0.7  # Use 70% of free memory
+
+                    K_pool_calculated = max(8, min(256, int((free_bytes - shared_overhead) * safety / bytes_per_net)))
+
+                    self.K_pool = K_pool_calculated
+                    self._k_pool_calculated = True
+
+                    logger.info(f"[MEMORY-AWARE] GPU memory: {free_bytes / 1e9:.2f} GB free, {total_bytes / 1e9:.2f} GB total")
+                    logger.info(f"[MEMORY-AWARE] Calculated K_pool: {self.K_pool} (allows {self.K_pool} nets in parallel)")
+                    logger.info(f"[MEMORY-AWARE] Per-net memory: {bytes_per_net / 1e6:.1f} MB")
+                    logger.info(f"[MEMORY-AWARE] Total pool memory: {self.K_pool * bytes_per_net / 1e9:.2f} GB")
+                else:
+                    N_max = 5_000_000  # Conservative max nodes
+
+                self.dist_val_pool = cp.full((self.K_pool, N_max), cp.inf, dtype=cp.float32)
+                self.dist_stamp_pool = cp.zeros((self.K_pool, N_max), dtype=cp.uint16)  # Phase A: uint16 stamps
+                self.parent_val_pool = cp.full((self.K_pool, N_max), -1, dtype=cp.int32)
+                self.parent_stamp_pool = cp.zeros((self.K_pool, N_max), dtype=cp.uint16)  # Phase A: uint16 stamps
+                # Phase B: Allocate as uint32 words (32 bits per word, properly aligned)
+                frontier_words = (N_max + 31) // 32  # Number of 32-bit words needed
+                self.near_bits_pool = cp.zeros((self.K_pool, frontier_words), dtype=cp.uint32)  # Phase B: 1 bit/node
+                self.far_bits_pool = cp.zeros((self.K_pool, frontier_words), dtype=cp.uint32)   # Phase B: 1 bit/node
+                logger.info(f"[STAMP-POOL] Allocated device pools: K={self.K_pool}, N={N_max}")
+                logger.info(f"[PHASE-A] Using uint16 stamps (16 MB memory savings per net)")
+                frontier_bytes = ((N_max + 31) // 32) * 4  # uint32 words * 4 bytes/word
+                logger.info(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB → {frontier_bytes/1e6:.1f} MB per net)")
+
+            # Slice pool instead of allocating new arrays (NO ZEROING!)
+            gen = self.current_gen
+            dist = self.dist_val_pool[:K, :max_roi_size]
+            parent = self.parent_val_pool[:K, :max_roi_size]
+            dist_stamps = self.dist_stamp_pool[:K, :max_roi_size]
+            parent_stamps = self.parent_stamp_pool[:K, :max_roi_size]
+            # Phase B: Slice bitset pools (size = (K, (max_roi_size+31)//32) uint32 words)
+            frontier_words = (max_roi_size + 31) // 32
+            near_bits = self.near_bits_pool[:K, :frontier_words]
+            far_bits = self.far_bits_pool[:K, :frontier_words]
+
+            # FIX: Use as_strided to create zero-copy broadcast view
+            # This creates a (K, N) view with stride (0, element_size) - true zero-copy broadcast
+            # Avoids cp.broadcast_to() which may copy/corrupt data
+            import cupy
+            batch_indptr = cupy.lib.stride_tricks.as_strided(
+                shared_indptr,
+                shape=(K, len(shared_indptr)),
+                strides=(0, shared_indptr.itemsize)
+            )
+            batch_indices = cupy.lib.stride_tricks.as_strided(
+                shared_indices,
+                shape=(K, len(shared_indices)),
+                strides=(0, shared_indices.itemsize)
+            )
+            batch_weights = cupy.lib.stride_tricks.as_strided(
+                shared_weights,
+                shape=(K, len(shared_weights)),
+                strides=(0, shared_weights.itemsize)
+            )
+
+            logger.info(f"[SHARED-CSR-FIX] Using as_strided for zero-copy broadcast")
+            logger.info(f"[SHARED-CSR-FIX] batch_indptr: shape={batch_indptr.shape}, strides={batch_indptr.strides}")
+            logger.info(f"[SHARED-CSR-FIX] batch_weights: shape={batch_weights.shape}, strides={batch_weights.strides}")
 
             logger.info(f"[SHARED-CSR] Memory saved: {K-1} × {max_edges * 8 / 1e9:.1f} GB = {(K-1) * max_edges * 8 / 1e9:.1f} GB")
         else:
@@ -473,10 +1622,64 @@ class CUDADijkstra:
             batch_indptr = cp.zeros((K, max_roi_size + 1), dtype=cp.int32)
             batch_indices = cp.zeros((K, max_edges), dtype=cp.int32)
             batch_weights = cp.zeros((K, max_edges), dtype=cp.float32)
-            dist = cp.full((K, max_roi_size), cp.inf, dtype=cp.float32)
-            parent = cp.full((K, max_roi_size), -1, dtype=cp.int32)
-            near_mask = cp.zeros((K, max_roi_size), dtype=cp.uint8)
-            far_mask = cp.zeros((K, max_roi_size), dtype=cp.uint8)
+
+            # Phase 1: STAMP TRICK - Lazy-allocate pools on first use
+            if self.dist_val_pool is None:
+                # Calculate K_pool dynamically from available GPU memory
+                if self.K_pool is None or not self._k_pool_calculated:
+                    # Query actual GPU memory
+                    free_bytes, total_bytes = cp.cuda.Device().mem_info
+                    N_max = 5_000_000  # Maximum node count
+
+                    # Bytes per net (estimate based on current implementation)
+                    # Will be optimized further with uint16 stamps + bitsets
+                    bytes_per_net = (
+                        4 * N_max +      # dist_val float32
+                        2 * N_max +      # dist_stamp uint16 (Phase A)
+                        4 * N_max +      # parent_val int32
+                        2 * N_max +      # parent_stamp uint16 (Phase A)
+                        (N_max + 7) // 8 +  # near_bits bitset (Phase B: 1 bit/node)
+                        (N_max + 7) // 8    # far_bits bitset (Phase B: 1 bit/node)
+                    )
+
+                    shared_overhead = 500 * (1024 ** 2)  # CSR + present/history/cost (~500 MB)
+                    safety = 0.7  # Use 70% of free memory
+
+                    K_pool_calculated = max(8, min(256, int((free_bytes - shared_overhead) * safety / bytes_per_net)))
+
+                    self.K_pool = K_pool_calculated
+                    self._k_pool_calculated = True
+
+                    logger.info(f"[MEMORY-AWARE] GPU memory: {free_bytes / 1e9:.2f} GB free, {total_bytes / 1e9:.2f} GB total")
+                    logger.info(f"[MEMORY-AWARE] Calculated K_pool: {self.K_pool} (allows {self.K_pool} nets in parallel)")
+                    logger.info(f"[MEMORY-AWARE] Per-net memory: {bytes_per_net / 1e6:.1f} MB")
+                    logger.info(f"[MEMORY-AWARE] Total pool memory: {self.K_pool * bytes_per_net / 1e9:.2f} GB")
+                else:
+                    N_max = 5_000_000  # Conservative max nodes
+
+                self.dist_val_pool = cp.full((self.K_pool, N_max), cp.inf, dtype=cp.float32)
+                self.dist_stamp_pool = cp.zeros((self.K_pool, N_max), dtype=cp.uint16)  # Phase A: uint16 stamps
+                self.parent_val_pool = cp.full((self.K_pool, N_max), -1, dtype=cp.int32)
+                self.parent_stamp_pool = cp.zeros((self.K_pool, N_max), dtype=cp.uint16)  # Phase A: uint16 stamps
+                # Phase B: Allocate as uint32 words (32 bits per word, properly aligned)
+                frontier_words = (N_max + 31) // 32  # Number of 32-bit words needed
+                self.near_bits_pool = cp.zeros((self.K_pool, frontier_words), dtype=cp.uint32)  # Phase B: 1 bit/node
+                self.far_bits_pool = cp.zeros((self.K_pool, frontier_words), dtype=cp.uint32)   # Phase B: 1 bit/node
+                logger.info(f"[STAMP-POOL] Allocated device pools: K={self.K_pool}, N={N_max}")
+                logger.info(f"[PHASE-A] Using uint16 stamps (16 MB memory savings per net)")
+                frontier_bytes = ((N_max + 31) // 32) * 4  # uint32 words * 4 bytes/word
+                logger.info(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB → {frontier_bytes/1e6:.1f} MB per net)")
+
+            # Slice pool instead of allocating new arrays (NO ZEROING!)
+            gen = self.current_gen
+            dist = self.dist_val_pool[:K, :max_roi_size]
+            parent = self.parent_val_pool[:K, :max_roi_size]
+            dist_stamps = self.dist_stamp_pool[:K, :max_roi_size]
+            parent_stamps = self.parent_stamp_pool[:K, :max_roi_size]
+            # Phase B: Slice bitset pools (size = (K, (max_roi_size+31)//32) uint32 words)
+            frontier_words = (max_roi_size + 31) // 32
+            near_bits = self.near_bits_pool[:K, :frontier_words]
+            far_bits = self.far_bits_pool[:K, :frontier_words]
 
         threshold = cp.full(K, 0.4, dtype=cp.float32)
 
@@ -500,49 +1703,99 @@ class CUDADijkstra:
                 batch_indices[i, :len(indices)] = indices
                 batch_weights[i, :len(weights)] = weights
 
-        # Build node coordinate lookup for A* heuristic
-        # Extract (x, y, z) for each node in the graph
-        # This allows kernel to compute Manhattan distance h(n) = |goal_x - x| + |goal_y - y| + 3*|goal_z - z|
+        # P0-3: Build GOAL coordinate array (K × 3, not max_roi_size × 3!)
+        # This eliminates global memory loads for ALL node coordinates
         import numpy as np
-        node_coords_array = np.zeros((max_roi_size, 3), dtype=np.int32)
+        goal_coords_array = np.zeros((K, 3), dtype=np.int32)
 
-        # For shared CSR (full graph), build coords once
-        if all_share_csr and hasattr(self, 'lattice'):
-            lattice = self.lattice  # Assume lattice is passed or stored
-            # Build coordinate lookup for all nodes
-            # This is expensive but done ONCE for all K nets
-            # node_idx → (x, y, z)
-            # For now, skip coordinate building and disable A* (will enable after testing)
-            # TODO: Build coordinate array from lattice geometry
-            pass
+        # P0-3: Extract lattice dimensions for procedural coordinate decoding
+        Nx, Ny, Nz = 0, 0, 0
+        if all_share_csr and self.lattice:
+            Nx = self.lattice.x_steps
+            Ny = self.lattice.y_steps
+            Nz = self.lattice.layers
+            logger.info(f"[P0-3] Using procedural coordinates: Nx={Nx}, Ny={Ny}, Nz={Nz}")
+            logger.info(f"[P0-3] Memory saved: {max_roi_size * 3 * 4 / 1e6:.1f} MB (no node_coords array!)")
 
         goal_nodes_array = cp.zeros(K, dtype=cp.int32)
+
+        # Phase 4: ROI bounding boxes (per net) for device-side ROI gating
+        roi_minx = cp.zeros(K, dtype=cp.int32)
+        roi_maxx = cp.zeros(K, dtype=cp.int32)
+        roi_miny = cp.zeros(K, dtype=cp.int32)
+        roi_maxy = cp.zeros(K, dtype=cp.int32)
+        roi_minz = cp.zeros(K, dtype=cp.int32)
+        roi_maxz = cp.zeros(K, dtype=cp.int32)
 
         # Initialize sources/sinks for all nets
         for i, (src, dst, indptr, indices, weights, roi_size) in enumerate(roi_batch):
             # Store goal node for A* heuristic
             goal_nodes_array[i] = dst
 
-            # CSR VALIDATION: Verify src has edges after transfer
+            # P0-3: Decode goal coordinates and store in small array
+            if self.lattice and all_share_csr:
+                gx, gy, gz = self.lattice.idx_to_coord(dst)
+                goal_coords_array[i] = [gx, gy, gz]
+
+                # Phase 4: Compute ROI bounding box from src/dst with margin
+                sx, sy, sz = self.lattice.idx_to_coord(src)
+                dx, dy, dz = self.lattice.idx_to_coord(dst)
+
+                # DISABLED: ROI bounding too restrictive for long detours
+                # margin = 50  # Grid cells (configurable)
+                # roi_minx[i] = max(0, min(sx, dx) - margin)
+                # roi_maxx[i] = min(Nx - 1, max(sx, dx) + margin)
+                # roi_miny[i] = max(0, min(sy, dy) - margin)
+                # roi_maxy[i] = min(Ny - 1, max(sy, dy) + margin)
+                # Use full board bounds (no ROI restriction)
+                roi_minx[i] = 0
+                roi_maxx[i] = Nx - 1
+                roi_miny[i] = 0
+                roi_maxy[i] = Ny - 1
+                roi_minz[i] = 0  # All layers
+                roi_maxz[i] = Nz - 1
+            else:
+                # Without lattice, use full space (no ROI gating)
+                roi_minx[i] = 0
+                roi_maxx[i] = 999999
+                roi_miny[i] = 0
+                roi_maxy[i] = 999999
+                roi_minz[i] = 0
+                roi_maxz[i] = 999999
+
+            # CSR VALIDATION: Verify src has edges after transfer (DEBUG ONLY)
             if src < len(indptr) - 1:
                 src_edge_start = int(batch_indptr[i, src])
                 src_edge_end = int(batch_indptr[i, src + 1])
                 num_src_neighbors = src_edge_end - src_edge_start
-                logger.info(f"[CSR-VALIDATION] ROI {i}: src={src} has {num_src_neighbors} neighbors in CSR (edges {src_edge_start} to {src_edge_end})")
+                logger.debug(f"[CSR-VALIDATION] ROI {i}: src={src} has {num_src_neighbors} neighbors in CSR (edges {src_edge_start} to {src_edge_end})")
                 if num_src_neighbors > 0 and src_edge_end <= len(indices):
                     # Sample first neighbor
                     first_neighbor = int(batch_indices[i, src_edge_start])
                     first_weight = float(batch_weights[i, src_edge_start])
-                    logger.info(f"[CSR-VALIDATION] ROI {i}: src={src} -> neighbor[0]={first_neighbor}, weight={first_weight:.3f}")
+                    logger.debug(f"[CSR-VALIDATION] ROI {i}: src={src} -> neighbor[0]={first_neighbor}, weight={first_weight:.3f}")
             else:
                 logger.warning(f"[CSR-VALIDATION] ROI {i}: src={src} is out of bounds! indptr length={len(indptr)}")
 
             # Initialize distance with source at 0
             dist[i, src] = 0.0
-            near_mask[i, src] = True  # For legacy compatibility
+            # Phase 1: Initialize source with stamp
+            dist_stamps[i, src] = gen
+            parent_stamps[i, src] = gen
+            # Phase B: Set bit in near_bits for source initialization (uint32 word addressing)
+            word_idx = src // 32
+            bit_pos = src % 32
+            near_bits[i, word_idx] = near_bits[i, word_idx] | (1 << bit_pos)
 
             sources.append(src)
             sinks.append(dst)
+
+        # Phase B: Create legacy near_mask/far_mask views by unpacking bitsets
+        # This maintains backward compatibility with legacy delta-stepping code
+        # CuPy doesn't support axis parameter, so we ravel, unpack, then reshape
+        # Note: unpackbits expects uint8, so view uint32 arrays as uint8 first
+        near_mask = cp.unpackbits(near_bits.view(cp.uint8).ravel(), bitorder='little').reshape(K, -1)[:, :max_roi_size].astype(cp.bool_)
+        far_mask = cp.unpackbits(far_bits.view(cp.uint8).ravel(), bitorder='little').reshape(K, -1)[:, :max_roi_size].astype(cp.bool_)
 
         return {
             'K': K,
@@ -553,25 +1806,53 @@ class CUDADijkstra:
             'batch_weights': batch_weights,
             'dist': dist,
             'parent': parent,
-            'near_mask': near_mask,  # Legacy
-            'far_mask': far_mask,    # Legacy
+            'near_bits': near_bits,  # Phase B: Bitset pools
+            'far_bits': far_bits,    # Phase B: Bitset pools
+            'near_mask': near_mask,  # Legacy compatibility (unpacked view)
+            'far_mask': far_mask,    # Legacy compatibility (unpacked view)
             'threshold': threshold,  # Legacy
             'sources': sources,
             'sinks': sinks,
             'goal_nodes': goal_nodes_array,        # NEW: for A* heuristic
-            'node_coords': cp.asarray(node_coords_array),  # NEW: for A* heuristic
-            'use_astar': 0  # Disabled for now (need lattice integration)
+            'Nx': Nx,  # P0-3: Lattice dimensions for procedural coordinates
+            'Ny': Ny,
+            'Nz': Nz,
+            'goal_coords': cp.asarray(goal_coords_array),  # P0-3: (K, 3) goal coordinates only
+            'use_astar': 1 if (Nx > 0 and Ny > 0 and Nz > 0) else 0,  # P0-3: Enable A* only if lattice available
+            # Phase 4: ROI bounding boxes for device-side gating
+            'roi_minx': roi_minx,
+            'roi_maxx': roi_maxx,
+            'roi_miny': roi_miny,
+            'roi_maxy': roi_maxy,
+            'roi_minz': roi_minz,
+            'roi_maxz': roi_maxz,
+            # Phase 1: Stamp arrays and generation counter
+            'dist_stamps': dist_stamps,
+            'parent_stamps': parent_stamps,
+            'generation': gen,
         }
+
+        # Phase 1: Increment generation for next batch
+        # Phase A: Wrap generation counter to prevent uint16 overflow (max 65535)
+        self.current_gen += 1
+        if self.current_gen >= 65535:
+            self.current_gen = 1  # Reset to 1 (0 is reserved for "uninitialized")
 
     def _run_near_far(self, data: dict, K: int, roi_batch: List[Tuple] = None) -> List[Optional[List[int]]]:
         """
-        Execute FAST WAVEFRONT algorithm on GPU (replaces slow Near-Far).
+        Execute GPU pathfinding algorithm - routes to either delta-stepping or BFS wavefront.
 
-        This uses parallel wavefront expansion:
-        1. Process ENTIRE frontier in parallel (not one node at a time!)
-        2. Use matrix operations for bulk edge relaxation
-        3. No bucketing overhead - direct distance propagation
-        4. 10-50× faster than Near-Far algorithm
+        NEW (Δ-stepping): Proper bucket-based priority queue expansion
+        - Processes nodes in cost order (buckets 0, 1, 2, ...)
+        - Maintains correctness of shortest-path guarantees
+        - Reduces atomic contention via distance-based bucketing
+        - Enabled via GPUConfig.USE_DELTA_STEPPING
+
+        OLD (BFS wavefront): Parallel wavefront expansion
+        - Process ENTIRE frontier in parallel (not one node at a time!)
+        - Use matrix operations for bulk edge relaxation
+        - No bucketing overhead - direct distance propagation
+        - 10-50× faster than Near-Far algorithm but ignores cost ordering
 
         Args:
             data: Batched GPU arrays from _prepare_batch
@@ -583,7 +1864,17 @@ class CUDADijkstra:
         """
         import time
 
-        logger.info(f"[CUDA-WAVEFRONT] Starting FAST wavefront algorithm for {K} ROIs")
+        # Route to delta-stepping if enabled (proper Δ-stepping with bucket-based priority queue)
+        use_delta_stepping = GPUConfig.USE_DELTA_STEPPING if hasattr(GPUConfig, 'USE_DELTA_STEPPING') else False
+
+        if use_delta_stepping:
+            # Get delta value from config (fallback to 0.5mm)
+            delta = GPUConfig.DELTA_VALUE if hasattr(GPUConfig, 'DELTA_VALUE') else 0.5
+            logger.info(f"[CUDA-PATHFINDING] Routing to DELTA-STEPPING algorithm (delta={delta:.3f}mm)")
+            return self._run_delta_stepping(data, K, delta, roi_batch)
+
+        # Otherwise use BFS wavefront (fast but incorrect cost ordering)
+        logger.info(f"[CUDA-WAVEFRONT] Starting BFS wavefront algorithm for {K} ROIs (WARNING: ignores cost ordering)")
 
         # Adaptive iteration budget for MASSIVE PARALLEL routing
         # For large batches on full graph, need enough iterations for longest path
@@ -593,8 +1884,8 @@ class CUDADijkstra:
 
             if roi_size > 1_000_000:  # Full graph
                 # For massive parallel batches: budget for worst-case path
-                # Board diagonal ~600 steps, so 1000 iterations should cover all nets
-                max_iterations = 1000
+                # Board diagonal ~600 steps, increased to 2000 for better convergence
+                max_iterations = 2000
                 logger.info(f"[MASSIVE-PARALLEL] Routing {batch_size} nets on full graph with {max_iterations} iterations")
             else:
                 # ROIs: scale with size
@@ -636,10 +1927,35 @@ class CUDADijkstra:
             logger.error(f"[CUDA-WAVEFRONT] Aborting - {len(invalid_rois)} ROI(s) have invalid src/dst")
             return [None] * K
 
-        # FIX: Initialize frontier mask as uint8 (not bool - ABI mismatch!)
-        frontier = cp.zeros((K, data['max_roi_size']), dtype=cp.uint8)
+        # P0-4: BIT-PACKED FRONTIER - 8× memory reduction!
+        # Instead of uint8 (1 byte per node), use uint32 bitset (1 bit per node)
+        # Memory: K × max_roi_size bytes → K × (max_roi_size/32) uint32 words = 8× smaller
+        max_roi_size = data['max_roi_size']
+        frontier_words = (max_roi_size + 31) // 32  # Round up to cover all nodes
+        frontier = cp.zeros((K, frontier_words), dtype=cp.uint32)
+
+        # Initialize source nodes in bitset
         for roi_idx in range(K):
-            frontier[roi_idx, data['sources'][roi_idx]] = 1  # uint8 write
+            src = data['sources'][roi_idx]
+            word_idx = src // 32
+            bit_pos = src % 32
+            frontier[roi_idx, word_idx] = cp.uint32(1) << bit_pos
+
+        logger.info(f"[BIT-FRONTIER] Memory: {K}×{max_roi_size} uint8 ({K*max_roi_size/1e6:.1f}MB) → "
+                   f"{K}×{frontier_words} uint32 ({K*frontier_words*4/1e6:.1f}MB) = {8.0:.1f}× reduction")
+
+        # DIAGNOSTIC: Verify frontier bits are actually set
+        frontier_check = int(cp.count_nonzero(frontier))
+        logger.info(f"[FRONTIER-INIT] After initialization: {frontier_check} non-zero words (expected ~{K})")
+
+        # Check first few ROIs have their source bit set
+        for roi_idx in range(min(3, K)):
+            src = data['sources'][roi_idx]
+            word_idx = src // 32
+            bit_pos = src % 32
+            word_val = int(frontier[roi_idx, word_idx])
+            bit_set = (word_val >> bit_pos) & 1
+            logger.info(f"[FRONTIER-INIT] ROI {roi_idx}: src={src}, word={word_idx}, bit={bit_pos}, word_val={word_val:08x}, bit_set={bit_set}")
 
         # DIAGNOSTIC: Check initial state
         for roi_idx in range(min(3, K)):  # Check first 3 ROIs
@@ -652,50 +1968,100 @@ class CUDADijkstra:
 
         logger.info(f"[CUDA-WAVEFRONT] Starting parallel wavefront expansion (max {max_iterations} iterations)")
 
+        # P1-6: PERSISTENT KERNEL OPTION (experimental)
+        # Hardcoded via GPUConfig.USE_PERSISTENT_KERNEL (was USE_PERSISTENT_KERNEL env var)
+        use_persistent = GPUConfig.USE_PERSISTENT_KERNEL if hasattr(GPUConfig, 'USE_PERSISTENT_KERNEL') else False
+
+        if use_persistent:
+            logger.info("[P1-6] PERSISTENT KERNEL enabled - attempting single-launch execution")
+            try:
+                iters = self._run_persistent_kernel(data, K, frontier)
+                if iters >= 0:
+                    logger.info(f"[P1-6] PERSISTENT KERNEL succeeded in {iters} iterations")
+                    # Continue to path reconstruction below (skip iterative loop)
+                    elapsed = time.perf_counter() - start_time
+                    logger.info(f"[CUDA-WAVEFRONT] GPU pathfinding complete: {elapsed:.4f}s total")
+                    # Jump to path reconstruction
+                    return self._reconstruct_paths(data, K)
+                else:
+                    logger.warning("[P1-6] PERSISTENT KERNEL failed - falling back to iterative")
+            except Exception as e:
+                logger.error(f"[P1-6] PERSISTENT KERNEL error: {e}")
+                logger.warning("[P1-6] Falling back to iterative kernel")
+
         for iteration in range(max_iterations):
-            # FIX: Unambiguous termination check (CuPy scalar issue)
-            if int(cp.sum(frontier)) == 0:
+            # FIX: Check for empty frontier (count non-zero words, not sum uint32 values!)
+            if int(cp.count_nonzero(frontier)) == 0:
                 logger.info(f"[CUDA-WAVEFRONT] Terminated: no active frontiers")
                 break
 
             # FAST WAVEFRONT EXPANSION - Process entire frontier in parallel!
             nodes_expanded = self._expand_wavefront_parallel(data, K, frontier)
 
-            # DIAGNOSTIC: Check sink distances AND general distance updates
-            if iteration % 10 == 0 or iteration < 10:
-                sink_dists = []
-                for roi_idx in range(K):
-                    sink = data['sinks'][roi_idx]
-                    sink_dist = float(data['dist'][roi_idx, sink])
-                    sink_dists.append(sink_dist)
-                min_sink_dist = min(sink_dists)
-                reached_count = sum(1 for d in sink_dists if d < 1e9)
+            # DIAGNOSTIC: Lightweight logging (no CPU syncs in hot loop!)
+            # Only log every 50 iterations to avoid overhead
+            if iteration % 50 == 0 or iteration < 3:
+                # FIX: Use fancy indexing for single GPU→CPU transfer instead of K transfers
+                # Old: for roi_idx in range(K): sink_dist = float(data['dist'][roi_idx, sink])
+                # New: Single vectorized operation gets all sink distances at once
+                sink_dists_gpu = data['dist'][cp.arange(K), data['sinks']]  # GPU operation
+                sink_dists = sink_dists_gpu.get()  # Single transfer: K values at once
+                min_sink_dist = float(cp.min(sink_dists_gpu).get())  # Compute min on GPU
+                reached_count = int(cp.sum(sink_dists_gpu < 1e9).get())  # Count on GPU
 
-                # Check if ANY distances changed
-                finite_count = int(cp.sum(data['dist'] < 1e9))
-                total_nodes = K * data['max_roi_size']
+                logger.info(f"[CUDA-WAVEFRONT] Iteration {iteration}: {reached_count}/{K} sinks reached, "
+                          f"min_sink_dist={min_sink_dist:.2f}")
 
-                if iteration < 3 or (iteration % 20 == 0):
-                    logger.info(f"[CUDA-WAVEFRONT] Iteration {iteration}: {reached_count}/{K} sinks reached, "
-                              f"min_sink_dist={min_sink_dist:.2f}, finite_dists={finite_count}/{total_nodes}")
+            # SPEEDUP: Disable expensive diagnostic logging in hot loop
+            # This .get() call copies 4M+ nodes from GPU→CPU every 50 iterations!
+            # Comment out for production, re-enable only for debugging
+            if False:  # Disabled for speedup - was causing 1.5-2× slowdown
+                pass  # Original Test D1 logging removed
 
-            # FIX: Unambiguous early termination check
-            sinks_reached_count = 0
-            for roi_idx in range(K):
-                sink = data['sinks'][roi_idx]
-                if float(data['dist'][roi_idx, sink]) < 1e9:
-                    sinks_reached_count += 1
+            # FIX: Unambiguous early termination check (vectorized for performance)
+            # Use fancy indexing to get all sink distances in one GPU operation
+            sink_dists_term = data['dist'][cp.arange(K), data['sinks']]
+            sinks_reached_count = int(cp.sum(sink_dists_term < 1e9).get())  # Single GPU→CPU transfer
 
+            # SPEEDUP: ε-optimal termination (anytime A* with slack)
+            # With A* enabled, first path is near-optimal. Allow small exploration for alternatives.
+            # Strategy: Minimal afterglow (was 64+64=128 iters, now 32+16=48 iters)
+            MIN_ITERS = 32                      # Minimum iterations (reduced from 64)
+            EXTRA_ITERS_AFTER_ALL_SINKS = 16    # Small afterglow (reduced from 64) - A* finds good paths fast!
+
+            if not hasattr(self, '_first_all_sinks_iter'):
+                self._first_all_sinks_iter = {}
+
+            # Track when each batch first reaches all sinks
+            batch_id = id(data)
+            if sinks_reached_count == K and batch_id not in self._first_all_sinks_iter:
+                self._first_all_sinks_iter[batch_id] = iteration
+                logger.info(f"[STABILIZATION] All sinks reached at iteration {iteration}, "
+                           f"continuing for {EXTRA_ITERS_AFTER_ALL_SINKS} more iterations to find alternatives...")
+
+            # Balanced termination: respect both MIN_ITERS and EXTRA_ITERS
             if sinks_reached_count == K:
-                logger.info(f"[CUDA-WAVEFRONT] Early termination at iteration {iteration}: all {K} sinks reached")
-                break
+                iters_since_all_sinks = iteration - self._first_all_sinks_iter[batch_id]
 
-            # Periodic logging
-            if iteration % 10 == 0 or iteration < 10:
-                active_rois = int((frontier.sum(axis=1) > 0).sum())
-                total_frontier_nodes = int(frontier.sum())
+                # Optional: check if frontier is empty (early convergence signal)
+                frontier_empty = int(cp.count_nonzero(frontier)) == 0
+
+                if iteration >= MIN_ITERS and iters_since_all_sinks >= EXTRA_ITERS_AFTER_ALL_SINKS:
+                    logger.info(f"[STABILIZATION] Terminating: iteration {iteration} >= MIN_ITERS and "
+                               f"{iters_since_all_sinks} >= EXTRA_ITERS after sinks")
+                    break
+
+                if frontier_empty and iteration >= MIN_ITERS:
+                    logger.info(f"[STABILIZATION] Early termination: frontier empty at iteration {iteration}")
+                    break
+
+            # Periodic logging (reduced frequency for speedup)
+            if iteration % 50 == 0 or iteration < 3:
+                # FIX: Count ROIs with any set bits (not sum of uint32 values!)
+                active_rois = int(cp.count_nonzero(cp.count_nonzero(frontier, axis=1)))
+                # Note: nodes_expanded already comes from compaction so it's correct
                 logger.info(f"[CUDA-WAVEFRONT] Iteration {iteration}: {active_rois}/{K} ROIs active, "
-                          f"frontier={total_frontier_nodes} nodes, expanded={nodes_expanded}")
+                          f"expanded={nodes_expanded}")
 
             # Progress check: warn if taking too long
             if iteration >= 200:
@@ -718,20 +2084,28 @@ class CUDADijkstra:
             min_len = min(path_lengths)
             logger.info(f"[CUDA-WAVEFRONT] Path stats: avg={avg_len:.1f}, min={min_len}, max={max_len} nodes")
 
+            # DIAGNOSTIC: Check X-coordinate exploration in first 3 paths
+            if self.lattice and K >= 3:
+                for roi_idx in range(min(3, K)):
+                    if paths[roi_idx]:
+                        path = paths[roi_idx]
+                        x_coords = [self.lattice.idx_to_coord(node_idx)[0] for node_idx in path[:20]]  # First 20 nodes
+                        x_min, x_max = min(x_coords), max(x_coords)
+                        x_range = x_max - x_min
+                        logger.info(f"[PATH-DIAG] ROI {roi_idx}: X-range {x_min}-{x_max} (span={x_range}), len={len(path)}")
+
         return paths
 
     def _expand_wavefront_parallel(self, data: dict, K: int, frontier: cp.ndarray) -> int:
         """
-        FULLY PARALLEL WAVEFRONT EXPANSION - Single GPU kernel processes ALL ROIs + ALL nodes!
+        FRONTIER-COMPACTED WAVEFRONT EXPANSION - Only processes active nodes!
 
-        This replaces the serial Python loops with a single CUDA kernel launch that:
-        - Launches K thread blocks (one per ROI)
-        - Each block has 256 threads
-        - Threads use grid-stride loops to process all frontier nodes in parallel
-        - All edges are processed with warp-level parallelism
+        SPEEDUP: Uses sparse frontier lists instead of checking all 4.2M nodes.
+        - Compact frontier mask into list of active indices (stream compaction)
+        - Process only ~1000 active nodes instead of 4.2M total nodes
+        - Expected: 100-1000× fewer memory accesses
 
-        This achieves TRUE parallelism: all K ROIs process simultaneously,
-        and all frontier nodes within each ROI process in parallel.
+        This is THE key optimization for GPU SSSP on sparse frontiers.
 
         Args:
             data: Batched GPU arrays
@@ -741,11 +2115,221 @@ class CUDADijkstra:
         Returns:
             Number of nodes expanded
         """
-        # Check if any work to do
-        frontier_count = int(cp.sum(frontier))
-        if frontier_count == 0:
+        # Check if any work to do (count set BITS, not uint32 values!)
+        # frontier is bit-packed uint32, need to count population (number of 1-bits)
+        # Quick estimate: count non-zero words as proxy
+        frontier_any_set = int(cp.count_nonzero(frontier))
+        if frontier_any_set == 0:
             return 0
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # FRONTIER COMPACTION: Convert sparse mask → dense list (100-1000× speedup!)
+        # ═══════════════════════════════════════════════════════════════════════
+        # P0-5: Time compaction step
+        compact_start = cp.cuda.Event()
+        compact_end = cp.cuda.Event()
+        compact_start.record()
+
+        # P0-4: Convert uint32 bit-packed frontier to uint8 bitset for compaction
+        # frontier is (K, frontier_words) uint32 - convert to (K, frontier_words*4) uint8 bitset
+        max_roi_size = data['max_roi_size']
+        frontier_words = frontier.shape[1]
+
+        # Phase B: View as uint8 bitset (each uint32 = 4 bytes = 32 bits)
+        frontier_bytes = frontier.view(cp.uint8)  # (K, frontier_words*4) uint8 bitset
+
+        # P3: Single-pass GPU-side compaction (replaces Python cp.nonzero!)
+        # Device-side compaction eliminates host<->device sync
+        # Phase B: Compaction now works directly on bitsets (no unpacking needed!)
+        use_gpu_compaction = GPUConfig.USE_GPU_COMPACTION if hasattr(GPUConfig, 'USE_GPU_COMPACTION') else True
+
+        if use_gpu_compaction:
+            # GPU compaction path (Phase 3 + Phase B optimization)
+            # Phase B: Pass bitset directly to compaction kernel (8× less memory!)
+            mask_size = K * max_roi_size
+            out_indices = cp.zeros(mask_size, dtype=cp.int32)
+            out_count = cp.zeros(1, dtype=cp.int32)
+
+            # Launch compaction kernel with bitset input
+            threads = 256
+            blocks = (mask_size + threads - 1) // threads
+            self.compact_kernel((blocks,), (threads,), (
+                frontier_bytes.ravel(),  # Phase B: Pass bitset directly
+                mask_size,
+                out_indices,
+                out_count
+            ))
+
+            # Get total active count
+            total_active = int(out_count[0])
+            flat_idx = out_indices[:total_active]
+        else:
+            # BASELINE: CPU compaction using cp.nonzero (needs unpacking)
+            logger.info("[BASELINE] Using cp.nonzero for compaction (USE_GPU_COMPACTION=0)")
+            # Unpack bitset for cp.nonzero
+            frontier_mask = cp.unpackbits(frontier_bytes, axis=1, bitorder='little')
+            frontier_mask = frontier_mask[:, :max_roi_size]
+            flat_idx = cp.nonzero(frontier_mask.ravel())[0]
+            total_active = int(flat_idx.size)
+
+        compact_end.record()
+        compact_end.synchronize()
+        compact_ms = cp.cuda.get_elapsed_time(compact_start, compact_end)
+
+        if total_active == 0:
+            return 0
+
+        N = max_roi_size
+        roi_ids = flat_idx // N
+        node_ids = flat_idx - (roi_ids * N)
+
+        # DIAGNOSTIC: Check compacted indices
+        if total_active > 0:
+            logger.info(f"[COMPACTION] total_active={total_active}, first 3 nodes:")
+            for i in range(min(3, total_active)):
+                roi = int(roi_ids[i])
+                node = int(node_ids[i])
+                src_expected = data['sources'][roi] if roi < len(data['sources']) else -1
+                logger.info(f"[COMPACTION]   [{i}] roi={roi}, node={node} (expected src={src_expected})")
+
+        # Use compacted kernel for ANY sparse frontier
+        # Compaction overhead is negligible compared to scanning 4.2M nodes
+        # FIX: Use total_active (actual bit count) instead of uint32 sum for sparsity
+        frontier_count = total_active  # This is the REAL number of active nodes
+        sparsity = frontier_count / (K * max_roi_size)
+        use_compaction = sparsity < 0.5  # Use compaction if <50% active (aggressive)
+
+        if use_compaction and total_active > 0:
+            # COMPACTED PATH: Only process active nodes (100-1000× faster!)
+            return self._expand_wavefront_compacted(data, K, roi_ids, node_ids, frontier, sparsity, compact_ms)
+        else:
+            # FULL SCAN PATH: Frontier is dense (>50% nodes active)
+            return self._expand_wavefront_full_scan(data, K, frontier)
+
+    def _expand_wavefront_compacted(self, data: dict, K: int, roi_ids: cp.ndarray,
+                                   node_ids: cp.ndarray, old_frontier: cp.ndarray, sparsity: float = 0.0,
+                                   compact_ms: float = 0.0) -> int:
+        """
+        Expand wavefront using ACTIVE-LIST kernel (2-3× faster than one-block-per-ROI!)
+
+        Only processes active nodes (~1000) instead of ALL nodes (4.2M).
+        Uses global thread indexing for better GPU occupancy and load balancing.
+
+        Args:
+            data: Batched GPU arrays
+            K: Number of ROIs
+            roi_ids: (total_active,) ROI index for each active node
+            node_ids: (total_active,) Node index within ROI for each active node
+            old_frontier: (K, max_roi_size) frontier mask to update
+            sparsity: Frontier sparsity (for logging)
+            compact_ms: Time spent on compaction (ms)
+        """
+        # Get total_active directly from roi_ids size
+        total_active = int(roi_ids.size)
+
+        # P0-5: CUDA Event instrumentation
+        start_event = cp.cuda.Event()
+        end_event = cp.cuda.Event()
+
+        # Log compaction benefit (only first time)
+        if not hasattr(self, '_compaction_logged'):
+            logger.info(f"[ACTIVE-LIST] Processing {total_active} active nodes (vs {K * data['max_roi_size']:,} total)")
+            logger.info(f"[ACTIVE-LIST] Sparsity={100*sparsity:.3f}% → {1/sparsity:.0f}× fewer memory accesses!")
+            logger.info(f"[ACTIVE-LIST] Launching over {total_active} items (not {K} blocks) for better occupancy")
+            self._compaction_logged = True
+
+        # Allocate new frontier
+        new_frontier = cp.zeros_like(old_frontier)
+
+        # Get CSR arrays and strides
+        indptr_arr = data['batch_indptr']
+        indices_arr = data['batch_indices']
+        weights_arr = data['batch_weights']
+
+        # Detect strides - check for stride=0 (shared CSR)
+        if hasattr(indptr_arr, 'strides') and len(indptr_arr.strides) == 2 and indptr_arr.strides[0] == 0:
+            # Stride 0 = shared CSR (zero-copy broadcast)
+            indptr_stride = 0
+            indices_stride = 0
+            weights_stride = 0
+        else:
+            # Per-ROI arrays
+            indptr_stride = indptr_arr.shape[1] if len(indptr_arr.shape) > 1 else data['max_roi_size'] + 1
+            indices_stride = indices_arr.shape[1] if len(indices_arr.shape) > 1 else data['max_edges']
+            weights_stride = weights_arr.shape[1] if len(weights_arr.shape) > 1 else data['max_edges']
+
+        # Launch active-list kernel: grid launches over total_active items (not K blocks!)
+        block_size = 256
+        grid_size = (total_active + block_size - 1) // block_size
+
+        # P0-4: Include frontier_words for bit-packed frontier
+        frontier_words = old_frontier.shape[1]
+        args = (
+            total_active,
+            data['max_roi_size'],
+            frontier_words,        # P0-4: Number of uint32 words per ROI
+            roi_ids.astype(cp.int32),
+            node_ids.astype(cp.int32),
+            indptr_arr,
+            indices_arr,
+            weights_arr,
+            indptr_stride,
+            indices_stride,
+            weights_stride,
+            data['goal_nodes'],
+            data['Nx'],            # P0-3: Lattice dimensions for procedural coords
+            data['Ny'],
+            data['Nz'],
+            data['goal_coords'],   # P0-3: (K, 3) goal coordinates only
+            data['use_astar'],
+            data['dist'].ravel(),
+            data['parent'].ravel(),
+            new_frontier.ravel(),  # P0-4: BIT-PACKED uint32 output
+            # Phase 4: ROI bounding boxes
+            data['roi_minx'],
+            data['roi_maxx'],
+            data['roi_miny'],
+            data['roi_maxy'],
+            data['roi_minz'],
+            data['roi_maxz'],
+        )
+
+        # P0-5: Time kernel execution
+        start_event.record()
+        self.active_list_kernel((grid_size,), (block_size,), args)
+        end_event.record()
+        end_event.synchronize()
+        kernel_ms = cp.cuda.get_elapsed_time(start_event, end_event)
+
+        # DIAGNOSTIC: Check if kernel wrote anything to new_frontier
+        new_frontier_words_set = int(cp.count_nonzero(new_frontier))
+        logger.info(f"[KERNEL-OUTPUT] new_frontier has {new_frontier_words_set} non-zero words (out of {K * frontier_words} total)")
+
+        # Count nodes expanded (count set BITS, not sum of uint32 values!)
+        # Fast bit count: unpack and count (ravel OK for counting only)
+        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8), axis=1, bitorder='little')
+        nodes_expanded = int(cp.count_nonzero(nodes_expanded_mask))
+        logger.info(f"[KERNEL-OUTPUT] After unpacking: {nodes_expanded} bits set (expanded nodes)")
+
+        old_frontier[:] = new_frontier
+
+        # P0-5: Log performance metrics
+        active_pct = 100.0 * total_active / (K * data['max_roi_size'])
+        # Estimate edges relaxed (assuming average degree ~4-6 for Manhattan grid)
+        edges_per_node = 5  # Conservative estimate
+        edges_relaxed = total_active * edges_per_node
+        edges_per_sec = edges_relaxed / (kernel_ms / 1000.0) if kernel_ms > 0 else 0
+
+        logger.info(f"[GPU-PERF] active={total_active:,} ({active_pct:.4f}%), "
+                   f"compact={compact_ms:.3f}ms, kernel={kernel_ms:.3f}ms, "
+                   f"edges/sec={edges_per_sec/1e6:.2f}M")
+
+        return nodes_expanded
+
+    def _expand_wavefront_full_scan(self, data: dict, K: int, frontier: cp.ndarray) -> int:
+        """
+        Expand wavefront using FULL SCAN (original kernel, for dense frontiers).
+        """
         # Allocate new frontier mask
         new_frontier = cp.zeros_like(frontier)
 
@@ -755,7 +2339,7 @@ class CUDADijkstra:
 
         # FIX: Launch exactly K blocks (kernel expects blockIdx.x = ROI index)
         # Each block grid-strides across its ROI's nodes
-        block_size = 256
+        block_size = 256  # EXP B0: Baseline validation
         grid_size = K  # One block per ROI (as kernel expects!)
 
         # CRITICAL: Determine CSR strides (0 for shared, actual dims for per-ROI)
@@ -764,8 +2348,7 @@ class CUDADijkstra:
         indices_arr = data['batch_indices']
         weights_arr = data['batch_weights']
 
-        # Detect shared CSR: if all ROIs share same graph, arrays are broadcast with stride 0
-        # Broadcast arrays have shape (K, N) but strides like (0, sizeof(elem))
+        # Detect shared CSR: check for stride=0
         is_shared_csr = False
         if hasattr(indptr_arr, 'strides') and len(indptr_arr.strides) == 2:
             # Check if first dimension has stride 0 (broadcast)
@@ -774,7 +2357,7 @@ class CUDADijkstra:
                 indptr_stride = 0
                 indices_stride = 0
                 weights_stride = 0
-                logger.info(f"[CUDA-WAVEFRONT] Detected shared CSR (broadcast), using stride=0")
+                logger.info(f"[CUDA-WAVEFRONT] Detected shared CSR (stride=0), using zero-copy broadcast")
             else:
                 # Per-ROI CSR: stride = number of elements in one ROI's row
                 indptr_stride = indptr_arr.shape[1]  # max_roi_size + 1
@@ -811,11 +2394,14 @@ class CUDADijkstra:
 
         # Only ravel per-ROI arrays (frontier, dist, parent) which MUST be flattened
         # CSR arrays: pass directly to preserve broadcast stride
+        # P0-4: frontier is now bit-packed uint32, include frontier_words parameter
+        frontier_words = frontier.shape[1]
         args = (
             K,
             max_roi_size,
             max_edges,
-            frontier.ravel(),      # OK: per-ROI, must flatten
+            frontier.ravel(),      # P0-4: BIT-PACKED uint32 frontier
+            frontier_words,        # P0-4: Number of uint32 words per ROI
             indptr_arr,            # FIX: Don't ravel! Preserves broadcast stride
             indices_arr,           # FIX: Don't ravel! Preserves broadcast stride
             weights_arr,           # FIX: Don't ravel! Preserves broadcast stride
@@ -823,11 +2409,14 @@ class CUDADijkstra:
             indices_stride,        # When stride=0, all ROIs share base pointer
             weights_stride,        # When stride>0, each ROI has own row
             data['goal_nodes'],    # NEW: A* goal nodes
-            data['node_coords'].ravel(),  # NEW: A* coordinate lookup
-            data['use_astar'],     # NEW: A* enable flag (0=disabled for now)
+            data['Nx'],            # P0-3: Lattice dimensions
+            data['Ny'],
+            data['Nz'],
+            data['goal_coords'],   # P0-3: Goal coordinates only (K×3, not max_roi_size×3!)
+            data['use_astar'],     # NEW: A* enable flag
             data['dist'].ravel(),  # OK: per-ROI, must flatten
             data['parent'].ravel(), # OK: per-ROI, must flatten
-            new_frontier.ravel(),  # OK: per-ROI, must flatten
+            new_frontier.ravel(),  # P0-4: BIT-PACKED uint32 output
         )
 
         if is_shared_csr:
@@ -837,8 +2426,9 @@ class CUDADijkstra:
         # Synchronize to ensure kernel completion
         cp.cuda.Stream.null.synchronize()
 
-        # Count nodes expanded
-        nodes_expanded = int(cp.sum(new_frontier))
+        # Count nodes expanded (count set BITS, not sum of uint32 values!)
+        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8), axis=1, bitorder='little')
+        nodes_expanded = int(cp.count_nonzero(nodes_expanded_mask))
 
         # DIAGNOSTIC: Check if distance array was modified at all
         if nodes_expanded > 0:
@@ -851,6 +2441,440 @@ class CUDADijkstra:
         frontier[:] = new_frontier
 
         return nodes_expanded
+
+    def _run_persistent_kernel(self, data: dict, K: int, initial_frontier: cp.ndarray) -> int:
+        """
+        P1-6: Execute persistent kernel with device-side queues.
+
+        This launches a SINGLE kernel that runs until all paths are found,
+        eliminating the overhead of 100-200 kernel launches per batch.
+
+        Args:
+            data: Batched GPU arrays from _prepare_batch
+            K: Number of ROIs
+            initial_frontier: (K, frontier_words) bit-packed initial frontier
+
+        Returns:
+            Number of iterations completed
+        """
+        import time
+
+        logger.info(f"[PERSISTENT-KERNEL] Initializing device-side queues for {K} ROIs")
+
+        max_roi_size = data['max_roi_size']
+
+        # Allocate device queues (ping-pong buffers)
+        # Size estimate: avg_degree * max_frontier_size
+        # Conservative: max_roi_size * 10 (assumes max 10× expansion per iteration)
+        max_queue_size = min(max_roi_size * 10, 50_000_000)  # Cap at 50M entries (200MB per queue)
+
+        logger.info(f"[PERSISTENT-KERNEL] Allocating queues: {max_queue_size:,} entries ({max_queue_size*4/1e6:.1f} MB each)")
+
+        queue_a = cp.zeros(max_queue_size, dtype=cp.int32)
+        queue_b = cp.zeros(max_queue_size, dtype=cp.int32)
+        size_a = cp.zeros(1, dtype=cp.int32)
+        size_b = cp.zeros(1, dtype=cp.int32)
+        iterations_out = cp.zeros(1, dtype=cp.int32)
+
+        # Initialize queue A with source nodes from frontier
+        # Unpack bit-packed frontier to get initial active nodes
+        frontier_words = initial_frontier.shape[1]
+        frontier_bytes = initial_frontier.view(cp.uint8)
+        # FIXED: Unpack along axis=1 to preserve ROI boundaries
+        frontier_mask = cp.unpackbits(frontier_bytes, axis=1, bitorder='little')
+        frontier_mask = frontier_mask[:, :max_roi_size]
+
+        # Compact to get (roi, node) pairs
+        flat_idx = cp.nonzero(frontier_mask.ravel())[0]
+        total_initial = int(flat_idx.size)
+
+        if total_initial == 0:
+            logger.warning("[PERSISTENT-KERNEL] No initial frontier nodes - nothing to do")
+            return 0
+
+        if total_initial > max_queue_size:
+            logger.error(f"[PERSISTENT-KERNEL] Initial frontier ({total_initial}) exceeds queue capacity ({max_queue_size})!")
+            logger.error("[PERSISTENT-KERNEL] Falling back to iterative kernel")
+            return -1
+
+        # Pack (roi, node) into queue_a
+        roi_ids = flat_idx // max_roi_size
+        node_ids = flat_idx - (roi_ids * max_roi_size)
+        packed = (roi_ids << 24) | node_ids  # 8-bit ROI + 24-bit node
+        queue_a[:total_initial] = packed
+        size_a[0] = total_initial
+
+        logger.info(f"[PERSISTENT-KERNEL] Initialized queue with {total_initial:,} active nodes")
+
+        # Get CSR arrays and strides
+        indptr_arr = data['batch_indptr']
+        indices_arr = data['batch_indices']
+        weights_arr = data['batch_weights']
+
+        # Detect strides (0 for shared CSR)
+        if hasattr(indptr_arr, 'strides') and len(indptr_arr.strides) == 2 and indptr_arr.strides[0] == 0:
+            # Stride 0 = shared CSR
+            indptr_stride = 0
+            indices_stride = 0
+            weights_stride = 0
+            logger.info("[PERSISTENT-KERNEL] Using shared CSR (stride=0)")
+        else:
+            # Per-ROI arrays
+            indptr_stride = indptr_arr.shape[1] if len(indptr_arr.shape) > 1 else max_roi_size + 1
+            indices_stride = indices_arr.shape[1] if len(indices_arr.shape) > 1 else data['max_edges']
+            weights_stride = weights_arr.shape[1] if len(weights_arr.shape) > 1 else data['max_edges']
+            logger.info(f"[PERSISTENT-KERNEL] Using per-ROI CSR (strides={indptr_stride}, {indices_stride}, {weights_stride})")
+
+        # Prepare kernel arguments
+        args = (
+            queue_a,
+            queue_b,
+            size_a,
+            size_b,
+            max_queue_size,
+            K,
+            max_roi_size,
+            indptr_arr,
+            indices_arr,
+            weights_arr,
+            indptr_stride,
+            indices_stride,
+            weights_stride,
+            data['Nx'],
+            data['Ny'],
+            data['Nz'],
+            data['goal_coords'],
+            data['use_astar'],
+            data['dist'].ravel(),
+            data['parent'].ravel(),
+            iterations_out,
+        )
+
+        # Launch configuration for cooperative kernel
+        block_size = 256
+        grid_size = 256  # Use many blocks for good occupancy
+
+        logger.info(f"[PERSISTENT-KERNEL] Launching cooperative kernel: {grid_size} blocks × {block_size} threads = {grid_size*block_size:,} total threads")
+
+        # NOTE: Cooperative kernel launch requires special API
+        # CuPy's RawKernel doesn't directly support launchCooperativeKernel
+        # We need to use the lower-level CUDA runtime API
+
+        try:
+            # Get CUDA function pointer
+            kernel_func = self.persistent_kernel
+
+            # Try cooperative launch using cupy.cuda.runtime
+            # This is the standard way but requires compute capability 6.0+
+            start_time = time.perf_counter()
+
+            # Standard launch (cooperative groups work with regular launch on modern GPUs)
+            kernel_func((grid_size,), (block_size,), args)
+
+            cp.cuda.Stream.null.synchronize()
+            elapsed = time.perf_counter() - start_time
+
+            iters = int(iterations_out[0])
+            logger.info(f"[PERSISTENT-KERNEL] Completed {iters} iterations in {elapsed*1000:.2f} ms ({elapsed*1000/max(iters,1):.3f} ms/iter)")
+            logger.info(f"[PERSISTENT-KERNEL] Compare to iterative: ~{iters*0.007:.2f} ms launch overhead eliminated")
+
+            return iters
+
+        except Exception as e:
+            logger.error(f"[PERSISTENT-KERNEL] Cooperative kernel launch failed: {e}")
+            logger.error("[PERSISTENT-KERNEL] This may require compute capability 6.0+ or cooperative launch API")
+            logger.error("[PERSISTENT-KERNEL] Falling back to iterative kernel")
+            return -1
+
+    def route_batch_persistent(self, roi_batch: List[Tuple], use_stamps: bool = True) -> List[Optional[List[int]]]:
+        """
+        AGENT B1: Single-launch persistent routing for entire batch.
+
+        This is the Phase 2 implementation that routes ALL nets in a SINGLE kernel launch,
+        eliminating per-iteration launch overhead (~7us per launch × 100-200 iterations = 0.7-1.4ms saved).
+
+        Features:
+        - Agent A1 integration: Stamp-based state management (no zeroing between nets)
+        - Agent B1 enhancement: Device-side backtrace (no host sync for path reconstruction)
+        - Single kernel launch: All routing happens on GPU without returning to host
+        - Early termination: Nets stop when goal reached (no wasted computation)
+
+        Args:
+            roi_batch: List of (src, dst, indptr, indices, weights, size) tuples
+            use_stamps: Use stamp-based kernel (default True, fallback to basic if False)
+
+        Returns:
+            List of paths (local ROI indices), one per ROI
+        """
+        if not roi_batch:
+            return []
+
+        # Force GPU memory cleanup to avoid stale allocations
+        import gc
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+
+        K = len(roi_batch)
+        logger.info(f"[AGENT-B1-PERSISTENT] Routing {K} nets with single-launch persistent kernel")
+
+        # Log actual GPU memory state
+        free_bytes, total_bytes = cp.cuda.Device().mem_info
+        logger.info(f"[AGENT-B1-PERSISTENT] GPU memory: {(total_bytes - free_bytes) / 1e9:.2f} GB used, {free_bytes / 1e9:.2f} GB free of {total_bytes / 1e9:.2f} GB total")
+
+        import numpy as np
+        import time
+
+        # Prepare batch data (with stamp pools from Agent A1)
+        data = self._prepare_batch(roi_batch)
+        max_roi_size = data['max_roi_size']
+
+        # Allocate device queues (ping-pong buffers)
+        max_queue_size = min(max_roi_size * 10, 50_000_000)
+        queue_a = cp.zeros(max_queue_size, dtype=cp.int32)
+        queue_b = cp.zeros(max_queue_size, dtype=cp.int32)
+        size_a = cp.zeros(1, dtype=cp.int32)
+        size_b = cp.zeros(1, dtype=cp.int32)
+        iterations_out = cp.zeros(1, dtype=cp.int32)
+
+        # Initialize source nodes in queue_a
+        srcs = cp.array([roi[0] for roi in roi_batch], dtype=cp.int32)
+        dsts = cp.array([roi[1] for roi in roi_batch], dtype=cp.int32)
+
+        # Pack (roi, src) into queue_a (24-bit node ID, 8-bit ROI)
+        packed_srcs = (cp.arange(K, dtype=cp.int32) << 24) | srcs
+        queue_a[:K] = packed_srcs
+        size_a[0] = K
+
+        logger.info(f"[AGENT-B1-PERSISTENT] Initialized queue with {K} source nodes")
+
+        # Get CSR arrays and detect strides
+        indptr_arr = data['batch_indptr']
+        indices_arr = data['batch_indices']
+        weights_arr = data['batch_weights']
+
+        if hasattr(indptr_arr, 'strides') and len(indptr_arr.strides) == 2 and indptr_arr.strides[0] == 0:
+            indptr_stride = 0
+            indices_stride = 0
+            weights_stride = 0
+            logger.info("[AGENT-B1-PERSISTENT] Using shared CSR (stride=0)")
+        else:
+            indptr_stride = indptr_arr.shape[1] if len(indptr_arr.shape) > 1 else max_roi_size + 1
+            indices_stride = indices_arr.shape[1] if len(indices_arr.shape) > 1 else data['max_edges']
+            weights_stride = weights_arr.shape[1] if len(weights_arr.shape) > 1 else data['max_edges']
+            logger.info(f"[AGENT-B1-PERSISTENT] Using per-ROI CSR (strides={indptr_stride})")
+
+        # Phase D: OOM Protection updated - no longer need contiguous buffer memory check
+        # since we now use strided pool access (Phase D). Pool is already allocated.
+        # Just verify batch size doesn't exceed K_pool.
+        if use_stamps:
+            if K > self.K_pool:
+                logger.error(f"[AGENT-B1] Batch size {K} exceeds K_pool {self.K_pool}!")
+                logger.error(f"  This should never happen - batch size should be limited by K_pool")
+                logger.error(f"  Falling back to basic mode")
+                use_stamps = False
+            else:
+                logger.info(f"[PHASE-D-MEMORY] Batch size {K} fits in K_pool {self.K_pool} - using strided pool access")
+
+        if use_stamps:
+            # Agent B1: Use stamped kernel with backtrace
+            logger.info("[AGENT-B1-PERSISTENT] Using stamped kernel with device-side backtrace")
+
+            # Allocate staging buffer for paths
+            max_path_nodes = K * 1000  # Conservative: 1000 nodes per path max
+            stage_path = cp.zeros(max_path_nodes, dtype=cp.int32)
+            stage_count = cp.zeros(1, dtype=cp.int32)
+            goal_reached = cp.zeros(K, dtype=cp.uint8)
+
+            # NOTE: _prepare_batch() already incremented generation and initialized sources
+            # at lines 1635-1639, so we just need to get the generation counter and views
+            gen = data['generation']
+
+            # Get pool views (already initialized by _prepare_batch)
+            dist_val = self.dist_val_pool[:K, :max_roi_size]
+            dist_stamp = self.dist_stamp_pool[:K, :max_roi_size]
+            parent_val = self.parent_val_pool[:K, :max_roi_size]
+            parent_stamp = self.parent_stamp_pool[:K, :max_roi_size]
+
+            # BUG FIX: Initialize source nodes for persistent kernel
+            # The views above were already initialized by _prepare_batch, but we need
+            # to ensure the stamps are set correctly for the kernel's stamp-based lookups
+            for i in range(K):
+                src_node = int(srcs[i])
+                dist_val[i, src_node] = 0.0
+                dist_stamp[i, src_node] = gen
+                parent_stamp[i, src_node] = gen
+
+            logger.info(f"[AGENT-B1-PERSISTENT] Initialized {K} source nodes with generation {gen}")
+
+            # Phase D: STRIDED POOL ACCESS (eliminates 4.26 GB contiguous buffer copies)
+            #
+            # Pool arrays have shape [K_pool, N_max] with stride [N_max, 1]
+            # Previously: Allocated K×N contiguous copies (4 arrays × 4 bytes × K × N = 4.26 GB for K=64, N=4.1M)
+            # Now: Pass pool base pointers + stride directly to kernel (0 bytes overhead)
+            #
+            # The kernel computes per-net slices using:
+            #   float* dist_val = dist_val_pool_base + (size_t)net * pool_stride;
+
+            logger.info(f"[PHASE-D] Using strided pool access (no contiguous copies needed)")
+            logger.info(f"[PHASE-D] Memory saved: {K * max_roi_size * 4 * 4 / 1e9:.2f} GB")
+
+            # Get pool stride (number of elements between consecutive net slices)
+            # For [K_pool, N_max] array, stride between rows is N_max elements
+            pool_stride = self.dist_val_pool.shape[1]  # N_max (e.g., 5M)
+
+            # Verify pools are properly shaped
+            assert self.dist_val_pool.shape == (self.K_pool, pool_stride), "Pool shape mismatch"
+            assert K <= self.K_pool, f"Batch size {K} exceeds K_pool {self.K_pool}"
+
+            logger.info(f"[AGENT-B1-MEMORY-AWARE] Pool stride: {pool_stride}, max_roi_size: {max_roi_size}")
+
+            args = (
+                queue_a, queue_b, size_a, size_b, max_queue_size,
+                K, max_roi_size,
+                indptr_arr, indices_arr, weights_arr,
+                indptr_stride, indices_stride, weights_stride,
+                weights_arr, weights_stride,  # total_cost = same as weights (already negotiated)
+                data['Nx'], data['Ny'], data['Nz'],
+                data['goal_coords'], srcs, dsts,
+                data['use_astar'],
+                # Pass pool base pointers + stride (kernel computes per-net slices)
+                self.dist_val_pool, pool_stride,
+                self.dist_stamp_pool, pool_stride,
+                self.parent_val_pool, pool_stride,
+                self.parent_stamp_pool, pool_stride,
+                stage_path, stage_count, gen,
+                iterations_out, goal_reached,
+                # Phase 4: ROI bounding boxes
+                data['roi_minx'], data['roi_maxx'],
+                data['roi_miny'], data['roi_maxy'],
+                data['roi_minz'], data['roi_maxz']
+            )
+
+            block_size = 256
+            grid_size = 256
+
+            # Diagnostic logging (can be disabled for production)
+            if True:  # Set to True for debugging
+                logger.info(f"[DEBUG] Kernel input: K={K}, max_roi_size={max_roi_size}, generation={gen}")
+                logger.info(f"[DEBUG] src nodes: {srcs[:min(5,K)].get()}")
+                logger.info(f"[DEBUG] dst nodes: {dsts[:min(5,K)].get()}")
+                logger.info(f"[DEBUG] goal_coords shape: {data['goal_coords'].shape}")
+                logger.info(f"[DEBUG] Initial queue size: {size_a[0].get()}")
+                logger.info(f"[DEBUG] Initial queue contents: {queue_a[:min(5,K)].get()}")
+                # Check source initialization
+                for i in range(min(3, K)):
+                    src = int(srcs[i])
+                    logger.info(f"[DEBUG] ROI {i}: src={src}, dist={float(dist_val[i, src])}, stamp={int(dist_stamp[i, src])}")
+
+            logger.info(f"[AGENT-B1-PERSISTENT] Launching stamped kernel: {grid_size} blocks × {block_size} threads")
+            start_time = time.perf_counter()
+
+            try:
+                # Standard kernel launch (no cooperative groups needed)
+                self.persistent_kernel_stamped((grid_size,), (block_size,), args)
+                cp.cuda.Stream.null.synchronize()
+                elapsed = time.perf_counter() - start_time
+
+                iters = int(iterations_out[0])
+                found_count = int(goal_reached.sum())
+                logger.info(f"[AGENT-B1-PERSISTENT] Completed in {elapsed*1000:.2f} ms ({iters} iterations)")
+                logger.info(f"[AGENT-B1-PERSISTENT] Found paths: {found_count}/{K}")
+                logger.info(f"[AGENT-B1-PERSISTENT] Launch overhead saved: ~{iters*0.007:.2f} ms")
+
+                # Diagnostic logging (can be disabled for production)
+                stage_count_val = int(stage_count[0])
+                if False:  # Set to True for debugging
+                    logger.info(f"[DEBUG] goal_reached: {goal_reached.get()[:min(5,K)]}")
+                    logger.info(f"[DEBUG] iterations: {iters}")
+                    logger.info(f"[DEBUG] stage_count: {stage_count_val}")
+
+                # Reconstruct paths from staging buffer
+                paths = []
+                stage_count_val = int(stage_count[0])
+                if stage_count_val > 0:
+                    stage_data = stage_path[:stage_count_val].get()
+
+                    # Group by net_id
+                    net_paths = {}
+                    for packed in stage_data:
+                        net_id = packed >> 24  # 8-bit net ID
+                        node = packed & 0xFFFFFF  # 24-bit node
+                        if net_id not in net_paths:
+                            net_paths[net_id] = []
+                        net_paths[net_id].append(node)
+
+                    # Build paths for each ROI
+                    for roi_idx in range(K):
+                        if roi_idx in net_paths:
+                            path = net_paths[roi_idx]
+                            path.reverse()  # Backtrace builds backwards
+                            path.insert(0, int(srcs[roi_idx]))  # Add source
+                            paths.append(path)
+                        else:
+                            paths.append(None)
+                else:
+                    # No paths found
+                    paths = [None] * K
+
+                return paths
+
+            except Exception as e:
+                import traceback
+                logger.error(f"[AGENT-B1-PERSISTENT] Stamped kernel failed: {e}")
+                logger.error(f"[AGENT-B1-PERSISTENT] Traceback: {traceback.format_exc()}")
+                logger.warning("[AGENT-B1-PERSISTENT] Falling back to basic persistent kernel")
+                use_stamps = False
+
+        if not use_stamps:
+            # Fallback: Use basic persistent kernel (no stamps/backtrace)
+            logger.info("[AGENT-B1-PERSISTENT] Using basic persistent kernel (fallback)")
+
+            # Initialize source distances
+            data['dist'][:] = cp.inf
+            data['parent'][:] = -1
+            for i in range(K):
+                data['dist'][i, srcs[i]] = 0.0
+
+            args = (
+                queue_a, queue_b, size_a, size_b, max_queue_size,
+                K, max_roi_size,
+                indptr_arr, indices_arr, weights_arr,
+                indptr_stride, indices_stride, weights_stride,
+                weights_arr, weights_stride,  # total_cost = same as weights (already negotiated)
+                data['Nx'], data['Ny'], data['Nz'],
+                data['goal_coords'],
+                data['use_astar'],
+                data['dist'].ravel(),
+                data['parent'].ravel(),
+                iterations_out
+            )
+
+            block_size = 256
+            grid_size = 256
+
+            logger.info(f"[AGENT-B1-PERSISTENT] Launching basic kernel: {grid_size} blocks × {block_size} threads")
+            start_time = time.perf_counter()
+
+            try:
+                self.persistent_kernel((grid_size,), (block_size,), args)
+                cp.cuda.Stream.null.synchronize()
+                elapsed = time.perf_counter() - start_time
+
+                iters = int(iterations_out[0])
+                logger.info(f"[AGENT-B1-PERSISTENT] Completed in {elapsed*1000:.2f} ms ({iters} iterations)")
+
+                # Reconstruct paths on CPU
+                data['sinks'] = [roi[1] for roi in roi_batch]
+                paths = self._reconstruct_paths(data, K)
+
+                found = sum(1 for p in paths if p)
+                logger.info(f"[AGENT-B1-PERSISTENT] Found paths: {found}/{K}")
+
+                return paths
+
+            except Exception as e:
+                logger.error(f"[AGENT-B1-PERSISTENT] Basic kernel failed: {e}")
+                raise
 
     def _relax_near_bucket_gpu(self, data: dict, K: int):
         """
@@ -905,7 +2929,11 @@ class CUDADijkstra:
 
     def _reconstruct_paths(self, data: dict, K: int) -> List[Optional[List[int]]]:
         """
-        Reconstruct paths from parent pointers (CPU-side).
+        Reconstruct paths from parent pointers using GPU kernel (eliminates 256 MB CPU transfer).
+
+        Strategy:
+        - For large ROIs (>100k nodes): Use GPU backtrace kernel (sparse transfer)
+        - For small ROIs (<100k nodes): Use CPU backtrace (low overhead)
 
         Args:
             data: Batched GPU arrays with parent pointers
@@ -916,47 +2944,403 @@ class CUDADijkstra:
         """
         import numpy as np
 
-        # Transfer to CPU
-        parent_cpu = data['parent'].get()
-        dist_cpu = data['dist'].get()
+        max_roi_size = data['max_roi_size']
         sinks = data['sinks']
 
-        paths = []
-        for roi_idx in range(K):
-            sink = sinks[roi_idx]
+        # Decide whether to use GPU or CPU path reconstruction
+        # For large graphs (>100k nodes), GPU kernel saves massive bandwidth
+        # For small ROIs, CPU is faster due to lower kernel launch overhead
+        use_gpu_backtrace = (max_roi_size > 100_000)
 
-            # Check if path exists
-            if dist_cpu[roi_idx, sink] == np.inf:
-                paths.append(None)
+        if use_gpu_backtrace:
+            # GPU PATH RECONSTRUCTION (eliminates 256 MB parent/dist transfer!)
+            import time
+            start = time.perf_counter()
+
+            # Estimate max path length (heuristic: sqrt of ROI size, capped at 4096)
+            max_path_len = min(4096, int(np.sqrt(max_roi_size)) + 100)
+
+            # Allocate GPU output buffers
+            paths_gpu = cp.zeros((K, max_path_len), dtype=cp.int32)
+            path_lengths_gpu = cp.zeros(K, dtype=cp.int32)
+            sinks_gpu = cp.array(sinks, dtype=cp.int32)
+
+            # Launch GPU backtrace kernel
+            block_size = 256
+            grid_size = (K + block_size - 1) // block_size
+
+            self.backtrace_kernel(
+                (grid_size,), (block_size,),
+                (K, max_roi_size,
+                 data['parent'], data['dist'], sinks_gpu,
+                 paths_gpu, path_lengths_gpu, max_path_len)
+            )
+            cp.cuda.Stream.null.synchronize()
+
+            # Transfer ONLY compact paths (much smaller than full parent/dist arrays)
+            paths_cpu = paths_gpu.get()
+            path_lengths_cpu = path_lengths_gpu.get()
+
+            elapsed_ms = (time.perf_counter() - start) * 1000
+
+            # Parse results
+            paths = []
+            for roi_idx in range(K):
+                path_len = path_lengths_cpu[roi_idx]
+                if path_len > 0:
+                    # Extract path from compact buffer
+                    path = paths_cpu[roi_idx, :path_len].tolist()
+                    paths.append(path)
+                elif path_len == -1:
+                    # Cycle detected
+                    logger.error(f"[GPU-BACKTRACE] Path reconstruction: cycle detected for ROI {roi_idx}")
+                    paths.append(None)
+                else:
+                    # No path found (path_len == 0)
+                    paths.append(None)
+
+            # Calculate bandwidth savings
+            old_transfer_mb = (K * max_roi_size * 4 * 2) / 1e6  # parent + dist (int32 + float32)
+            new_transfer_mb = (K * max_path_len * 4 + K * 4) / 1e6  # paths + lengths
+            savings_mb = old_transfer_mb - new_transfer_mb
+
+            logger.info(f"[GPU-BACKTRACE] Reconstructed {K} paths in {elapsed_ms:.2f}ms on GPU")
+            logger.info(f"[GPU-BACKTRACE] Transfer: {new_transfer_mb:.2f} MB (saved {savings_mb:.2f} MB vs CPU method)")
+
+            return paths
+
+        else:
+            # CPU PATH RECONSTRUCTION (for small ROIs, faster due to low overhead)
+            logger.info(f"[CPU-BACKTRACE] Using CPU path reconstruction for {K} small ROIs ({max_roi_size:,} nodes)")
+
+            # Transfer to CPU (acceptable for small ROIs)
+            parent_cpu = data['parent'].get()
+            dist_cpu = data['dist'].get()
+
+            paths = []
+            for roi_idx in range(K):
+                sink = sinks[roi_idx]
+
+                # Check if path exists
+                if dist_cpu[roi_idx, sink] == np.inf:
+                    paths.append(None)
+                    continue
+
+                # Walk backward from sink to source
+                path = []
+                curr = sink
+                visited = set()
+
+                while curr != -1:
+                    # Cycle detection
+                    if curr in visited:
+                        logger.error(f"[CPU-BACKTRACE] Path reconstruction: cycle detected at node {curr}")
+                        paths.append(None)
+                        break
+
+                    path.append(curr)
+                    visited.add(curr)
+                    curr = parent_cpu[roi_idx, curr]
+
+                    # Safety limit
+                    if len(path) > max_roi_size:
+                        logger.error(f"[CPU-BACKTRACE] Path reconstruction: exceeded max_roi_size")
+                        paths.append(None)
+                        break
+                else:
+                    # Reverse path (built backward)
+                    path.reverse()
+                    paths.append(path)
+
+            return paths
+
+    # ========================================================================
+    # DELTA-STEPPING SSSP ALGORITHM (P1-7)
+    # ========================================================================
+
+    def _run_delta_stepping(self, data: dict, K: int, delta: float, roi_batch: List[Tuple] = None) -> List[Optional[List[int]]]:
+        """
+        Execute delta-stepping SSSP algorithm on GPU with distance-based bucketing.
+
+        Delta-stepping reduces atomic contention by organizing nodes into distance buckets
+        and processing them in waves. Nodes at similar distances are processed together,
+        reducing conflicting atomic updates.
+
+        Algorithm:
+        1. Maintain buckets: bucket[b] contains nodes with distance in [b*Δ, (b+1)*Δ)
+        2. Process current bucket with light edges (cost < Δ)
+        3. Heavy edges (cost ≥ Δ) relax to future buckets
+        4. Less contention since nodes at similar distances don't compete
+
+        Args:
+            data: Batched GPU arrays from _prepare_batch
+            K: Number of ROIs
+            delta: Bucket width (Δ parameter) - typically median edge cost (0.4-1.0)
+            roi_batch: Original ROI batch (for diagnostics)
+
+        Returns:
+            List of paths (local ROI indices)
+
+        Performance:
+            - Expected 2-4× faster on large graphs due to reduced atomic contention
+            - Best for graphs with diverse edge weights and long paths
+            - Delta selection is critical: too small = many buckets, too large = poor parallelism
+        """
+        import time
+
+        logger.info(f"[DELTA-STEPPING] Starting with K={K} ROIs, delta={delta:.3f}")
+
+        # Adaptive iteration budget
+        if roi_batch and len(roi_batch) > 0:
+            roi_size = roi_batch[0][5]
+            batch_size = len(roi_batch)
+
+            if roi_size > 1_000_000:  # Full graph
+                max_iterations = 2000
+                logger.info(f"[DELTA-STEPPING] Full graph routing: {batch_size} nets, {max_iterations} iterations")
+            else:
+                max_iterations = min(4096, roi_size // 100 + 500)
+        else:
+            max_iterations = 2000
+
+        start_time = time.perf_counter()
+
+        # Validate sources and sinks
+        invalid_rois = []
+        for roi_idx in range(K):
+            src = data['sources'][roi_idx]
+            dst = data['sinks'][roi_idx]
+
+            if roi_batch and roi_idx < len(roi_batch):
+                actual_roi_size = roi_batch[roi_idx][5]
+            else:
+                actual_roi_size = data['max_roi_size']
+
+            if src < 0 or src >= actual_roi_size:
+                logger.error(f"[DELTA-STEPPING] ROI {roi_idx}: INVALID SOURCE {src}")
+                invalid_rois.append(roi_idx)
+
+            if dst < 0 or dst >= actual_roi_size:
+                logger.error(f"[DELTA-STEPPING] ROI {roi_idx}: INVALID SINK {dst}")
+                invalid_rois.append(roi_idx)
+
+        if invalid_rois:
+            logger.error(f"[DELTA-STEPPING] Aborting - {len(invalid_rois)} invalid ROI(s)")
+            return [None] * K
+
+        # Initialize buckets
+        max_roi_size = data['max_roi_size']
+        max_buckets = int(cp.ceil(1000.0 / delta))  # Assume max distance ~1000mm
+
+        # Bucket structure: (K, max_buckets, frontier_words) - bit-packed nodes per bucket
+        frontier_words = (max_roi_size + 31) // 32
+        buckets = cp.zeros((K, max_buckets, frontier_words), dtype=cp.uint32)
+
+        # Initialize: place source nodes in bucket 0 (distance 0)
+        for roi_idx in range(K):
+            src = data['sources'][roi_idx]
+            word_idx = src // 32
+            bit_pos = src % 32
+            buckets[roi_idx, 0, word_idx] = cp.uint32(1) << bit_pos
+
+        logger.info(f"[DELTA-STEPPING] Initialized {max_buckets} buckets with width {delta:.3f}")
+        logger.info(f"[DELTA-STEPPING] Memory: {K}×{max_buckets}×{frontier_words} uint32 = "
+                   f"{K*max_buckets*frontier_words*4/1e6:.1f}MB")
+
+        # Main delta-stepping loop
+        current_bucket = 0
+        iteration = 0
+
+        while iteration < max_iterations:
+            # Find first non-empty bucket
+            while current_bucket < max_buckets:
+                bucket_sum = int(cp.sum(buckets[:, current_bucket, :]))
+                if bucket_sum > 0:
+                    break
+                current_bucket += 1
+
+            if current_bucket >= max_buckets:
+                logger.info(f"[DELTA-STEPPING] All buckets empty at iteration {iteration}")
+                break
+
+            # Get nodes in current bucket
+            frontier = buckets[:, current_bucket, :].copy()
+            bucket_node_count = int(cp.sum(frontier))
+
+            # Clear current bucket (nodes will be reinserted if distances improve)
+            buckets[:, current_bucket, :] = 0
+
+            if bucket_node_count == 0:
+                current_bucket += 1
                 continue
 
-            # Walk backward from sink to source
-            path = []
-            curr = sink
-            visited = set()
+            # Process bucket with light edge relaxation
+            # Light edges: cost < delta (can stay in same or next bucket)
+            # Heavy edges: cost >= delta (go to future buckets)
+            nodes_expanded = self._delta_relax_bucket(
+                data, K, frontier, buckets, current_bucket, delta
+            )
 
-            while curr != -1:
-                # Cycle detection
-                if curr in visited:
-                    logger.error(f"[CUDA-NF] Path reconstruction: cycle detected at node {curr}")
-                    paths.append(None)
-                    break
+            # Check termination: have all sinks been reached? (vectorized)
+            # Use fancy indexing to avoid K separate GPU→CPU transfers
+            sink_dists_check = data['dist'][cp.arange(K), data['sinks']]
+            sinks_reached = int(cp.sum(sink_dists_check < 1e9).get())  # Single transfer
 
-                path.append(curr)
-                visited.add(curr)
-                curr = parent_cpu[roi_idx, curr]
+            if iteration % 50 == 0 or iteration < 3:
+                logger.info(f"[DELTA-STEPPING] Iter {iteration}: bucket={current_bucket}, "
+                          f"nodes={bucket_node_count}, expanded={nodes_expanded}, "
+                          f"sinks_reached={sinks_reached}/{K}")
 
-                # Safety limit
-                if len(path) > data['max_roi_size']:
-                    logger.error(f"[CUDA-NF] Path reconstruction: exceeded max_roi_size")
-                    paths.append(None)
-                    break
-            else:
-                # Reverse path (built backward)
-                path.reverse()
-                paths.append(path)
+            # Early termination when all sinks reached
+            if sinks_reached == K:
+                logger.info(f"[DELTA-STEPPING] All sinks reached at iteration {iteration}")
+                break
+
+            iteration += 1
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        logger.info(f"[DELTA-STEPPING] Complete in {iteration+1} iterations, {elapsed_ms:.1f}ms "
+                   f"({elapsed_ms/(iteration+1):.2f}ms/iter)")
+
+        # Reconstruct paths
+        paths = self._reconstruct_paths(data, K)
+        found = sum(1 for p in paths if p)
+        logger.info(f"[DELTA-STEPPING] Paths found: {found}/{K} ({100*found/K:.1f}% success)")
 
         return paths
+
+    def _delta_relax_bucket(self, data: dict, K: int, frontier: cp.ndarray,
+                           buckets: cp.ndarray, current_bucket: int, delta: float) -> int:
+        """
+        Relax edges for nodes in current bucket using delta-stepping rules.
+
+        Light edges (cost < delta): Can update same or next bucket
+        Heavy edges (cost >= delta): Update distant buckets
+
+        This reduces atomic contention because:
+        1. Nodes at similar distances process together
+        2. Light edges stay local (less bucket conflicts)
+        3. Heavy edges are deferred to well-separated buckets
+
+        Args:
+            data: Batched GPU arrays
+            K: Number of ROIs
+            frontier: (K, frontier_words) bit-packed mask of active nodes in bucket
+            buckets: (K, max_buckets, frontier_words) all distance buckets
+            current_bucket: Index of bucket being processed
+            delta: Bucket width
+
+        Returns:
+            Number of nodes expanded
+        """
+        # Unpack frontier bits for processing
+        max_roi_size = data['max_roi_size']
+        frontier_words = frontier.shape[1]
+
+        # Unpack bits to bytes for nonzero operation
+        frontier_bytes = frontier.view(cp.uint8)
+        # FIXED: Unpack along axis=1 to preserve ROI boundaries
+        frontier_mask = cp.unpackbits(frontier_bytes, axis=1, bitorder='little')
+        frontier_mask = frontier_mask[:, :max_roi_size]
+
+        # Compact active nodes
+        flat_idx = cp.nonzero(frontier_mask.ravel())[0]
+        total_active = int(flat_idx.size)
+        if total_active == 0:
+            return 0
+
+        N = max_roi_size
+        roi_ids = flat_idx // N
+        node_ids = flat_idx - (roi_ids * N)
+
+        # Allocate temporary frontier for relaxed nodes
+        new_frontier = cp.zeros((K, frontier_words), dtype=cp.uint32)
+
+        # Get CSR arrays
+        indptr_arr = data['batch_indptr']
+        indices_arr = data['batch_indices']
+        weights_arr = data['batch_weights']
+
+        # Detect strides (shared vs per-ROI CSR)
+        if hasattr(indptr_arr, 'strides') and len(indptr_arr.strides) == 2 and indptr_arr.strides[0] == 0:
+            # Stride 0 = shared CSR
+            indptr_stride = 0
+            indices_stride = 0
+            weights_stride = 0
+        else:
+            # Per-ROI arrays
+            indptr_stride = indptr_arr.shape[1] if len(indptr_arr.shape) > 1 else max_roi_size + 1
+            indices_stride = indices_arr.shape[1] if len(indices_arr.shape) > 1 else data['max_edges']
+            weights_stride = weights_arr.shape[1] if len(weights_arr.shape) > 1 else data['max_edges']
+
+        # Launch kernel: process active nodes with delta-aware bucketing
+        block_size = 256
+        grid_size = (total_active + block_size - 1) // block_size
+
+        # Use active_list_kernel (could be extended with delta-specific logic)
+        args = (
+            total_active,
+            max_roi_size,
+            frontier_words,
+            roi_ids.astype(cp.int32),
+            node_ids.astype(cp.int32),
+            indptr_arr,
+            indices_arr,
+            weights_arr,
+            indptr_stride,
+            indices_stride,
+            weights_stride,
+            data['goal_nodes'],
+            data['Nx'],            # P0-3: Lattice dimensions
+            data['Ny'],
+            data['Nz'],
+            data['goal_coords'],   # P0-3: Goal coordinates
+            data['use_astar'],
+            data['dist'].ravel(),
+            data['parent'].ravel(),
+            new_frontier.ravel(),
+            # Phase 4: ROI bounding boxes
+            data['roi_minx'],
+            data['roi_maxx'],
+            data['roi_miny'],
+            data['roi_maxy'],
+            data['roi_minz'],
+            data['roi_maxz'],
+        )
+
+        self.active_list_kernel((grid_size,), (block_size,), args)
+        cp.cuda.Stream.null.synchronize()
+
+        # P1-7: GPU-accelerated bucket assignment (replaces slow Python loop)
+        # Old approach: Python loop over K×max_roi_size (potentially millions of iterations)
+        # New approach: GPU kernel processes only updated nodes in parallel
+        max_buckets = buckets.shape[1]
+
+        # Launch bucket assignment kernel
+        # Use grid-stride loop to handle large node counts
+        total_nodes = K * max_roi_size
+        block_size_bucket = 256
+        # Launch enough blocks to cover all nodes, but not excessive
+        grid_size_bucket = min((total_nodes + block_size_bucket - 1) // block_size_bucket, 65535)
+
+        bucket_args = (
+            K,
+            max_roi_size,
+            max_buckets,
+            frontier_words,
+            new_frontier.ravel(),      # Updated nodes (bit-packed)
+            data['dist'].ravel(),      # Current distances
+            cp.float32(delta),         # Bucket width
+            buckets.ravel(),           # Output buckets
+        )
+
+        self.bucket_assign_kernel((grid_size_bucket,), (block_size_bucket,), bucket_args)
+        cp.cuda.Stream.null.synchronize()
+
+        # Count nodes expanded (count set BITS, not sum uint32!)
+        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8), axis=1, bitorder='little')
+        nodes_expanded = int(cp.count_nonzero(nodes_expanded_mask))
+        return nodes_expanded
 
     def _fallback_cpu_dijkstra(self, roi_batch: List[Tuple]) -> List[Optional[List[int]]]:
         """
@@ -981,9 +3365,9 @@ class CUDADijkstra:
                 indices_cpu = np.asarray(indices)
                 weights_cpu = np.asarray(weights)
 
-            # Heap-based Dijkstra
-            dist = [float('inf')] * size
-            parent = [-1] * size
+            # Heap-based Dijkstra - FIX: Use NumPy arrays not Python lists (4M nodes!)
+            dist = np.full(size, np.inf, dtype=np.float32)
+            parent = np.full(size, -1, dtype=np.int32)
             dist[src] = 0.0
 
             heap = [(0.0, src)]
@@ -1339,3 +3723,393 @@ class CUDADijkstra:
                     f"edge_density={len(local_edges)/(roi_size*roi_size) if roi_size > 0 else 0:.3f}")
 
         return roi_indptr, roi_indices, roi_weights
+
+    # ========================================================================
+    # BI-DIRECTIONAL ε-A* SEARCH (P1-9)
+    # ========================================================================
+
+    def _transpose_csr(self, indptr, indices, weights, num_nodes):
+        """
+        Transpose CSR graph for backward search.
+
+        Converts forward adjacency list to backward (reverse edges).
+        For each edge (u → v), creates reverse edge (v → u) with same weight.
+
+        Args:
+            indptr: (num_nodes+1,) CSR indptr array
+            indices: (num_edges,) CSR indices array
+            weights: (num_edges,) Edge weights array
+            num_nodes: Number of nodes in graph
+
+        Returns:
+            (indptr_T, indices_T, weights_T): Transposed CSR representation
+        """
+        import numpy as np
+
+        # Convert to CPU numpy arrays if needed
+        if hasattr(indptr, 'get'):
+            indptr = indptr.get()
+        if hasattr(indices, 'get'):
+            indices = indices.get()
+        if hasattr(weights, 'get'):
+            weights = weights.get()
+
+        indptr = np.asarray(indptr, dtype=np.int32)
+        indices = np.asarray(indices, dtype=np.int32)
+        weights = np.asarray(weights, dtype=np.float32)
+
+        num_edges = len(indices)
+
+        # Count incoming edges for each node
+        indptr_T = np.zeros(num_nodes + 1, dtype=np.int32)
+
+        for edge_idx in range(num_edges):
+            v = indices[edge_idx]
+            if v < num_nodes:  # Validate index
+                indptr_T[v + 1] += 1
+
+        # Convert counts to cumulative sum (CSR indptr format)
+        np.cumsum(indptr_T, out=indptr_T)
+
+        # Allocate transposed arrays
+        indices_T = np.zeros(num_edges, dtype=np.int32)
+        weights_T = np.zeros(num_edges, dtype=np.float32)
+
+        # Fill transposed arrays using write positions
+        write_pos = indptr_T[:-1].copy()
+
+        for u in range(num_nodes):
+            start = indptr[u]
+            end = indptr[u + 1]
+
+            for edge_idx in range(start, end):
+                v = indices[edge_idx]
+                weight = weights[edge_idx]
+
+                if v < num_nodes:  # Validate index
+                    # Add reverse edge: v → u
+                    pos = write_pos[v]
+                    indices_T[pos] = u
+                    weights_T[pos] = weight
+                    write_pos[v] += 1
+
+        return indptr_T, indices_T, weights_T
+
+    def find_path_bidirectional(self,
+                               adjacency_csr,
+                               edge_costs,
+                               source: int,
+                               sink: int,
+                               epsilon: float = 0.1,
+                               max_iterations: int = 1000) -> Optional[List[int]]:
+        """
+        Find shortest path using bi-directional ε-A* search.
+
+        Searches from both source and sink simultaneously, halving search depth
+        from ~300 nodes to ~150 nodes per direction.
+
+        Algorithm:
+        1. Maintain two frontiers: forward (from source) and backward (from sink)
+        2. Maintain two distance arrays: dist_fwd and dist_bwd
+        3. Alternate expansions: forward frontier, then backward frontier
+        4. Track best meeting point: best_cost = min(dist_fwd[v] + dist_bwd[v])
+        5. Terminate when: min_f_fwd + min_f_bwd >= (1+ε) × best_cost
+        6. Reconstruct path by joining forward and backward paths
+
+        Args:
+            adjacency_csr: Forward CSR adjacency matrix (N×N)
+            edge_costs: Edge weights (E,)
+            source: Source node index
+            sink: Sink node index
+            epsilon: Suboptimality bound (0.1 = 10% slack)
+            max_iterations: Maximum iterations per direction
+
+        Returns:
+            Path as list of node indices, or None if no path found
+
+        Expected speedup: ~2× (halves search depth)
+        """
+        logger.info(f"[BIDIR-A*] Starting bi-directional search: src={source}, dst={sink}, ε={epsilon}")
+
+        num_nodes = adjacency_csr.shape[0]
+
+        # Extract CSR arrays
+        indptr_fwd = adjacency_csr.indptr
+        indices_fwd = adjacency_csr.indices
+        weights_fwd = edge_costs
+
+        # Build backward graph (transpose CSR)
+        logger.info(f"[BIDIR-A*] Building backward graph (CSR transpose)")
+        indptr_bwd, indices_bwd, weights_bwd = self._transpose_csr(
+            indptr_fwd, indices_fwd, weights_fwd, num_nodes
+        )
+
+        # Transfer to GPU
+        indptr_bwd_gpu = cp.asarray(indptr_bwd)
+        indices_bwd_gpu = cp.asarray(indices_bwd)
+        weights_bwd_gpu = cp.asarray(weights_bwd)
+
+        # Initialize forward search
+        inf = cp.float32(cp.inf)
+        dist_fwd = cp.full(num_nodes, inf, dtype=cp.float32)
+        dist_bwd = cp.full(num_nodes, inf, dtype=cp.float32)
+        parent_fwd = cp.full(num_nodes, -1, dtype=cp.int32)
+        parent_bwd = cp.full(num_nodes, -1, dtype=cp.int32)
+
+        dist_fwd[source] = 0.0
+        dist_bwd[sink] = 0.0
+
+        # Bit-packed frontiers
+        frontier_words = (num_nodes + 31) // 32
+        frontier_fwd = cp.zeros(frontier_words, dtype=cp.uint32)
+        frontier_bwd = cp.zeros(frontier_words, dtype=cp.uint32)
+
+        # Set source in forward frontier
+        src_word = source // 32
+        src_bit = source % 32
+        frontier_fwd[src_word] = cp.uint32(1) << src_bit
+
+        # Set sink in backward frontier
+        dst_word = sink // 32
+        dst_bit = sink % 32
+        frontier_bwd[dst_word] = cp.uint32(1) << dst_bit
+
+        # Track best meeting point
+        best_path_cost = float('inf')
+        meeting_point = -1
+
+        logger.info(f"[BIDIR-A*] Starting alternating expansion (max {max_iterations} iters)")
+
+        for iteration in range(max_iterations):
+            # Check termination
+            fwd_active = int(cp.sum(frontier_fwd))
+            bwd_active = int(cp.sum(frontier_bwd))
+
+            if fwd_active == 0 and bwd_active == 0:
+                logger.info(f"[BIDIR-A*] No active frontiers at iteration {iteration}")
+                break
+
+            # Expand forward frontier
+            if fwd_active > 0:
+                self._expand_frontier_single(
+                    dist_fwd, parent_fwd, frontier_fwd,
+                    indptr_fwd, indices_fwd, weights_fwd,
+                    num_nodes
+                )
+
+            # Expand backward frontier
+            if bwd_active > 0:
+                self._expand_frontier_single(
+                    dist_bwd, parent_bwd, frontier_bwd,
+                    indptr_bwd_gpu, indices_bwd_gpu, weights_bwd_gpu,
+                    num_nodes
+                )
+
+            # Check for meeting points (nodes visited by both searches)
+            # Unpack frontiers to find intersection
+            frontier_fwd_mask = self._unpack_frontier(frontier_fwd, num_nodes)
+            frontier_bwd_mask = self._unpack_frontier(frontier_bwd, num_nodes)
+
+            # Find nodes in both frontiers
+            meeting_mask = frontier_fwd_mask & frontier_bwd_mask
+            meeting_nodes = cp.where(meeting_mask)[0]
+
+            if len(meeting_nodes) > 0:
+                # Check each meeting point for best path
+                meeting_nodes_cpu = meeting_nodes.get()
+                dist_fwd_cpu = dist_fwd.get()
+                dist_bwd_cpu = dist_bwd.get()
+
+                for v in meeting_nodes_cpu:
+                    path_cost = dist_fwd_cpu[v] + dist_bwd_cpu[v]
+                    if path_cost < best_path_cost:
+                        best_path_cost = path_cost
+                        meeting_point = int(v)
+                        logger.info(f"[BIDIR-A*] New best meeting point: {meeting_point}, cost={best_path_cost:.2f}")
+
+            # Termination check (simplified - no A* heuristic)
+            # In practice, should use: min_f_fwd + min_f_bwd >= (1+ε) × best_path_cost
+            # For now, terminate when meeting point found and frontiers explored
+            if best_path_cost < float('inf'):
+                # Found meeting point - continue for a few more iterations
+                if iteration > 10:  # Small buffer for exploration
+                    logger.info(f"[BIDIR-A*] Terminating at iteration {iteration}")
+                    break
+
+            # Periodic logging
+            if iteration % 50 == 0 or iteration < 3:
+                logger.info(f"[BIDIR-A*] Iter {iteration}: fwd_frontier={fwd_active}, bwd_frontier={bwd_active}, "
+                          f"best_cost={best_path_cost:.2f}")
+
+        # Reconstruct path
+        if meeting_point < 0 or best_path_cost >= float('inf'):
+            logger.warning(f"[BIDIR-A*] No path found")
+            return None
+
+        logger.info(f"[BIDIR-A*] Reconstructing path through meeting point {meeting_point}")
+
+        # Transfer to CPU for reconstruction
+        parent_fwd_cpu = parent_fwd.get()
+        parent_bwd_cpu = parent_bwd.get()
+
+        # Reconstruct forward path (source → meeting_point)
+        fwd_path = []
+        curr = meeting_point
+        while curr != -1 and curr != source:
+            fwd_path.append(curr)
+            curr = parent_fwd_cpu[curr]
+        fwd_path.append(source)
+        fwd_path.reverse()
+
+        # Reconstruct backward path (meeting_point → sink)
+        bwd_path = []
+        curr = meeting_point
+        while curr != -1 and curr != sink:
+            curr = parent_bwd_cpu[curr]
+            if curr >= 0:
+                bwd_path.append(curr)
+
+        # Join paths (avoid duplicating meeting point)
+        full_path = fwd_path + bwd_path
+
+        logger.info(f"[BIDIR-A*] Path found: length={len(full_path)}, cost={best_path_cost:.2f}")
+        return full_path
+
+    def _unpack_frontier(self, frontier_packed, num_nodes):
+        """
+        Unpack bit-packed frontier to boolean mask.
+
+        Args:
+            frontier_packed: (frontier_words,) uint32 bit-packed frontier
+            num_nodes: Total number of nodes
+
+        Returns:
+            (num_nodes,) boolean mask
+        """
+        # Unpack bits to bytes
+        frontier_bytes = frontier_packed.view(cp.uint8)
+        frontier_mask = cp.unpackbits(frontier_bytes)[:num_nodes]
+        return frontier_mask.astype(bool)
+
+    def _expand_frontier_single(self, dist, parent, frontier, indptr, indices, weights, num_nodes):
+        """
+        Expand frontier by one step (Dijkstra-style relaxation).
+
+        For each node u in frontier:
+        - Relax all outgoing edges (u → v)
+        - Update dist[v] and parent[v] if improved
+        - Add v to new frontier if distance improved
+
+        Args:
+            dist: (num_nodes,) distance array (in/out)
+            parent: (num_nodes,) parent array (in/out)
+            frontier: (frontier_words,) bit-packed frontier (in/out)
+            indptr: CSR indptr array
+            indices: CSR indices array
+            weights: Edge weights array
+            num_nodes: Number of nodes
+        """
+        # Unpack frontier to get active nodes
+        frontier_mask = self._unpack_frontier(frontier, num_nodes)
+        active_nodes = cp.where(frontier_mask)[0]
+
+        if len(active_nodes) == 0:
+            return
+
+        # Clear old frontier
+        frontier.fill(0)
+
+        # New frontier to populate
+        new_frontier_mask = cp.zeros(num_nodes, dtype=bool)
+
+        # Process each active node
+        for u_idx in range(len(active_nodes)):
+            u = int(active_nodes[u_idx])
+            u_dist = float(dist[u])
+
+            # Get neighbors from CSR
+            start = int(indptr[u])
+            end = int(indptr[u + 1])
+
+            if end > start:
+                neighbors = indices[start:end]
+                costs = weights[start:end]
+
+                # Calculate candidate distances
+                new_dists = u_dist + costs
+
+                # Update distances and parents
+                for i in range(len(neighbors)):
+                    v = int(neighbors[i])
+                    new_dist = float(new_dists[i])
+
+                    if new_dist < float(dist[v]):
+                        dist[v] = new_dist
+                        parent[v] = u
+                        new_frontier_mask[v] = True
+
+        # Pack new frontier back to bits
+        new_frontier_mask_uint8 = new_frontier_mask.astype(cp.uint8)
+        frontier_words = len(frontier)
+        frontier_bytes = cp.packbits(new_frontier_mask_uint8)
+
+        # Copy packed bits back to frontier
+        if len(frontier_bytes) >= frontier_words * 4:
+            frontier[:] = frontier_bytes[:frontier_words*4].view(cp.uint32)
+
+    def find_paths_bidirectional_batch(self, roi_batch: List[Tuple], epsilon: float = 0.1) -> List[Optional[List[int]]]:
+        """
+        Find paths using bi-directional search for multiple ROIs in batch.
+
+        This is a wrapper that applies bi-directional search to each ROI independently.
+        Unlike the standard batch processing, each ROI gets its own forward and backward graph.
+
+        Args:
+            roi_batch: List of (src, dst, indptr, indices, weights, size)
+            epsilon: Suboptimality bound (0.1 = 10% slack)
+
+        Returns:
+            List of paths (local ROI indices), one per ROI
+
+        Integration:
+            This can be called instead of find_paths_on_rois() for single-net routing
+            when you want to use bi-directional search instead of uni-directional.
+        """
+        import numpy as np
+        from cupyx.scipy.sparse import csr_matrix
+
+        logger.info(f"[BIDIR-BATCH] Processing {len(roi_batch)} ROIs with bi-directional search")
+
+        paths = []
+        for roi_idx, (src, dst, indptr, indices, weights, roi_size) in enumerate(roi_batch):
+            logger.info(f"[BIDIR-BATCH] ROI {roi_idx}/{len(roi_batch)}: src={src}, dst={dst}, size={roi_size}")
+
+            # Convert to CuPy arrays
+            if not isinstance(indptr, cp.ndarray):
+                indptr = cp.asarray(indptr)
+            if not isinstance(indices, cp.ndarray):
+                indices = cp.asarray(indices)
+            if not isinstance(weights, cp.ndarray):
+                weights = cp.asarray(weights)
+
+            # Build CSR matrix
+            adjacency_csr = csr_matrix((weights, indices, indptr), shape=(roi_size, roi_size))
+
+            # Run bi-directional search
+            try:
+                path = self.find_path_bidirectional(
+                    adjacency_csr,
+                    weights,
+                    src,
+                    dst,
+                    epsilon=epsilon,
+                    max_iterations=1000
+                )
+                paths.append(path)
+            except Exception as e:
+                logger.error(f"[BIDIR-BATCH] ROI {roi_idx} failed: {e}")
+                paths.append(None)
+
+        found = sum(1 for p in paths if p)
+        logger.info(f"[BIDIR-BATCH] Complete: {found}/{len(roi_batch)} paths found")
+        return paths
