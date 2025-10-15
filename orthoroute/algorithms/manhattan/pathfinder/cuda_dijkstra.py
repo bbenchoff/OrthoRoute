@@ -151,8 +151,10 @@ class CUDADijkstra:
             const int Nz,                   // P0-3: Lattice Z dimension
             const int* goal_coords,         // P0-3: (K, 3) goal coordinates only
             const int use_astar,            // 1 = enable A* heuristic, 0 = plain Dijkstra
-            float* dist,                    // (K, max_roi_size) distances
-            int* parent,                    // (K, max_roi_size) parents
+            const int pool_stride_val,      // POOL STRIDE: stride between ROI rows in dist pool
+            const int pool_stride_parent,   // POOL STRIDE: stride between ROI rows in parent pool
+            float* dist,                    // (K_pool, pool_stride) distances POOL
+            int* parent,                    // (K_pool, pool_stride) parents POOL
             unsigned int* new_frontier      // (K, frontier_words) BIT-PACKED output - uint32!
         ) {
             // Block index = ROI index (expects exactly K blocks!)
@@ -164,8 +166,9 @@ class CUDADijkstra:
             int B = blockDim.x;
 
             // Calculate base offsets for this ROI
-            // For dist/parent: always use roi_idx * max_roi_size (contiguous)
-            const int dist_off = roi_idx * max_roi_size;
+            // For dist/parent: use pool_stride (NOT max_roi_size!) - pool may be larger than batch
+            const size_t dist_off = (size_t)roi_idx * (size_t)pool_stride_val;
+            const size_t parent_off = (size_t)roi_idx * (size_t)pool_stride_parent;
             // For frontier: use roi_idx * frontier_words (bit-packed)
             const int frontier_off = roi_idx * frontier_words;
 
@@ -231,7 +234,7 @@ class CUDADijkstra:
                     if (g_new + 1e-8f < old) {
                         // FIX D1: ALWAYS update parent on improvement (allow node reopening!)
                         // Use atomicExch for thread-safe parent update
-                        atomicExch(&parent[nidx], node);
+                        atomicExch(&parent[parent_off + neighbor], node);
 
                         // P0-4: BIT-PACKED WRITE using atomicOr
                         const int nbr_word_idx = neighbor / 32;
@@ -293,8 +296,10 @@ class CUDADijkstra:
             const int Nz,                       // P0-3: Lattice Z dimension (layers)
             const int* goal_coords,             // (K, 3) goal coordinates (gx, gy, gz) per ROI
             const int use_astar,                // A* enable flag
-            float* dist,                        // (K, max_roi_size) distances
-            int* parent,                        // (K, max_roi_size) parents
+            const int pool_stride_val,          // POOL STRIDE: stride between ROI rows in dist pool
+            const int pool_stride_parent,       // POOL STRIDE: stride between ROI rows in parent pool
+            float* dist,                        // (K_pool, pool_stride) distances POOL
+            int* parent,                        // (K_pool, pool_stride) parents POOL
             unsigned int* new_frontier,         // (K, frontier_words) BIT-PACKED output
             // Phase 4: ROI bounding boxes
             const int* roi_minx,                // (K,) Min X per ROI
@@ -317,7 +322,8 @@ class CUDADijkstra:
             const int indices_off = roi_idx * indices_stride;
             const int weights_off = roi_idx * weights_stride;
             const int total_cost_off = roi_idx * total_cost_stride; // PathFinder negotiated costs
-            const int dist_off = roi_idx * max_roi_size;
+            const size_t dist_off = (size_t)roi_idx * (size_t)pool_stride_val;
+            const size_t parent_off = (size_t)roi_idx * (size_t)pool_stride_parent;
             const int frontier_off = roi_idx * frontier_words;
 
             // Guarded atomic: Check distance before edge expansion
@@ -373,7 +379,7 @@ class CUDADijkstra:
 
                 // Update parent and frontier on improvement
                 if (g_new + 1e-8f < old) {
-                    atomicExch(&parent[nidx], node);
+                    atomicExch(&parent[parent_off + neighbor], node);
 
                     // P0-4: BIT-PACKED WRITE using atomicOr
                     const int nbr_word_idx = neighbor / 32;
@@ -1954,6 +1960,9 @@ class CUDADijkstra:
         sources_cp = cp.asarray([roi[0] for roi in roi_batch], dtype=cp.int32)
         sinks_cp = cp.asarray([roi[1] for roi in roi_batch], dtype=cp.int32)
         logger.info(f"[SOURCES-SINKS] Converted to CuPy: sources.shape={sources_cp.shape}, sinks.shape={sinks_cp.shape}")
+        # DEBUG: Check for duplicates
+        unique_sources = int(cp.unique(sources_cp).size)
+        logger.info(f"[SOURCES-DEBUG] Unique sources: {unique_sources}/{K} (sample: {cp.asnumpy(sources_cp[:5]).tolist()})")
 
         data_dict = {
             'K': K,
@@ -2376,6 +2385,13 @@ class CUDADijkstra:
         roi_ids = (flat_idx // N).astype(cp.int32)
         node_ids = (flat_idx - (roi_ids * N)).astype(cp.int32)
 
+        # FIX 7: Add sanity logging after compaction
+        n_rois = int(cp.unique(roi_ids).size)
+        logger.info(f"[ACTIVE-SET] total_active={total_active}, unique_rois={n_rois}")
+        if n_rois < 10:
+            heads = cp.asnumpy(cp.stack([roi_ids[:16], node_ids[:16]], axis=1)) if total_active >= 16 else cp.asnumpy(cp.stack([roi_ids, node_ids], axis=1))
+            logger.debug(f"[ACTIVE-HEAD] (roi,node)[:16] = {heads.tolist()}")
+
         # DIAGNOSTIC: Check compacted indices
         if total_active > 0:
             logger.info(f"[COMPACTION] total_active={total_active}, first 3 nodes:")
@@ -2457,6 +2473,10 @@ class CUDADijkstra:
 
         # P0-4: Include frontier_words for bit-packed frontier
         frontier_words = old_frontier.shape[1]
+
+        # Calculate pool_stride for kernel (N_max from pool shape)
+        pool_stride = self.dist_val_pool.shape[1] if self.dist_val_pool is not None else data['max_roi_size']
+
         args = (
             total_active,
             data['max_roi_size'],
@@ -2477,8 +2497,10 @@ class CUDADijkstra:
             data['Nz'],
             data['goal_coords'],   # P0-3: (K, 3) goal coordinates only
             data['use_astar'],
-            data['dist'].ravel(),
-            data['parent'].ravel(),
+            pool_stride,           # pool_stride_val
+            pool_stride,           # pool_stride_parent (same as dist)
+            self.dist_val_pool[:K, :data['max_roi_size']].ravel() if self.dist_val_pool is not None else data['dist'].ravel(),
+            self.parent_val_pool[:K, :data['max_roi_size']].ravel() if self.parent_val_pool is not None else data['parent'].ravel(),
             new_frontier.ravel(),  # P0-4: BIT-PACKED uint32 output
             # Phase 4: ROI bounding boxes
             data['roi_minx'],
@@ -2509,6 +2531,19 @@ class CUDADijkstra:
         nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8).ravel(), bitorder='little')
         nodes_expanded = int(cp.count_nonzero(nodes_expanded_mask))
         logger.info(f"[KERNEL-OUTPUT] After unpacking: {nodes_expanded} bits set (expanded nodes)")
+
+        # FIX 7: Track ROI activity after kernel execution
+        # Check which ROIs have active nodes in new_frontier
+        if nodes_expanded > 0:
+            # Compact new_frontier to see which ROIs are active
+            new_flat_idx = cp.nonzero(nodes_expanded_mask.reshape(K, -1)[:, :data['max_roi_size']].ravel())[0]
+            if new_flat_idx.size > 0:
+                new_roi_ids = (new_flat_idx // data['max_roi_size']).astype(cp.int32)
+                n_active_rois = int(cp.unique(new_roi_ids).size)
+                logger.info(f"[ACTIVE-SET] After kernel: unique_rois={n_active_rois}, total_expanded={nodes_expanded}")
+                if n_active_rois < 10:
+                    unique_rois_list = cp.asnumpy(cp.unique(new_roi_ids)).tolist()
+                    logger.debug(f"[ACTIVE-ROIS] Active ROI IDs: {unique_rois_list}")
 
         old_frontier[:] = new_frontier
 
@@ -2595,6 +2630,10 @@ class CUDADijkstra:
         # CSR arrays: pass directly to preserve broadcast stride
         # P0-4: frontier is now bit-packed uint32, include frontier_words parameter
         frontier_words = frontier.shape[1]
+
+        # Calculate pool_stride for kernel (N_max from pool shape)
+        pool_stride = self.dist_val_pool.shape[1] if self.dist_val_pool is not None else max_roi_size
+
         args = (
             K,
             max_roi_size,
@@ -2615,8 +2654,10 @@ class CUDADijkstra:
             data['Nz'],
             data['goal_coords'],   # P0-3: Goal coordinates only (K×3, not max_roi_size×3!)
             data['use_astar'],     # NEW: A* enable flag
-            data['dist'].ravel(),  # OK: per-ROI, must flatten
-            data['parent'].ravel(), # OK: per-ROI, must flatten
+            pool_stride,           # pool_stride_val
+            pool_stride,           # pool_stride_parent (same as dist)
+            self.dist_val_pool[:K, :max_roi_size].ravel() if self.dist_val_pool is not None else data['dist'].ravel(),
+            self.parent_val_pool[:K, :max_roi_size].ravel() if self.parent_val_pool is not None else data['parent'].ravel(),
             new_frontier.ravel(),  # P0-4: BIT-PACKED uint32 output
         )
 
@@ -3492,6 +3533,9 @@ class CUDADijkstra:
         block_size = 256
         grid_size = (total_active + block_size - 1) // block_size
 
+        # Calculate pool_stride for kernel (N_max from pool shape)
+        pool_stride = self.dist_val_pool.shape[1] if self.dist_val_pool is not None else max_roi_size
+
         # Use active_list_kernel (could be extended with delta-specific logic)
         args = (
             total_active,
@@ -3513,8 +3557,10 @@ class CUDADijkstra:
             data['Nz'],
             data['goal_coords'],   # P0-3: Goal coordinates
             data['use_astar'],
-            data['dist'].ravel(),
-            data['parent'].ravel(),
+            pool_stride,           # pool_stride_val
+            pool_stride,           # pool_stride_parent (same as dist)
+            self.dist_val_pool[:K, :max_roi_size].ravel() if self.dist_val_pool is not None else data['dist'].ravel(),
+            self.parent_val_pool[:K, :max_roi_size].ravel() if self.parent_val_pool is not None else data['parent'].ravel(),
             new_frontier.ravel(),
             # Phase 4: ROI bounding boxes
             data['roi_minx'],
