@@ -143,8 +143,8 @@ class CUDADijkstra:
             const int indptr_stride,        // Stride between ROI rows (0 for shared CSR!)
             const int indices_stride,       // Stride between ROI rows (0 for shared CSR!)
             const int weights_stride,       // Stride between ROI rows (0 for shared CSR!)
-            const float* total_cost,            // CSR negotiated costs
-            const int total_cost_stride,        // Stride for total_cost
+            const float* total_cost,        // CSR negotiated costs (weights + present + history)
+            const int total_cost_stride,    // Stride for total_cost
             const int* goal_nodes,          // (K,) goal node index for each ROI (for A* heuristic)
             const int Nx,                   // P0-3: Lattice X dimension
             const int Ny,                   // P0-3: Lattice Y dimension
@@ -285,7 +285,7 @@ class CUDADijkstra:
             const int indptr_stride,            // Stride (0 for shared)
             const int indices_stride,
             const int weights_stride,
-            const float* total_cost,            // CSR negotiated costs
+            const float* total_cost,            // CSR negotiated costs (weights + present + history)
             const int total_cost_stride,        // Stride for total_cost
             const int* goal_nodes,              // (K,) goal indices for A*
             const int Nx,                       // P0-3: Lattice X dimension (procedural coords)
@@ -1238,41 +1238,6 @@ class CUDADijkstra:
         logger.info("[CUDA] Compiled ACCOUNTANT KERNEL (Phase 5: GPU-side history/present/cost updates!)")
         logger.info("[CUDA] Compiled GPU BACKTRACE KERNEL (eliminates 256 MB parent/dist CPU transfers!)")
 
-    def _normalize_batch(self, roi_batch):
-        """
-        Ensure the batch size used by all GPU code is consistent:
-          - Clamp to self.K_pool if present
-          - Return (K, sliced_roi_batch)
-        Never allocate or stride anything until after this runs.
-        """
-        K_in = len(roi_batch)
-        K_pool = getattr(self, "K_pool", None)
-        if K_pool is not None and K_in > K_pool:
-            K_eff = K_pool
-            roi_batch = roi_batch[:K_eff]
-        else:
-            K_eff = K_in
-        return K_eff, roi_batch
-
-    def _cp_array(self, x, dtype=None):
-        """Normalize x to a contiguous CuPy array with optional dtype (no copy if already correct)."""
-        import cupy as cp
-        if isinstance(x, cp.ndarray):
-            return x if (dtype is None or x.dtype == dtype) else x.astype(dtype, copy=False)
-        return cp.asarray(x, dtype=dtype)
-
-    def _slice_per_roi(self, data: dict, K: int) -> None:
-        """Slice every per-ROI array in data to length K (1st dimension)."""
-        import cupy as cp
-        for key, val in list(data.items()):
-            if isinstance(val, list):
-                if len(val) > K:
-                    data[key] = val[:K]
-                continue
-            if hasattr(val, "shape") and isinstance(val.shape, tuple) and len(val.shape) >= 1:
-                if val.shape[0] > K:
-                    data[key] = val[:K]
-
     def _relax_edges_parallel(self, K, max_roi_size, max_edges,
                              active, min_nodes,
                              batch_indptr, batch_indices, batch_weights,
@@ -1343,11 +1308,6 @@ class CUDADijkstra:
             batch_data = self._prepare_batch(roi_batch)
             logger.info(f"[DEBUG-GPU] Batch data prepared, starting Near-Far algorithm")
 
-            # CRITICAL: Use the K that _prepare_batch actually built arrays for
-            K_actual = int(batch_data.get('K', len(roi_batch)))
-            logger.info(f"[K-RESYNC-CALLER] K adjusted from {K} → {K_actual} after _prepare_batch")
-            K = K_actual
-
             # INVARIANT CHECKS: Shared-CSR indexing (user-requested debugging)
             if GPUConfig.DEBUG_INVARIANTS if hasattr(GPUConfig, 'DEBUG_INVARIANTS') else True:
                 # Check if using shared CSR (stride=0 indicates broadcast)
@@ -1370,9 +1330,8 @@ class CUDADijkstra:
                     logger.info("[INVARIANT-CHECK] Per-ROI CSR mode (no shared CSR)")
 
             # Run Near-Far algorithm on GPU
-            # CRITICAL: Slice roi_batch to match K so indices align with arrays
             try:
-                paths = self._run_near_far(batch_data, K, roi_batch[:K])
+                paths = self._run_near_far(batch_data, K, roi_batch)
                 logger.info(f"[DEBUG-GPU] Near-Far algorithm completed")
             except Exception as near_far_error:
                 logger.error(f"[DEBUG-GPU] Error in _run_near_far: {near_far_error}")
@@ -1529,9 +1488,7 @@ class CUDADijkstra:
         """
         import numpy as np
 
-        # CRITICAL: Normalize batch BEFORE any allocations or as_strided views
-        K, roi_batch = self._normalize_batch(roi_batch)
-        logger.info(f"[PREPARE] preparing batch for {K} ROIs (after normalization)")
+        K = len(roi_batch)
 
         # Check if all nets share the same CSR (full graph routing)
         # Use array length instead of id() - if all have same huge size, it's shared full graph
@@ -1633,12 +1590,6 @@ class CUDADijkstra:
                 else:
                     N_max = 5_000_000  # Conservative max nodes
 
-                # CRITICAL: Now that K_pool exists, re-normalize K and roi_batch
-                K_old = K
-                K, roi_batch = self._normalize_batch(roi_batch)
-                if K != K_old:
-                    logger.warning(f"[K-RENORMALIZE] After K_pool calculated: K {K_old} → {K}")
-
                 self.dist_val_pool = cp.full((self.K_pool, N_max), cp.inf, dtype=cp.float32)
                 self.dist_stamp_pool = cp.zeros((self.K_pool, N_max), dtype=cp.uint16)  # Phase A: uint16 stamps
                 self.parent_val_pool = cp.full((self.K_pool, N_max), -1, dtype=cp.int32)
@@ -1734,12 +1685,6 @@ class CUDADijkstra:
                 else:
                     N_max = 5_000_000  # Conservative max nodes
 
-                # CRITICAL: Now that K_pool exists, re-normalize K and roi_batch
-                K_old = K
-                K, roi_batch = self._normalize_batch(roi_batch)
-                if K != K_old:
-                    logger.warning(f"[K-RENORMALIZE] After K_pool calculated: K {K_old} → {K}")
-
                 self.dist_val_pool = cp.full((self.K_pool, N_max), cp.inf, dtype=cp.float32)
                 self.dist_stamp_pool = cp.zeros((self.K_pool, N_max), dtype=cp.uint16)  # Phase A: uint16 stamps
                 self.parent_val_pool = cp.full((self.K_pool, N_max), -1, dtype=cp.int32)
@@ -1766,17 +1711,19 @@ class CUDADijkstra:
 
         threshold = cp.full(K, 0.4, dtype=cp.float32)
 
-        # CRITICAL: Log K vs roi_batch size to catch off-by-one bugs
-        logger.info(f"[PREPARE-BATCH] K={K}, len(roi_batch)={len(roi_batch)}, will process roi_batch[:K] = {K} elements")
-
         sources = []
         sinks = []
 
         # Fill arrays from ROI batch
         if not all_share_csr:
             # Only transfer CSR if nets have different ROIs
-            # roi_batch is already sliced to K at the top of function
-            for i, (src, dst, indptr, indices, weights, roi_size, roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz) in enumerate(roi_batch):
+            for i, roi_tuple in enumerate(roi_batch):
+                # Handle both 6-element (old) and 7-element (new with roi_bitmap) tuples
+                if len(roi_tuple) == 7:
+                    src, dst, indptr, indices, weights, roi_size, roi_bitmap = roi_tuple
+                else:
+                    src, dst, indptr, indices, weights, roi_size = roi_tuple
+                    roi_bitmap = None  # Old format without ROI bitmap
                 # CRITICAL FIX: Verify indptr has correct size (roi_size + 1)
                 if len(indptr) != roi_size + 1:
                     logger.warning(f"[INDIVIDUAL-CSR-FIX] ROI {i}: indptr size mismatch: len={len(indptr)}, expected={roi_size + 1}")
@@ -1837,8 +1784,13 @@ class CUDADijkstra:
         roi_maxz = cp.zeros(K, dtype=cp.int32)
 
         # Initialize sources/sinks for all nets
-        # roi_batch is already sliced to K at the top of function
-        for i, (src, dst, indptr, indices, weights, roi_size, roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz) in enumerate(roi_batch):
+        for i, roi_tuple in enumerate(roi_batch):
+            # Handle both 6-element (old) and 7-element (new with roi_bitmap) tuples
+            if len(roi_tuple) == 7:
+                src, dst, indptr, indices, weights, roi_size, roi_bitmap = roi_tuple
+            else:
+                src, dst, indptr, indices, weights, roi_size = roi_tuple
+                roi_bitmap = None  # Old format without ROI bitmap
             # Store goal node for A* heuristic
             goal_nodes_array[i] = dst
 
@@ -1900,12 +1852,6 @@ class CUDADijkstra:
             sources.append(src)
             sinks.append(dst)
 
-
-        # Convert sources/sinks to CuPy int32 arrays for consistent indexing
-        sources = cp.asarray(sources, dtype=cp.int32)
-        sinks = cp.asarray(sinks, dtype=cp.int32)
-        logger.info(f"[PREPARE-BATCH] Converted sources/sinks to CuPy arrays: sources.shape={sources.shape}, sinks.shape={sinks.shape}")
-
         # Phase B: Create legacy near_mask/far_mask views by unpacking bitsets
         # This maintains backward compatibility with legacy delta-stepping code
         # CuPy doesn't support axis parameter, so we ravel, unpack, then reshape
@@ -1948,68 +1894,6 @@ class CUDADijkstra:
             'generation': gen,
         }
 
-        # K-consistency invariants check
-        # CRITICAL: Convert sources/sinks to CuPy int32 arrays (not Python lists!)
-        # Build directly from roi_batch to ensure K consistency
-        sources_cp = cp.asarray([roi[0] for roi in roi_batch], dtype=cp.int32)
-        sinks_cp = cp.asarray([roi[1] for roi in roi_batch], dtype=cp.int32)
-        logger.info(f"[SOURCES-SINKS] Converted to CuPy: sources.shape={sources_cp.shape}, sinks.shape={sinks_cp.shape}")
-
-        data_dict = {
-            'K': K,
-            'max_roi_size': max_roi_size,
-            'max_edges': max_edges,
-            'batch_indptr': batch_indptr,
-            'batch_indices': batch_indices,
-            'batch_weights': batch_weights,
-            'dist': dist,
-            'parent': parent,
-            'near_bits': near_bits,
-            'far_bits': far_bits,
-            'near_mask': near_mask,
-            'far_mask': far_mask,
-            'threshold': threshold,
-            'sources': sources_cp,  # Now CuPy int32 array
-            'sinks': sinks_cp,      # Now CuPy int32 array
-            'goal_nodes': goal_nodes_array,
-            'Nx': Nx,
-            'Ny': Ny,
-            'Nz': Nz,
-            'goal_coords': cp.asarray(goal_coords_array),
-            'use_astar': 1 if (Nx > 0 and Ny > 0 and Nz > 0) else 0,
-            'roi_minx': roi_minx,
-            'roi_maxx': roi_maxx,
-            'roi_miny': roi_miny,
-            'roi_maxy': roi_maxy,
-            'roi_minz': roi_minz,
-            'roi_maxz': roi_maxz,
-            'dist_stamps': dist_stamps,
-            'parent_stamps': parent_stamps,
-            'generation': gen,
-        }
-        
-        # Verify all per-ROI arrays have shape[0] == K
-        for key in ['dist', 'parent', 'near_bits', 'far_bits', 'near_mask', 'far_mask', 
-                    'threshold', 'goal_nodes', 'roi_minx', 'roi_maxx', 'roi_miny', 'roi_maxy', 
-                    'roi_minz', 'roi_maxz', 'dist_stamps', 'parent_stamps']:
-            arr = data_dict[key]
-            if hasattr(arr, 'shape') and len(arr.shape) >= 1:
-                if arr.shape[0] != K:
-                    logger.error(f"[K-INVARIANT-FAIL] {key}.shape[0]={arr.shape[0]} != K={K}")
-                    raise ValueError(f"K-consistency check failed: {key}.shape[0]={arr.shape[0]} != K={K}")
-        
-        # Verify sources/sinks have shape[0] == K
-        if sources_cp.shape[0] != K:
-            logger.error(f"[K-INVARIANT-FAIL] sources.shape[0]={sources_cp.shape[0]} != K={K}")
-            raise ValueError(f"K-consistency check failed: sources.shape[0]={sources_cp.shape[0]} != K={K}")
-        if sinks_cp.shape[0] != K:
-            logger.error(f"[K-INVARIANT-FAIL] sinks.shape[0]={sinks_cp.shape[0]} != K={K}")
-            raise ValueError(f"K-consistency check failed: sinks.shape[0]={sinks_cp.shape[0]} != K={K}")
-        
-        logger.info(f"[K-INVARIANT-PASS] All per-ROI arrays have shape[0]={K}")
-        
-        return data_dict
-
         # Phase 1: Increment generation for next batch
         # Phase A: Wrap generation counter to prevent uint16 overflow (max 65535)
         self.current_gen += 1
@@ -2042,30 +1926,18 @@ class CUDADijkstra:
         """
         import time
 
-        
-        # Respect the batch width prepared upstream
-        K = int(data.get('K', K))
-        # Basic invariants to catch off-by-one before launching kernels
-        try:
-            n_src = len(data['sources'])
-            n_dst = len(data['sinks'])
-        except Exception:
-            n_src = int(data['sources'].shape[0])
-            n_dst = int(data['sinks'].shape[0])
-        assert n_src == K and n_dst == K, f"K mismatch: K={K} sources={n_src} sinks={n_dst}"
-        logger.info(f"[_run_near_far] Using K={K}, sources.shape={n_src}, sinks.shape={n_dst}")
+        # Route to delta-stepping if enabled (proper Δ-stepping with bucket-based priority queue)
+        use_delta_stepping = GPUConfig.USE_DELTA_STEPPING if hasattr(GPUConfig, 'USE_DELTA_STEPPING') else False
 
-# Route to delta-stepping if enabled (proper Δ-stepping with bucket-based priority queue)
-        # Temporarily force wavefront for iteration-1 debugging
-        use_delta_stepping = False
-        
-        # TEMPORARILY DISABLED for testing
-        if False:  # Disabled delta-stepping for K-consistency testing
+        if use_delta_stepping:
             # Get delta value from config (fallback to 0.5mm)
             delta = GPUConfig.DELTA_VALUE if hasattr(GPUConfig, 'DELTA_VALUE') else 0.5
             logger.info(f"[CUDA-PATHFINDING] Routing to DELTA-STEPPING algorithm (delta={delta:.3f}mm)")
             return self._run_delta_stepping(data, K, delta, roi_batch)
 
+        # Log dispatcher decision
+        use_persistent_check = GPUConfig.USE_PERSISTENT_KERNEL if hasattr(GPUConfig, "USE_PERSISTENT_KERNEL") else False
+        logger.info(f"[CUDA-DISPATCHER] Delta-stepping: DISABLED | Persistent kernel: {"ENABLED" if use_persistent_check else "DISABLED"}")
         # Otherwise use BFS wavefront (fast but incorrect cost ordering)
         logger.info(f"[CUDA-WAVEFRONT] Starting BFS wavefront algorithm for {K} ROIs (WARNING: ignores cost ordering)")
 
@@ -2091,8 +1963,8 @@ class CUDADijkstra:
         logger.info(f"[DEBUG-GPU] Validating ROI sources and destinations")
         invalid_rois = []
         for roi_idx in range(K):
-            src = int(data['sources'][roi_idx].item())
-            dst = int(data['sinks'][roi_idx].item())
+            src = data['sources'][roi_idx]
+            dst = data['sinks'][roi_idx]
 
             # Get actual ROI size for this ROI (not padded size)
             if roi_batch and roi_idx < len(roi_batch):
@@ -2129,7 +2001,7 @@ class CUDADijkstra:
 
         # Initialize source nodes in bitset
         for roi_idx in range(K):
-            src = int(data['sources'][roi_idx].item())
+            src = data['sources'][roi_idx]
             word_idx = src // 32
             bit_pos = src % 32
             frontier[roi_idx, word_idx] = cp.uint32(1) << bit_pos
@@ -2143,7 +2015,7 @@ class CUDADijkstra:
 
         # Check first few ROIs have their source bit set
         for roi_idx in range(min(3, K)):
-            src = int(data['sources'][roi_idx].item())
+            src = data['sources'][roi_idx]
             word_idx = src // 32
             bit_pos = src % 32
             word_val = int(frontier[roi_idx, word_idx])
@@ -2152,8 +2024,8 @@ class CUDADijkstra:
 
         # DIAGNOSTIC: Check initial state
         for roi_idx in range(min(3, K)):  # Check first 3 ROIs
-            src = int(data['sources'][roi_idx].item())
-            sink = int(data['sinks'][roi_idx].item())
+            src = data['sources'][roi_idx]
+            sink = data['sinks'][roi_idx]
             src_dist = float(data['dist'][roi_idx, src])
             sink_dist = float(data['dist'][roi_idx, sink])
             logger.info(f"[CUDA-WAVEFRONT] ROI {roi_idx}: src={src} (dist={src_dist}), "
@@ -2359,9 +2231,9 @@ class CUDADijkstra:
         else:
             # BASELINE: CPU compaction using cp.nonzero (needs unpacking)
             logger.info("[BASELINE] Using cp.nonzero for compaction (USE_GPU_COMPACTION=0)")
-            # Unpack bitset for cp.nonzero (CuPy doesn't support axis, use ravel+reshape)
-            frontier_mask = cp.unpackbits(frontier_bytes.ravel(), bitorder='little')
-            frontier_mask = frontier_mask.reshape(K, -1)[:, :max_roi_size]
+            # Unpack bitset for cp.nonzero
+            frontier_mask = cp.unpackbits(frontier_bytes, axis=1, bitorder='little')
+            frontier_mask = frontier_mask[:, :max_roi_size]
             flat_idx = cp.nonzero(frontier_mask.ravel())[0]
             total_active = int(flat_idx.size)
 
@@ -2373,8 +2245,8 @@ class CUDADijkstra:
             return 0
 
         N = max_roi_size
-        roi_ids = (flat_idx // N).astype(cp.int32)
-        node_ids = (flat_idx - (roi_ids * N)).astype(cp.int32)
+        roi_ids = flat_idx // N
+        node_ids = flat_idx - (roi_ids * N)
 
         # DIAGNOSTIC: Check compacted indices
         if total_active > 0:
@@ -2382,7 +2254,7 @@ class CUDADijkstra:
             for i in range(min(3, total_active)):
                 roi = int(roi_ids[i])
                 node = int(node_ids[i])
-                src_expected = int(data['sources'][roi].item()) if roi < len(data['sources']) else -1
+                src_expected = data['sources'][roi] if roi < len(data['sources']) else -1
                 logger.info(f"[COMPACTION]   [{i}] roi={roi}, node={node} (expected src={src_expected})")
 
         # Use compacted kernel for ANY sparse frontier
@@ -2461,16 +2333,16 @@ class CUDADijkstra:
             total_active,
             data['max_roi_size'],
             frontier_words,        # P0-4: Number of uint32 words per ROI
-            roi_ids,
-            node_ids,
+            roi_ids.astype(cp.int32),
+            node_ids.astype(cp.int32),
             indptr_arr,
             indices_arr,
             weights_arr,
             indptr_stride,
             indices_stride,
             weights_stride,
-            weights_arr,           # total_cost = same as weights (already negotiated)
-            weights_stride,        # total_cost_stride
+            data.get('total_cost', weights_arr),           # Negotiated costs or fallback to weights
+            data.get('total_cost_stride', weights_stride), # Stride for total_cost
             data['goal_nodes'],
             data['Nx'],            # P0-3: Lattice dimensions for procedural coords
             data['Ny'],
@@ -2491,9 +2363,6 @@ class CUDADijkstra:
 
         # P0-5: Time kernel execution
         start_event.record()
-        # BATCH SANITY CHECK
-        logger.info(f"[BATCH-SANITY] active_list_kernel: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape} node_ids.shape={node_ids.shape}")
-        logger.info(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
         self.active_list_kernel((grid_size,), (block_size,), args)
         end_event.record()
         end_event.synchronize()
@@ -2505,8 +2374,7 @@ class CUDADijkstra:
 
         # Count nodes expanded (count set BITS, not sum of uint32 values!)
         # Fast bit count: unpack and count (ravel OK for counting only)
-        # CuPy doesn't support axis parameter - ravel, unpack, count (result is same)
-        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8).ravel(), bitorder='little')
+        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8), axis=1, bitorder='little')
         nodes_expanded = int(cp.count_nonzero(nodes_expanded_mask))
         logger.info(f"[KERNEL-OUTPUT] After unpacking: {nodes_expanded} bits set (expanded nodes)")
 
@@ -2607,8 +2475,6 @@ class CUDADijkstra:
             indptr_stride,         # Kernel uses this to compute correct address
             indices_stride,        # When stride=0, all ROIs share base pointer
             weights_stride,        # When stride>0, each ROI has own row
-            weights_arr,           # total_cost = same as weights (already negotiated)
-            weights_stride,        # total_cost_stride
             data['goal_nodes'],    # NEW: A* goal nodes
             data['Nx'],            # P0-3: Lattice dimensions
             data['Ny'],
@@ -2628,8 +2494,7 @@ class CUDADijkstra:
         cp.cuda.Stream.null.synchronize()
 
         # Count nodes expanded (count set BITS, not sum of uint32 values!)
-        # CuPy doesn't support axis parameter - ravel, unpack, count (result is same)
-        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8).ravel(), bitorder='little')
+        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8), axis=1, bitorder='little')
         nodes_expanded = int(cp.count_nonzero(nodes_expanded_mask))
 
         # DIAGNOSTIC: Check if distance array was modified at all
@@ -3290,19 +3155,6 @@ class CUDADijkstra:
         """
         import time
 
-        
-        # Respect the batch width prepared upstream
-        K = int(data.get('K', K))
-        # Basic invariants to catch off-by-one before launching kernels
-        try:
-            n_src = len(data['sources'])
-            n_dst = len(data['sinks'])
-        except Exception:
-            n_src = int(data['sources'].shape[0])
-            n_dst = int(data['sinks'].shape[0])
-        assert n_src == K and n_dst == K, f"K mismatch: K={K} sources={n_src} sinks={n_dst}"
-        logger.info(f"[_run_delta_stepping] Using K={K}, sources.shape={n_src}, sinks.shape={n_dst}")
-
         logger.info(f"[DELTA-STEPPING] Starting with K={K} ROIs, delta={delta:.3f}")
 
         # Adaptive iteration budget
@@ -3323,8 +3175,8 @@ class CUDADijkstra:
         # Validate sources and sinks
         invalid_rois = []
         for roi_idx in range(K):
-            src = int(data['sources'][roi_idx].item())
-            dst = int(data['sinks'][roi_idx].item())
+            src = data['sources'][roi_idx]
+            dst = data['sinks'][roi_idx]
 
             if roi_batch and roi_idx < len(roi_batch):
                 actual_roi_size = roi_batch[roi_idx][5]
@@ -3353,7 +3205,7 @@ class CUDADijkstra:
 
         # Initialize: place source nodes in bucket 0 (distance 0)
         for roi_idx in range(K):
-            src = int(data['sources'][roi_idx].item())
+            src = data['sources'][roi_idx]
             word_idx = src // 32
             bit_pos = src % 32
             buckets[roi_idx, 0, word_idx] = cp.uint32(1) << bit_pos
@@ -3465,8 +3317,8 @@ class CUDADijkstra:
             return 0
 
         N = max_roi_size
-        roi_ids = (flat_idx // N).astype(cp.int32)
-        node_ids = (flat_idx - (roi_ids * N)).astype(cp.int32)
+        roi_ids = flat_idx // N
+        node_ids = flat_idx - (roi_ids * N)
 
         # Allocate temporary frontier for relaxed nodes
         new_frontier = cp.zeros((K, frontier_words), dtype=cp.uint32)
@@ -3497,16 +3349,14 @@ class CUDADijkstra:
             total_active,
             max_roi_size,
             frontier_words,
-            roi_ids,
-            node_ids,
+            roi_ids.astype(cp.int32),
+            node_ids.astype(cp.int32),
             indptr_arr,
             indices_arr,
             weights_arr,
             indptr_stride,
             indices_stride,
             weights_stride,
-            weights_arr,           # total_cost = same as weights (already negotiated)
-            weights_stride,        # total_cost_stride
             data['goal_nodes'],
             data['Nx'],            # P0-3: Lattice dimensions
             data['Ny'],
@@ -3525,9 +3375,6 @@ class CUDADijkstra:
             data['roi_maxz'],
         )
 
-        # BATCH SANITY CHECK
-        logger.info(f"[BATCH-SANITY] delta_stepping active_list: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape}")
-        logger.info(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
         self.active_list_kernel((grid_size,), (block_size,), args)
         cp.cuda.Stream.null.synchronize()
 
@@ -3558,8 +3405,7 @@ class CUDADijkstra:
         cp.cuda.Stream.null.synchronize()
 
         # Count nodes expanded (count set BITS, not sum uint32!)
-        # CuPy doesn't support axis parameter - ravel, unpack, count (result is same)
-        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8).ravel(), bitorder='little')
+        nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8), axis=1, bitorder='little')
         nodes_expanded = int(cp.count_nonzero(nodes_expanded_mask))
         return nodes_expanded
 
@@ -3575,9 +3421,13 @@ class CUDADijkstra:
         logger.info(f"[CUDA-FALLBACK] Using CPU Dijkstra for {len(roi_batch)} ROIs")
 
         paths = []
-        # roi_batch now has 13 elements: (src, dst, indptr, indices, weights, roi_size, roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz)
-        # CPU fallback only needs the first 6
-        for src, sink, indptr, indices, weights, size, *_ in roi_batch:
+        for roi_tuple in roi_batch:
+            # Handle both 6-element (old) and 7-element (new with roi_bitmap) tuples
+            if len(roi_tuple) == 7:
+                src, sink, indptr, indices, weights, size, roi_bitmap = roi_tuple
+            else:
+                src, sink, indptr, indices, weights, size = roi_tuple
+                roi_bitmap = None  # Old format without ROI bitmap
             # Transfer to CPU if needed
             if hasattr(indptr, 'get'):
                 indptr_cpu = indptr.get()
@@ -4304,7 +4154,13 @@ class CUDADijkstra:
         logger.info(f"[BIDIR-BATCH] Processing {len(roi_batch)} ROIs with bi-directional search")
 
         paths = []
-        for roi_idx, (src, dst, indptr, indices, weights, roi_size, roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz) in enumerate(roi_batch):
+        for roi_idx, roi_tuple in enumerate(roi_batch):
+            # Handle both 6-element (old) and 7-element (new with roi_bitmap) tuples
+            if len(roi_tuple) == 7:
+                src, dst, indptr, indices, weights, roi_size, roi_bitmap = roi_tuple
+            else:
+                src, dst, indptr, indices, weights, roi_size = roi_tuple
+                roi_bitmap = None  # Old format without ROI bitmap
             logger.info(f"[BIDIR-BATCH] ROI {roi_idx}/{len(roi_batch)}: src={src}, dst={dst}, size={roi_size}")
 
             # Convert to CuPy arrays

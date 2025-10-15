@@ -492,6 +492,12 @@ from collections import defaultdict
 
 # Third-party
 import numpy as np
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except ImportError:
+    cp = np  # Fallback to numpy if cupy not available
+    CUPY_AVAILABLE = False
 
 # Local config
 from .pathfinder.config import PAD_CLEARANCE_MM
@@ -534,9 +540,9 @@ class GPUConfig:
     """GPU pathfinding algorithm configuration"""
     GPU_MODE = True  # Enable GPU acceleration (set to False for CPU-only)
     DEBUG_INVARIANTS = True
-    USE_PERSISTENT_KERNEL = False
+    USE_PERSISTENT_KERNEL = False  # DISABLED: Hangs indefinitely on full 2.4M node graph (runs all 2000 iterations)
     USE_GPU_COMPACTION = True
-    USE_DELTA_STEPPING = True  # Use proper Δ-stepping bucket-based priority queue (instead of BFS wavefront)
+    USE_DELTA_STEPPING = False  # DISABLED: Causes OOM from bucket allocation on large graphs
     DELTA_VALUE = 0.5  # Bucket width in mm (0.5mm ≈ 1.25 × 0.4mm grid pitch)
     # Recommended delta values:
     # - 0.4: Same as grid pitch (many buckets, high precision)
@@ -1086,33 +1092,131 @@ class ROIExtractor:
         roi_nodes = np.array(list(roi_nodes_set), dtype=np.int32)
 
         # Cap ROI size if enormous (100K is ~2.4% of a 4M node graph)
-        max_nodes = getattr(self, "max_roi_nodes", 1_000_000)  # Increased from 100k to 1M
+        max_nodes = getattr(self, "max_roi_nodes", 100_000)  # [FIX-5] Reduced from 1M to 100K to avoid full-graph routing
         if roi_nodes.size > max_nodes:
             logger.warning(f"Geometric ROI {roi_nodes.size:,} > {max_nodes:,}, truncating to {max_nodes} (keeping {len(must_keep_nodes)} critical nodes)")
 
-            # FIXED: Move ALL must-keep nodes to the beginning (not just those beyond boundary)
-            # Convert must_keep_nodes to set for O(1) lookup
-            must_keep_set = set(must_keep_nodes)
+            # CONNECTIVITY-PRESERVING TRUNCATION: BFS growth from src/dst
+            # This ensures src's neighbors are included so GPU wavefront can expand
+            from collections import deque
 
-            # Partition: must-keep nodes first, then others
-            kept_nodes = []
-            other_nodes = []
-            for node in roi_nodes:
-                if node in must_keep_set:
-                    kept_nodes.append(node)
-                else:
-                    other_nodes.append(node)
+            # Build candidate set and neighbor lookup
+            cand_set = set(roi_nodes.tolist())
 
-            # Verify we found all must-keep nodes
-            if len(kept_nodes) != len(must_keep_nodes):
-                logger.error(f"BUG: Found {len(kept_nodes)}/{len(must_keep_nodes)} must-keep nodes in ROI")
+            def get_neighbors(node_idx):
+                """Get 4-way (+ via) neighbors for this node"""
+                neighbors = []
+                x_steps = self.lattice.x_steps
+                y_steps = self.lattice.y_steps
+                plane_size = x_steps * y_steps
 
-            # Reconstruct array: must-keep first, then fill with others
-            num_kept = len(kept_nodes)
-            num_others = min(max_nodes - num_kept, len(other_nodes))
-            roi_nodes = np.array(kept_nodes + other_nodes[:num_others], dtype=np.int32)
+                z, r = divmod(node_idx, plane_size)
+                y, x = divmod(r, x_steps)
 
-            logger.info(f"After truncation: preserved {num_kept} critical nodes + {num_others} other nodes = {len(roi_nodes)} total")
+                # 4-way horizontal
+                if x > 0:
+                    neighbors.append(node_idx - 1)
+                if x + 1 < x_steps:
+                    neighbors.append(node_idx + 1)
+                if y > 0:
+                    neighbors.append(node_idx - x_steps)
+                if y + 1 < y_steps:
+                    neighbors.append(node_idx + x_steps)
+
+                # Vias (vertical)
+                if z > 0:
+                    neighbors.append(node_idx - plane_size)
+                if z + 1 < self.lattice.layers:
+                    neighbors.append(node_idx + plane_size)
+
+                return neighbors
+
+            # BFS from src and dst alternating (to keep both regions connected)
+            selected = set(must_keep_nodes)
+            q_src = deque([src])
+            q_dst = deque([dst])
+
+            # Add portal seeds to their appropriate queues
+            if portal_seeds:
+                for node_id, _ in portal_seeds:
+                    if node_id != src and node_id != dst:
+                        # Add to src queue (arbitrary choice)
+                        q_src.append(node_id)
+
+            toggle = 0
+            while len(selected) < max_nodes and (q_src or q_dst):
+                # Alternate between src and dst fronts for balanced growth
+                q = q_src if toggle == 0 else q_dst
+                toggle ^= 1
+
+                if not q:
+                    continue
+
+                # Process one node from this frontier
+                u = q.popleft()
+                for v in get_neighbors(u):
+                    if v in selected:
+                        continue
+                    if v not in cand_set:
+                        continue  # Must be in geometric corridor
+
+                    selected.add(v)
+                    q.append(v)
+
+                    if len(selected) >= max_nodes:
+                        break
+
+                if len(selected) >= max_nodes:
+                    break
+
+            roi_nodes = np.array(list(selected), dtype=np.int32)
+            logger.info(f"After BFS truncation: {len(roi_nodes)} nodes (connectivity-preserving from src/dst) vs {max_nodes} budget")
+
+            # DEBUG: Verify src's immediate neighbors are included
+            src_neighbors = set(get_neighbors(src))
+            neighbors_in_roi = src_neighbors & selected
+            logger.info(f"[BFS-DEBUG] Src {src} has {len(src_neighbors)} neighbors, {len(neighbors_in_roi)} are in BFS-selected ROI")
+
+            # ROI REACHABILITY CHECK: Verify dst is reachable from src within truncated ROI
+            logger.info(f"[ROI-REACHABILITY] Testing if dst {dst} is reachable from src {src} within truncated ROI...")
+
+            # Quick BFS to check connectivity (ignoring costs)
+            from collections import deque
+            queue = deque([src])
+            visited_bfs = {src}
+            found_dst = False
+            hop_count = 0
+            max_hops = 10000  # Safety limit
+
+            while queue and hop_count < max_hops:
+                u = queue.popleft()
+                u = int(u)  # CRITICAL: Cast to Python int
+                hop_count += 1
+
+                if u == dst:
+                    found_dst = True
+                    logger.info(f"[ROI-REACHABILITY] ✓ dst {dst} REACHABLE from src {src} in {hop_count} hops")
+                    break
+
+                # Get neighbors from graph - CAST TO INT
+                u_start = int(self.graph.indptr[u])
+                u_end = int(self.graph.indptr[u + 1])
+
+                for e in range(u_start, u_end):
+                    v = int(self.graph.indices[e])  # CAST neighbor to int
+
+                    # Only expand within ROI
+                    if v not in selected:
+                        continue
+
+                    if v not in visited_bfs:
+                        visited_bfs.add(v)
+                        queue.append(v)
+
+            if not found_dst:
+                logger.error(f"[ROI-REACHABILITY] ✗ dst {dst} NOT REACHABLE from src {src} within truncated ROI!")
+                logger.error(f"[ROI-REACHABILITY] ROI has {len(roi_nodes)} nodes but src/dst are DISCONNECTED")
+                logger.error(f"[ROI-REACHABILITY] Need to expand ROI budget or fix truncation logic")
 
         # Build global_to_roi mapping
         global_to_roi = np.full(self.N, -1, dtype=np.int32)
@@ -1567,8 +1671,8 @@ class PathFinderRouter:
 
         if use_gpu_solver:
             try:
-                self.solver.gpu_solver = CUDADijkstra(self.graph)
-                logger.info("[GPU] CUDA Near-Far Dijkstra enabled (ROI > 5K nodes)")
+                self.solver.gpu_solver = CUDADijkstra(self.graph, self.lattice)
+                logger.info("[GPU] CUDA Near-Far Dijkstra enabled (ROI > 5K nodes) with lattice dims")
                 # Log GPU details
                 device = cp.cuda.Device()
                 mem_free, mem_total = device.mem_info
@@ -2554,15 +2658,35 @@ class PathFinderRouter:
             # Also consider compute: RTX 4090 has 16,384 CUDA cores, optimal batch = cores / 32 (warp size)
             optimal_compute_batch = 512
 
-            effective_batch_size = min(max_batch_for_memory, optimal_compute_batch, total)
+            # [FIX-3] Also respect K_pool (GPU pool capacity) in iteration 1
+            if hasattr(self.solver, 'gpu_solver') and self.solver.gpu_solver and hasattr(self.solver.gpu_solver, 'K_pool') and self.solver.gpu_solver.K_pool:
+                effective_batch_size = min(self.solver.gpu_solver.K_pool, max_batch_for_memory, optimal_compute_batch, total)
+                logger.info(f"[FIX-3] ITER-1: batch_size capped by K_pool={self.solver.gpu_solver.K_pool}")
+            else:
+                effective_batch_size = min(max_batch_for_memory, optimal_compute_batch, total)
             logger.info(f"[ITER-1-BATCH] Full graph routing: N={self.N:,} nodes")
             logger.info(f"[ITER-1-BATCH] Memory limit: {max_batch_for_memory} nets, Compute optimal: {optimal_compute_batch}")
             logger.info(f"[ITER-1-BATCH] Using batch_size={effective_batch_size} for {total} nets")
         else:
             # ITERATION 2+: ROI-based routing (smaller graphs ~500K nodes)
-            # Can use larger batches since each net works on smaller subgraph
-            effective_batch_size = min(cfg.batch_size, 64, total)
-            logger.info(f"[ITER-{self.iteration}-BATCH] ROI-based routing: using batch_size={effective_batch_size}")
+            # FIX-3: Use K_pool for batch sizing instead of hardcoded 64
+            # K_pool is dynamically calculated from GPU memory by cuda_dijkstra
+            if hasattr(self.solver, 'gpu_solver') and self.solver.gpu_solver and hasattr(self.solver.gpu_solver, 'K_pool') and self.solver.gpu_solver.K_pool:
+                effective_batch_size = min(self.solver.gpu_solver.K_pool, total)
+                logger.info(f"[FIX-3] Using K_pool-based batch_size={effective_batch_size} (K_pool={self.solver.gpu_solver.K_pool})")
+            else:
+                # Fallback if K_pool not available yet (will be calculated on first batch)
+                effective_batch_size = min(cfg.batch_size, 64, total)
+                logger.info(f"[ITER-{self.iteration}-BATCH] ROI-based routing: using batch_size={effective_batch_size} (K_pool not yet calculated)")
+
+        # FIX 4: Respect GPU K_pool capacity (final clamp)
+        if hasattr(self.solver, 'gpu_solver') and self.solver.gpu_solver:
+            gpu_solver = self.solver.gpu_solver
+            if hasattr(gpu_solver, 'K_pool') and gpu_solver.K_pool:
+                k_cap = int(gpu_solver.K_pool)
+                if effective_batch_size > k_cap:
+                    logger.info(f"[GPU-BATCH] Clamping batch_size {effective_batch_size} -> K_pool {k_cap}")
+                    effective_batch_size = k_cap
 
         routed_this_pass = 0
         failed_this_pass = 0
@@ -2618,8 +2742,9 @@ class PathFinderRouter:
             # Timing breakdowns
             roi_extract_time = 0.0
             csr_build_time = 0.0
+            roi_sizes = []  # Track ROI sizes for logging
 
-            # Prepare all nets in batch (use full graph for all - skip ROI extraction!)
+            # [FIX-5] Prepare all nets in batch with per-net ROI extraction
             for net_id in batch_nets:
                 src, dst = tasks[net_id]
 
@@ -2638,16 +2763,18 @@ class PathFinderRouter:
                 dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
                 manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
 
-                # ALWAYS use GEOMETRIC ROI to avoid GPU OOM (adaptive corridor based on net length)
+                # [FIX-5] ALWAYS use GEOMETRIC ROI to avoid GPU OOM (adaptive corridor based on net length)
+                # Keep ROI sizes manageable to avoid 3-second CSR extraction bottleneck
                 # Short nets: smaller corridor (12mm)
-                # Long nets: larger corridor (24-40mm) but still bounded
+                # Long nets: larger corridor but capped at 60 steps (24mm) to keep ROI < 100K nodes
                 if manhattan_dist < 125:
                     corridor_buffer = 30  # 12mm @ 0.4mm pitch
                     layer_margin = 3
                 else:
-                    # Long nets: increase corridor proportionally but cap at 100 steps (40mm)
-                    corridor_buffer = min(100, int(manhattan_dist * 0.4) + 30)
-                    layer_margin = 5  # More layers for long nets
+                    # Long nets: increase corridor proportionally but cap at 60 steps (24mm)
+                    # [FIX-5] Reduced from 100 to 60 to prevent huge ROIs that cause CSR bottleneck
+                    corridor_buffer = min(60, int(manhattan_dist * 0.3) + 30)
+                    layer_margin = 4  # Balanced layer count for long nets
 
                 roi_nodes, global_to_roi = self.roi_extractor.extract_roi_geometric(src, dst, corridor_buffer=corridor_buffer, layer_margin=layer_margin)
 
@@ -2677,6 +2804,7 @@ class PathFinderRouter:
                 # Build ROI CSR for this net
                 csr_start = time.time()
                 roi_size = len(roi_nodes)
+                roi_sizes.append(roi_size)  # [FIX-5] Track for stats
                 roi_src = int(global_to_roi[src])
                 roi_dst = int(global_to_roi[dst])
 
@@ -2684,40 +2812,168 @@ class PathFinderRouter:
                     batch_metadata.append((net_id, False, None, None, None))
                     continue
 
-                # PERFORMANCE FIX: Use full graph CSR directly (already on GPU)
-                # Skip CPU-based CSR extraction - this was the 3-second bottleneck!
-                full_graph_size = len(self.graph.indptr) - 1
-                if roi_size == full_graph_size:
-                    # Full graph: use SHARED CSR structure (copied once before batch loop)
-                    roi_indptr = shared_indptr
-                    roi_indices = shared_indices
-                    roi_weights = shared_weights
-                    # CRITICAL FIX: For full graph, use GLOBAL indices (not ROI-local)
-                    # The CSR arrays are the full graph, so src/dst must be global node IDs
-                    actual_roi_src = src  # Use global src
-                    actual_roi_dst = dst  # Use global dst
-                    logger.info(f"[DEBUG] Net {net_id}: Using shared CSR (no copy), src={src}, dst={dst}")
-                else:
-                    # ROI subgraph: extract CSR (fallback for small nets if needed)
-                    # Use shared_weights instead of copying costs again
-                    roi_indptr, roi_indices, roi_weights = self.solver.gpu_solver._extract_roi_csr(
-                        roi_nodes.get() if hasattr(roi_nodes, 'get') else roi_nodes,
-                        global_to_roi.get() if hasattr(global_to_roi, 'get') else global_to_roi,
-                        shared_weights
-                    )
-                    # For ROI subgraph, use local indices
-                    actual_roi_src = roi_src
-                    actual_roi_dst = roi_dst
-                    logger.info(f"[DEBUG] Net {net_id}: Extracted ROI CSR subgraph")
+                # [FIX-6] ALWAYS use full-graph CSR + ROI node bitmap (no CSR extraction!)
+                # This eliminates the 48s _extract_roi_csr() bottleneck
+                # GPU kernel will filter edges based on ROI membership
+                roi_indptr = shared_indptr
+                roi_indices = shared_indices
+                roi_weights = shared_weights
+                # Use GLOBAL indices (not ROI-local) since we're using full-graph CSR
+                actual_roi_src = src  # Global src
+                actual_roi_dst = dst  # Global dst
 
-                # Single-source routing: src/dst are portal nodes from escape planner
-                roi_batch.append((actual_roi_src, actual_roi_dst, roi_indptr, roi_indices, roi_weights, roi_size))
+                # Convert roi_nodes to bitmap for edge filtering (use numpy)
+                # FIX-BITMAP-1: Use uint32 bitmap with little-endian bit order (32 nodes per word)
+                full_graph_size = len(self.graph.indptr) - 1
+                N_global = full_graph_size
+                words_per_roi = (N_global + 31) // 32
+
+                # Create uint32 bitmap: each word covers 32 consecutive nodes
+                roi_bitmap = np.zeros(words_per_roi, dtype=np.uint32)
+
+                # Get roi_nodes as numpy array (global IDs)
+                if hasattr(roi_nodes, 'get'):
+                    roi_nodes_cpu = roi_nodes.get()
+                else:
+                    roi_nodes_cpu = np.asarray(roi_nodes)
+
+                # Fill bitmap: for each node u, set bit (u & 31) in word (u >> 5)
+                # Little-endian: bit 0 is LSB, bit 31 is MSB
+                for u in roi_nodes_cpu:
+                    roi_bitmap[u >> 5] |= (np.uint32(1) << np.uint32(u & 31))
+
+                # FIX 5: Always use full graph size since we're using full-graph CSR
+                graph_size = full_graph_size
+                roi_bitmap_stride = words_per_roi  # WORDS not bytes
+
+                logger.info(f"[FIX-6] Net {net_id}: Using full-graph CSR + ROI bitmap ({roi_size}/{full_graph_size} nodes, {words_per_roi} words)")
+
+                # FIX-BITMAP-4: Host-side validation probe - check if src's neighbors are in bitmap
+                src_start = shared_indptr[src]
+                src_end = shared_indptr[src + 1]
+                src_neighbors = shared_indices[src_start:src_end]
+                if hasattr(src_neighbors, 'get'):
+                    src_neighbors = src_neighbors.get()
+                hit_count = sum(((roi_bitmap[nbr >> 5] >> (nbr & 31)) & 1) != 0 for nbr in src_neighbors)
+                logger.info(f"[HOST-PROBE] Net {net_id} src {src}: {hit_count}/{len(src_neighbors)} neighbors in bitmap")
+                if hit_count == 0 and len(src_neighbors) > 0:
+                    logger.error(f"[HOST-PROBE] BITMAP BROKEN for net {net_id}: src has {len(src_neighbors)} neighbors but NONE in bitmap!")
+
+                # CRITICAL FIX: Compute bbox from ALL ROI nodes using vectorized operations
+                # This is fast (<1ms for 100k nodes) and guarantees exact min/max
+                sx, sy, sz = self.lattice.idx_to_coord(src)
+                dx, dy, dz = self.lattice.idx_to_coord(dst)
+
+                if len(roi_nodes_cpu) > 0:
+                    # VECTORIZED coordinate decoding (no Python loops!)
+                    # For lattice: node_id = z*(Ny*Nx) + y*Nx + x
+                    nodes = roi_nodes_cpu.astype(np.int64)
+                    Nx = self.lattice.x_steps
+                    Ny = self.lattice.y_steps
+
+                    x = nodes % Nx
+                    yz = nodes // Nx
+                    y = yz % Ny
+                    z = yz // Ny
+
+                    # Exact min/max from ALL nodes (fast vectorized ops)
+                    bbox_minx = int(x.min())
+                    bbox_maxx = int(x.max())
+                    bbox_miny = int(y.min())
+                    bbox_maxy = int(y.max())
+                    bbox_minz = int(z.min())
+                    bbox_maxz = int(z.max())
+                else:
+                    # Empty ROI - use src/dst as starting point
+                    bbox_minx = min(sx, dx)
+                    bbox_maxx = max(sx, dx)
+                    bbox_miny = min(sy, dy)
+                    bbox_maxy = max(sy, dy)
+                    bbox_minz = min(sz, dz)
+                    bbox_maxz = max(sz, dz)
+                    x = y = z = np.array([], dtype=np.int64)
+
+                # Defensively include src/dst and add +1 halo, then clamp to lattice
+                bbox_minx = max(0, min(bbox_minx, sx, dx) - 1)
+                bbox_miny = max(0, min(bbox_miny, sy, dy) - 1)
+                bbox_minz = max(0, min(bbox_minz, sz, dz) - 1)
+
+                bbox_maxx = min(self.lattice.x_steps - 1, max(bbox_maxx, sx, dx) + 1)
+                bbox_maxy = min(self.lattice.y_steps - 1, max(bbox_maxy, sy, dy) + 1)
+                bbox_maxz = min(self.lattice.layers - 1, max(bbox_maxz, sz, dz) + 1)
+
+                # Preflight assertion: verify src and dst are inside bbox
+                if not (bbox_minx <= sx <= bbox_maxx and bbox_miny <= sy <= bbox_maxy and bbox_minz <= sz <= bbox_maxz):
+                    logger.error(f"[BBOX-PREFLIGHT] ROI {net_id}: src {src} at ({sx},{sy},{sz}) OUTSIDE bbox ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
+                    logger.error(f"[BBOX-PREFLIGHT] This should not happen after defensive expansion!")
+
+                if not (bbox_minx <= dx <= bbox_maxx and bbox_miny <= dy <= bbox_maxy and bbox_minz <= dz <= bbox_maxz):
+                    logger.error(f"[BBOX-PREFLIGHT] ROI {net_id}: dst {dst} at ({dx},{dy},{dz}) OUTSIDE bbox ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
+
+                # DST CHECKS: Verify dst is in ROI bitmap and bbox
+                dst_in_bitmap = ((roi_bitmap[dst >> 5] >> (dst & 31)) & 1) != 0
+                if not dst_in_bitmap:
+                    logger.error(f"[DST-CHECK] ROI {net_id}: dst {dst} NOT in roi_bitmap!")
+                    logger.error(f"[DST-CHECK] This ROI cannot possibly route to dst")
+                else:
+                    logger.debug(f"[DST-CHECK] ROI {net_id}: dst {dst} in roi_bitmap ✓")
+
+                # Check if dst is in bbox (already checked above, but explicit for diagnostics)
+                if not (bbox_minx <= dx <= bbox_maxx and bbox_miny <= dy <= bbox_maxy and bbox_minz <= dz <= bbox_maxz):
+                    logger.error(f"[DST-CHECK] ROI {net_id}: dst {dst} at ({dx},{dy},{dz}) OUTSIDE bbox!")
+                    logger.error(f"[DST-CHECK] This ROI cannot possibly route to dst")
+                else:
+                    logger.debug(f"[DST-CHECK] ROI {net_id}: dst {dst} at ({dx},{dy},{dz}) INSIDE bbox ✓")
+
+                # Preflight assertion: verify src's immediate neighbors in bitmap are inside bbox
+                failed_neighbors = []
+                for nbr in src_neighbors[:6]:  # Check all 6 immediate neighbors
+                    if ((roi_bitmap[nbr >> 5] >> (nbr & 31)) & 1) != 0:
+                        nx, ny, nz = self.lattice.idx_to_coord(int(nbr))
+                        if not (bbox_minx <= nx <= bbox_maxx and bbox_miny <= ny <= bbox_maxy and bbox_minz <= nz <= bbox_maxz):
+                            failed_neighbors.append((nbr, nx, ny, nz))
+
+                if failed_neighbors:
+                    logger.error(f"[BBOX-PREFLIGHT] ROI {net_id}: {len(failed_neighbors)} neighbors of src in bitmap but OUTSIDE bbox!")
+                    for nbr, nx, ny, nz in failed_neighbors[:2]:  # Log first 2
+                        logger.error(f"[BBOX-PREFLIGHT]   neighbor {nbr} at ({nx},{ny},{nz}) outside ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
+
+                # ROBUST PREFLIGHT: Check bbox covers entire ROI (vectorized, only in debug mode)
+                if len(roi_nodes_cpu) > 0 and __debug__:
+                    # Vectorized check for ALL ROI nodes
+                    outside = np.where(
+                        (x < bbox_minx) | (x > bbox_maxx) |
+                        (y < bbox_miny) | (y > bbox_maxy) |
+                        (z < bbox_minz) | (z > bbox_maxz)
+                    )[0]
+                    if outside.size > 0:
+                        bad_node = int(nodes[outside[0]])
+                        bx, by, bz = int(x[outside[0]]), int(y[outside[0]]), int(z[outside[0]])
+                        logger.error(f"[BBOX-PREFLIGHT-FULL] ROI {net_id}: node {bad_node} at ({bx},{by},{bz}) OUTSIDE bbox "
+                                   f"([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
+                        logger.error(f"[BBOX-PREFLIGHT-FULL] This should NEVER happen with vectorized min/max! Bug in bbox computation!")
+                    else:
+                        logger.debug(f"[BBOX-OK-FULL] ROI {net_id}: All {len(nodes)} nodes inside bbox ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
+                elif not failed_neighbors:
+                    logger.debug(f"[BBOX-OK] ROI {net_id}: src/dst and immediate neighbors inside bbox ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
+
+                # FIX 5: Pass full-graph CSR + ROI bitmap + bbox + global src/dst with graph_size (not roi_size)
+                roi_batch.append((actual_roi_src, actual_roi_dst, roi_indptr, roi_indices, roi_weights, graph_size, roi_bitmap,
+                                 bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz))
                 batch_metadata.append((net_id, False, roi_nodes, src, dst))
                 csr_build_time += time.time() - csr_start
 
             # Route entire batch on GPU in parallel
             if roi_batch:
                 prep_time = time.time() - batch_start_time
+                # [FIX-5] Calculate and log ROI statistics
+                if roi_sizes:
+                    avg_roi_size = sum(roi_sizes) / len(roi_sizes)
+                    min_roi = min(roi_sizes)
+                    max_roi = max(roi_sizes)
+                    full_graph_size = len(self.graph.indptr) - 1
+                    full_graph_count = sum(1 for s in roi_sizes if s == full_graph_size)
+                    logger.info(f"[FIX-5] ROI extraction enabled per net (avg: {avg_roi_size:,.0f} nodes, min: {min_roi:,}, max: {max_roi:,}, full-graph: {full_graph_count}/{len(roi_sizes)})")
                 logger.info(f"[BATCH-{batch_num}] Prep complete: ROI={roi_extract_time:.2f}s, CSR={csr_build_time:.2f}s, Total={prep_time:.2f}s")
 
                 gpu_start = time.time()
@@ -2737,9 +2993,19 @@ class PathFinderRouter:
 
                     local_path = paths[i]
                     if local_path and len(local_path) > 1:
-                        # Convert local ROI path to global
+                        # [FIX-6] Check if path is already in global indices (full-graph CSR)
+                        # If using full-graph CSR, path is already global - no conversion needed
                         roi_nodes_cpu = roi_nodes_arr.get() if hasattr(roi_nodes_arr, 'get') else roi_nodes_arr
-                        global_path = [int(roi_nodes_cpu[node_idx]) for node_idx in local_path]
+                        full_graph_size = len(self.graph.indptr) - 1
+
+                        # If any node in path is >= ROI size, it's using global indices
+                        if len(roi_nodes_cpu) < full_graph_size and any(node >= len(roi_nodes_cpu) for node in local_path):
+                            # Path uses global indices - no conversion needed
+                            global_path = [int(node) for node in local_path]
+                            logger.debug(f"[FIX-6] Net {net_id}: Path already in global indices (full-graph CSR)")
+                        else:
+                            # Path uses local ROI indices - convert to global
+                            global_path = [int(roi_nodes_cpu[node_idx]) for node_idx in local_path]
 
                         # Commit path
                         edge_indices = self._path_to_edges(global_path)
