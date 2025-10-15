@@ -5,7 +5,8 @@
     </td>
     <td align="left">
       <h2>OrthoRoute - GPU Accelerated Autorouting for KiCad</h2>
-      <p><em>Non-trivial! Orthogonal! Runs on GPUs! I live in San Francisco!</em></p>
+      <p><em>Orthogonal! Non-trivial! Runs on GPUs! I live in San Francisco!</em>
+      </p><p><em>Never trust the autorouter, but at least this one is fast.</em></p>
     </td>
   </tr>
 </table>
