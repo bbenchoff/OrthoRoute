@@ -155,7 +155,10 @@ class CUDADijkstra:
             const int dist_stride,          // NEW: Pool stride for dist
             int* parent,                    // (K, max_roi_size) parents - SLICED pool view
             const int parent_stride,        // NEW: Pool stride for parent
-            unsigned int* new_frontier      // (K, frontier_words) BIT-PACKED output - uint32!
+            unsigned int* new_frontier,     // (K, frontier_words) BIT-PACKED output - uint32!
+            // FIX-7: ROI bitmap for neighbor validation
+            const unsigned int* roi_bitmap, // (K, bitmap_words) per ROI - neighbor must be in bitmap!
+            const int bitmap_words          // Words per ROI bitmap
         ) {
             // Block index = ROI index (expects exactly K blocks!)
             int roi_idx = blockIdx.x;
@@ -206,6 +209,15 @@ class CUDADijkstra:
 
                     const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
                     const float g_new = node_dist + edge_cost;  // g(n) = distance from start
+
+                    // FIX-7: BITMAP CHECK - skip neighbors not in ROI bitmap!
+                    const int nbr_word = neighbor >> 5;
+                    const int nbr_bit = neighbor & 31;
+                    const int bitmap_off = roi_idx * bitmap_words;
+                    const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
+                    if (nbr_in_bitmap == 0) {
+                        continue;  // Neighbor not in ROI - prevents diagonal traces!
+                    }
 
                     // P0-3: A* HEURISTIC with procedural coordinate decoding
                     float f_new = g_new;  // Default: Dijkstra (no heuristic)
@@ -301,6 +313,9 @@ class CUDADijkstra:
             int* parent,                        // (K, max_roi_size) parents - SLICED pool view
             const int parent_stride,            // NEW: Pool stride for parent
             unsigned int* new_frontier,         // (K, frontier_words) BIT-PACKED output
+            // FIX-7: ROI bitmap for neighbor validation
+            const unsigned int* roi_bitmap,     // (K, bitmap_words) per ROI - neighbor must be in bitmap!
+            const int bitmap_words,             // Words per ROI bitmap
             // Phase 4: ROI bounding boxes
             const int* roi_minx,                // (K,) Min X per ROI
             const int* roi_maxx,                // (K,) Max X per ROI
@@ -352,6 +367,16 @@ class CUDADijkstra:
                 // Phase 4: ROI gate - skip neighbors outside bounding box
                 if (!in_roi(nx, ny, nz, roi_idx, roi_minx, roi_maxx, roi_miny, roi_maxy, roi_minz, roi_maxz)) {
                     continue;  // Skip this neighbor
+                }
+
+                // FIX-7: BITMAP CHECK - only relax edges to nodes actually in ROI!
+                // This prevents corrupt parent pointers causing diagonal traces
+                const int nbr_word = neighbor >> 5;  // neighbor / 32
+                const int nbr_bit = neighbor & 31;   // neighbor % 32
+                const int bitmap_off = roi_idx * bitmap_words;
+                const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
+                if (nbr_in_bitmap == 0) {
+                    continue;  // Neighbor not in ROI - skip to prevent diagonal traces!
                 }
 
                 // P0-3: A* heuristic with PROCEDURAL coordinate decoding (no global loads!)
@@ -1842,6 +1867,12 @@ class CUDADijkstra:
         roi_minz = cp.zeros(K, dtype=cp.int32)
         roi_maxz = cp.zeros(K, dtype=cp.int32)
 
+        # FIX-7: Batch bitmaps (all bitmaps should have same size for full-graph CSR)
+        first_bitmap = roi_batch[0][6]
+        bitmap_words = len(first_bitmap)
+        batch_bitmaps = cp.zeros((K, bitmap_words), dtype=cp.uint32)
+        logger.info(f"[FIX-7-BITMAP] Batching {K} bitmaps, {bitmap_words} words each ({bitmap_words*4/1e6:.2f} MB per bitmap)")
+
         # Initialize sources/sinks for all nets
         # roi_batch is already sliced to K at the top of function
         for i, (src, dst, indptr, indices, weights, roi_size, roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz) in enumerate(roi_batch):
@@ -1878,6 +1909,12 @@ class CUDADijkstra:
                 roi_maxy[i] = 999999
                 roi_minz[i] = 0
                 roi_maxz[i] = 999999
+
+            # FIX-7: Copy bitmap into batched array
+            if len(roi_bitmap) == bitmap_words:
+                batch_bitmaps[i] = roi_bitmap
+            else:
+                logger.warning(f"[FIX-7-BITMAP] ROI {i}: bitmap size mismatch ({len(roi_bitmap)} vs {bitmap_words})")
 
             # CSR VALIDATION: Verify src has edges after transfer (DEBUG ONLY)
             if src < len(indptr) - 1:
@@ -1948,6 +1985,9 @@ class CUDADijkstra:
             'roi_maxy': roi_maxy,
             'roi_minz': roi_minz,
             'roi_maxz': roi_maxz,
+            # FIX-7: ROI bitmaps for neighbor validation in kernels
+            'roi_bitmaps': batch_bitmaps,
+            'bitmap_words': bitmap_words,
             # Phase 1: Stamp arrays and generation counter
             'dist_stamps': dist_stamps,
             'parent_stamps': parent_stamps,
@@ -2513,6 +2553,9 @@ class CUDADijkstra:
             self.parent_val_pool.ravel(),   # FIX: Pass full pool without slicing
             pool_stride,                    # Pool stride (N_max)
             new_frontier.ravel(),  # P0-4: BIT-PACKED uint32 output
+            # FIX-7: ROI bitmaps for neighbor validation
+            data['roi_bitmaps'].ravel(),    # (K, bitmap_words) flattened
+            data['bitmap_words'],           # Words per bitmap
             # Phase 4: ROI bounding boxes
             data['roi_minx'],
             data['roi_maxx'],
@@ -2670,6 +2713,9 @@ class CUDADijkstra:
             self.parent_val_pool.ravel(),   # FIX: Pass full pool without slicing
             pool_stride,                    # Pool stride (N_max)
             new_frontier.ravel(),  # P0-4: BIT-PACKED uint32 output
+            # FIX-7: ROI bitmaps for neighbor validation
+            data['roi_bitmaps'].ravel(),    # (K, bitmap_words) flattened
+            data['bitmap_words'],           # Words per bitmap
         )
 
         if is_shared_csr:

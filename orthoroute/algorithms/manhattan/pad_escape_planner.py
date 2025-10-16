@@ -837,6 +837,11 @@ class PadEscapePlanner:
         # 1. Escape routing: vertical segment + 45-degree segment to portal via
         pad_layer_name = self.config.layer_names[portal.pad_layer] if portal.pad_layer < len(self.config.layer_names) else f"L{portal.pad_layer}"
 
+        # DEBUG: Log to catch layer assignment bug
+        if portal.pad_layer != 0:
+            logger.error(f"[ESCAPE-LAYER-BUG] net={net_id}, pad={pad_id}: portal.pad_layer={portal.pad_layer} (should be 0!), entry_layer={entry_layer}")
+            logger.error(f"[ESCAPE-LAYER-BUG] This will create escape stubs on {pad_layer_name} instead of F.Cu!")
+
         # Get portal mm coordinates
         portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(portal.x_idx, portal.y_idx)
 

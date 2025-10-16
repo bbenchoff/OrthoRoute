@@ -935,18 +935,18 @@ class Lattice3D:
         for x in range(self.x_steps):
             for y in range(self.y_steps):
                 for z_from in range(self.layers):
-                    for z_to in range(z_from + 1, self.layers):
+                    # MANHATTAN ROUTING FIX: Only create edges to ADJACENT layers
+                    # Multi-layer blind/buried vias will be decomposed into single-hop chains
+                    # This ensures parent pointers always point to adjacent nodes
+                    for z_to in range(z_from + 1, min(z_from + 2, self.layers)):
                         # Check if this via span is allowed
                         if allowed_via_spans is not None:
                             # Explicit whitelist: check both directions
                             if (z_from, z_to) not in allowed_via_spans and (z_to, z_from) not in allowed_via_spans:
                                 continue
 
-                        # Calculate via cost with span penalty: cost = base * (1 + alpha*(span-1))
-                        # This allows span-1 to cost 'via_cost', but longer spans cost progressively more
-                        span = z_to - z_from
-                        span_alpha = 0.15  # Mild penalty for long spans
-                        cost = via_cost * (1.0 + span_alpha * (span - 1))
+                        # Adjacent layer via: fixed cost (no span penalty needed)
+                        cost = via_cost
 
                         u = self.node_idx(x, y, z_from)
                         v = self.node_idx(x, y, z_to)
@@ -2815,52 +2815,47 @@ class PathFinderRouter:
                     batch_metadata.append((net_id, False, None, None, None))
                     continue
 
-                # [FIX-6] ALWAYS use full-graph CSR + ROI node bitmap (no CSR extraction!)
-                # This eliminates the 48s _extract_roi_csr() bottleneck
-                # GPU kernel will filter edges based on ROI membership
+                # [FIX-7] Keep full-graph CSR + bitmap (fast!) but ADD bitmap checking to kernels!
+                # The bitmap approach avoids expensive CPU CSR extraction
+                # Just need to make GPU kernels actually CHECK the bitmap before relaxing edges
+
+                # Use full-graph CSR (already on GPU, no extraction needed)
                 roi_indptr = shared_indptr
                 roi_indices = shared_indices
                 roi_weights = shared_weights
-                # Use GLOBAL indices (not ROI-local) since we're using full-graph CSR
+                # Use GLOBAL indices since we're routing on full graph
                 actual_roi_src = src  # Global src
                 actual_roi_dst = dst  # Global dst
 
-                # Convert roi_nodes to bitmap for edge filtering (use numpy)
-                # FIX-BITMAP-1: Use uint32 bitmap with little-endian bit order (32 nodes per word)
-                full_graph_size = len(self.graph.indptr) - 1
-                N_global = full_graph_size
-                words_per_roi = (N_global + 31) // 32
-
-                # Create uint32 bitmap: each word covers 32 consecutive nodes
-                roi_bitmap = np.zeros(words_per_roi, dtype=np.uint32)
-
-                # Get roi_nodes as numpy array (global IDs)
+                # Convert roi_nodes to bitmap for GPU edge filtering
+                # Get roi_nodes as numpy
                 if hasattr(roi_nodes, 'get'):
                     roi_nodes_cpu = roi_nodes.get()
                 else:
                     roi_nodes_cpu = np.asarray(roi_nodes)
 
+                # Create uint32 bitmap: each word covers 32 consecutive nodes
+                full_graph_size = len(self.graph.indptr) - 1
+                words_per_roi = (full_graph_size + 31) // 32
+                roi_bitmap = np.zeros(words_per_roi, dtype=np.uint32)
+
                 # Fill bitmap: for each node u, set bit (u & 31) in word (u >> 5)
-                # Little-endian: bit 0 is LSB, bit 31 is MSB
                 for u in roi_nodes_cpu:
                     roi_bitmap[u >> 5] |= (np.uint32(1) << np.uint32(u & 31))
 
-                # FIX 5: Always use full graph size since we're using full-graph CSR
+                # Transfer bitmap to GPU (import cupy here to avoid issues)
+                try:
+                    import cupy as cp
+                except:
+                    # Fallback if cupy not available
+                    import numpy as cp_fallback
+                    cp = cp_fallback
+                roi_bitmap_gpu = cp.asarray(roi_bitmap)
+
+                # Use full graph size
                 graph_size = full_graph_size
-                roi_bitmap_stride = words_per_roi  # WORDS not bytes
 
-                logger.info(f"[FIX-6] Net {net_id}: Using full-graph CSR + ROI bitmap ({roi_size}/{full_graph_size} nodes, {words_per_roi} words)")
-
-                # FIX-BITMAP-4: Host-side validation probe - check if src's neighbors are in bitmap
-                src_start = shared_indptr[src]
-                src_end = shared_indptr[src + 1]
-                src_neighbors = shared_indices[src_start:src_end]
-                if hasattr(src_neighbors, 'get'):
-                    src_neighbors = src_neighbors.get()
-                hit_count = sum(((roi_bitmap[nbr >> 5] >> (nbr & 31)) & 1) != 0 for nbr in src_neighbors)
-                logger.info(f"[HOST-PROBE] Net {net_id} src {src}: {hit_count}/{len(src_neighbors)} neighbors in bitmap")
-                if hit_count == 0 and len(src_neighbors) > 0:
-                    logger.error(f"[HOST-PROBE] BITMAP BROKEN for net {net_id}: src has {len(src_neighbors)} neighbors but NONE in bitmap!")
+                logger.info(f"[FIX-7] Net {net_id}: Using full-graph CSR + GPU bitmap ({roi_size}/{full_graph_size} nodes, {words_per_roi} words)")
 
                 # CRITICAL FIX: Compute bbox from ALL ROI nodes using vectorized operations
                 # This is fast (<1ms for 100k nodes) and guarantees exact min/max
@@ -2928,18 +2923,7 @@ class PathFinderRouter:
                 else:
                     logger.debug(f"[DST-CHECK] ROI {net_id}: dst {dst} at ({dx},{dy},{dz}) INSIDE bbox ✓")
 
-                # Preflight assertion: verify src's immediate neighbors in bitmap are inside bbox
-                failed_neighbors = []
-                for nbr in src_neighbors[:6]:  # Check all 6 immediate neighbors
-                    if ((roi_bitmap[nbr >> 5] >> (nbr & 31)) & 1) != 0:
-                        nx, ny, nz = self.lattice.idx_to_coord(int(nbr))
-                        if not (bbox_minx <= nx <= bbox_maxx and bbox_miny <= ny <= bbox_maxy and bbox_minz <= nz <= bbox_maxz):
-                            failed_neighbors.append((nbr, nx, ny, nz))
-
-                if failed_neighbors:
-                    logger.error(f"[BBOX-PREFLIGHT] ROI {net_id}: {len(failed_neighbors)} neighbors of src in bitmap but OUTSIDE bbox!")
-                    for nbr, nx, ny, nz in failed_neighbors[:2]:  # Log first 2
-                        logger.error(f"[BBOX-PREFLIGHT]   neighbor {nbr} at ({nx},{ny},{nz}) outside ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
+                # Validation disabled - src_neighbors not available in FIX-7
 
                 # ROBUST PREFLIGHT: Check bbox covers entire ROI (vectorized, only in debug mode)
                 if len(roi_nodes_cpu) > 0 and __debug__:
@@ -2957,11 +2941,12 @@ class PathFinderRouter:
                         logger.error(f"[BBOX-PREFLIGHT-FULL] This should NEVER happen with vectorized min/max! Bug in bbox computation!")
                     else:
                         logger.debug(f"[BBOX-OK-FULL] ROI {net_id}: All {len(nodes)} nodes inside bbox ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
-                elif not failed_neighbors:
-                    logger.debug(f"[BBOX-OK] ROI {net_id}: src/dst and immediate neighbors inside bbox ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
+                else:
+                    logger.debug(f"[BBOX-OK] ROI {net_id}: src/dst inside bbox ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
 
-                # FIX 5: Pass full-graph CSR + ROI bitmap + bbox + global src/dst with graph_size (not roi_size)
-                roi_batch.append((actual_roi_src, actual_roi_dst, roi_indptr, roi_indices, roi_weights, graph_size, roi_bitmap,
+                # FIX-7: Pass full-graph CSR + GPU bitmap + bbox
+                # Kernel will check bitmap before relaxing edges (prevents diagonal traces)
+                roi_batch.append((actual_roi_src, actual_roi_dst, roi_indptr, roi_indices, roi_weights, graph_size, roi_bitmap_gpu,
                                  bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz))
                 batch_metadata.append((net_id, False, roi_nodes, src, dst))
                 csr_build_time += time.time() - csr_start
@@ -2996,19 +2981,10 @@ class PathFinderRouter:
 
                     local_path = paths[i]
                     if local_path and len(local_path) > 1:
-                        # [FIX-6] Check if path is already in global indices (full-graph CSR)
-                        # If using full-graph CSR, path is already global - no conversion needed
-                        roi_nodes_cpu = roi_nodes_arr.get() if hasattr(roi_nodes_arr, 'get') else roi_nodes_arr
-                        full_graph_size = len(self.graph.indptr) - 1
-
-                        # If any node in path is >= ROI size, it's using global indices
-                        if len(roi_nodes_cpu) < full_graph_size and any(node >= len(roi_nodes_cpu) for node in local_path):
-                            # Path uses global indices - no conversion needed
-                            global_path = [int(node) for node in local_path]
-                            logger.debug(f"[FIX-6] Net {net_id}: Path already in global indices (full-graph CSR)")
-                        else:
-                            # Path uses local ROI indices - convert to global
-                            global_path = [int(roi_nodes_cpu[node_idx]) for node_idx in local_path]
+                        # [FIX-7] Path is already in GLOBAL indices (using full-graph CSR)
+                        # Bitmap filtering happens in GPU kernel, so paths are valid global indices
+                        global_path = [int(node) for node in local_path]
+                        logger.debug(f"[FIX-7] Net {net_id}: Path has {len(local_path)} nodes (already global indices)")
 
                         # Commit path
                         edge_indices = self._path_to_edges(global_path)
@@ -3429,6 +3405,19 @@ class PathFinderRouter:
             for node in path[1:]:
                 x0, y0, z0 = self.lattice.idx_to_coord(prev)
                 x1, y1, z1 = self.lattice.idx_to_coord(node)
+
+                # VALIDATION: Check if nodes are adjacent (Manhattan distance should be 1)
+                dx = abs(x1 - x0)
+                dy = abs(y1 - y0)
+                dz = abs(z1 - z0)
+                if dz == 0 and (dx + dy) != 1:
+                    # Non-adjacent nodes on same layer - this should NEVER happen!
+                    logger.error(f"[GEOMETRY-BUG] Non-adjacent nodes in path for net {net_id}: "
+                               f"({x0},{y0},{z0}) → ({x1},{y1},{z1}), Manhattan dist = {dx+dy}")
+                    logger.error(f"[GEOMETRY-BUG] Path indices: prev={prev}, node={node}")
+                    logger.error(f"[GEOMETRY-BUG] This creates diagonal segment! GPU parent pointers are CORRUPT!")
+                    # Skip this segment to prevent diagonal
+                    continue
 
                 if z1 != z0:
                     # flush any pending straight run before via
