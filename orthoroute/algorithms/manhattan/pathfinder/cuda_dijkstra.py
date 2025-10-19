@@ -30,8 +30,8 @@ except ImportError:
         DEBUG_INVARIANTS = True
         USE_PERSISTENT_KERNEL = False  # Overridden by GPU_PERSISTENT_ROUTER in unified_pathfinder
         USE_GPU_COMPACTION = True
-        USE_DELTA_STEPPING = True  # Use proper Δ-stepping bucket-based priority queue (instead of BFS wavefront)
-        DELTA_VALUE = 0.5  # Bucket width in mm (0.5mm ≈ 1.25 × 0.4mm grid pitch)
+        USE_DELTA_STEPPING = True  # Use proper Delta-stepping bucket-based priority queue (instead of BFS wavefront)
+        DELTA_VALUE = 0.5  # Bucket width in mm (0.5mm ~= 1.25 x 0.4mm grid pitch)
 
 
 class CUDADijkstra:
@@ -130,6 +130,11 @@ class CUDADijkstra:
             return __int_as_float(old);
         }
 
+        // FIX-BITMAP: Macro to check if node is in ROI bitmap
+        #define IN_BITMAP(roi_idx, node, roi_bitmap, bitmap_words) ( \
+            ((node) >> 5) < (bitmap_words) && \
+            ((roi_bitmap)[(roi_idx) * (bitmap_words) + ((node) >> 5)] >> ((node) & 31)) & 1u )
+
         extern "C" __global__
         void wavefront_expand_all(
             const int K,                    // Number of ROIs
@@ -158,7 +163,8 @@ class CUDADijkstra:
             unsigned int* new_frontier,     // (K, frontier_words) BIT-PACKED output - uint32!
             // FIX-7: ROI bitmap for neighbor validation
             const unsigned int* roi_bitmap, // (K, bitmap_words) per ROI - neighbor must be in bitmap!
-            const int bitmap_words          // Words per ROI bitmap
+            const int bitmap_words,         // Words per ROI bitmap
+            const int use_bitmap            // 1 = enforce bitmap, 0 = bbox-only (iteration 1 mode)
         ) {
             // Block index = ROI index (expects exactly K blocks!)
             int roi_idx = blockIdx.x;
@@ -190,6 +196,9 @@ class CUDADijkstra:
                 const unsigned int bit_mask = 1u << bit_pos;
                 if ((frontier[frontier_off + word_idx] & bit_mask) == 0) continue;  // Bit not set
 
+                // NOTE: We DO NOT check if current node is in bitmap - it's in frontier, so expand it
+                // Bitmap check happens when relaxing NEIGHBOR edges (prevents expanding OUTSIDE ROI)
+
                 // Get node distance
                 const int nidx_self = dist_off + node;
                 const float node_dist = dist[nidx_self];
@@ -210,13 +219,17 @@ class CUDADijkstra:
                     const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
                     const float g_new = node_dist + edge_cost;  // g(n) = distance from start
 
-                    // FIX-7: BITMAP CHECK - skip neighbors not in ROI bitmap!
-                    const int nbr_word = neighbor >> 5;
-                    const int nbr_bit = neighbor & 31;
-                    const int bitmap_off = roi_idx * bitmap_words;
-                    const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
-                    if (nbr_in_bitmap == 0) {
-                        continue;  // Neighbor not in ROI - prevents diagonal traces!
+                    // FIX-7: BITMAP CHECK - conditional based on use_bitmap flag
+                    if (use_bitmap) {
+                        const int nbr_word = neighbor >> 5;
+                        const int nbr_bit = neighbor & 31;
+                        const int bitmap_off = roi_idx * bitmap_words;
+                        // Bounds check for bitmap access
+                        if (nbr_word >= bitmap_words) continue;  // Neighbor index exceeds bitmap size
+                        const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
+                        if (nbr_in_bitmap == 0) {
+                            continue;  // Neighbor not in ROI - prevents diagonal traces!
+                        }
                     }
 
                     // P0-3: A* HEURISTIC with procedural coordinate decoding
@@ -244,9 +257,43 @@ class CUDADijkstra:
                     const float old = atomicMinFloat(&dist[nidx], g_new);  // Store g(n), not f(n)!
                     // STABILIZATION: Epsilon guard prevents float-noise equal-cost flip-flops
                     if (g_new + 1e-8f < old) {
-                        // FIX D1: ALWAYS update parent on improvement (allow node reopening!)
-                        // Use atomicExch for thread-safe parent update
-                        atomicExch(&parent[parent_off + neighbor], node);
+                        // MANHATTAN VALIDATION: Verify parent->child is adjacent
+                        // Decode current node coordinates
+                        const int plane_size_node = Nx * Ny;
+                        const int z_node = node / plane_size_node;
+                        const int remainder_node = node - (z_node * plane_size_node);
+                        const int y_node = remainder_node / Nx;
+                        const int x_node = remainder_node - (y_node * Nx);
+
+                        // Check if parent->child relationship is Manhattan-legal
+                        bool valid_parent = false;
+                        if (z_node != nz) {
+                            // Via jump - same X,Y required
+                            if (nx == x_node && ny == y_node) {
+                                valid_parent = true;
+                            }
+                        } else {
+                            // Same layer - must be adjacent with correct direction
+                            const int dx = abs(nx - x_node);
+                            const int dy = abs(ny - y_node);
+
+                            if (dx + dy == 1) {
+                                // Check layer direction discipline (matches graph construction)
+                                const bool is_h_layer = (nz % 2) == 1;  // Odd layers = horizontal
+                                if (is_h_layer) {
+                                    if (dy == 0) valid_parent = true;  // H layer must have dy=0
+                                } else {
+                                    if (dx == 0) valid_parent = true;  // V layer must have dx=0
+                                }
+                            }
+                        }
+
+                        // Only update parent if validation passed
+                        if (valid_parent) {
+                            // FIX D1: ALWAYS update parent on improvement (allow node reopening!)
+                            // Use atomicExch for thread-safe parent update
+                            atomicExch(&parent[parent_off + neighbor], node);
+                        }
 
                         // P0-4: BIT-PACKED WRITE using atomicOr
                         const int nbr_word_idx = neighbor / 32;
@@ -275,6 +322,11 @@ class CUDADijkstra:
             } while (assumed != old);
             return __int_as_float(old);
         }
+
+        // FIX-BITMAP: Macro to check if node is in ROI bitmap
+        #define IN_BITMAP(roi_idx, node, roi_bitmap, bitmap_words) ( \
+            ((node) >> 5) < (bitmap_words) && \
+            ((roi_bitmap)[(roi_idx) * (bitmap_words) + ((node) >> 5)] >> ((node) & 31)) & 1u )
 
         // Phase 4: ROI bounding box check
         __device__ __forceinline__
@@ -316,6 +368,7 @@ class CUDADijkstra:
             // FIX-7: ROI bitmap for neighbor validation
             const unsigned int* roi_bitmap,     // (K, bitmap_words) per ROI - neighbor must be in bitmap!
             const int bitmap_words,             // Words per ROI bitmap
+            const int use_bitmap,               // 1 = enforce bitmap, 0 = bbox-only (iteration 1 mode)
             // Phase 4: ROI bounding boxes
             const int* roi_minx,                // (K,) Min X per ROI
             const int* roi_maxx,                // (K,) Max X per ROI
@@ -331,6 +384,9 @@ class CUDADijkstra:
             // Get ROI and node for this frontier item
             const int roi_idx = roi_ids[idx];
             const int node = node_ids[idx];
+
+            // NOTE: We DO NOT check if current node is in bitmap - it's in frontier, so expand it
+            // Bitmap check happens when relaxing NEIGHBOR edges (prevents expanding OUTSIDE ROI)
 
             // CSR offsets for this ROI
             const int indptr_off = roi_idx * indptr_stride;
@@ -369,14 +425,17 @@ class CUDADijkstra:
                     continue;  // Skip this neighbor
                 }
 
-                // FIX-7: BITMAP CHECK - only relax edges to nodes actually in ROI!
-                // This prevents corrupt parent pointers causing diagonal traces
-                const int nbr_word = neighbor >> 5;  // neighbor / 32
-                const int nbr_bit = neighbor & 31;   // neighbor % 32
-                const int bitmap_off = roi_idx * bitmap_words;
-                const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
-                if (nbr_in_bitmap == 0) {
-                    continue;  // Neighbor not in ROI - skip to prevent diagonal traces!
+                // FIX-7: BITMAP CHECK - conditional based on use_bitmap flag
+                if (use_bitmap) {
+                    const int nbr_word = neighbor >> 5;  // neighbor / 32
+                    const int nbr_bit = neighbor & 31;   // neighbor % 32
+                    const int bitmap_off = roi_idx * bitmap_words;
+                    // Bounds check for bitmap access
+                    if (nbr_word >= bitmap_words) continue;  // Neighbor index exceeds bitmap size
+                    const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
+                    if (nbr_in_bitmap == 0) {
+                        continue;  // Neighbor not in ROI - skip to prevent diagonal traces!
+                    }
                 }
 
                 // P0-3: A* heuristic with PROCEDURAL coordinate decoding (no global loads!)
@@ -404,7 +463,41 @@ class CUDADijkstra:
 
                 // Update parent and frontier on improvement
                 if (g_new + 1e-8f < old) {
-                    atomicExch(&parent[parent_off + neighbor], node);
+                    // MANHATTAN VALIDATION: Verify parent->child is adjacent
+                    // Decode current node coordinates
+                    const int plane_size_node = Nx * Ny;
+                    const int z_node = node / plane_size_node;
+                    const int remainder_node = node - (z_node * plane_size_node);
+                    const int y_node = remainder_node / Nx;
+                    const int x_node = remainder_node - (y_node * Nx);
+
+                    // Check if parent->child relationship is Manhattan-legal
+                    bool valid_parent = false;
+                    if (z_node != nz) {
+                        // Via jump - same X,Y required
+                        if (nx == x_node && ny == y_node) {
+                            valid_parent = true;
+                        }
+                    } else {
+                        // Same layer - must be adjacent with correct direction
+                        const int dx = abs(nx - x_node);
+                        const int dy = abs(ny - y_node);
+
+                        if (dx + dy == 1) {
+                            // Check layer direction discipline (matches graph construction)
+                            const bool is_h_layer = (nz % 2) == 1;  // Odd layers = horizontal
+                            if (is_h_layer) {
+                                if (dy == 0) valid_parent = true;  // H layer must have dy=0
+                            } else {
+                                if (dx == 0) valid_parent = true;  // V layer must have dx=0
+                            }
+                        }
+                    }
+
+                    // Only update parent if validation passed
+                    if (valid_parent) {
+                        atomicExch(&parent[parent_off + neighbor], node);
+                    }
 
                     // P0-4: BIT-PACKED WRITE using atomicOr
                     const int nbr_word_idx = neighbor / 32;
@@ -431,6 +524,11 @@ class CUDADijkstra:
             } while (assumed != old);
             return __int_as_float(old);
         }
+
+        // FIX-BITMAP: Macro to check if node is in ROI bitmap
+        #define IN_BITMAP(roi_idx, node, roi_bitmap, bitmap_words) ( \
+            ((node) >> 5) < (bitmap_words) && \
+            ((roi_bitmap)[(roi_idx) * (bitmap_words) + ((node) >> 5)] >> ((node) & 31)) & 1u )
 
         // Phase 4: ROI bounding box check
         __device__ __forceinline__
@@ -469,7 +567,11 @@ class CUDADijkstra:
             const int* roi_miny,            // (K,) Min Y per ROI
             const int* roi_maxy,            // (K,) Max Y per ROI
             const int* roi_minz,            // (K,) Min Z per ROI
-            const int* roi_maxz             // (K,) Max Z per ROI
+            const int* roi_maxz,            // (K,) Max Z per ROI
+            // FIX-7: ROI bitmap for neighbor validation
+            const unsigned int* roi_bitmap, // (K, bitmap_words) per ROI - neighbor must be in bitmap!
+            const int bitmap_words,         // Words per ROI bitmap
+            const int use_bitmap            // 1 = enforce bitmap, 0 = bbox-only (iteration 1 mode)
         ) {
             // Global thread ID
             int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -477,6 +579,9 @@ class CUDADijkstra:
 
             const int roi_idx = roi_ids[idx];
             const int node = node_ids[idx];
+
+            // NOTE: We DO NOT check if current node is in bitmap - it's in frontier, so expand it
+            // Bitmap check happens when relaxing NEIGHBOR edges (prevents expanding OUTSIDE ROI)
 
             // Decode node coordinates procedurally
             const int plane_size = Nx * Ny;
@@ -516,6 +621,19 @@ class CUDADijkstra:
                     } \
                     \
                     const int neighbor = (nz) * plane_size + (ny) * Nx + (nx); \
+                    \
+                    /* FIX-7: BITMAP CHECK - conditional based on use_bitmap flag */ \
+                    if (use_bitmap) { \
+                        const int nbr_word = neighbor >> 5; \
+                        const int nbr_bit = neighbor & 31; \
+                        const int bitmap_off = roi_idx * bitmap_words; \
+                        if (nbr_word >= bitmap_words) break; \
+                        const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1; \
+                        if (nbr_in_bitmap == 0) { \
+                            break; /* Neighbor not in ROI */ \
+                        } \
+                    } \
+                    \
                     float g_new = node_dist + (edge_cost); \
                     \
                     /* A* heuristic */ \
@@ -530,7 +648,42 @@ class CUDADijkstra:
                     if (g_new < old_dist) { \
                         const float old = atomicMinFloat(&dist[nidx], g_new); \
                         if (g_new + 1e-8f < old) { \
-                            atomicExch(&parent[nidx], node); \
+                            /* MANHATTAN VALIDATION: Verify parent->child is adjacent */ \
+                            /* Decode current node coordinates */ \
+                            const int plane_size_node = Nx * Ny; \
+                            const int z_node = node / plane_size_node; \
+                            const int remainder_node = node - (z_node * plane_size_node); \
+                            const int y_node = remainder_node / Nx; \
+                            const int x_node = remainder_node - (y_node * Nx); \
+                            \
+                            /* Check if parent->child relationship is Manhattan-legal */ \
+                            bool valid_parent = false; \
+                            if (z_node != (nz)) { \
+                                /* Via jump - same X,Y required */ \
+                                if ((nx) == x_node && (ny) == y_node) { \
+                                    valid_parent = true; \
+                                } \
+                            } else { \
+                                /* Same layer - must be adjacent with correct direction */ \
+                                const int dx = abs((nx) - x_node); \
+                                const int dy = abs((ny) - y_node); \
+                                \
+                                if (dx + dy == 1) { \
+                                    /* Check layer direction discipline */ \
+                                    const bool is_h_layer = ((nz) % 2) == 1;  /* Odd layers = horizontal */ \
+                                    if (is_h_layer) { \
+                                        if (dy == 0) valid_parent = true;  /* H layer must have dy=0 */ \
+                                    } else { \
+                                        if (dx == 0) valid_parent = true;  /* V layer must have dx=0 */ \
+                                    } \
+                                } \
+                            } \
+                            \
+                            /* Only update parent if validation passed */ \
+                            if (valid_parent) { \
+                                atomicExch(&parent[nidx], node); \
+                            } \
+                            \
                             const int nbr_word_idx = neighbor / 32; \
                             const int nbr_bit_pos = neighbor % 32; \
                             atomicOr(&new_frontier[frontier_off + nbr_word_idx], 1u << nbr_bit_pos); \
@@ -630,6 +783,11 @@ class CUDADijkstra:
             return __int_as_float(old);
         }
 
+        // FIX-BITMAP: Macro to check if node is in ROI bitmap
+        #define IN_BITMAP(roi_idx, node, roi_bitmap, bitmap_words) ( \
+            ((node) >> 5) < (bitmap_words) && \
+            ((roi_bitmap)[(roi_idx) * (bitmap_words) + ((node) >> 5)] >> ((node) & 31)) & 1u )
+
         extern "C" __global__
         void __launch_bounds__(256)
         sssp_persistent_cooperative(
@@ -655,6 +813,9 @@ class CUDADijkstra:
             const int use_astar,            // A* enable flag
             float* dist,                    // (K, max_roi_size) distances
             int* parent,                    // (K, max_roi_size) parents
+            const unsigned int* roi_bitmap, // FIX-BITMAP: ROI bitmap for validation
+            const int bitmap_words,         // FIX-BITMAP: Words per ROI bitmap
+            const int use_bitmap,           // 1 = enforce bitmap, 0 = bbox-only (iteration 1 mode)
             int* iterations_out             // Output: number of iterations completed
         ) {
             // Grid handle for cooperative groups
@@ -724,17 +885,30 @@ class CUDADijkstra:
                         const int neighbor = indices[indices_off + e];
                         if (neighbor < 0 || neighbor >= max_roi_size) continue;
 
+                        // BITMAP CHECK - conditional based on use_bitmap flag
+                        if (use_bitmap) {
+                            const int nbr_word = neighbor >> 5;
+                            const int nbr_bit = neighbor & 31;
+                            const int bitmap_off = roi_idx * bitmap_words;
+                            if (nbr_word >= bitmap_words) continue;  // Out of bitmap bounds
+                            const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
+                            if (nbr_in_bitmap == 0) continue;  // Neighbor not in ROI bitmap
+                        }
+
                         const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
                         const float g_new = node_dist + edge_cost;
 
                         // A* heuristic with procedural coordinate decoding
+                        // CRITICAL FIX: Declare neighbor coordinates at function scope (needed for validation later)
+                        int nx, ny, nz;
+
                         float f_new = g_new;
                         if (use_astar) {
                             const int plane_size = Nx * Ny;
-                            const int nz = neighbor / plane_size;
+                            nz = neighbor / plane_size;  // Now properly scoped (no 'const')
                             const int remainder = neighbor - (nz * plane_size);
-                            const int ny = remainder / Nx;
-                            const int nx = remainder - (ny * Nx);
+                            ny = remainder / Nx;
+                            nx = remainder - (ny * Nx);
 
                             const int gx = goal_coords[roi_idx * 3 + 0];
                             const int gy = goal_coords[roi_idx * 3 + 1];
@@ -742,6 +916,13 @@ class CUDADijkstra:
 
                             const float h = (abs(gx - nx) + abs(gy - ny)) * 0.4f + abs(gz - nz) * 1.5f;
                             f_new = g_new + h;
+                        } else {
+                            // Decode coordinates even if not using A* (needed for validation)
+                            const int plane_size = Nx * Ny;
+                            nz = neighbor / plane_size;
+                            const int remainder = neighbor - (nz * plane_size);
+                            ny = remainder / Nx;
+                            nx = remainder - (ny * Nx);
                         }
 
                         // Atomic distance update
@@ -750,7 +931,42 @@ class CUDADijkstra:
 
                         // If improved, update parent and add to output queue
                         if (g_new + 1e-8f < old) {
-                            atomicExch(&parent[nidx], node);
+                            // MANHATTAN VALIDATION: Verify parent->child is adjacent
+                            // Decode current node coordinates
+                            const int plane_size_node = Nx * Ny;
+                            const int z_node = node / plane_size_node;
+                            const int remainder_node = node - (z_node * plane_size_node);
+                            const int y_node = remainder_node / Nx;
+                            const int x_node = remainder_node - (y_node * Nx);
+
+                            // Check if parent->child relationship is Manhattan-legal
+                            // Neighbor coordinates (nx, ny, nz) are now always decoded above
+                            bool valid_parent = false;
+                            if (z_node != nz) {
+                                // Via jump - same X,Y required
+                                if (nx == x_node && ny == y_node) {
+                                    valid_parent = true;
+                                }
+                            } else {
+                                // Same layer - must be adjacent with correct direction
+                                const int dx = abs(nx - x_node);
+                                const int dy = abs(ny - y_node);
+
+                                if (dx + dy == 1) {
+                                    // Check layer direction discipline (matches graph construction)
+                                    const bool is_h_layer = (nz % 2) == 1;  // Odd layers = horizontal
+                                    if (is_h_layer) {
+                                        if (dy == 0) valid_parent = true;  // H layer must have dy=0
+                                    } else {
+                                        if (dx == 0) valid_parent = true;  // V layer must have dx=0
+                                    }
+                                }
+                            }
+
+                            // Only update parent if validation passed
+                            if (valid_parent) {
+                                atomicExch(&parent[nidx], node);
+                            }
 
                             // Add to output queue using atomic counter
                             int queue_pos = atomicAdd(sz_out, 1);
@@ -854,7 +1070,9 @@ class CUDADijkstra:
         __device__ void backtrace_to_staging(
             int net_id, int src, int dst,
             const int* parent_val, const unsigned short* parent_stamp, unsigned short gen,
-            int* stage_path, int* stage_count, int max_path_len
+            int* stage_path, int* stage_count, int max_path_len,
+            // Add lattice dimensions for coordinate decoding
+            int Nx, int Ny, int Nz
         ) {
             int path_len = 0;
             int curr = dst;
@@ -862,12 +1080,61 @@ class CUDADijkstra:
             // Walk backwards from dst to src
             while (curr != src && curr != -1 && path_len < max_path_len) {
                 if (parent_stamp[curr] == gen) {
+                    int parent_node = parent_val[curr];
+
+                    // MANHATTAN VALIDATION: Check parent->child adjacency
+                    if (parent_node != -1 && parent_node != src) {
+                        // Decode current node coordinates
+                        const int plane_size = Nx * Ny;
+                        const int z_curr = curr / plane_size;
+                        const int remainder_curr = curr - (z_curr * plane_size);
+                        const int y_curr = remainder_curr / Nx;
+                        const int x_curr = remainder_curr - (y_curr * Nx);
+
+                        // Decode parent node coordinates
+                        const int z_par = parent_node / plane_size;
+                        const int remainder_par = parent_node - (z_par * plane_size);
+                        const int y_par = remainder_par / Nx;
+                        const int x_par = remainder_par - (y_par * Nx);
+
+                        // Check adjacency
+                        const int dx = abs(x_curr - x_par);
+                        const int dy = abs(y_curr - y_par);
+                        const int dz = abs(z_curr - z_par);
+
+                        // Validate Manhattan legality
+                        if (dz != 0) {
+                            // Via jump - must have same X,Y
+                            if (dx != 0 || dy != 0) {
+                                // Non-adjacent via - corrupt parent!
+                                atomicExch(stage_count, -2);  // Error code: invalid parent
+                                return;
+                            }
+                        } else if ((dx + dy) != 1) {
+                            // Same layer - must be adjacent
+                            atomicExch(stage_count, -2);  // Error code: invalid parent
+                            return;
+                        } else {
+                            // Check layer direction discipline
+                            const bool is_h_layer = (z_curr % 2) == 1;  // Odd layers = horizontal
+                            if (is_h_layer && dy != 0) {
+                                // H-layer violation
+                                atomicExch(stage_count, -2);  // Error code: invalid parent
+                                return;
+                            } else if (!is_h_layer && dx != 0) {
+                                // V-layer violation
+                                atomicExch(stage_count, -2);  // Error code: invalid parent
+                                return;
+                            }
+                        }
+                    }
+
                     // Store (net_id, node) packed into 32 bits
                     int pos = atomicAdd(stage_count, 1);
                     if (pos < max_path_len * 512) {  // Safety limit
                         stage_path[pos] = (net_id << 24) | curr;  // 8-bit net ID + 24-bit node
                     }
-                    curr = parent_val[curr];
+                    curr = parent_node;
                     path_len++;
                 } else {
                     break;  // Invalid stamp - path broken
@@ -920,7 +1187,11 @@ class CUDADijkstra:
             const int* roi_miny,            // (K,) Min Y per ROI
             const int* roi_maxy,            // (K,) Max Y per ROI
             const int* roi_minz,            // (K,) Min Z per ROI
-            const int* roi_maxz             // (K,) Max Z per ROI
+            const int* roi_maxz,            // (K,) Max Z per ROI
+            // ROI bitmaps for neighbor validation
+            const unsigned int* roi_bitmap, // (K, bitmap_words) per ROI - neighbor must be in bitmap!
+            const int bitmap_words,         // Words per ROI bitmap
+            const int use_bitmap            // 1 = enforce bitmap, 0 = bbox-only (iteration 1 mode)
         ) {
             // Thread ID and total threads
             const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1011,7 +1282,8 @@ class CUDADijkstra:
                         backtrace_to_staging(
                             roi_idx, src, dst,
                             parent_val, parent_stamp, generation,
-                            stage_path, stage_count, 1000
+                            stage_path, stage_count, 1000,
+                            Nx, Ny, Nz  // Add lattice dimensions for validation
                         );
                         continue;
                     }
@@ -1024,6 +1296,16 @@ class CUDADijkstra:
                     for (int e = e0; e < e1; ++e) {
                         const int neighbor = indices[indices_off + e];
                         if (neighbor < 0 || neighbor >= max_roi_size) continue;
+
+                        // BITMAP CHECK - conditional based on use_bitmap flag
+                        if (use_bitmap) {
+                            const int nbr_word = neighbor >> 5;
+                            const int nbr_bit = neighbor & 31;
+                            const int bitmap_off = roi_idx * bitmap_words;
+                            if (nbr_word >= bitmap_words) continue;  // Out of bitmap bounds
+                            const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
+                            if (nbr_in_bitmap == 0) continue;  // Neighbor not in ROI bitmap
+                        }
 
                         const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
                         const float g_new = node_dist + edge_cost;
@@ -1042,6 +1324,16 @@ class CUDADijkstra:
                             // Phase 4: ROI gate - skip neighbors outside bounding box
                             if (!in_roi_persistent(nx, ny, nz, roi_idx, roi_minx, roi_maxx, roi_miny, roi_maxy, roi_minz, roi_maxz)) {
                                 continue;  // Skip this neighbor
+                            }
+
+                            // BITMAP CHECK - conditional based on use_bitmap flag
+                            if (use_bitmap) {
+                                const int nbr_word = neighbor >> 5;
+                                const int nbr_bit = neighbor & 31;
+                                const int bitmap_off = roi_idx * bitmap_words;
+                                if (nbr_word >= bitmap_words) continue;  // Out of bitmap bounds
+                                const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
+                                if (nbr_in_bitmap == 0) continue;  // Neighbor not in ROI bitmap
                             }
                         }
 
@@ -1184,26 +1476,76 @@ class CUDADijkstra:
         }
         ''', 'accountant_update')
 
+        # PARENT-CSR CONSISTENCY VALIDATOR KERNEL: Diagnose parent pointer corruption
+        # Checks if every parent[node] is actually a CSR neighbor of that node
+        # This helps identify if corruption happens during search or during backtrace/mapping
+        logger.info("[CUDA-COMPILE] Compiling validate_parents kernel for debugging")
+        self.validate_parents_kernel = cp.RawKernel(r'''
+        extern "C" __global__
+        void validate_parents(
+            const int K,
+            const int max_roi_size,
+            const int* __restrict__ indptr,
+            const int indptr_stride,
+            const int* __restrict__ indices,
+            const int indices_stride,
+            const int* __restrict__ parent,
+            const int parent_stride,  // CRITICAL FIX: Need stride for parent array too!
+            int* __restrict__ bad_counts
+        ){
+            int roi = blockIdx.x;
+            int u = blockIdx.y * blockDim.x + threadIdx.x;
+            if (roi >= K || u >= max_roi_size) return;
+
+            int parent_base = roi * parent_stride;  // Use parent_stride, not max_roi_size!
+            int p = parent[parent_base + u];
+            if (p < 0 || p >= max_roi_size) return;  // -1 or invalid parent
+
+            // Check if u is in p's neighbor list
+            int prow = roi * indptr_stride + p;
+            int istart = indptr[prow];
+            int iend = indptr[prow + 1];
+            bool ok = false;
+            for (int e = istart; e < iend; ++e) {
+                int v = indices[roi * indices_stride + e];
+                if (v == u) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) atomicAdd(&bad_counts[roi], 1);
+        }
+        ''', 'validate_parents')
+
         # GPU PATH RECONSTRUCTION KERNEL: Backtrace on GPU to avoid 256 MB CPU transfers
         # Each thread reconstructs one path by following parent pointers on GPU
         # Outputs: compact path arrays + path lengths (sparse transfer)
+        # BACKTRACE KERNEL COMPILATION (should see this log EXACTLY ONCE)
+        logger.info("[CUDA-COMPILE] Compiling backtrace_paths kernel with use_bitmap parameter")
         self.backtrace_kernel = cp.RawKernel(r'''
         extern "C" __global__
         void backtrace_paths(
             const int K,                    // Number of ROIs
             const int max_roi_size,         // Max nodes per ROI
-            const int* parent,              // (K, max_roi_size) parent pointers
-            const float* dist,              // (K, max_roi_size) distances (for validation)
+            const int* parent,              // (K, parent_stride) parent pointers
+            const int parent_stride,        // CRITICAL: Stride for parent array (pool stride!)
+            const float* dist,              // (K, dist_stride) distances
+            const int dist_stride,          // CRITICAL: Stride for dist array (pool stride!)
             const int* sinks,               // (K,) sink nodes
             int* paths_out,                 // (K, max_path_len) output paths
             int* path_lengths,              // (K,) output path lengths
-            const int max_path_len          // Maximum path length (safety limit)
+            const int max_path_len,         // Maximum path length (safety limit)
+            // FIX-BITMAP-BUG: Add bitmap validation to backtrace
+            const unsigned int* roi_bitmap, // (K, bitmap_words) per ROI - validate each path node!
+            const int bitmap_words,         // Words per ROI bitmap
+            const int use_bitmap            // 1 = enforce bitmap, 0 = bbox-only (skip validation)
         ) {
             int roi_idx = blockIdx.x * blockDim.x + threadIdx.x;
             if (roi_idx >= K) return;
 
             const int sink = sinks[roi_idx];
-            const int dist_off = roi_idx * max_roi_size;
+            const int parent_off = roi_idx * parent_stride;  // Use parent_stride!
+            const int dist_off = roi_idx * dist_stride;  // Use dist_stride!
             const int path_off = roi_idx * max_path_len;
 
             // Check if path exists (distance is finite)
@@ -1234,6 +1576,23 @@ class CUDADijkstra:
                     return;
                 }
 
+                // FIX-BITMAP-BUG: Validate current node is in bitmap before adding to path
+                // Only validate if use_bitmap=1, skip validation if use_bitmap=0
+                if (use_bitmap) {
+                    const int curr_word = curr >> 5;
+                    const int curr_bit = curr & 31;
+                    const int bitmap_off = roi_idx * bitmap_words;
+                    if (curr_word >= bitmap_words) {
+                        path_lengths[roi_idx] = -2;  // Indicate bitmap bounds error
+                        return;
+                    }
+                    const unsigned int curr_in_bitmap = (roi_bitmap[bitmap_off + curr_word] >> curr_bit) & 1;
+                    if (curr_in_bitmap == 0) {
+                        path_lengths[roi_idx] = -2;  // Indicate bitmap validation error (node not in ROI)
+                        return;
+                    }
+                }
+
                 // Add to path (stored in reverse order)
                 paths_out[path_off + path_len] = curr;
                 path_len++;
@@ -1244,7 +1603,7 @@ class CUDADijkstra:
                 }
 
                 // Follow parent pointer
-                curr = parent[dist_off + curr];
+                curr = parent[parent_off + curr];  // Use parent_off, not dist_off!
             }
 
             // Store final path length
@@ -1350,7 +1709,7 @@ class CUDADijkstra:
                     dist[roi_idx, improved_nbrs] = improved_dists
                     parent[roi_idx, improved_nbrs] = u
 
-    def find_paths_on_rois(self, roi_batch: List[Tuple]) -> List[Optional[List[int]]]:
+    def find_paths_on_rois(self, roi_batch: List[Tuple], use_bitmap: bool = True) -> List[Optional[List[int]]]:
         """
         Find paths on ROI subgraphs using GPU Near-Far worklist algorithm.
 
@@ -1366,17 +1725,18 @@ class CUDADijkstra:
             return []
 
         K = len(roi_batch)
-        logger.info(f"[CUDA-ROI] Processing {K} ROI subgraphs using GPU Near-Far algorithm")
+        mode_desc = "BBOX-ONLY (no bitmap fence)" if not use_bitmap else "BITMAP-FILTERED (L-corridor)"
+        logger.info(f"[CUDA-ROI] Processing {K} ROI subgraphs using GPU Near-Far algorithm ({mode_desc})")
 
         try:
             # Prepare batched GPU arrays
-            logger.info(f"[DEBUG-GPU] Preparing batch data for {K} ROIs")
-            batch_data = self._prepare_batch(roi_batch)
+            logger.info(f"[DEBUG-GPU] Preparing batch data for {K} ROIs (use_bitmap={use_bitmap})")
+            batch_data = self._prepare_batch(roi_batch, use_bitmap=use_bitmap)
             logger.info(f"[DEBUG-GPU] Batch data prepared, starting Near-Far algorithm")
 
             # CRITICAL: Use the K that _prepare_batch actually built arrays for
             K_actual = int(batch_data.get('K', len(roi_batch)))
-            logger.info(f"[K-RESYNC-CALLER] K adjusted from {K} → {K_actual} after _prepare_batch")
+            logger.info(f"[K-RESYNC-CALLER] K adjusted from {K} -> {K_actual} after _prepare_batch")
             K = K_actual
 
             # INVARIANT CHECKS: Shared-CSR indexing (user-requested debugging)
@@ -1548,7 +1908,7 @@ class CUDADijkstra:
     # NEAR-FAR WORKLIST ALGORITHM - PRODUCTION IMPLEMENTATION
     # ========================================================================
 
-    def _prepare_batch(self, roi_batch: List[Tuple]) -> dict:
+    def _prepare_batch(self, roi_batch: List[Tuple], use_bitmap: bool = True) -> dict:
         """
         Prepare batched GPU arrays for FAST WAVEFRONT algorithm.
 
@@ -1617,7 +1977,7 @@ class CUDADijkstra:
                 was_cpu = True
                 shared_weights_cpu = shared_weights  # Save CPU version for debug
                 shared_weights = cp.asarray(shared_weights)
-                # DEBUG: Verify infinity survived CPU→GPU transfer
+                # DEBUG: Verify infinity survived CPU->GPU transfer
                 import numpy as np
                 test_edges = [822688, 822689, 822690]  # Test edges around the infinite one
                 for edge_idx in test_edges:
@@ -1626,9 +1986,9 @@ class CUDADijkstra:
                         gpu_val = float(shared_weights[edge_idx])
                         if cpu_val > 1e8:  # If CPU had infinity
                             if gpu_val > 1e8:
-                                logger.info(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} → GPU={gpu_val:.2e} ✅")
+                                logger.info(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} -> GPU={gpu_val:.2e} ✅")
                             else:
-                                logger.error(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} → GPU={gpu_val:.2e} ❌ LOST INFINITY!")
+                                logger.error(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} -> GPU={gpu_val:.2e} ❌ LOST INFINITY!")
 
             # Phase 1: STAMP TRICK - Lazy-allocate pools on first use
             if self.dist_val_pool is None:
@@ -1668,7 +2028,7 @@ class CUDADijkstra:
                 K_old = K
                 K, roi_batch = self._normalize_batch(roi_batch)
                 if K != K_old:
-                    logger.warning(f"[K-RENORMALIZE] After K_pool calculated: K {K_old} → {K}")
+                    logger.warning(f"[K-RENORMALIZE] After K_pool calculated: K {K_old} -> {K}")
 
                 self.dist_val_pool = cp.full((self.K_pool, N_max), cp.inf, dtype=cp.float32)
                 self.dist_stamp_pool = cp.zeros((self.K_pool, N_max), dtype=cp.uint16)  # Phase A: uint16 stamps
@@ -1681,7 +2041,7 @@ class CUDADijkstra:
                 logger.info(f"[STAMP-POOL] Allocated device pools: K={self.K_pool}, N={N_max}")
                 logger.info(f"[PHASE-A] Using uint16 stamps (16 MB memory savings per net)")
                 frontier_bytes = ((N_max + 31) // 32) * 4  # uint32 words * 4 bytes/word
-                logger.info(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB → {frontier_bytes/1e6:.1f} MB per net)")
+                logger.info(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB -> {frontier_bytes/1e6:.1f} MB per net)")
 
             # Slice pool instead of allocating new arrays (NO ZEROING!)
             gen = self.current_gen
@@ -1769,7 +2129,7 @@ class CUDADijkstra:
                 K_old = K
                 K, roi_batch = self._normalize_batch(roi_batch)
                 if K != K_old:
-                    logger.warning(f"[K-RENORMALIZE] After K_pool calculated: K {K_old} → {K}")
+                    logger.warning(f"[K-RENORMALIZE] After K_pool calculated: K {K_old} -> {K}")
 
                 self.dist_val_pool = cp.full((self.K_pool, N_max), cp.inf, dtype=cp.float32)
                 self.dist_stamp_pool = cp.zeros((self.K_pool, N_max), dtype=cp.uint16)  # Phase A: uint16 stamps
@@ -1782,7 +2142,7 @@ class CUDADijkstra:
                 logger.info(f"[STAMP-POOL] Allocated device pools: K={self.K_pool}, N={N_max}")
                 logger.info(f"[PHASE-A] Using uint16 stamps (16 MB memory savings per net)")
                 frontier_bytes = ((N_max + 31) // 32) * 4  # uint32 words * 4 bytes/word
-                logger.info(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB → {frontier_bytes/1e6:.1f} MB per net)")
+                logger.info(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB -> {frontier_bytes/1e6:.1f} MB per net)")
 
             # Slice pool instead of allocating new arrays (NO ZEROING!)
             gen = self.current_gen
@@ -1867,11 +2227,35 @@ class CUDADijkstra:
         roi_minz = cp.zeros(K, dtype=cp.int32)
         roi_maxz = cp.zeros(K, dtype=cp.int32)
 
-        # FIX-7: Batch bitmaps (all bitmaps should have same size for full-graph CSR)
-        first_bitmap = roi_batch[0][6]
-        bitmap_words = len(first_bitmap)
-        batch_bitmaps = cp.zeros((K, bitmap_words), dtype=cp.uint32)
-        logger.info(f"[FIX-7-BITMAP] Batching {K} bitmaps, {bitmap_words} words each ({bitmap_words*4/1e6:.2f} MB per bitmap)")
+        # FIX-7: Batch bitmaps (conditional based on use_bitmap flag)
+        if use_bitmap and roi_batch[0][6] is not None:
+            first_bitmap = roi_batch[0][6]
+            bitmap_words = len(first_bitmap)
+
+            # FIX-7: STRICT bitmap size validation - all bitmaps MUST be same size
+            for i, roi_tuple in enumerate(roi_batch):
+                roi_bitmap = roi_tuple[6]
+                if roi_bitmap is not None and len(roi_bitmap) != bitmap_words:
+                    raise ValueError(
+                        f"[FIX-7-BITMAP] ROI {i}: bitmap size mismatch! "
+                        f"Expected {bitmap_words} words, got {len(roi_bitmap)} words. "
+                        f"All ROIs must use the same graph size for batched processing."
+                    )
+
+            batch_bitmaps = cp.zeros((K, bitmap_words), dtype=cp.uint32)
+            logger.info(f"[FIX-7-BITMAP] Validated {K} bitmaps, all have {bitmap_words} words ({bitmap_words*4/1e6:.2f} MB each)")
+        else:
+            # No bitmap filtering - bbox-only mode (iteration 1 wide search)
+            # Create dummy all-ones bitmap (all nodes allowed) to avoid None errors in kernel launches
+            # Need to cover ALL nodes in the full graph!
+            if all_share_csr and self.lattice:
+                full_graph_size = self.lattice.x_steps * self.lattice.y_steps * self.lattice.layers
+            else:
+                # Fallback: estimate from max_roi_size
+                full_graph_size = max_roi_size
+            bitmap_words = (full_graph_size + 31) // 32
+            batch_bitmaps = cp.ones((K, bitmap_words), dtype=cp.uint32) * 0xFFFFFFFF
+            logger.info(f"[BBOX-ONLY] Bitmap filtering DISABLED (using all-ones bitmap covering {full_graph_size} nodes = {bitmap_words} words)")
 
         # Initialize sources/sinks for all nets
         # roi_batch is already sliced to K at the top of function
@@ -1910,11 +2294,12 @@ class CUDADijkstra:
                 roi_minz[i] = 0
                 roi_maxz[i] = 999999
 
-            # FIX-7: Copy bitmap into batched array
-            if len(roi_bitmap) == bitmap_words:
-                batch_bitmaps[i] = roi_bitmap
-            else:
-                logger.warning(f"[FIX-7-BITMAP] ROI {i}: bitmap size mismatch ({len(roi_bitmap)} vs {bitmap_words})")
+            # FIX-7: Copy bitmap into batched array (only if use_bitmap=True)
+            if use_bitmap and batch_bitmaps is not None and roi_bitmap is not None:
+                if len(roi_bitmap) == bitmap_words:
+                    batch_bitmaps[i] = roi_bitmap
+                else:
+                    logger.warning(f"[FIX-7-BITMAP] ROI {i}: bitmap size mismatch ({len(roi_bitmap)} vs {bitmap_words})")
 
             # CSR VALIDATION: Verify src has edges after transfer (DEBUG ONLY)
             if src < len(indptr) - 1:
@@ -1956,43 +2341,8 @@ class CUDADijkstra:
         near_mask = cp.unpackbits(near_bits.view(cp.uint8).ravel(), bitorder='little').reshape(K, -1)[:, :max_roi_size].astype(cp.bool_)
         far_mask = cp.unpackbits(far_bits.view(cp.uint8).ravel(), bitorder='little').reshape(K, -1)[:, :max_roi_size].astype(cp.bool_)
 
-        return {
-            'K': K,
-            'max_roi_size': max_roi_size,
-            'max_edges': max_edges,
-            'batch_indptr': batch_indptr,
-            'batch_indices': batch_indices,
-            'batch_weights': batch_weights,
-            'dist': dist,
-            'parent': parent,
-            'near_bits': near_bits,  # Phase B: Bitset pools
-            'far_bits': far_bits,    # Phase B: Bitset pools
-            'near_mask': near_mask,  # Legacy compatibility (unpacked view)
-            'far_mask': far_mask,    # Legacy compatibility (unpacked view)
-            'threshold': threshold,  # Legacy
-            'sources': sources,
-            'sinks': sinks,
-            'goal_nodes': goal_nodes_array,        # NEW: for A* heuristic
-            'Nx': Nx,  # P0-3: Lattice dimensions for procedural coordinates
-            'Ny': Ny,
-            'Nz': Nz,
-            'goal_coords': cp.asarray(goal_coords_array),  # P0-3: (K, 3) goal coordinates only
-            'use_astar': 1 if (Nx > 0 and Ny > 0 and Nz > 0) else 0,  # P0-3: Enable A* only if lattice available
-            # Phase 4: ROI bounding boxes for device-side gating
-            'roi_minx': roi_minx,
-            'roi_maxx': roi_maxx,
-            'roi_miny': roi_miny,
-            'roi_maxy': roi_maxy,
-            'roi_minz': roi_minz,
-            'roi_maxz': roi_maxz,
-            # FIX-7: ROI bitmaps for neighbor validation in kernels
-            'roi_bitmaps': batch_bitmaps,
-            'bitmap_words': bitmap_words,
-            # Phase 1: Stamp arrays and generation counter
-            'dist_stamps': dist_stamps,
-            'parent_stamps': parent_stamps,
-            'generation': gen,
-        }
+        # FIX-BITMAP-BUG: Removed duplicate return statement - was dead code that never executed
+        # The actual data_dict is built below after sources/sinks conversion
 
         # K-consistency invariants check
         # CRITICAL: Convert sources/sinks to CuPy int32 arrays (not Python lists!)
@@ -2032,15 +2382,19 @@ class CUDADijkstra:
             'roi_maxy': roi_maxy,
             'roi_minz': roi_minz,
             'roi_maxz': roi_maxz,
+            # FIX-BITMAP-BUG: Add bitmap arrays to data_dict (were missing, causing backtrace to always validate)
+            'roi_bitmaps': batch_bitmaps,
+            'bitmap_words': bitmap_words,
+            'use_bitmap': use_bitmap,  # Flag to enable/disable bitmap filtering in kernels
             'dist_stamps': dist_stamps,
             'parent_stamps': parent_stamps,
             'generation': gen,
         }
         
         # Verify all per-ROI arrays have shape[0] == K
-        for key in ['dist', 'parent', 'near_bits', 'far_bits', 'near_mask', 'far_mask', 
-                    'threshold', 'goal_nodes', 'roi_minx', 'roi_maxx', 'roi_miny', 'roi_maxy', 
-                    'roi_minz', 'roi_maxz', 'dist_stamps', 'parent_stamps']:
+        for key in ['dist', 'parent', 'near_bits', 'far_bits', 'near_mask', 'far_mask',
+                    'threshold', 'goal_nodes', 'roi_minx', 'roi_maxx', 'roi_miny', 'roi_maxy',
+                    'roi_minz', 'roi_maxz', 'dist_stamps', 'parent_stamps', 'roi_bitmaps']:
             arr = data_dict[key]
             if hasattr(arr, 'shape') and len(arr.shape) >= 1:
                 if arr.shape[0] != K:
@@ -2056,20 +2410,20 @@ class CUDADijkstra:
             raise ValueError(f"K-consistency check failed: sinks.shape[0]={sinks_cp.shape[0]} != K={K}")
         
         logger.info(f"[K-INVARIANT-PASS] All per-ROI arrays have shape[0]={K}")
-        
-        return data_dict
 
-        # Phase 1: Increment generation for next batch
+        # Phase 1: Increment generation for next batch (MUST be before return!)
         # Phase A: Wrap generation counter to prevent uint16 overflow (max 65535)
         self.current_gen += 1
         if self.current_gen >= 65535:
             self.current_gen = 1  # Reset to 1 (0 is reserved for "uninitialized")
 
+        return data_dict
+
     def _run_near_far(self, data: dict, K: int, roi_batch: List[Tuple] = None) -> List[Optional[List[int]]]:
         """
         Execute GPU pathfinding algorithm - routes to either delta-stepping or BFS wavefront.
 
-        NEW (Δ-stepping): Proper bucket-based priority queue expansion
+        NEW (Delta-stepping): Proper bucket-based priority queue expansion
         - Processes nodes in cost order (buckets 0, 1, 2, ...)
         - Maintains correctness of shortest-path guarantees
         - Reduces atomic contention via distance-based bucketing
@@ -2104,7 +2458,7 @@ class CUDADijkstra:
         assert n_src == K and n_dst == K, f"K mismatch: K={K} sources={n_src} sinks={n_dst}"
         logger.info(f"[_run_near_far] Using K={K}, sources.shape={n_src}, sinks.shape={n_dst}")
 
-# Route to delta-stepping if enabled (proper Δ-stepping with bucket-based priority queue)
+# Route to delta-stepping if enabled (proper Delta-stepping with bucket-based priority queue)
         # Temporarily force wavefront for iteration-1 debugging
         use_delta_stepping = False
         
@@ -2171,7 +2525,7 @@ class CUDADijkstra:
 
         # P0-4: BIT-PACKED FRONTIER - 8× memory reduction!
         # Instead of uint8 (1 byte per node), use uint32 bitset (1 bit per node)
-        # Memory: K × max_roi_size bytes → K × (max_roi_size/32) uint32 words = 8× smaller
+        # Memory: K × max_roi_size bytes -> K × (max_roi_size/32) uint32 words = 8× smaller
         max_roi_size = data['max_roi_size']
         frontier_words = (max_roi_size + 31) // 32  # Round up to cover all nodes
         frontier = cp.zeros((K, frontier_words), dtype=cp.uint32)
@@ -2183,7 +2537,7 @@ class CUDADijkstra:
             bit_pos = src % 32
             frontier[roi_idx, word_idx] = cp.uint32(1) << bit_pos
 
-        logger.info(f"[BIT-FRONTIER] Memory: {K}×{max_roi_size} uint8 ({K*max_roi_size/1e6:.1f}MB) → "
+        logger.info(f"[BIT-FRONTIER] Memory: {K}×{max_roi_size} uint8 ({K*max_roi_size/1e6:.1f}MB) -> "
                    f"{K}×{frontier_words} uint32 ({K*frontier_words*4/1e6:.1f}MB) = {8.0:.1f}× reduction")
 
         # DIAGNOSTIC: Verify frontier bits are actually set
@@ -2243,7 +2597,7 @@ class CUDADijkstra:
             # DIAGNOSTIC: Lightweight logging (no CPU syncs in hot loop!)
             # Only log every 50 iterations to avoid overhead
             if iteration % 50 == 0 or iteration < 3:
-                # FIX: Use fancy indexing for single GPU→CPU transfer instead of K transfers
+                # FIX: Use fancy indexing for single GPU->CPU transfer instead of K transfers
                 # Old: for roi_idx in range(K): sink_dist = float(data['dist'][roi_idx, sink])
                 # New: Single vectorized operation gets all sink distances at once
                 sink_dists_gpu = data['dist'][cp.arange(K), data['sinks']]  # GPU operation
@@ -2255,7 +2609,7 @@ class CUDADijkstra:
                           f"min_sink_dist={min_sink_dist:.2f}")
 
             # SPEEDUP: Disable expensive diagnostic logging in hot loop
-            # This .get() call copies 4M+ nodes from GPU→CPU every 50 iterations!
+            # This .get() call copies 4M+ nodes from GPU->CPU every 50 iterations!
             # Comment out for production, re-enable only for debugging
             if False:  # Disabled for speedup - was causing 1.5-2× slowdown
                 pass  # Original Test D1 logging removed
@@ -2263,7 +2617,7 @@ class CUDADijkstra:
             # FIX: Unambiguous early termination check (vectorized for performance)
             # Use fancy indexing to get all sink distances in one GPU operation
             sink_dists_term = data['dist'][cp.arange(K), data['sinks']]
-            sinks_reached_count = int(cp.sum(sink_dists_term < 1e9).get())  # Single GPU→CPU transfer
+            sinks_reached_count = int(cp.sum(sink_dists_term < 1e9).get())  # Single GPU->CPU transfer
 
             # SPEEDUP: ε-optimal termination (anytime A* with slack)
             # With A* enabled, first path is near-optimal. Allow small exploration for alternatives.
@@ -2365,7 +2719,7 @@ class CUDADijkstra:
             return 0
 
         # ═══════════════════════════════════════════════════════════════════════
-        # FRONTIER COMPACTION: Convert sparse mask → dense list (100-1000× speedup!)
+        # FRONTIER COMPACTION: Convert sparse mask -> dense list (100-1000× speedup!)
         # ═══════════════════════════════════════════════════════════════════════
         # P0-5: Time compaction step
         compact_start = cp.cuda.Event()
@@ -2491,7 +2845,7 @@ class CUDADijkstra:
         # Log compaction benefit (only first time)
         if not hasattr(self, '_compaction_logged'):
             logger.info(f"[ACTIVE-LIST] Processing {total_active} active nodes (vs {K * data['max_roi_size']:,} total)")
-            logger.info(f"[ACTIVE-LIST] Sparsity={100*sparsity:.3f}% → {1/sparsity:.0f}× fewer memory accesses!")
+            logger.info(f"[ACTIVE-LIST] Sparsity={100*sparsity:.3f}% -> {1/sparsity:.0f}× fewer memory accesses!")
             logger.info(f"[ACTIVE-LIST] Launching over {total_active} items (not {K} blocks) for better occupancy")
             self._compaction_logged = True
 
@@ -2528,6 +2882,9 @@ class CUDADijkstra:
         pool_stride = self.dist_val_pool.shape[1]  # N_max
 
 
+        # Get use_bitmap flag from data dict
+        use_bitmap_flag = 1 if data.get('use_bitmap', True) else 0
+
         args = (
             total_active,
             max_roi_size,
@@ -2556,6 +2913,7 @@ class CUDADijkstra:
             # FIX-7: ROI bitmaps for neighbor validation
             data['roi_bitmaps'].ravel(),    # (K, bitmap_words) flattened
             data['bitmap_words'],           # Words per bitmap
+            use_bitmap_flag,                # 1 = enforce bitmap, 0 = bbox-only
             # Phase 4: ROI bounding boxes
             data['roi_minx'],
             data['roi_maxx'],
@@ -2688,6 +3046,9 @@ class CUDADijkstra:
         # Get pool stride and pass sliced pool views (matching persistent kernel pattern)
         pool_stride = self.dist_val_pool.shape[1]  # N_max
 
+        # Get use_bitmap flag from data dict
+        use_bitmap_flag = 1 if data.get('use_bitmap', True) else 0
+
         args = (
             K,
             max_roi_size,
@@ -2716,6 +3077,7 @@ class CUDADijkstra:
             # FIX-7: ROI bitmaps for neighbor validation
             data['roi_bitmaps'].ravel(),    # (K, bitmap_words) flattened
             data['bitmap_words'],           # Words per bitmap
+            use_bitmap_flag,                # 1 = enforce bitmap, 0 = bbox-only
         )
 
         if is_shared_csr:
@@ -3028,6 +3390,9 @@ class CUDADijkstra:
 
             logger.info(f"[AGENT-B1-MEMORY-AWARE] Pool stride: {pool_stride}, max_roi_size: {max_roi_size}")
 
+            # Get use_bitmap flag from data dict
+            use_bitmap_flag = 1 if data.get('use_bitmap', True) else 0
+
             args = (
                 queue_a, queue_b, size_a, size_b, max_queue_size,
                 K, max_roi_size,
@@ -3047,7 +3412,10 @@ class CUDADijkstra:
                 # Phase 4: ROI bounding boxes
                 data['roi_minx'], data['roi_maxx'],
                 data['roi_miny'], data['roi_maxy'],
-                data['roi_minz'], data['roi_maxz']
+                data['roi_minz'], data['roi_maxz'],
+                data['roi_bitmaps'].ravel(),  # ROI bitmaps for neighbor validation
+                data['bitmap_words'],          # Words per bitmap
+                use_bitmap_flag                # 1 = enforce bitmap, 0 = bbox-only
             )
 
             block_size = 256
@@ -3135,6 +3503,9 @@ class CUDADijkstra:
             for i in range(K):
                 data['dist'][i, srcs[i]] = 0.0
 
+            # Get use_bitmap flag from data dict
+            use_bitmap_flag = 1 if data.get('use_bitmap', True) else 0
+
             args = (
                 queue_a, queue_b, size_a, size_b, max_queue_size,
                 K, max_roi_size,
@@ -3146,6 +3517,9 @@ class CUDADijkstra:
                 data['use_astar'],
                 data['dist'].ravel(),
                 data['parent'].ravel(),
+                data['roi_bitmaps'].ravel(),  # FIX-BITMAP: Add bitmap for validation
+                data['bitmap_words'],          # FIX-BITMAP: Add bitmap size
+                use_bitmap_flag,               # 1 = enforce bitmap, 0 = bbox-only
                 iterations_out
             )
 
@@ -3269,11 +3643,65 @@ class CUDADijkstra:
             block_size = 256
             grid_size = (K + block_size - 1) // block_size
 
+            # Get use_bitmap flag from data dict
+            use_bitmap_flag = 1 if data.get('use_bitmap', True) else 0
+
+            # DIAGNOSTIC: Log backtrace kernel args
+            logger.debug(f"[BACKTRACE-ARGS] K={K}, max_roi_size={max_roi_size}, max_path_len={max_path_len}")
+            logger.debug(f"[BACKTRACE-ARGS] bitmap_words={data['bitmap_words']}, use_bitmap_flag={use_bitmap_flag}")
+            logger.debug(f"[BACKTRACE-ARGS] roi_bitmaps.shape={data['roi_bitmaps'].shape if data['roi_bitmaps'] is not None else 'None'}")
+
+            # CRITICAL DIAGNOSTIC: Validate parent-CSR consistency BEFORE backtrace
+            # This detects if parent pointers are corrupted during search phase
+            bad_counts = cp.zeros(K, dtype=cp.int32)
+            threads = 256
+            grid_y = (max_roi_size + threads - 1) // threads
+            val_grid = (K, grid_y)
+
+            # Get parent stride (N_max for full pool, or max_roi_size for sliced arrays)
+            parent_stride = self.parent_val_pool.shape[1] if self.parent_val_pool is not None else max_roi_size
+
+            logger.debug(f"[VALIDATOR] parent.shape={data['parent'].shape}, parent_stride={parent_stride}")
+            logger.debug(f"[VALIDATOR] Using strides: indptr=0, indices=0, parent={parent_stride}")
+
+            self.validate_parents_kernel(
+                val_grid, (threads,),
+                (K, max_roi_size,
+                 data['batch_indptr'], 0,  # indptr_stride=0 for shared CSR
+                 data['batch_indices'], 0,  # indices_stride=0 for shared CSR
+                 self.parent_val_pool.ravel(),  # Use FULL pool, not sliced view
+                 parent_stride,  # Stride between ROIs in parent array (N_max)
+                 bad_counts)
+            )
+            cp.cuda.Stream.null.synchronize()
+
+            violations = bad_counts.get()
+            total_violations = int(violations.sum())
+            if total_violations > 0:
+                rois_with_errors = np.where(violations > 0)[0]
+                logger.error(f"[PARENT-VALIDATE] {total_violations} parent-CSR mismatches across {len(rois_with_errors)} ROIs!")
+                for roi_idx in rois_with_errors[:10]:  # Show first 10
+                    logger.error(f"[PARENT-VALIDATE]   ROI {roi_idx}: {violations[roi_idx]} bad parents")
+                logger.error(f"[PARENT-VALIDATE] Corruption in SEARCH PHASE - parent writes are invalid!")
+            else:
+                logger.info(f"[PARENT-VALIDATE] 0 parent-CSR mismatches ✓ Parents are valid!")
+
+            # Calculate strides (pool strides, not max_roi_size!)
+            parent_stride_val = self.parent_val_pool.shape[1] if self.parent_val_pool is not None else max_roi_size
+            dist_stride_val = self.dist_val_pool.shape[1] if self.dist_val_pool is not None else max_roi_size
+
+            logger.debug(f"[BACKTRACE-STRIDE] parent_stride={parent_stride_val}, dist_stride={dist_stride_val}, max_roi_size={max_roi_size}")
+
             self.backtrace_kernel(
                 (grid_size,), (block_size,),
                 (K, max_roi_size,
-                 data['parent'], data['dist'], sinks_gpu,
-                 paths_gpu, path_lengths_gpu, max_path_len)
+                 self.parent_val_pool.ravel(),  # Pass FULL pool
+                 parent_stride_val,  # CRITICAL: Pass parent_stride!
+                 self.dist_val_pool.ravel(),  # Pass FULL pool
+                 dist_stride_val,  # CRITICAL: Pass dist_stride!
+                 sinks_gpu,
+                 paths_gpu, path_lengths_gpu, max_path_len,
+                 data['roi_bitmaps'].ravel(), data['bitmap_words'], use_bitmap_flag)  # Add use_bitmap flag
             )
             cp.cuda.Stream.null.synchronize()
 
@@ -3294,6 +3722,10 @@ class CUDADijkstra:
                 elif path_len == -1:
                     # Cycle detected
                     logger.error(f"[GPU-BACKTRACE] Path reconstruction: cycle detected for ROI {roi_idx}")
+                    paths.append(None)
+                elif path_len == -2:
+                    # Bitmap validation error (node not in ROI bitmap)
+                    logger.error(f"[GPU-BACKTRACE] Path reconstruction: bitmap validation error for ROI {roi_idx}")
                     paths.append(None)
                 else:
                     # No path found (path_len == 0)
@@ -3340,7 +3772,44 @@ class CUDADijkstra:
 
                     path.append(curr)
                     visited.add(curr)
-                    curr = parent_cpu[roi_idx, curr]
+                    parent_node = parent_cpu[roi_idx, curr]
+
+                    # MANHATTAN VALIDATION: Check if parent->curr is adjacent
+                    if parent_node != -1 and len(path) > 1:
+                        # Get coordinates (using lattice if available)
+                        if hasattr(self, 'lattice') and self.lattice:
+                            x_curr, y_curr, z_curr = self.lattice.idx_to_coord(curr)
+                            x_par, y_par, z_par = self.lattice.idx_to_coord(parent_node)
+
+                            dx = abs(x_curr - x_par)
+                            dy = abs(y_curr - y_par)
+                            dz = abs(z_curr - z_par)
+
+                            # Check if parent->child is Manhattan-legal
+                            if dz != 0:
+                                # Via jump - same X,Y required
+                                if dx != 0 or dy != 0:
+                                    logger.error(f"[PARENT-VALIDATION] Non-adjacent via: {parent_node}->{curr}, dist=({dx},{dy},{dz})")
+                                    paths.append(None)  # Reject path
+                                    break
+                            elif (dx + dy) != 1:
+                                # Same layer - must be adjacent
+                                logger.error(f"[PARENT-VALIDATION] Non-adjacent parent: {parent_node}->{curr}, dist=({dx},{dy},{dz})")
+                                paths.append(None)  # Reject path
+                                break
+                            else:
+                                # Check layer direction discipline
+                                is_h_layer = (z_curr % 2) == 1  # Odd layers = horizontal
+                                if is_h_layer and dy != 0:
+                                    logger.error(f"[PARENT-VALIDATION] H-layer violation: {parent_node}->{curr}, dy={dy}")
+                                    paths.append(None)  # Reject path
+                                    break
+                                elif not is_h_layer and dx != 0:
+                                    logger.error(f"[PARENT-VALIDATION] V-layer violation: {parent_node}->{curr}, dx={dx}")
+                                    paths.append(None)  # Reject path
+                                    break
+
+                    curr = parent_node
 
                     # Safety limit
                     if len(path) > max_roi_size:
@@ -3367,15 +3836,15 @@ class CUDADijkstra:
         reducing conflicting atomic updates.
 
         Algorithm:
-        1. Maintain buckets: bucket[b] contains nodes with distance in [b*Δ, (b+1)*Δ)
-        2. Process current bucket with light edges (cost < Δ)
-        3. Heavy edges (cost ≥ Δ) relax to future buckets
+        1. Maintain buckets: bucket[b] contains nodes with distance in [b*Delta, (b+1)*Delta)
+        2. Process current bucket with light edges (cost < Delta)
+        3. Heavy edges (cost >= Delta) relax to future buckets
         4. Less contention since nodes at similar distances don't compete
 
         Args:
             data: Batched GPU arrays from _prepare_batch
             K: Number of ROIs
-            delta: Bucket width (Δ parameter) - typically median edge cost (0.4-1.0)
+            delta: Bucket width (Delta parameter) - typically median edge cost (0.4-1.0)
             roi_batch: Original ROI batch (for diagnostics)
 
         Returns:
@@ -3495,7 +3964,7 @@ class CUDADijkstra:
             )
 
             # Check termination: have all sinks been reached? (vectorized)
-            # Use fancy indexing to avoid K separate GPU→CPU transfers
+            # Use fancy indexing to avoid K separate GPU->CPU transfers
             sink_dists_check = data['dist'][cp.arange(K), data['sinks']]
             sinks_reached = int(cp.sum(sink_dists_check < 1e9).get())  # Single transfer
 
@@ -3593,6 +4062,9 @@ class CUDADijkstra:
         # Calculate pool_stride for kernel (N_max from pool shape)
         pool_stride = self.dist_val_pool.shape[1] if self.dist_val_pool is not None else max_roi_size
 
+        # Get use_bitmap flag from data dict
+        use_bitmap_flag = 1 if data.get('use_bitmap', True) else 0
+
         # Use active_list_kernel (could be extended with delta-specific logic)
         args = (
             total_active,
@@ -3619,6 +4091,10 @@ class CUDADijkstra:
             self.dist_val_pool.ravel() if self.dist_val_pool is not None else data['dist'].ravel(),
             self.parent_val_pool.ravel() if self.parent_val_pool is not None else data['parent'].ravel(),
             new_frontier.ravel(),
+            # FIX-7: ROI bitmaps for neighbor validation
+            data['roi_bitmaps'].ravel(),    # (K, bitmap_words) flattened
+            data['bitmap_words'],           # Words per bitmap
+            use_bitmap_flag,                # 1 = enforce bitmap, 0 = bbox-only
             # Phase 4: ROI bounding boxes
             data['roi_minx'],
             data['roi_maxx'],
@@ -3680,7 +4156,7 @@ class CUDADijkstra:
         paths = []
         # roi_batch now has 13 elements: (src, dst, indptr, indices, weights, roi_size, roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz)
         # CPU fallback only needs the first 6
-        for src, sink, indptr, indices, weights, size, *_ in roi_batch:
+        for roi_idx, (src, sink, indptr, indices, weights, size, *_) in enumerate(roi_batch):
             # Transfer to CPU if needed
             if hasattr(indptr, 'get'):
                 indptr_cpu = indptr.get()
@@ -3691,10 +4167,10 @@ class CUDADijkstra:
                 indices_cpu = np.asarray(indices)
                 weights_cpu = np.asarray(weights)
 
-            # Heap-based Dijkstra - FIX: Use NumPy arrays not Python lists (4M nodes!)
-            dist = np.full(size, np.inf, dtype=np.float32)
-            parent = np.full(size, -1, dtype=np.int32)
-            dist[src] = 0.0
+            # Heap-based Dijkstra - Use sparse dictionaries to avoid large allocations
+            # This prevents "Unable to allocate X MiB" errors on large graphs
+            dist = {src: 0.0}
+            parent = {}
 
             heap = [(0.0, src)]
             visited = set()
@@ -3720,21 +4196,31 @@ class CUDADijkstra:
 
                     if v not in visited:
                         new_dist = current_dist + cost
-                        if new_dist < dist[v]:
+                        old_dist = dist.get(v, float('inf'))
+                        if new_dist < old_dist:
                             dist[v] = new_dist
                             parent[v] = u
                             heapq.heappush(heap, (new_dist, v))
 
             # Reconstruct path
-            if dist[sink] < float('inf'):
+            if sink in dist and dist[sink] < float('inf'):
                 path = []
                 curr = sink
-                while curr != -1:
+                while curr != src:
                     path.append(curr)
+                    if curr not in parent:
+                        logger.warning(f"[CPU-FALLBACK] ROI {roi_idx}: Path reconstruction failed at node {curr}")
+                        path = None
+                        break
                     curr = parent[curr]
-                path.reverse()
-                paths.append(path)
+                if path is not None:
+                    path.append(src)
+                    path.reverse()
+                    paths.append(path)
+                else:
+                    paths.append(None)
             else:
+                logger.info(f"[CPU-FALLBACK] ROI {roi_idx}: No path found from {src} to {sink}")
                 paths.append(None)
 
         return paths
@@ -3965,7 +4451,7 @@ class CUDADijkstra:
         if not paths or paths[0] is None:
             return None
 
-        # Convert local ROI path → global path
+        # Convert local ROI path -> global path
         local_path = paths[0]
         global_path = [int(roi_nodes_cpu[node_idx]) for node_idx in local_path]
 
@@ -4059,7 +4545,7 @@ class CUDADijkstra:
         Transpose CSR graph for backward search.
 
         Converts forward adjacency list to backward (reverse edges).
-        For each edge (u → v), creates reverse edge (v → u) with same weight.
+        For each edge (u -> v), creates reverse edge (v -> u) with same weight.
 
         Args:
             indptr: (num_nodes+1,) CSR indptr array
@@ -4113,7 +4599,7 @@ class CUDADijkstra:
                 weight = weights[edge_idx]
 
                 if v < num_nodes:  # Validate index
-                    # Add reverse edge: v → u
+                    # Add reverse edge: v -> u
                     pos = write_pos[v]
                     indices_T[pos] = u
                     weights_T[pos] = weight
@@ -4278,7 +4764,7 @@ class CUDADijkstra:
         parent_fwd_cpu = parent_fwd.get()
         parent_bwd_cpu = parent_bwd.get()
 
-        # Reconstruct forward path (source → meeting_point)
+        # Reconstruct forward path (source -> meeting_point)
         fwd_path = []
         curr = meeting_point
         while curr != -1 and curr != source:
@@ -4287,7 +4773,7 @@ class CUDADijkstra:
         fwd_path.append(source)
         fwd_path.reverse()
 
-        # Reconstruct backward path (meeting_point → sink)
+        # Reconstruct backward path (meeting_point -> sink)
         bwd_path = []
         curr = meeting_point
         while curr != -1 and curr != sink:
@@ -4322,7 +4808,7 @@ class CUDADijkstra:
         Expand frontier by one step (Dijkstra-style relaxation).
 
         For each node u in frontier:
-        - Relax all outgoing edges (u → v)
+        - Relax all outgoing edges (u -> v)
         - Update dist[v] and parent[v] if improved
         - Add v to new frontier if distance improved
 

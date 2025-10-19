@@ -552,12 +552,12 @@ class GPUConfig:
 
 
 class PathFinderConfig:
-    """PathFinder algorithm parameters - LOCKED CONFIG FOR STABILITY"""
-    max_iterations: int = 10  # Reduced for speed testing
-    # LOCKED CONFIGURATION (DO NOT MODIFY):
-    pres_fac_init: float = 1.0
-    pres_fac_mult: float = 1.8
-    pres_fac_max: float = 1000.0
+    """PathFinder algorithm parameters - TUNED FOR FAST CONVERGENCE"""
+    max_iterations: int = 30  # Increased from 10 to allow full convergence
+    # AGGRESSIVE CONVERGENCE SCHEDULE:
+    pres_fac_init: float = 1.0   # Start gentle
+    pres_fac_mult: float = 2.0   # Double each iteration (was 1.8)
+    pres_fac_max: float = 64.0   # Cap at 64× (was 1000.0)
     hist_gain: float = 2.5
     grid_pitch: float = 0.4
     via_cost: float = 3.0  # Base via cost for routing
@@ -866,6 +866,42 @@ class Lattice3D:
                 dirs.append('h' if z % 2 == 1 else 'v')
         return dirs
 
+    def get_legal_axis(self, layer: int) -> str:
+        """Return 'h' or 'v' for which axis this layer allows."""
+        if layer >= len(self.layer_dir):
+            return 'h' if layer % 2 == 1 else 'v'
+        return self.layer_dir[layer]
+
+    def is_legal_planar_edge(self, from_x: int, from_y: int, from_layer: int,
+                              to_x: int, to_y: int, to_layer: int) -> bool:
+        """Check if planar edge follows H/V discipline."""
+        if from_layer != to_layer:
+            return True  # Vias always legal (checked separately)
+
+        dx = abs(to_x - from_x)
+        dy = abs(to_y - from_y)
+
+        # Must be adjacent (Manhattan distance 1)
+        if dx + dy != 1:
+            return False
+
+        # Check layer direction
+        direction = self.get_legal_axis(from_layer)
+        if direction == 'h':
+            return dy == 0 and dx == 1  # Horizontal: only ±X
+        else:
+            return dx == 0 and dy == 1  # Vertical: only ±Y
+
+    def get_legal_via_pairs(self, layer_count: int) -> set:
+        """Return set of legal (from_layer, to_layer) via pairs."""
+        # Adjacent pairs, but exclude outer layers (0 and layer_count-1)
+        legal_pairs = set()
+        # z runs 1 .. layer_count-3, pairs are (z, z+1) up to (layer_count-3, layer_count-2)
+        for z in range(1, layer_count - 2):
+            legal_pairs.add((z, z+1))
+            legal_pairs.add((z+1, z))
+        return legal_pairs
+
     def node_idx(self, x: int, y: int, z: int) -> int:
         """(x,y,z) → flat"""
         return self.geom.node_index(x, y, z)
@@ -892,8 +928,8 @@ class Lattice3D:
         # Count edges to pre-allocate array (avoids MemoryError with 30M edges)
         edge_count = 0
 
-        # Count H/V edges
-        for z in range(self.layers):
+        # Count H/V edges (exclude outer layers 0 and self.layers-1)
+        for z in range(1, self.layers - 1):
             if self.layer_dir[z] == 'h':
                 edge_count += 2 * self.y_steps * (self.x_steps - 1)
             else:  # 'v'
@@ -911,8 +947,8 @@ class Lattice3D:
         logger.info(f"Pre-allocating for {edge_count:,} edges")
         graph = CSRGraph(use_gpu, edge_capacity=edge_count)
 
-        # Build lateral edges (H/V discipline)
-        for z in range(self.layers):
+        # Build lateral edges (H/V discipline, exclude outer layers 0 and self.layers-1)
+        for z in range(1, self.layers - 1):
             direction = self.layer_dir[z]
 
             if direction == 'h':
@@ -920,6 +956,12 @@ class Lattice3D:
                     for x in range(self.x_steps - 1):
                         u = self.node_idx(x, y, z)
                         v = self.node_idx(x+1, y, z)
+
+                        # MANHATTAN VALIDATION
+                        if not self.is_legal_planar_edge(x, y, z, x+1, y, z):
+                            logger.error(f"[MANHATTAN-VIOLATION] Illegal H edge on layer {z}: ({x},{y}) → ({x+1},{y})")
+                            continue  # Skip illegal edge
+
                         graph.add_edge(u, v, self.pitch)
                         graph.add_edge(v, u, self.pitch)
             else:  # direction == 'v'
@@ -927,38 +969,93 @@ class Lattice3D:
                     for y in range(self.y_steps - 1):
                         u = self.node_idx(x, y, z)
                         v = self.node_idx(x, y+1, z)
+
+                        # MANHATTAN VALIDATION
+                        if not self.is_legal_planar_edge(x, y, z, x, y+1, z):
+                            logger.error(f"[MANHATTAN-VIOLATION] Illegal V edge on layer {z}: ({x},{y}) → ({x},{y+1})")
+                            continue  # Skip illegal edge
+
                         graph.add_edge(u, v, self.pitch)
                         graph.add_edge(v, u, self.pitch)
 
-        # Build via edges with flexible layer spans
+        # Build via edges with STRICT layer mask (no "all pairs allowed"!)
         via_count = 0
+
+        # Get legal via pairs (adjacent layers only for now)
+        legal_via_pairs = self.get_legal_via_pairs(self.layers)
+
         for x in range(self.x_steps):
             for y in range(self.y_steps):
-                for z_from in range(self.layers):
-                    # MANHATTAN ROUTING FIX: Only create edges to ADJACENT layers
-                    # Multi-layer blind/buried vias will be decomposed into single-hop chains
-                    # This ensures parent pointers always point to adjacent nodes
-                    for z_to in range(z_from + 1, min(z_from + 2, self.layers)):
-                        # Check if this via span is allowed
-                        if allowed_via_spans is not None:
-                            # Explicit whitelist: check both directions
-                            if (z_from, z_to) not in allowed_via_spans and (z_to, z_from) not in allowed_via_spans:
-                                continue
+                for (z_from, z_to) in legal_via_pairs:
+                    # Only add if this specific pair is legal
+                    span = abs(z_to - z_from)
+                    span_alpha = 0.15
+                    cost = via_cost * (1.0 + span_alpha * (span - 1))
 
-                        # Adjacent layer via: fixed cost (no span penalty needed)
-                        cost = via_cost
+                    u = self.node_idx(x, y, z_from)
+                    v = self.node_idx(x, y, z_to)
+                    graph.add_edge(u, v, cost)
+                    graph.add_edge(v, u, cost)
+                    via_count += 2
 
-                        u = self.node_idx(x, y, z_from)
-                        v = self.node_idx(x, y, z_to)
-                        graph.add_edge(u, v, cost)
-                        graph.add_edge(v, u, cost)
-                        via_count += 2
+        # LOG what was built
+        logger.info(f"Vias: {via_count} edges using CONTROLLED via mask")
+        logger.info(f"Via policy: {len(legal_via_pairs)} layer pairs (NO 'all pairs allowed'!)")
+        for pair in sorted(list(legal_via_pairs))[:10]:
+            logger.info(f"  Legal via: {pair[0]} ↔ {pair[1]}")
 
-        logger.info(f"Vias: {via_count:,} edges ({via_count // 2} bidirectional pairs)")
-        if allowed_via_spans is not None:
-            logger.info(f"Via policy: {len(allowed_via_spans)} allowed layer pairs")
-        else:
-            logger.info(f"Via policy: all layer pairs allowed (full blind/buried)")
+        # Finalize the graph before validation (converts edge list to CSR format)
+        graph.finalize(self.num_nodes)
+
+        # MANHATTAN VALIDATION: Sample 1000 random edges and verify they're legal
+        edge_count = len(graph.indices) if hasattr(graph, 'indices') else 0
+        sample_size = min(1000, edge_count)
+
+        if sample_size > 0:
+            logger.info(f"[MANHATTAN-VALIDATION] Sampling {sample_size} edges to verify H/V discipline...")
+            violations = 0
+
+            import numpy as np
+
+            # Convert indptr to CPU for validation (if it's on GPU)
+            indptr_cpu = graph.indptr if isinstance(graph.indptr, np.ndarray) else graph.indptr.get()
+
+            for _ in range(sample_size):
+                # Pick random edge from CSR structure
+                edge_idx = random.randint(0, edge_count - 1)
+
+                # Get source node (find which node this edge belongs to) using binary search
+                # indptr[u] <= edge_idx < indptr[u+1], so searchsorted gives us u+1
+                u = int(np.searchsorted(indptr_cpu, edge_idx, side='right')) - 1
+
+                # Get target node
+                v = int(graph.indices[edge_idx]) if isinstance(graph.indices[edge_idx], (int, np.integer)) else int(graph.indices[edge_idx].get())
+
+                # Convert to coordinates
+                x_u, y_u, z_u = self.idx_to_coord(u)
+                x_v, y_v, z_v = self.idx_to_coord(v)
+
+                # Convert to Python ints for set membership testing
+                z_u, z_v = int(z_u), int(z_v)
+
+                # Check if it's a via (different layers)
+                if z_u != z_v:
+                    # Via edge - check if it's in legal pairs
+                    if (z_u, z_v) not in legal_via_pairs and (z_v, z_u) not in legal_via_pairs:
+                        logger.error(f"[MANHATTAN-VIOLATION] Illegal via: layer {z_u} ↔ {z_v} at ({x_u},{y_u})")
+                        violations += 1
+                else:
+                    # Planar edge - check H/V discipline
+                    if not self.is_legal_planar_edge(x_u, y_u, z_u, x_v, y_v, z_v):
+                        logger.error(f"[MANHATTAN-VIOLATION] Illegal planar edge on layer {z_u}: ({x_u},{y_u}) → ({x_v},{y_v})")
+                        violations += 1
+
+            if violations > 0:
+                logger.error(f"[MANHATTAN-VALIDATION] Found {violations} illegal edges in graph!")
+                raise RuntimeError("Graph contains non-Manhattan edges")
+            else:
+                logger.info(f"[MANHATTAN-VALIDATION] All {sample_size} sampled edges are legal ✓")
+
         return graph
 
 
@@ -1012,15 +1109,22 @@ class ROIExtractor:
         min_z = min(src_z, dst_z)
         max_z = max(src_z, dst_z)
 
+        # Include portal seeds in bounding box if provided
+        if portal_seeds:
+            seed_layers = [self.lattice.idx_to_coord(n)[2] for (n, _) in portal_seeds]
+            if seed_layers:
+                min_z = min(min_z, min(seed_layers))
+                max_z = max(max_z, max(seed_layers))
+
         # Add corridor buffer perpendicular to main direction
         min_x = max(0, min_x - corridor_buffer)
         max_x = min(self.lattice.x_steps - 1, max_x + corridor_buffer)
         min_y = max(0, min_y - corridor_buffer)
         max_y = min(self.lattice.y_steps - 1, max_y + corridor_buffer)
 
-        # Add layer margin (but don't exceed board layer limits)
-        min_z = max(0, min_z - layer_margin)
-        max_z = min(self.lattice.layers - 1, max_z + layer_margin)
+        # Add layer margin (clamp to inner layers only - exclude outer layers 0 and layers-1)
+        min_z = max(1, min_z - layer_margin)
+        max_z = min(self.lattice.layers - 2, max_z + layer_margin)
 
         # Generate L-shaped corridor using SET for O(1) deduplication
         x_steps = self.lattice.x_steps
@@ -1655,7 +1759,7 @@ class PathFinderRouter:
             allowed_via_spans=self.config.allowed_via_spans,
             use_gpu=self.config.use_gpu and GPU_AVAILABLE
         )
-        self.graph.finalize(self.lattice.num_nodes)
+        # Note: graph.finalize() is now called inside build_graph() before validation
 
         # Set N for ROI checks (number of nodes in full graph)
         self.N = self.lattice.num_nodes
@@ -2212,13 +2316,69 @@ class PathFinderRouter:
                 try:
                     # Generate current routing state for visualization
                     provisional_tracks, provisional_vias = self._generate_geometry_from_paths()
+
+                    # CRITICAL: Merge escape geometry for complete board state visualization
+                    # Without this, iteration screenshots only show routed nets, not pad escapes
+                    if hasattr(self, '_escape_tracks') and self._escape_tracks:
+                        # Deduplicate helper
+                        def _dedupe(items, key_fn):
+                            seen, out = set(), []
+                            for item in items:
+                                k = key_fn(item)
+                                if k not in seen:
+                                    seen.add(k)
+                                    out.append(item)
+                            return out
+
+                        # Merge escapes + routed geometry
+                        combined_tracks = self._escape_tracks + provisional_tracks
+                        combined_vias = self._escape_vias + provisional_vias
+
+                        # Deduplicate by geometric signature (safe key access to avoid None subscripting)
+                        def safe_track_key(t):
+                            start = t.get("start") or t.get("x1", 0), t.get("y1", 0)
+                            end = t.get("end") or t.get("x2", 0), t.get("y2", 0)
+                            return (t.get("net"), t.get("layer"),
+                                   round(start[0] if isinstance(start, (list, tuple)) else 0, 3),
+                                   round(start[1] if isinstance(start, (list, tuple)) else 0, 3),
+                                   round(end[0] if isinstance(end, (list, tuple)) else 0, 3),
+                                   round(end[1] if isinstance(end, (list, tuple)) else 0, 3),
+                                   round(t.get("width", 0), 3))
+
+                        def safe_via_key(v):
+                            at_pos = v.get("at") or v.get("x", 0), v.get("y", 0)
+                            return (v.get("net"),
+                                   round(at_pos[0] if isinstance(at_pos, (list, tuple)) else 0, 3),
+                                   round(at_pos[1] if isinstance(at_pos, (list, tuple)) else 0, 3),
+                                   v.get("layers") or (v.get("from_layer"), v.get("to_layer")),
+                                   round(v.get("size", 0), 3),
+                                   round(v.get("drill", 0), 3),
+                                   round(v.get("diameter", 0), 3))
+
+                        provisional_tracks = _dedupe(combined_tracks, safe_track_key)
+                        provisional_vias = _dedupe(combined_vias, safe_via_key)
+
+                        logger.debug(f"[ITER {it}] Screenshot: escapes={len(self._escape_tracks)} + "
+                                    f"routed={len(provisional_tracks) - len(self._escape_tracks)} → "
+                                    f"total={len(provisional_tracks)} tracks, {len(provisional_vias)} vias")
+
                     iteration_cb(it, provisional_tracks, provisional_vias)
                 except Exception as e:
                     logger.warning(f"[ITER {it}] Iteration callback failed: {e}")
 
             # STEP 6: Terminate?
             if failed == 0 and over_sum == 0:
-                logger.info("[SUCCESS] Zero overuse")
+                logger.info("[SUCCESS] Zero overuse and zero failed nets")
+
+                # Final collision detection validation
+                edges_over_capacity = [(e, usage) for e, usage in self.accounting.edge_usage.items() if usage > 1]
+                if edges_over_capacity:
+                    logger.error(f"[COLLISION] {len(edges_over_capacity)} edges over capacity (SHOULD BE ZERO!)")
+                    for e, usage in edges_over_capacity[:10]:  # Show first 10
+                        logger.error(f"[COLLISION]   Edge {e}: {usage} nets (capacity=1)")
+                else:
+                    logger.info("[COLLISION] 0 edges over capacity ✓ PERFECT!")
+
                 return {'success': True, 'paths': self.net_paths}
 
             if over_sum < best_overuse:
@@ -2494,11 +2654,19 @@ class PathFinderRouter:
                 # Adaptive radius: 150% of distance for detours
                 adaptive_radius = max(40, int(manhattan_dist * 1.5) + 10)
 
+                # Gather portal seeds if available
+                portal_seeds = None
+                if use_portals and src_portal and dst_portal:
+                    s_seeds = self._get_portal_seeds(src_portal)
+                    d_seeds = self._get_portal_seeds(dst_portal)
+                    portal_seeds = (s_seeds or []) + (d_seeds or [])
+
                 # Extract ROI
                 roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
                     roi_src_node, roi_dst_node,
                     initial_radius=adaptive_radius,
-                    stagnation_bonus=roi_margin_bonus
+                    stagnation_bonus=roi_margin_bonus,
+                    portal_seeds=portal_seeds
                 )
 
                 if idx % 100 == 0:
@@ -2583,8 +2751,9 @@ class PathFinderRouter:
                     src_portal = self.portals.get(src_pad_id)
                     dst_portal = self.portals.get(dst_pad_id)
                     if src_portal and dst_portal:
-                        src_portal_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.pad_layer)
-                        dst_portal_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.pad_layer)
+                        # CRITICAL FIX: Use entry_layer (routing layer) not pad_layer (F.Cu)!
+                        src_portal_node = self.lattice.node_idx(src_portal.x_idx, src_portal.y_idx, src_portal.entry_layer)
+                        dst_portal_node = self.lattice.node_idx(dst_portal.x_idx, dst_portal.y_idx, dst_portal.entry_layer)
                         roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
                             src_portal_node, dst_portal_node, initial_radius=fallback_radius, stagnation_bonus=roi_margin_bonus * 2
                         )
@@ -2766,42 +2935,55 @@ class PathFinderRouter:
                 dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
                 manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
 
-                # [FIX-5] ALWAYS use GEOMETRIC ROI to avoid GPU OOM (adaptive corridor based on net length)
-                # Keep ROI sizes manageable to avoid 3-second CSR extraction bottleneck
-                # Short nets: smaller corridor (12mm)
-                # Long nets: larger corridor but capped at 60 steps (24mm) to keep ROI < 100K nodes
-                if manhattan_dist < 125:
-                    corridor_buffer = 30  # 12mm @ 0.4mm pitch
-                    layer_margin = 3
+                # Get portal landing nodes for routing (convert from pad coords to portal coords)
+                # This is CRITICAL for all iterations - routing happens between portals, not pads!
+                portal_seeds = None
+                if self.config.portal_enabled and (net_id in self.net_pad_ids):
+                    s_pad, d_pad = self.net_pad_ids[net_id]
+                    s_portal = self.portals.get(s_pad)
+                    d_portal = self.portals.get(d_pad)
+                    if s_portal and d_portal:
+                        # Use portal landing nodes (on entry_layer, not F.Cu!)
+                        src = self.lattice.node_idx(s_portal.x_idx, s_portal.y_idx, s_portal.entry_layer)
+                        dst = self.lattice.node_idx(d_portal.x_idx, d_portal.y_idx, d_portal.entry_layer)
+
+                        # Portal seeds for ROI expansion (iteration 2+ only)
+                        s_seeds = self._get_portal_seeds(s_portal)
+                        d_seeds = self._get_portal_seeds(d_portal)
+                        portal_seeds = (s_seeds or []) + (d_seeds or [])
+
+                        logger.debug(f"[PORTAL-ROUTING] Net {net_id}: src portal at layer {s_portal.entry_layer}, dst portal at layer {d_portal.entry_layer}")
+
+                # ITERATION-AWARE ROI EXTRACTION
+                # Iteration 1: Use FULL GRAPH (bbox-only, no ROI extraction)
+                # Iteration 2+: Use L-corridor ROI (bitmap-filtered for hotset)
+
+                if self.iteration == 1:
+                    # ITERATION 1: FULL-GRAPH mode (no ROI extraction)
+                    # Use entire graph with generous bbox constraints
+                    roi_nodes = np.arange(self.N, dtype=np.int32)  # All nodes
+                    global_to_roi = np.arange(self.N, dtype=np.int32)  # Identity mapping
+                    logger.debug(f"[ITER-1-FULLGRAPH] Net {net_id}: Using full graph ({self.N} nodes)")
                 else:
-                    # Long nets: increase corridor proportionally but cap at 60 steps (24mm)
-                    # [FIX-5] Reduced from 100 to 60 to prevent huge ROIs that cause CSR bottleneck
-                    corridor_buffer = min(60, int(manhattan_dist * 0.3) + 30)
-                    layer_margin = 4  # Balanced layer count for long nets
+                    # ITERATION 2+: L-CORRIDOR mode with bitmap filtering
+                    # Extract geometric ROI to avoid processing blocked regions
+                    if manhattan_dist < 125:
+                        corridor_buffer = 80  # 32mm @ 0.4mm pitch
+                        layer_margin = 5
+                    else:
+                        corridor_buffer = min(150, int(manhattan_dist * 0.5) + 60)
+                        layer_margin = 6
 
-                roi_nodes, global_to_roi = self.roi_extractor.extract_roi_geometric(src, dst, corridor_buffer=corridor_buffer, layer_margin=layer_margin)
+                    # Extract L-corridor ROI (portal_seeds and src/dst already set above)
+                    roi_nodes, global_to_roi = self.roi_extractor.extract_roi_geometric(
+                        src, dst, corridor_buffer=corridor_buffer, layer_margin=layer_margin, portal_seeds=portal_seeds
+                    )
 
-                if batch_num == 0:  # Log first batch only
+                if batch_num == 0 and self.iteration > 1:  # Log first batch only (skip iter1 full-graph)
                     net_type = "SHORT" if manhattan_dist < 125 else "LONG"
                     logger.info(f"[GEOMETRIC-ROI] Net {net_id}: {net_type} ({manhattan_dist} steps, buffer={corridor_buffer}) → ROI ({len(roi_nodes):,} nodes)")
 
-                # Keep iteration 2+ logic for reference
-                if False and self.iteration == 1:
-                    pass  # Disabled: now use hybrid for all iterations
-                elif False:
-                    # ITERATION 2+: Congestion-aware routing, ROI helps avoid processing blocked regions
-                    # Adaptive radius: 120% of Manhattan distance + minimum buffer
-                    # Target ROI size: ~500K nodes (fast CSR extraction, large enough for detours)
-                    adaptive_radius = max(40, min(int(manhattan_dist * 1.2) + 10, 800))
-
-                    # For very long nets (>800 steps), use full graph to guarantee connectivity
-                    if manhattan_dist > 800 or adaptive_radius >= 800:
-                        roi_nodes = np.arange(self.N, dtype=np.int32)
-                        global_to_roi = np.arange(self.N, dtype=np.int32)
-                    else:
-                        # Extract ROI using BFS
-                        roi_nodes, global_to_roi = self.extract_roi_bfs(src, dst, initial_radius=adaptive_radius)
-
+                # ROI extraction complete (iteration-aware: full-graph for iter1, L-corridor for iter2+)
                 roi_extract_time += time.time() - roi_start
 
                 # Build ROI CSR for this net
@@ -2827,40 +3009,65 @@ class PathFinderRouter:
                 actual_roi_src = src  # Global src
                 actual_roi_dst = dst  # Global dst
 
-                # Convert roi_nodes to bitmap for GPU edge filtering
-                # Get roi_nodes as numpy
-                if hasattr(roi_nodes, 'get'):
-                    roi_nodes_cpu = roi_nodes.get()
+                # ITERATION-AWARE: Create bitmap only for iteration 2+ (hotset mode)
+                # Iteration 1 uses bbox-only mode for wide search
+                import cupy as cp
+
+                if self.iteration == 1:
+                    # ITERATION 1: BBOX-ONLY mode (no bitmap fence)
+                    # This allows wide exploration to seed hundreds of nets
+                    roi_bitmap_gpu = None
+                    logger.info(f"[ITER-1-BBOX] Net {net_id}: BBOX-ONLY mode (no bitmap fence)")
                 else:
-                    roi_nodes_cpu = np.asarray(roi_nodes)
+                    # ITERATION 2+: BITMAP-FILTERED mode (L-corridor for hotset)
+                    # Convert roi_nodes to bitmap for GPU edge filtering
+                    # Get roi_nodes as numpy
+                    if hasattr(roi_nodes, 'get'):
+                        roi_nodes_cpu = roi_nodes.get()
+                    else:
+                        roi_nodes_cpu = np.asarray(roi_nodes)
 
-                # Create uint32 bitmap: each word covers 32 consecutive nodes
-                full_graph_size = len(self.graph.indptr) - 1
-                words_per_roi = (full_graph_size + 31) // 32
-                roi_bitmap = np.zeros(words_per_roi, dtype=np.uint32)
+                    # Create uint32 bitmap: each word covers 32 consecutive nodes
+                    full_graph_size = len(self.graph.indptr) - 1
+                    words_per_roi = (full_graph_size + 31) // 32
+                    roi_bitmap = np.zeros(words_per_roi, dtype=np.uint32)
 
-                # Fill bitmap: for each node u, set bit (u & 31) in word (u >> 5)
-                for u in roi_nodes_cpu:
-                    roi_bitmap[u >> 5] |= (np.uint32(1) << np.uint32(u & 31))
+                    # VECTORIZED bitmap fill (1000× faster than Python loop!)
+                    # Compute word indices and bit positions for all nodes at once
+                    word_indices = (roi_nodes_cpu >> 5).astype(np.int32)
+                    bit_positions = (roi_nodes_cpu & 31).astype(np.uint32)
+                    bit_masks = np.uint32(1) << bit_positions
 
-                # Transfer bitmap to GPU (import cupy here to avoid issues)
-                try:
-                    import cupy as cp
-                except:
-                    # Fallback if cupy not available
-                    import numpy as cp_fallback
-                    cp = cp_fallback
-                roi_bitmap_gpu = cp.asarray(roi_bitmap)
+                    # Group by word index and OR all masks for each word
+                    unique_words = np.unique(word_indices)
+                    for word_idx in unique_words:
+                        mask = np.bitwise_or.reduce(bit_masks[word_indices == word_idx])
+                        roi_bitmap[word_idx] = mask
+
+                    # CRITICAL: Ensure src and dst are in the bitmap
+                    src_word, src_bit = src >> 5, src & 31
+                    dst_word, dst_bit = dst >> 5, dst & 31
+
+                    roi_bitmap[src_word] |= (np.uint32(1) << src_bit)
+                    roi_bitmap[dst_word] |= (np.uint32(1) << dst_bit)
+
+                    roi_bitmap_gpu = cp.asarray(roi_bitmap)
+                    logger.info(f"[ITER-2+BITMAP] Net {net_id}: Using L-corridor bitmap ({roi_size}/{full_graph_size} nodes)")
 
                 # Use full graph size
+                full_graph_size = len(self.graph.indptr) - 1
                 graph_size = full_graph_size
 
-                logger.info(f"[FIX-7] Net {net_id}: Using full-graph CSR + GPU bitmap ({roi_size}/{full_graph_size} nodes, {words_per_roi} words)")
-
                 # CRITICAL FIX: Compute bbox from ALL ROI nodes using vectorized operations
-                # This is fast (<1ms for 100k nodes) and guarantees exact min/max
+                # Iteration 1: generous bbox from src/dst with margin (bbox-only mode)
+                # Iteration 2+: tight bbox from roi_nodes (bitmap mode)
                 sx, sy, sz = self.lattice.idx_to_coord(src)
                 dx, dy, dz = self.lattice.idx_to_coord(dst)
+
+                if self.iteration > 1 and hasattr(roi_nodes, 'get'):
+                    roi_nodes_cpu = roi_nodes.get() if hasattr(roi_nodes, 'get') else np.asarray(roi_nodes)
+                else:
+                    roi_nodes_cpu = np.array([], dtype=np.int64)
 
                 if len(roi_nodes_cpu) > 0:
                     # VECTORIZED coordinate decoding (no Python loops!)
@@ -2891,14 +3098,22 @@ class PathFinderRouter:
                     bbox_maxz = max(sz, dz)
                     x = y = z = np.array([], dtype=np.int64)
 
-                # Defensively include src/dst and add +1 halo, then clamp to lattice
-                bbox_minx = max(0, min(bbox_minx, sx, dx) - 1)
-                bbox_miny = max(0, min(bbox_miny, sy, dy) - 1)
-                bbox_minz = max(0, min(bbox_minz, sz, dz) - 1)
+                # Defensively include src/dst and add halo
+                # CRITICAL FIX: Reduced halo from 100 to 5 steps to prevent teleport paths
+                # 100-step halo allowed routing through distant nodes, creating apparent teleports
+                # Even though each edge is valid, paths wound through areas 50+ steps from corridor
+                halo_margin = 5 if self.iteration == 1 else 1
 
-                bbox_maxx = min(self.lattice.x_steps - 1, max(bbox_maxx, sx, dx) + 1)
-                bbox_maxy = min(self.lattice.y_steps - 1, max(bbox_maxy, sy, dy) + 1)
-                bbox_maxz = min(self.lattice.layers - 1, max(bbox_maxz, sz, dz) + 1)
+                bbox_minx = max(0, min(bbox_minx, sx, dx) - halo_margin)
+                bbox_miny = max(0, min(bbox_miny, sy, dy) - halo_margin)
+                # CRITICAL: Portals are on layer 0 (F.Cu entry), so bbox must include them!
+                # But routing should be on inner layers (1 to layers-2)
+                # Include portal layers (typically 0-2) + full inner layer span
+                bbox_minz = max(0, min(bbox_minz, sz, dz) - 1)  # Include portal entry layers
+
+                bbox_maxx = min(self.lattice.x_steps - 1, max(bbox_maxx, sx, dx) + halo_margin)
+                bbox_maxy = min(self.lattice.y_steps - 1, max(bbox_maxy, sy, dy) + halo_margin)
+                bbox_maxz = min(self.lattice.layers - 1, max(bbox_maxz, sz, dz) + 2)  # Include portal layers + routing layers
 
                 # Preflight assertion: verify src and dst are inside bbox
                 if not (bbox_minx <= sx <= bbox_maxx and bbox_miny <= sy <= bbox_maxy and bbox_minz <= sz <= bbox_maxz):
@@ -2908,13 +3123,7 @@ class PathFinderRouter:
                 if not (bbox_minx <= dx <= bbox_maxx and bbox_miny <= dy <= bbox_maxy and bbox_minz <= dz <= bbox_maxz):
                     logger.error(f"[BBOX-PREFLIGHT] ROI {net_id}: dst {dst} at ({dx},{dy},{dz}) OUTSIDE bbox ([{bbox_minx},{bbox_maxx}],[{bbox_miny},{bbox_maxy}],[{bbox_minz},{bbox_maxz}])")
 
-                # DST CHECKS: Verify dst is in ROI bitmap and bbox
-                dst_in_bitmap = ((roi_bitmap[dst >> 5] >> (dst & 31)) & 1) != 0
-                if not dst_in_bitmap:
-                    logger.error(f"[DST-CHECK] ROI {net_id}: dst {dst} NOT in roi_bitmap!")
-                    logger.error(f"[DST-CHECK] This ROI cannot possibly route to dst")
-                else:
-                    logger.debug(f"[DST-CHECK] ROI {net_id}: dst {dst} in roi_bitmap ✓")
+                # (Note: src/dst bitmap validation now happens earlier, before GPU transfer)
 
                 # Check if dst is in bbox (already checked above, but explicit for diagnostics)
                 if not (bbox_minx <= dx <= bbox_maxx and bbox_miny <= dy <= bbox_maxy and bbox_minz <= dz <= bbox_maxz):
@@ -2948,7 +3157,8 @@ class PathFinderRouter:
                 # Kernel will check bitmap before relaxing edges (prevents diagonal traces)
                 roi_batch.append((actual_roi_src, actual_roi_dst, roi_indptr, roi_indices, roi_weights, graph_size, roi_bitmap_gpu,
                                  bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz))
-                batch_metadata.append((net_id, False, roi_nodes, src, dst))
+                # Pass None for roi_nodes in full-graph mode since paths are already in global index space
+                batch_metadata.append((net_id, False, None, src, dst))
                 csr_build_time += time.time() - csr_start
 
             # Route entire batch on GPU in parallel
@@ -2965,7 +3175,10 @@ class PathFinderRouter:
                 logger.info(f"[BATCH-{batch_num}] Prep complete: ROI={roi_extract_time:.2f}s, CSR={csr_build_time:.2f}s, Total={prep_time:.2f}s")
 
                 gpu_start = time.time()
-                paths = self.solver.gpu_solver.find_paths_on_rois(roi_batch)
+                # CRITICAL: Iteration 1 uses bbox-only (no bitmap fence), iteration 2+ uses bitmap
+                use_bitmap_for_routing = (self.iteration > 1)
+                logger.info(f"[BATCH-{batch_num}] GPU mode: {'BITMAP-FILTERED (L-corridor)' if use_bitmap_for_routing else 'BBOX-ONLY (wide search)'}")
+                paths = self.solver.gpu_solver.find_paths_on_rois(roi_batch, use_bitmap=use_bitmap_for_routing)
                 gpu_time = time.time() - gpu_start
                 logger.info(f"[BATCH-{batch_num}] GPU routing complete: {gpu_time:.2f}s ({batch_size_actual} nets)")
 
@@ -2973,24 +3186,95 @@ class PathFinderRouter:
                 batch_routed = 0
                 batch_failed = 0
                 for i, (net_id, use_portals, roi_nodes_arr, src, dst) in enumerate(batch_metadata):
-                    if roi_nodes_arr is None or i >= len(paths):
+                    # Note: roi_nodes_arr can be None in full-graph CSR mode (valid!)
+                    if i >= len(paths):
                         failed_this_pass += 1
                         batch_failed += 1
                         self.net_paths[net_id] = []
                         continue
 
                     local_path = paths[i]
+                    if not local_path:
+                        logger.debug(f"[PATH-SKIP] Net {net_id}: GPU returned None path")
+                        failed_this_pass += 1
+                        batch_failed += 1
+                        self.net_paths[net_id] = []
+                        continue
+                    if len(local_path) <= 1:
+                        logger.debug(f"[PATH-SKIP] Net {net_id}: GPU path too short ({len(local_path)} nodes)")
+                        failed_this_pass += 1
+                        batch_failed += 1
+                        self.net_paths[net_id] = []
+                        continue
+
                     if local_path and len(local_path) > 1:
-                        # [FIX-7] Path is already in GLOBAL indices (using full-graph CSR)
-                        # Bitmap filtering happens in GPU kernel, so paths are valid global indices
-                        global_path = [int(node) for node in local_path]
-                        logger.debug(f"[FIX-7] Net {net_id}: Path has {len(local_path)} nodes (already global indices)")
+                        # Convert to global index space
+                        # roi_nodes_arr is None in full-graph CSR mode (paths already global)
+                        # roi_nodes_arr is mapping array in per-ROI CSR mode (paths are ROI-local)
+                        try:
+                            if roi_nodes_arr is None:
+                                # Full-graph CSR mode: paths are already global indices
+                                global_path = [int(k) for k in local_path]
+                            else:
+                                # Per-ROI CSR mode: map ROI-local indices to global
+                                global_path = [int(roi_nodes_arr[int(k)]) for k in local_path]
+                        except Exception as e:
+                            logger.error(f"[INDEX-MAP] Fallback to global (roi_nodes_arr invalid): {e}")
+                            global_path = [int(k) for k in local_path]
+
+                        # Validate adjacency (planar 4-neighbor or pure Z via)
+                        def _is_adj(a, b):
+                            x0, y0, z0 = self.lattice.idx_to_coord(a)
+                            x1, y1, z1 = self.lattice.idx_to_coord(b)
+                            if z0 == z1:
+                                # Planar: must be 4-adjacent
+                                return (abs(x1 - x0) + abs(y1 - y0)) == 1
+                            else:
+                                # Via: same X,Y, any Z distance (allow multi-layer vias)
+                                return (x0 == x1) and (y0 == y1) and (abs(z1 - z0) >= 1)
+
+                        bad = next(((a, b) for a, b in zip(global_path, global_path[1:]) if not _is_adj(a, b)), None)
+                        if bad:
+                            (a, b) = bad
+                            ax, ay, az = self.lattice.idx_to_coord(a)
+                            bx, by, bz = self.lattice.idx_to_coord(b)
+                            logger.error(f"[PATH-INVALID] Non-adjacent step in net {net_id}: ({ax},{ay},{az})->({bx},{by},{bz})")
+                            logger.error(f"[PATH-INVALID]   Node IDs: {a} -> {b} (delta={b-a})")
+                            logger.error(f"[PATH-INVALID]   Coord deltas: dX={bx-ax}, dY={by-ay}, dZ={bz-az}")
+                            self.net_paths[net_id] = []
+                            self._clear_net_edge_tracking(net_id)
+                            failed_this_pass += 1
+                            batch_failed += 1
+                            continue
 
                         # Commit path
+                        logger.debug(f"[COMMIT] Net {net_id}: committing path with {len(global_path)} nodes")
                         edge_indices = self._path_to_edges(global_path)
+                        logger.debug(f"[COMMIT] Net {net_id}: converted to {len(edge_indices)} edges")
                         self.accounting.commit_path(edge_indices)
                         self.net_paths[net_id] = global_path
                         self._update_net_edge_tracking(net_id, edge_indices)
+                        logger.info(f"[COMMIT-SUCCESS] Net {net_id}: {len(global_path)} nodes, {len(edge_indices)} edges")
+
+                        # MANHATTAN DEBUG: Sample first few paths and log deltas
+                        if not hasattr(self, '_path_debug_count'):
+                            self._path_debug_count = 0
+
+                        if self._path_debug_count < 5:  # First 5 paths only
+                            logger.info(f"[PATH-DEBUG] Net {net_id}: path length {len(global_path)}")
+                            for j in range(min(5, len(global_path) - 1)):
+                                u, v = global_path[j], global_path[j+1]
+                                x_u, y_u, z_u = self.lattice.idx_to_coord(u)
+                                x_v, y_v, z_v = self.lattice.idx_to_coord(v)
+                                dx, dy, dz = x_v - x_u, y_v - y_u, z_v - z_u
+                                # Check if legal: either via (dz != 0, same X,Y) or adjacent (dx+dy==1)
+                                if dz != 0:
+                                    legal = "VIA" if (dx == 0 and dy == 0) else "ILLEGAL VIA"
+                                else:
+                                    legal = "OK" if (abs(dx) + abs(dy) == 1) else "ILLEGAL"
+                                logger.info(f"[PATH-DEBUG]   [{j}] ({x_u},{y_u},{z_u}) -> ({x_v},{y_v},{z_v}), delta=({dx},{dy},{dz}) {legal}")
+                            self._path_debug_count += 1
+
                         routed_this_pass += 1
                         batch_routed += 1
                     else:
@@ -3311,6 +3595,23 @@ class PathFinderRouter:
                     break
         return out
 
+    def _path_is_manhattan(self, path: List[int]) -> bool:
+        """Validate that path obeys Manhattan routing discipline"""
+        for a, b in zip(path, path[1:]):
+            x0, y0, z0 = self.lattice.idx_to_coord(a)
+            x1, y1, z1 = self.lattice.idx_to_coord(b)
+            if z0 == z1:
+                # Planar move: must be adjacent (Manhattan distance = 1)
+                if (abs(x1 - x0) + abs(y1 - y0)) != 1:
+                    logger.error(f"[PATH-INVALID-DETAIL] Planar non-adjacent: ({x0},{y0},{z0}) -> ({x1},{y1},{z1}), dist={abs(x1-x0)+abs(y1-y0)}")
+                    return False
+            else:
+                # Via move: same X,Y, any Z distance (allow multi-layer vias for portals)
+                if not ((x1 == x0) and (y1 == y0)):
+                    logger.error(f"[PATH-INVALID-DETAIL] Via with X/Y change: ({x0},{y0},{z0}) -> ({x1},{y1},{z1})")
+                    return False
+        return True
+
     def map_all_pads(self, board: Board) -> None:
         """Legacy API: pad mapping (already done in initialize_graph)"""
         logger.info(f"map_all_pads: Already mapped {len(self.pad_to_node)} pads")
@@ -3324,6 +3625,17 @@ class PathFinderRouter:
         bx, by, _ = self.lattice.idx_to_coord(b_idx)
         (ax_mm, ay_mm) = self.lattice.geom.lattice_to_world(ax, ay)
         (bx_mm, by_mm) = self.lattice.geom.lattice_to_world(bx, by)
+
+        # QUANTIZE: Round to grid to prevent float drift
+        pitch = self.lattice.geom.pitch
+        origin_x = self.lattice.geom.grid_min_x
+        origin_y = self.lattice.geom.grid_min_y
+
+        ax_mm = origin_x + round((ax_mm - origin_x) / pitch) * pitch
+        ay_mm = origin_y + round((ay_mm - origin_y) / pitch) * pitch
+        bx_mm = origin_x + round((bx_mm - origin_x) / pitch) * pitch
+        by_mm = origin_y + round((by_mm - origin_y) / pitch) * pitch
+
         return {
             'net': net,
             'layer': self.config.layer_names[layer] if layer < len(self.config.layer_names) else f"L{layer}",
@@ -3347,6 +3659,10 @@ class PathFinderRouter:
         # The pathfinder needs these to route from portal positions, not pad positions
         self.portals = self.escape_planner.portals.copy()
         logger.info(f"Copied {len(self.portals)} portals from escape planner to pathfinder")
+
+        # Cache escape geometry for merging into final payload
+        self._escape_tracks, self._escape_vias = result
+        logger.info(f"Cached {len(self._escape_tracks)} escape tracks and {len(self._escape_vias)} escape vias")
 
         return result
 
@@ -3382,8 +3698,52 @@ class PathFinderRouter:
 
         # No overuse: emit clean geometry for export
         logger.info("[EMIT] Converting to clean geometry")
-        self._geometry_payload = GeometryPayload(provisional_tracks, provisional_vias)
-        return (len(provisional_tracks), len(provisional_vias))
+
+        # Merge escape geometry with routed geometry
+        final_tracks = provisional_tracks
+        final_vias = provisional_vias
+
+        if hasattr(self, '_escape_tracks') and self._escape_tracks:
+            # Deduplicate helper
+            def _dedupe(items, key_fn):
+                seen, out = set(), []
+                for it in items:
+                    k = key_fn(it)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    out.append(it)
+                return out
+
+            # Merge escapes first (so they're visually "underneath")
+            combined_tracks = self._escape_tracks + provisional_tracks
+            combined_vias = self._escape_vias + provisional_vias
+
+            # Deduplicate by geometric signature
+            final_tracks = _dedupe(
+                combined_tracks,
+                lambda t: (t["net"], t["layer"],
+                          round(t["x1"], 3), round(t["y1"], 3),
+                          round(t["x2"], 3), round(t["y2"], 3),
+                          round(t["width"], 3))
+            )
+            final_vias = _dedupe(
+                combined_vias,
+                lambda v: (v["net"], round(v["x"], 3), round(v["y"], 3),
+                          v.get("from_layer"), v.get("to_layer"),
+                          round(v.get("drill", 0), 3),
+                          round(v.get("diameter", 0), 3))
+            )
+
+            logger.info(f"[PREVIEW-MERGE] escapes={len(self._escape_tracks)} + "
+                       f"routed={len(provisional_tracks)} → "
+                       f"total={len(final_tracks)} tracks after dedup")
+            logger.info(f"[PREVIEW-MERGE] escape_vias={len(self._escape_vias)} + "
+                       f"routed_vias={len(provisional_vias)} → "
+                       f"total={len(final_vias)} vias after dedup")
+
+        self._geometry_payload = GeometryPayload(final_tracks, final_vias)
+        return (len(final_tracks), len(final_vias))
 
     def _generate_geometry_from_paths(self) -> Tuple[List, List]:
         """Generate tracks and vias from net_paths"""
@@ -3393,8 +3753,8 @@ class PathFinderRouter:
             if not path:
                 continue
 
-            # NOTE: Escape geometry is pre-computed by PadEscapePlanner and already
-            # added to board_data in main_window.py. No need to emit it here.
+            # NOTE: Escape geometry is pre-computed by PadEscapePlanner and cached.
+            # It will be merged with routed geometry in emit_geometry().
 
             # Generate tracks/vias from main path
             run_start = path[0]
@@ -3406,18 +3766,42 @@ class PathFinderRouter:
                 x0, y0, z0 = self.lattice.idx_to_coord(prev)
                 x1, y1, z1 = self.lattice.idx_to_coord(node)
 
+                # Drop any planar segment on outer layers (shouldn't happen once graph/ROI are fixed)
+                if z0 == z1 and (z0 == 0 or z0 == self.lattice.layers - 1):
+                    logger.error(f"[EMIT-GUARD] refusing planar segment on outer layer {z0} for net {net_id}")
+                    prev = node
+                    prev_layer = z1
+                    run_start = node
+                    continue
+
                 # VALIDATION: Check if nodes are adjacent (Manhattan distance should be 1)
                 dx = abs(x1 - x0)
                 dy = abs(y1 - y0)
                 dz = abs(z1 - z0)
-                if dz == 0 and (dx + dy) != 1:
-                    # Non-adjacent nodes on same layer - this should NEVER happen!
-                    logger.error(f"[GEOMETRY-BUG] Non-adjacent nodes in path for net {net_id}: "
-                               f"({x0},{y0},{z0}) → ({x1},{y1},{z1}), Manhattan dist = {dx+dy}")
-                    logger.error(f"[GEOMETRY-BUG] Path indices: prev={prev}, node={node}")
-                    logger.error(f"[GEOMETRY-BUG] This creates diagonal segment! GPU parent pointers are CORRUPT!")
-                    # Skip this segment to prevent diagonal
-                    continue
+
+                if dz == 0:  # Same layer - enforce H/V discipline
+                    # Must be adjacent
+                    if (dx + dy) != 1:
+                        logger.error(f"[GEOMETRY-BUG] Non-adjacent nodes in path for net {net_id}: "
+                                   f"({x0},{y0},{z0}) → ({x1},{y1},{z1}), Manhattan dist = {dx+dy}")
+                        logger.error(f"[GEOMETRY-BUG] Path indices: prev={prev}, node={node}")
+                        logger.error(f"[GEOMETRY-BUG] This creates diagonal segment! GPU parent pointers are CORRUPT!")
+                        continue  # Skip illegal segment
+
+                    # Check layer direction discipline
+                    layer_axis = self.lattice.get_legal_axis(z0)
+                    if layer_axis == 'h':
+                        # H layer: y must be constant (horizontal movement)
+                        if dy != 0:
+                            logger.error(f"[LAYER-VIOLATION] H-layer {z0} has vertical move: "
+                                       f"({x0},{y0})→({x1},{y1}), dy={dy}")
+                            continue
+                    else:  # 'v'
+                        # V layer: x must be constant (vertical movement)
+                        if dx != 0:
+                            logger.error(f"[LAYER-VIOLATION] V-layer {z0} has horizontal move: "
+                                       f"({x0},{y0})→({x1},{y1}), dx={dx}")
+                            continue
 
                 if z1 != z0:
                     # flush any pending straight run before via
@@ -3443,6 +3827,70 @@ class PathFinderRouter:
             # flush final run
             if prev != run_start:
                 tracks.append(self._segment_world(run_start, prev, prev_layer, net_id))
+
+        # FINAL VALIDATION: Check all tracks are axis-aligned
+        violations = []
+        for i, track in enumerate(tracks):
+            x1, y1 = track['x1'], track['y1']
+            x2, y2 = track['x2'], track['y2']
+
+            # Must be axis-aligned (one coordinate must be constant)
+            dx = abs(x1 - x2)
+            dy = abs(y1 - y2)
+            if dx > 0.001 and dy > 0.001:
+                violations.append((i, track, dx, dy))
+
+        if violations:
+            logger.error(f"[EMIT-VALIDATION] Found {len(violations)} diagonal segments!")
+            for i, track, dx, dy in violations[:5]:  # Show first 5
+                logger.error(f"  Track {i}: ({track['x1']:.2f},{track['y1']:.2f})->({track['x2']:.2f},{track['y2']:.2f}), "
+                           f"Delta=({dx:.2f},{dy:.2f}) on {track['layer']}")
+
+            # In debug mode, raise error
+            if __debug__:
+                raise RuntimeError(f"{len(violations)} diagonal segments detected at emission")
+        else:
+            logger.info(f"[EMIT-VALIDATION] All {len(tracks)} tracks are axis-aligned ✓")
+
+        # Count tracks by layer and direction
+        layer_stats = {}
+        for track in tracks:
+            layer = track['layer']
+            x1, y1 = track['x1'], track['y1']
+            x2, y2 = track['x2'], track['y2']
+
+            is_horizontal = (abs(y1 - y2) < 0.001)
+            is_vertical = (abs(x1 - x2) < 0.001)
+
+            if layer not in layer_stats:
+                layer_stats[layer] = {'h': 0, 'v': 0}
+
+            if is_horizontal:
+                layer_stats[layer]['h'] += 1
+            elif is_vertical:
+                layer_stats[layer]['v'] += 1
+
+        # Log per-layer statistics and check direction discipline
+        for layer in sorted(layer_stats.keys()):
+            h_count = layer_stats[layer]['h']
+            v_count = layer_stats[layer]['v']
+            logger.info(f"[LAYER-STATS] {layer}: {h_count} horizontal, {v_count} vertical")
+
+            # Check if layer has wrong direction (extract layer index from name)
+            # Assuming layer names like "In1.Cu", "In2.Cu", etc.
+            if 'In' in layer:
+                try:
+                    layer_str = layer.replace('In', '').replace('.Cu', '')
+                    layer_num = int(layer_str)
+                    # Odd layers (In1, In3) = H, Even layers (In2, In4) = V
+                    expected_dir = 'h' if layer_num % 2 == 1 else 'v'
+
+                    if expected_dir == 'h' and v_count > h_count:
+                        logger.warning(f"[LAYER-DIRECTION] {layer} should be H-dominant but has more V traces!")
+                    elif expected_dir == 'v' and h_count > v_count:
+                        logger.warning(f"[LAYER-DIRECTION] {layer} should be V-dominant but has more H traces!")
+                except (ValueError, IndexError):
+                    pass  # Skip if layer name doesn't match expected pattern
 
         return (tracks, vias)
 

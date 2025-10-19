@@ -327,6 +327,118 @@ class PadEscapePlanner:
 
         logger.info(f"Planned {portal_count} portals using column-based approach")
 
+        # STEP 3.5: Fill gaps in portal distribution (Option A - Simple interpolation)
+        # After column-based portal generation, detect and fill gaps > 3 grid steps
+        logger.info(f"[GAP-FILL] Starting gap-filling check (have {len(self.portals)} portals)")
+        if self.portals:
+            logger.info(f"[GAP-FILL] self.portals exists with {len(self.portals)} items")
+            # Get sorted list of X-coordinates with portals
+            try:
+                portal_x_coords = sorted(set(portal.x_idx for portal in self.portals.values()))
+                logger.info(f"[GAP-FILL] Extracted {len(portal_x_coords)} unique X-coordinates")
+            except Exception as e:
+                logger.error(f"[GAP-FILL] Error extracting X-coordinates: {e}")
+                raise
+
+            if len(portal_x_coords) > 1:
+                gap_portals_created = 0
+                gap_fill_spacing = 3  # Create portals every 3 grid steps in gaps
+                gap_threshold = 3     # Only fill gaps larger than 3 grid steps
+
+                # Entry layer for gap-filling portals (use vertical layer for Y-routing)
+                # Use layer 2 (first vertical layer) for gap portals
+                gap_entry_layer = 2 if self.lattice.layers > 2 else 1
+
+                logger.info(f"[GAP-FILL] Checking for gaps in portal distribution (threshold={gap_threshold} steps)")
+
+                # Check each consecutive pair of X-coordinates
+                for i in range(len(portal_x_coords) - 1):
+                    x_left = portal_x_coords[i]
+                    x_right = portal_x_coords[i + 1]
+                    gap_size = x_right - x_left
+
+                    if gap_size > gap_threshold:
+                        logger.info(f"[GAP-FILL] Found gap: X={x_left} to X={x_right} ({gap_size} steps)")
+
+                        # Collect Y-coordinates from portals at left and right boundaries
+                        left_y_coords = [p.y_idx for p in self.portals.values() if p.x_idx == x_left]
+                        right_y_coords = [p.y_idx for p in self.portals.values() if p.x_idx == x_right]
+
+                        # Use median Y-coordinate as representative
+                        if left_y_coords and right_y_coords:
+                            left_y_median = sorted(left_y_coords)[len(left_y_coords) // 2]
+                            right_y_median = sorted(right_y_coords)[len(right_y_coords) // 2]
+                            # Average the two medians for gap portal Y-coordinate
+                            gap_y_base = (left_y_median + right_y_median) // 2
+                        elif left_y_coords:
+                            gap_y_base = sorted(left_y_coords)[len(left_y_coords) // 2]
+                        elif right_y_coords:
+                            gap_y_base = sorted(right_y_coords)[len(right_y_coords) // 2]
+                        else:
+                            # Fallback: use middle of board
+                            gap_y_base = self.lattice.y_steps // 2
+
+                        # Clamp Y to valid range
+                        gap_y_base = max(0, min(gap_y_base, self.lattice.y_steps - 1))
+
+                        # Create portals at evenly-spaced X-coordinates within the gap
+                        gap_x_coords = range(x_left + gap_fill_spacing, x_right, gap_fill_spacing)
+
+                        for gap_x in gap_x_coords:
+                            # Create synthetic portal ID
+                            synthetic_pad_id = f"GAP_PORTAL_X{gap_x}_Y{gap_y_base}"
+
+                            # Convert to world coordinates for portal
+                            gap_x_mm, gap_y_mm = self.lattice.geom.lattice_to_world(gap_x, gap_y_base)
+
+                            # Create gap-filling portal (no pad, just a routing anchor point)
+                            gap_portal = Portal(
+                                x_idx=gap_x,
+                                y_idx=gap_y_base,
+                                pad_layer=0,  # Nominal pad layer (not used for gap portals)
+                                delta_steps=0,  # No escape (this is already a portal point)
+                                direction=0,    # No direction (no escape)
+                                pad_x=gap_x_mm,
+                                pad_y=gap_y_mm,
+                                entry_layer=gap_entry_layer,
+                                score=0.0,
+                                retarget_count=0
+                            )
+
+                            # Add to portals dict with synthetic ID
+                            # Note: These portals won't generate escape geometry (no real pad)
+                            # but they will be available for pathfinding as routing waypoints
+                            self.portals[synthetic_pad_id] = gap_portal
+                            gap_portals_created += 1
+
+                            logger.debug(f"[GAP-FILL] Created portal at X={gap_x}, Y={gap_y_base} (layer={gap_entry_layer})")
+
+                logger.info(f"[GAP-FILL] Created {gap_portals_created} gap-filling portals")
+                portal_count += gap_portals_created
+
+        # Debug: Check portal X-distribution
+        if self.portals:
+            portal_x_coords = []
+            for portal in self.portals.values():
+                x = portal.x_idx
+                portal_x_coords.append(x)
+
+            unique_x = len(set(portal_x_coords))
+            logger.info(f"[PORTAL-DISTRIBUTION] {len(portal_x_coords)} portals across {unique_x} unique X-coordinates")
+            logger.info(f"[PORTAL-DISTRIBUTION] X-range: min={min(portal_x_coords)}, max={max(portal_x_coords)}")
+
+            # Show histogram of X-distribution
+            import collections
+            x_histogram = collections.Counter(portal_x_coords)
+            x_bins = sorted(x_histogram.keys())
+            logger.info(f"[PORTAL-DISTRIBUTION] First 10 X-coords: {x_bins[:10]}")
+            logger.info(f"[PORTAL-DISTRIBUTION] Last 10 X-coords: {x_bins[-10:]}")
+
+            # Check for gaps
+            if len(x_bins) > 1:
+                max_gap = max(x_bins[i+1] - x_bins[i] for i in range(len(x_bins)-1))
+                logger.info(f"[PORTAL-DISTRIBUTION] Largest gap between portal columns: {max_gap} grid steps")
+
         # Build reverse lookup: pad_id -> net_id
         pad_to_net = {}
         for net_id, (src_pad_id, dst_pad_id) in net_pad_mapping.items():
@@ -872,6 +984,7 @@ class PadEscapePlanner:
                     'x2': intermediate_x,
                     'y2': intermediate_y,
                     'width': self.config.grid_pitch * 0.6,
+                    'escape': True,  # Tag for easy identification
                 })
 
             # 45-degree segment from intermediate point to portal via
@@ -883,6 +996,7 @@ class PadEscapePlanner:
                 'x2': portal_x_mm,
                 'y2': portal_y_mm,
                 'width': self.config.grid_pitch * 0.6,
+                'escape': True,  # Tag for easy identification
             })
         else:
             # Pure vertical escape (no horizontal offset)
@@ -894,6 +1008,7 @@ class PadEscapePlanner:
                 'x2': portal_x_mm,
                 'y2': portal_y_mm,
                 'width': self.config.grid_pitch * 0.6,
+                'escape': True,  # Tag for easy identification
             })
 
         # 2. Portal via stack (minimal: only from pad_layer to entry_layer)
@@ -907,6 +1022,7 @@ class PadEscapePlanner:
                 'from_layer': pad_layer_name,
                 'to_layer': entry_layer_name,
                 'diameter': 0.25,  # hole (0.15) + 2×annular (0.05) = 0.25mm
+                'escape': True,  # Tag for easy identification
                 'drill': 0.15,     # hole diameter
             })
 
