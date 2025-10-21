@@ -2142,11 +2142,11 @@ class PathFinderRouter:
                         p1_portal = self.portals[p1_id]
                         p2_portal = self.portals[p2_id]
 
-                        # CRITICAL FIX: Route on F.Cu (layer 0) where the escape vias are located!
-                        # The escape stubs connect pads to vias on F.Cu, so routing must happen on F.Cu
-                        # The pathfinder will automatically use internal layers via vias when needed
-                        entry_layer = 0  # F.Cu
-                        exit_layer = 0   # F.Cu
+                        # CRITICAL FIX: Use portal's computed entry_layer (routing layer, NOT F.Cu!)
+                        # Portals land on internal routing layers (1-17), NOT on F.Cu (0)
+                        # The escape planner already handles F.Cu → portal transitions
+                        entry_layer = p1_portal.entry_layer  # Use portal's routing layer
+                        exit_layer = p2_portal.entry_layer   # Use portal's routing layer
 
                         # Convert portal positions to node indices
                         src = self.lattice.node_idx(p1_portal.x_idx, p1_portal.y_idx, entry_layer)
