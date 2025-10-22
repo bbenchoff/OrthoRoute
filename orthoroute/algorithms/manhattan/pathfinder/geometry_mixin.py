@@ -18,7 +18,12 @@ except ImportError:
     CUPY_AVAILABLE = False
 
 from types import SimpleNamespace
-from ....domain.models.board import Board, Pad
+
+# Prefer local light interfaces; fall back to monorepo types if available
+try:
+    from ....domain.models.board import Board as BoardLike, Pad
+except Exception:  # pragma: no cover - plugin environment
+    from ..types import BoardLike, Pad
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,11 @@ class GeometryMixin:
     - edges: list of edges
     - nodes: dict of node data
     """
+
+    def _ensure_keepout_state(self):
+        if not hasattr(self, "_via_keepouts_map"):
+            # map: (z, x, y) -> owner_net (str)
+            self._via_keepouts_map = {}
 
     def emit_geometry(self, board) -> tuple[int, int]:
         """Build geometry intents, strict DRC pre-emit gate, push to GUI."""
@@ -1237,7 +1247,29 @@ class GeometryMixin:
                 tracks.append(track)
         
         return tracks
-    
+
     # ===== MULTI-ROI PARALLEL PROCESSING =====
-    
+
+    def _emit_via(self, net_id: str, x_idx: int, y_idx: int, z1: int, z2: int):
+        """
+        Emit a via connecting two layers at the specified lattice position.
+        This method should be implemented by subclasses to handle via emission.
+        """
+        # Base implementation - subclasses should override
+        # For now, just register keepouts if enabled
+
+        # Register keepouts for intermediate layers if policy is enabled (owner-aware)
+        if bool(getattr(self.config, "enable_buried_via_keepouts", False)):
+            self._ensure_keepout_state()
+            lo, hi = (z1, z2) if z1 < z2 else (z2, z1)
+            # intermediate layers only
+            for z in range(lo + 1, hi):
+                key = (z, x_idx, y_idx)
+                # First owner wins; subsequent vias at the same column keep the original owner
+                self._via_keepouts_map.setdefault(key, net_id)
+            if hi - lo > 1:  # Only log if there are intermediate layers
+                logger.info(f"[VIA-KEEPOUT] net={net_id} registered buried keepout @ ({x_idx},{y_idx}) layers {lo+1}..{hi-1}")
+
+    # Note: apply_via_keepouts_to_graph() removed - keepouts are now enforced per-net
+    # in ROI extraction (owner-aware), not by globally modifying graph weights.
 

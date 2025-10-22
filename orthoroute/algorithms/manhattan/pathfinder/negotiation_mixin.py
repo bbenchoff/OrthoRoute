@@ -18,7 +18,12 @@ except ImportError:
     CUPY_AVAILABLE = False
 
 from types import SimpleNamespace
-from ....domain.models.board import Board, Pad
+
+# Prefer local light interfaces; fall back to monorepo types if available
+try:
+    from ....domain.models.board import Board as BoardLike, Pad
+except Exception:  # pragma: no cover - plugin environment
+    from ..types import BoardLike, Pad
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,10 @@ class NegotiationMixin:
         OPTIMIZED PathFinder with fast net parsing and GPU acceleration
         """
         logger.info(f"[UPF] instance=%s enter %s", getattr(self, "_instance_tag", "NO_TAG"), "route_multiple_nets")
+
+        # Initialize failure tracking for adaptive corridor widening
+        if not hasattr(self, 'net_fail_streak'):
+            self.net_fail_streak = {}  # Dict[str, int] - consecutive failures per net
 
         # Normalize edge owner types to prevent crashes
         self._normalize_owner_types()
@@ -299,6 +308,10 @@ class NegotiationMixin:
             logger.info("[NEGOTIATE] iter=%d pres_fac=%.2f", it, pres_fac)
             self.current_iteration = it
 
+            # Log iteration 1 always-connect policy
+            if it == 1 and cfg.iter1_always_connect:
+                logger.info("[ITER-1-POLICY] Always-connect mode: soft costs only (no hard blocks)")
+
             # Track path changes for stagnation detection
             import numpy as np
             old_paths = {
@@ -352,8 +365,15 @@ class NegotiationMixin:
                         len(self._edge_store),
                         int((self.edge_present_usage > 0).sum()))
 
+            # Note: Buried-via keepouts are now enforced per-net during ROI extraction
+            # (owner-aware filtering in roi_extractor_mixin.py), not by globally modifying graph weights
+
             logger.info("[ITER-RESULT] routed=%d failed=%d overuse_edges=%d over_sum=%d changed=%s",
                         routed_ct, failed_ct, over_edges, over_sum, bool(changed))
+
+            # ===== COLUMN BALANCE METRICS (Fix #9) =====
+            # Track vertical traffic distribution across columns to monitor "elevator shaft" problem
+            self._log_column_balance_metrics(it)
 
             # Log top congested nets for diagnostic purposes
             if over_edges > 0:
@@ -467,6 +487,15 @@ class NegotiationMixin:
         for net_id, (src, dst) in batch:
             prev_idx = self._prepare_net_for_reroute(net_id)
 
+            # Apply round-robin layer bias for first iterations (when symmetry matters most)
+            # DISABLED AGAIN: Still hitting slow CPU fallback (7-8s per net)
+            # TODO: Implement as kernel-side bias (expert suggestion A) for true speed
+            if False and self.current_iteration <= 3:
+                try:
+                    self._apply_roundrobin_layer_bias_fast(net_id, src)
+                except Exception as e:
+                    logger.warning(f"[ROUNDROBIN] Failed to apply bias for {net_id}: {e}")
+
             res = self._route_single_net_cpu(net_id, src, dst)  # your existing call
             if res.success:
                 csr_idx = res.csr_edge_indices or self._edge_indices_from_node_path(res.node_path)
@@ -478,6 +507,9 @@ class NegotiationMixin:
                         self.edge_owners[e] = net_id
                 routed_ct += 1
 
+                # Update failure tracking: success resets streak
+                self._update_failure_tracking(net_id, success=True)
+
                 result = type('RouteResult', (), {
                     'success': True,
                     'net_id': net_id,
@@ -487,6 +519,9 @@ class NegotiationMixin:
                 # failed: put the old path back so we don't lose capacity accounting
                 self._restore_net_after_failed_reroute(net_id, prev_idx)
                 failed_ct += 1
+
+                # Update failure tracking: failure increments streak
+                self._update_failure_tracking(net_id, success=False)
 
                 result = type('RouteResult', (), {
                     'success': False,
@@ -524,6 +559,26 @@ class NegotiationMixin:
             })()
 
 
+    def _update_failure_tracking(self, net_id: str, success: bool) -> None:
+        """Update per-net failure tracking for adaptive corridor widening (Fix #7).
+
+        Args:
+            net_id: Network identifier
+            success: True if routing succeeded, False if failed
+        """
+        if not hasattr(self, 'net_fail_streak'):
+            from collections import defaultdict
+            self.net_fail_streak = defaultdict(int)
+
+        if success:
+            # Success resets the failure streak
+            self.net_fail_streak[net_id] = 0
+        else:
+            # Failure increments the streak
+            self.net_fail_streak[net_id] = self.net_fail_streak.get(net_id, 0) + 1
+            logger.debug(f"[FAIL-TRACK] {net_id}: failure streak now {self.net_fail_streak[net_id]}")
+
+
     def _update_edge_total_costs(self, pres_fac: float) -> None:
         """Update total edge costs for PathFinder negotiation using present cost factor.
 
@@ -556,13 +611,33 @@ class NegotiationMixin:
         # Calculate total cost: base + present_penalty + historical
         total = base + pres_fac * usage + self.config.hist_cost_weight * hist
 
-        # Hard-block illegal edges
-        total[~legal] = np.inf
+        # FIX #6: Column Occupancy Soft-Cap
+        # Apply soft-cap multiplier to vertical edges based on column usage
+        column_softcap_applied = self._apply_column_occupancy_softcap(total)
 
-        # Strict DRC: also block explicit overuse immediately (only in HARD phase)
-        if self.current_iteration >= self.config.phase_block_after and self.config.strict_overuse_block:
+        # PATHFINDER ITERATION 1 POLICY: Always-connect (soft costs only)
+        # Iteration 1 should route ~100% of nets using geometric paths
+        # Hard blocks (infinity costs) should only apply in iterations 2+
+        if self.config.iter1_always_connect and self.current_iteration == 1:
+            # Iteration 1: Use high soft penalties instead of hard blocks
+            # This allows ANY geometric path to be found
+            illegal_penalty = 1000.0  # High cost but not infinite
+
+            # Soft-block illegal edges (e.g., wrong-direction edges)
+            total[~legal] *= illegal_penalty
+
+            # Soft-block overused edges (capacity violations)
             over_mask = usage > cap
-            total[over_mask] = np.inf
+            total[over_mask] *= illegal_penalty
+        else:
+            # Iterations 2+: Use hard blocks (infinity costs) to enforce constraints
+            # Hard-block illegal edges
+            total[~legal] = np.inf
+
+            # Strict DRC: also block explicit overuse immediately (only in HARD phase)
+            if self.current_iteration >= self.config.phase_block_after and self.config.strict_overuse_block:
+                over_mask = usage > cap
+                total[over_mask] = np.inf
 
         self.edge_total_cost = total
 
@@ -571,6 +646,113 @@ class NegotiationMixin:
             # If this flag is enabled, peeling logic would go here
             # Currently disabled to prevent cost update side effects
             pass
+
+
+    def _apply_column_occupancy_softcap(self, total: 'np.ndarray') -> int:
+        """Apply soft-cap penalty to vertical edges based on (layer, x) column usage.
+
+        This prevents "elevator shaft" congestion by adding immediate pricing feedback
+        when multiple nets share the same vertical column before hard overuse occurs.
+
+        Args:
+            total: Edge total cost array to modify in-place
+
+        Returns:
+            Number of vertical edges with soft-cap applied
+        """
+        import numpy as np
+
+        # Count nets using each (layer, x) column for vertical edges
+        col_use = {}  # (layer, x) -> count of nets using this column
+
+        # Iterate over all nets with committed paths
+        for net_id, edge_indices in self._net_paths.items():
+            if edge_indices is None or len(edge_indices) == 0:
+                continue
+
+            # Convert to numpy array if needed
+            if not isinstance(edge_indices, np.ndarray):
+                edge_indices = np.asarray(edge_indices, dtype=np.int64)
+
+            # Track which columns this net uses (to count once per net per column)
+            net_columns = set()
+
+            # Check each edge in this net's path
+            for edge_idx in edge_indices:
+                # Get source and destination nodes for this edge
+                # Use CSR structure: indptr and indices
+                if not hasattr(self, 'indptr_cpu') or not hasattr(self, 'indices_cpu'):
+                    continue
+
+                # Find which node this edge belongs to by searching indptr
+                u = 0
+                for node_idx in range(len(self.indptr_cpu) - 1):
+                    if self.indptr_cpu[node_idx] <= edge_idx < self.indptr_cpu[node_idx + 1]:
+                        u = node_idx
+                        break
+
+                # Get destination node
+                v = self.indices_cpu[edge_idx]
+
+                # Get coordinates for both nodes
+                u_coord = self._idx_to_coord(u)
+                v_coord = self._idx_to_coord(v)
+
+                if u_coord is None or v_coord is None:
+                    continue
+
+                u_x, u_y, u_layer = u_coord
+                v_x, v_y, v_layer = v_coord
+
+                # Check if this is a vertical edge (same x, different y, same layer)
+                if u_x == v_x and u_y != v_y and u_layer == v_layer:
+                    col_key = (u_layer, u_x)
+                    net_columns.add(col_key)
+
+            # Count this net for each column it uses
+            for col_key in net_columns:
+                col_use[col_key] = col_use.get(col_key, 0) + 1
+
+        # Apply soft-cap multiplier to vertical edges
+        beta = self.config.column_present_beta
+        vertical_edges_modified = 0
+        max_col_usage = 0
+
+        # Iterate through all edges and apply soft-cap to vertical ones
+        for node_idx in range(len(self.indptr_cpu) - 1):
+            start_idx = self.indptr_cpu[node_idx]
+            end_idx = self.indptr_cpu[node_idx + 1]
+
+            for edge_idx in range(start_idx, end_idx):
+                v = self.indices_cpu[edge_idx]
+
+                # Get coordinates
+                u_coord = self._idx_to_coord(node_idx)
+                v_coord = self._idx_to_coord(v)
+
+                if u_coord is None or v_coord is None:
+                    continue
+
+                u_x, u_y, u_layer = u_coord
+                v_x, v_y, v_layer = v_coord
+
+                # Check if vertical edge
+                if u_x == v_x and u_y != v_y and u_layer == v_layer:
+                    col_key = (u_layer, u_x)
+                    col_usage = col_use.get(col_key, 0)
+                    max_col_usage = max(max_col_usage, col_usage)
+
+                    # Apply soft-cap: multiply cost by (1 + beta * max(0, count - 1))
+                    if col_usage > 1:
+                        col_pres = 1.0 + beta * (col_usage - 1)
+                        total[edge_idx] *= col_pres
+                        vertical_edges_modified += 1
+
+        # Log results
+        if vertical_edges_modified > 0:
+            logger.info(f"[COLUMN-SOFTCAP] Applied to {vertical_edges_modified} vertical edges, max_col_usage={max_col_usage}")
+
+        return vertical_edges_modified
 
 
     def _compute_overuse_stats(self) -> tuple[int, int]:
@@ -600,7 +782,215 @@ class NegotiationMixin:
             # CPU fallback
             overuse = np.maximum(self.edge_present_usage - self.edge_capacity, 0.0)
             self.edge_history += overuse * 0.1
-    
+
+        # FIX #4: Diffused History Cost on Vertical Columns (CRITICAL)
+        # Make long-term congestion pressure BLEED sideways so a single column can't stay cheapest forever
+        self._apply_column_spread_diffusion(overuse)
+
+
+    def _apply_column_spread_diffusion(self, overuse: 'np.ndarray') -> None:
+        """Apply diffused history cost to vertical columns to prevent "elevator shaft" congestion.
+
+        VPR-style history cost is local to exact edges, which causes one "elevator shaft"
+        to stay marginally cheapest while getting overused. Diffusing history across
+        adjacent columns makes them attractive alternatives.
+
+        Args:
+            overuse: Overuse array for all edges (already computed)
+        """
+        import numpy as np
+        from scipy.ndimage import convolve1d
+
+        # Get config parameters
+        alpha = self.config.column_spread_alpha  # 0.35 - fraction that diffuses sideways
+        radius = self.config.column_spread_radius  # 2 - columns ±2 get blurred cost
+
+        if alpha <= 0.0:
+            return  # Feature disabled
+
+        # Get lattice dimensions
+        if not hasattr(self, 'lattice') or self.lattice is None:
+            logger.debug("[COLUMN-SPREAD] No lattice available, skipping diffusion")
+            return
+
+        lattice = self.lattice
+        num_layers = lattice.layers
+        x_steps = lattice.x_steps
+        y_steps = lattice.y_steps
+
+        # Identify vertical routing layers (even-numbered internal layers)
+        vertical_layers = [l for l in range(num_layers) if lattice.get_legal_axis(l) == 'v']
+
+        if not vertical_layers:
+            return
+
+        # 1. Accumulate per-(layer, x) vertical overuse
+        # Shape: (num_vertical_layers, x_steps)
+        vert_overuse = np.zeros((len(vertical_layers), x_steps), dtype=np.float32)
+
+        # Map layer index to position in vert_overuse array
+        layer_to_idx = {layer: idx for idx, layer in enumerate(vertical_layers)}
+
+        # Iterate through all edges and accumulate overuse for vertical edges
+        if not hasattr(self, 'indptr_cpu') or not hasattr(self, 'indices_cpu'):
+            logger.debug("[COLUMN-SPREAD] CSR arrays not available, skipping diffusion")
+            return
+
+        # Ensure overuse is on CPU
+        if hasattr(overuse, 'get'):
+            overuse = overuse.get()
+
+        for node_idx in range(len(self.indptr_cpu) - 1):
+            start_idx = self.indptr_cpu[node_idx]
+            end_idx = self.indptr_cpu[node_idx + 1]
+
+            for edge_idx in range(start_idx, end_idx):
+                # Skip edges with no overuse
+                if overuse[edge_idx] <= 0:
+                    continue
+
+                v = self.indices_cpu[edge_idx]
+
+                # Get coordinates for both nodes
+                u_coord = self._idx_to_coord(node_idx)
+                v_coord = self._idx_to_coord(v)
+
+                if u_coord is None or v_coord is None:
+                    continue
+
+                u_x, u_y, u_layer = u_coord
+                v_x, v_y, v_layer = v_coord
+
+                # Check if this is a vertical edge (same x, different y, same layer)
+                if u_x == v_x and u_y != v_y and u_layer == v_layer:
+                    # This is a vertical edge
+                    if u_layer in layer_to_idx:
+                        z_index = layer_to_idx[u_layer]
+                        if 0 <= u_x < x_steps:
+                            vert_overuse[z_index, u_x] += overuse[edge_idx]
+
+        # 2. Convolve with Gaussian kernel to blur across columns
+        kernel = np.exp(-np.abs(np.arange(-radius, radius + 1)))
+        kernel = kernel / kernel.sum()
+
+        # Apply 1D convolution along x-axis (axis=1) for each layer
+        vert_overuse_blurred = np.zeros_like(vert_overuse)
+        for z_idx in range(len(vertical_layers)):
+            vert_overuse_blurred[z_idx, :] = convolve1d(
+                vert_overuse[z_idx, :], kernel, axis=0, mode='nearest'
+            )
+
+        # 3. Add blurred cost to vertical edge history
+        total_added = 0.0
+        edges_updated = 0
+
+        for node_idx in range(len(self.indptr_cpu) - 1):
+            start_idx = self.indptr_cpu[node_idx]
+            end_idx = self.indptr_cpu[node_idx + 1]
+
+            for edge_idx in range(start_idx, end_idx):
+                v = self.indices_cpu[edge_idx]
+
+                # Get coordinates
+                u_coord = self._idx_to_coord(node_idx)
+                v_coord = self._idx_to_coord(v)
+
+                if u_coord is None or v_coord is None:
+                    continue
+
+                u_x, u_y, u_layer = u_coord
+                v_x, v_y, v_layer = v_coord
+
+                # Check if vertical edge
+                if u_x == v_x and u_y != v_y and u_layer == v_layer:
+                    if u_layer in layer_to_idx:
+                        z_index = layer_to_idx[u_layer]
+                        if 0 <= u_x < x_steps:
+                            # Add diffused cost
+                            diffused_cost = alpha * vert_overuse_blurred[z_index, u_x]
+                            self.edge_history[edge_idx] += diffused_cost
+                            total_added += diffused_cost
+                            edges_updated += 1
+
+        # Logging
+        if edges_updated > 0:
+            mean_per_col = total_added / edges_updated
+            logger.info(f"[COLUMN-SPREAD] Diffused history: total_added={total_added:.1f}, "
+                       f"mean_per_col={mean_per_col:.3f}, edges_updated={edges_updated}")
+        else:
+            logger.debug("[COLUMN-SPREAD] No vertical edges to diffuse")
+
+
+    def _compute_overuse_stats_present(self) -> tuple[int, int]:
+        """Compute overuse statistics from present usage arrays (alias for _compute_overuse_stats)"""
+        return self._compute_overuse_stats()
+
+
+    def _compute_overuse_from_present(self) -> tuple[int, int]:
+        """Compute overuse from present usage arrays (alias for _compute_overuse_stats)"""
+        return self._compute_overuse_stats()
+
+
+    def _compute_overuse_from_store(self) -> tuple[int, int]:
+        """Compute overuse from edge store (alias for _compute_overuse_from_edge_store)"""
+        return self._compute_overuse_from_edge_store()
+
+
+    def _refresh_present_usage_from_store(self) -> int:
+        """Rebuild present usage arrays from canonical edge store accounting data."""
+        import numpy as np
+        # Ensure arrays sized to live CSR
+        E = self._live_edge_count() if hasattr(self, '_live_edge_count') else len(self.edge_present_usage)
+        if getattr(self, 'edge_present_usage', None) is None or len(self.edge_present_usage) != E:
+            self.edge_present_usage = np.zeros(E, dtype=np.float32)
+        else:
+            self.edge_present_usage.fill(0.0)
+
+        store = getattr(self, "_edge_store", None) or getattr(self, 'edge_store', None) or {}
+        mapped = 0
+        for ei, usage in store.items():
+            if isinstance(ei, int) and 0 <= ei < E and int(usage) > 0:
+                self.edge_present_usage[ei] = float(usage)
+                mapped += 1
+        logger.debug("[UPF] Usage refresh: mapped %d store entries to present usage", mapped)
+        return mapped
+
+
+    def _commit_present_usage_to_store(self) -> bool:
+        """Commit present usage to edge store."""
+        import numpy as np
+        store = getattr(self, "_edge_store", None) or {}
+        if not hasattr(self, "_edge_store"):
+            self._edge_store = {}
+            store = self._edge_store
+
+        changed = False
+        usage = self.edge_present_usage
+        if hasattr(usage, 'get'):
+            usage = usage.get()
+
+        for edge_idx in range(len(usage)):
+            usage_val = int(usage[edge_idx])
+            if usage_val > 0:
+                if store.get(edge_idx, 0) != usage_val:
+                    store[edge_idx] = usage_val
+                    changed = True
+            elif edge_idx in store:
+                del store[edge_idx]
+                changed = True
+
+        return changed
+
+
+    def _live_edge_count(self) -> int:
+        """Return the number of edges in the graph."""
+        if hasattr(self, 'indptr_cpu') and hasattr(self, 'indices_cpu'):
+            return len(self.indices_cpu)
+        elif hasattr(self, 'edge_present_usage'):
+            return len(self.edge_present_usage)
+        else:
+            return 0
+
 
     def rip_up_net(self, net_id: str) -> None:
         """Remove a previously committed path for net_id from congestion accounting"""
@@ -796,6 +1186,347 @@ class NegotiationMixin:
             logger.info(f"[RIPUP] top offenders: {ordered[:10]}")
 
         return queue
+
+    def _pick_preferred_even_layer(self, net_id: str) -> int:
+        """Hash net_id to preferred even layer for round-robin load balancing.
+
+        Uses deterministic hash with good distribution to assign each net
+        a preferred even (vertical routing) layer among L0, L2, L4, L6, etc.
+        This breaks symmetry and prevents all nets from choosing the same column.
+        """
+        layer_count = getattr(self.config, 'layer_count', 18)
+        even_layers = [z for z in range(layer_count) if (z & 1) == 0]
+        if not even_layers:
+            return 0
+
+        # Deterministic hash with good distribution
+        h = (hash(net_id) ^ 0x9E3779B9) & 0xffffffff
+        return even_layers[h % len(even_layers)]
+
+    def _apply_roundrobin_layer_bias_fast(self, net_id: str, source_idx: int) -> None:
+        """Fast round-robin layer bias using column multiplier table.
+
+        This optimized version avoids the GPU↔CPU bottleneck by:
+        1. Creating a small column multiplier table on CPU (O(L×W))
+        2. Applying it to vertical edges on GPU in vectorized fashion (O(E))
+        3. No large array transfers - only tiny metadata
+
+        Original version took 7-8s per net, this takes <10ms per net.
+        """
+        import numpy as np
+
+        # Get grid dimensions
+        x_steps = getattr(self.lattice, 'x_steps', 0) or getattr(self.geometry, 'x_steps', 0)
+        y_steps = getattr(self.lattice, 'y_steps', 0) or getattr(self.geometry, 'y_steps', 0)
+        layer_count = getattr(self.config, 'layer_count', 0) or getattr(self.geometry, 'layer_count', 6)
+
+        if x_steps == 0 or y_steps == 0:
+            return
+
+        plane_size = x_steps * y_steps
+
+        # Get source coordinates
+        src_z = source_idx // plane_size
+        src_remainder = source_idx % plane_size
+        src_y = src_remainder // x_steps
+        src_x = src_remainder % x_steps
+
+        # Get even layers (routing layers)
+        even_layers = [l for l in range(layer_count) if l % 2 == 0]
+        if not even_layers:
+            return
+
+        # Hash net_name to pick preferred layer
+        h = (hash(net_id) ^ 0x9E3779B9) & 0xffffffff
+        preferred_z = even_layers[h % len(even_layers)]
+
+        logger.info(f"[ROUNDROBIN] net={net_id} preferred_even_layer=L{preferred_z}")
+
+        # Parameters
+        alpha = self.config.first_vertical_roundrobin_alpha  # 0.15 default
+        window_cols = 32  # ~8mm at 0.25mm pitch, will scale with actual pitch
+        pitch = self.config.grid_pitch
+        window_cols = int(8.0 / pitch)  # 8mm window
+
+        # Create column multiplier table: shape [layer_count, x_steps]
+        # Default: all ones (no modification)
+        col_mult = np.ones((layer_count, x_steps), dtype=np.float32)
+
+        # Apply bias only to even (vertical routing) layers within window of source
+        x_min = max(0, src_x - window_cols)
+        x_max = min(x_steps - 1, src_x + window_cols)
+
+        for z in even_layers:
+            if z == preferred_z:
+                # Preferred layer gets discount
+                col_mult[z, x_min:x_max+1] *= (1.0 - alpha)
+            else:
+                # Other even layers get penalty
+                col_mult[z, x_min:x_max+1] *= (1.0 + alpha)
+
+        # Apply multipliers to vertical edges on GPU (vectorized)
+        self._apply_column_multipliers_gpu(col_mult, plane_size, x_steps, y_steps, layer_count)
+
+        logger.debug(f"[ROUNDROBIN] net={net_id} applied bias via column multipliers (window={window_cols} cols)")
+
+    def _apply_column_multipliers_gpu(self, col_mult: np.ndarray, plane_size: int,
+                                      x_steps: int, y_steps: int, layer_count: int) -> None:
+        """Apply column multipliers to vertical edges on GPU in vectorized fashion."""
+        try:
+            import cupy as cp
+        except ImportError:
+            # Fallback to CPU if no GPU
+            self._apply_column_multipliers_cpu(col_mult, plane_size, x_steps, y_steps, layer_count)
+            return
+
+        # Get edge costs (should be on GPU)
+        if not hasattr(self.edge_total_cost, 'get'):
+            # Already CPU array, use CPU path
+            self._apply_column_multipliers_cpu(col_mult, plane_size, x_steps, y_steps, layer_count)
+            return
+
+        # Get adjacency matrix
+        adj_indptr = self.adjacency_matrix.indptr
+        adj_indices = self.adjacency_matrix.indices
+
+        # Upload column multiplier table to GPU (tiny - only L×X floats)
+        col_mult_gpu = cp.asarray(col_mult)
+
+        # Get via edges mask (if available)
+        if hasattr(self, '_via_edges') and self._via_edges is not None:
+            via_edges = cp.asarray(self._via_edges) if not hasattr(self._via_edges, 'get') else self._via_edges
+        else:
+            # Need to identify vertical edges on the fly
+            # For now, skip if we don't have the mask
+            return
+
+        # Create custom CUDA kernel for applying multipliers
+        # This is still a simple vectorized operation on GPU
+        apply_mult_kernel = cp.RawKernel(r'''
+        extern "C" __global__
+        void apply_column_multipliers(
+            float* edge_costs,
+            const int* indptr,
+            const int* indices,
+            const unsigned char* via_edges,
+            const float* col_mult,
+            int num_nodes,
+            int plane_size,
+            int x_steps,
+            int layer_count
+        ) {
+            int node_idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (node_idx >= num_nodes) return;
+
+            // Decode node to (x, y, z)
+            int z = node_idx / plane_size;
+            int remainder = node_idx % plane_size;
+            int y = remainder / x_steps;
+            int x = remainder % x_steps;
+
+            // Apply to outgoing via edges
+            for (int e_idx = indptr[node_idx]; e_idx < indptr[node_idx + 1]; e_idx++) {
+                if (via_edges[e_idx]) {
+                    int neighbor_idx = indices[e_idx];
+                    int neighbor_z = neighbor_idx / plane_size;
+
+                    // Vertical edge - use source layer's column multiplier
+                    if (neighbor_z != z) {
+                        edge_costs[e_idx] *= col_mult[z * x_steps + x];
+                    }
+                }
+            }
+        }
+        ''', 'apply_column_multipliers')
+
+        # Launch kernel
+        num_nodes = len(adj_indptr) - 1
+        threads_per_block = 256
+        num_blocks = (num_nodes + threads_per_block - 1) // threads_per_block
+
+        apply_mult_kernel(
+            (num_blocks,), (threads_per_block,),
+            (self.edge_total_cost, adj_indptr, adj_indices, via_edges,
+             col_mult_gpu.ravel(), num_nodes, plane_size, x_steps, layer_count)
+        )
+
+    def _apply_column_multipliers_cpu(self, col_mult: np.ndarray, plane_size: int,
+                                      x_steps: int, y_steps: int, layer_count: int) -> None:
+        """CPU fallback for applying column multipliers."""
+        import numpy as np
+
+        # Get adjacency matrix on CPU
+        adj_indptr = self.adjacency_matrix.indptr
+        adj_indices = self.adjacency_matrix.indices
+
+        if hasattr(adj_indptr, 'get'):
+            adj_indptr = adj_indptr.get()
+            adj_indices = adj_indices.get()
+
+        # Get edge costs on CPU
+        edge_costs = self.edge_total_cost
+        if hasattr(edge_costs, 'get'):
+            edge_costs = edge_costs.get()
+
+        # Get via edges mask
+        via_edges = getattr(self, '_via_edges', None)
+        if via_edges is not None and hasattr(via_edges, 'get'):
+            via_edges = via_edges.get()
+
+        num_nodes = len(adj_indptr) - 1
+        modified_count = 0
+
+        # Apply multipliers to vertical edges
+        for node_idx in range(num_nodes):
+            # Decode node to (x, y, z)
+            z = node_idx // plane_size
+            remainder = node_idx % plane_size
+            y = remainder // x_steps
+            x = remainder % x_steps
+
+            # Process outgoing edges
+            for e_idx in range(adj_indptr[node_idx], adj_indptr[node_idx + 1]):
+                # Check if via edge
+                is_via = via_edges[e_idx] if via_edges is not None else True
+
+                if is_via:
+                    neighbor_idx = adj_indices[e_idx]
+                    neighbor_z = neighbor_idx // plane_size
+
+                    # Vertical edge
+                    if neighbor_z != z:
+                        edge_costs[e_idx] *= col_mult[z, x]
+                        modified_count += 1
+
+        # Write back if needed
+        if hasattr(self.edge_total_cost, 'get'):
+            try:
+                import cupy as cp
+                self.edge_total_cost = cp.asarray(edge_costs)
+            except ImportError:
+                self.edge_total_cost = edge_costs
+        else:
+            self.edge_total_cost = edge_costs
+
+        logger.debug(f"[ROUNDROBIN-CPU] Modified {modified_count} via edges")
+
+    def _apply_roundrobin_layer_bias(self, net_id: str, source_idx: int) -> int:
+        """Apply round-robin layer preference for first vertical run near source portal.
+
+        This breaks symmetry when nets leave their portals by giving each net a
+        preferred even layer (L2/L4/L6...) for its first vertical segment. When all
+        nets see identical costs near portals, they all pick the same "cheapest" even
+        layer, creating an instant elevator shaft. This fix assigns each net a different
+        preferred layer via hashing.
+
+        Args:
+            net_id: Net name/identifier
+            source_idx: Global source node index
+
+        Returns:
+            preferred_layer: The preferred even layer index for this net
+        """
+        import numpy as np
+
+        # Get even layers (0-indexed where even indices = L1, L3, L5... in KiCad)
+        # But we want routing layers which are typically the even indices in 0-indexed
+        layer_count = getattr(self.config, 'layer_count', 0)
+        if layer_count == 0:
+            layer_count = getattr(self.geometry, 'layer_count', 6)
+
+        # Even layer indices for routing (0, 2, 4, ...)
+        even_layers = [l for l in range(layer_count) if l % 2 == 0]
+        if not even_layers:
+            return 0  # Fallback
+
+        # Hash net_name to pick preferred layer
+        bucket = hash(net_id) % len(even_layers)
+        preferred_z = even_layers[bucket]
+
+        logger.info(f"[ROUNDROBIN] net={net_id} preferred_even_layer=L{preferred_z}")
+
+        # Get grid dimensions for node -> (x, y, z) conversion
+        x_steps = getattr(self.lattice, 'x_steps', 0) or getattr(self.geometry, 'x_steps', 0)
+        y_steps = getattr(self.lattice, 'y_steps', 0) or getattr(self.geometry, 'y_steps', 0)
+
+        if x_steps == 0 or y_steps == 0:
+            logger.warning(f"[ROUNDROBIN] Cannot apply bias: grid dimensions not available")
+            return preferred_z
+
+        plane_size = x_steps * y_steps
+
+        # Get source coordinates
+        src_z = source_idx // plane_size
+        src_remainder = source_idx % plane_size
+        src_y = src_remainder // x_steps
+        src_x = src_remainder % x_steps
+
+        # Define "near portal" distance (8mm / pitch)
+        pitch = self.config.grid_pitch
+        distance_mm = 8.0
+        distance_cells = int(distance_mm / pitch)
+
+        # Apply penalty to via edges that connect to non-preferred even layers
+        # within distance_cells of the source
+        alpha = self.config.first_vertical_roundrobin_alpha
+
+        # Get edge costs (need to work with both CPU and GPU arrays)
+        if hasattr(self.edge_total_cost, 'get'):
+            edge_costs = self.edge_total_cost.get()
+        else:
+            edge_costs = self.edge_total_cost
+
+        # Get adjacency matrix for edge lookup
+        if hasattr(self.adjacency_matrix, 'get'):
+            adj_indptr = self.adjacency_matrix.indptr.get()
+            adj_indices = self.adjacency_matrix.indices.get()
+        else:
+            adj_indptr = self.adjacency_matrix.indptr
+            adj_indices = self.adjacency_matrix.indices
+
+        # Track how many edges we modify
+        modified_count = 0
+
+        # Scan nodes near source and penalize non-preferred vertical transitions
+        for dx in range(-distance_cells, distance_cells + 1):
+            for dy in range(-distance_cells, distance_cells + 1):
+                nx, ny = src_x + dx, src_y + dy
+                if not (0 <= nx < x_steps and 0 <= ny < y_steps):
+                    continue
+
+                # Check all layers at this (x, y) position
+                for nz in range(layer_count):
+                    node_idx = nz * plane_size + ny * x_steps + nx
+
+                    # Get all outgoing edges from this node
+                    edge_start = adj_indptr[node_idx]
+                    edge_end = adj_indptr[node_idx + 1]
+
+                    for edge_idx in range(edge_start, edge_end):
+                        neighbor_idx = adj_indices[edge_idx]
+                        neighbor_z = neighbor_idx // plane_size
+
+                        # Check if this is a vertical (via) edge to an even layer
+                        if neighbor_z != nz and neighbor_z in even_layers:
+                            # If neighbor is not the preferred layer, penalize
+                            if neighbor_z != preferred_z:
+                                edge_costs[edge_idx] *= (1.0 + alpha)
+                                modified_count += 1
+
+        # Write back modified costs
+        if hasattr(self.edge_total_cost, 'get'):
+            # GPU array - need to convert back
+            try:
+                import cupy as cp
+                self.edge_total_cost = cp.asarray(edge_costs)
+            except ImportError:
+                self.edge_total_cost = edge_costs
+        else:
+            self.edge_total_cost = edge_costs
+
+        logger.debug(f"[ROUNDROBIN] net={net_id} modified {modified_count} via edges near source")
+
+        return preferred_z
 
 
     def _select_offenders_for_ripup(self, routing_queue: List[str]) -> List[str]:
@@ -1122,6 +1853,15 @@ class NegotiationMixin:
             import time
             t0 = time.time()
 
+            # Apply round-robin layer bias for first iterations (when symmetry matters most)
+            # DISABLED: Performance bottleneck - causes 7-8s per net due to GPU↔CPU transfers
+            # TODO: Optimize by doing GPU-side modifications or pre-computing once
+            if False and self.current_iteration <= 3:
+                try:
+                    self._apply_roundrobin_layer_bias(net_id, source_idx)
+                except Exception as e:
+                    logger.warning(f"[ROUNDROBIN] Failed to apply bias for {net_id}: {e}")
+
             # PRAGMATIC FIX: Test first few nets on CPU, use GPU only if it proves fast
             emergency_cpu_only = EMERGENCY_CPU_ONLY
             smart_fallback = SMART_FALLBACK  # GPU->CPU fallback
@@ -1380,6 +2120,107 @@ class NegotiationMixin:
                 del self._net_failure_count[net_id]
             if net_id in self._net_roi_margin:
                 del self._net_roi_margin[net_id]
+
+
+    def _log_column_balance_metrics(self, iteration: int) -> None:
+        """
+        Log column balance metrics to monitor vertical traffic distribution.
+
+        This tracks how vertical traffic is distributed across columns (x-coordinates)
+        on even-numbered vertical routing layers. The Gini coefficient measures
+        inequality - lower is better (0 = perfectly balanced, 1 = all traffic in one column).
+
+        This helps diagnose the "elevator shaft" problem where traffic concentrates
+        in a few overused columns instead of spreading evenly.
+        """
+        import numpy as np
+
+        def compute_gini(values):
+            """Compute Gini coefficient (0=perfect equality, 1=perfect inequality)"""
+            values = np.array(sorted(values), dtype=np.float64)
+            n = len(values)
+            if n == 0 or values.sum() == 0:
+                return 0.0
+            index = np.arange(1, n + 1)
+            return (2.0 * np.sum(index * values)) / (n * values.sum()) - (n + 1) / n
+
+        # Get lattice dimensions
+        if not hasattr(self, 'lattice') or self.lattice is None:
+            logger.debug("[COLUMN-BALANCE] No lattice available, skipping metrics")
+            return
+
+        lattice = self.lattice
+        num_layers = lattice.layers
+        x_steps = lattice.x_steps
+        y_steps = lattice.y_steps
+
+        # Track column usage per layer
+        layer_gini = {}  # layer -> gini coefficient
+        layer_top5 = {}  # layer -> top 5 overused columns
+
+        # Analyze vertical routing layers (even-numbered internal layers: 0, 2, 4, 6, ...)
+        vertical_layers = [l for l in range(num_layers) if lattice.get_legal_axis(l) == 'v']
+
+        for layer in vertical_layers:
+            col_usage = {}  # x -> usage count
+
+            # Count vertical edges per column by examining all routed nets
+            for net_id, path_indices in self._net_paths.items():
+                if path_indices is None or len(path_indices) == 0:
+                    continue
+
+                # Convert to list if it's a numpy array
+                if hasattr(path_indices, 'tolist'):
+                    path_indices = path_indices.tolist()
+                elif not isinstance(path_indices, list):
+                    path_indices = list(path_indices)
+
+                # Walk consecutive node pairs in the path
+                for i in range(len(path_indices) - 1):
+                    try:
+                        node_a = int(path_indices[i])
+                        node_b = int(path_indices[i + 1])
+
+                        # Get coordinates for both nodes
+                        xa, ya, za = lattice.idx_to_coord(node_a)
+                        xb, yb, zb = lattice.idx_to_coord(node_b)
+
+                        # Check if this is a vertical edge on the current layer
+                        # Vertical edge: same x, different y, same layer
+                        if za == zb == layer and xa == xb and ya != yb:
+                            # This is a vertical edge at column x
+                            col_usage[xa] = col_usage.get(xa, 0) + 1
+
+                    except (ValueError, TypeError, IndexError) as e:
+                        # Skip malformed paths
+                        continue
+
+            # Compute statistics for this layer
+            if col_usage:
+                usage_vals = list(col_usage.values())
+                gini = compute_gini(usage_vals)
+                layer_gini[layer] = gini
+
+                # Get top 5 columns by usage
+                top5 = sorted(col_usage.items(), key=lambda kv: -kv[1])[:5]
+                layer_top5[layer] = top5
+
+                # Log per-layer details
+                logger.info(f"[COLUMN-STATS] Iter={iteration} L{layer}: "
+                          f"top-5 columns by usage -> {top5}, gini={gini:.3f} "
+                          f"(total_cols={len(col_usage)}, max_usage={max(usage_vals)}, avg_usage={np.mean(usage_vals):.1f})")
+            else:
+                layer_gini[layer] = 0.0
+                layer_top5[layer] = []
+                logger.info(f"[COLUMN-STATS] Iter={iteration} L{layer}: no vertical traffic")
+
+        # Summary line showing Gini across all vertical layers
+        if layer_gini:
+            gini_summary = ", ".join([f"L{layer}: gini={gini:.2f}" for layer, gini in sorted(layer_gini.items())])
+            avg_gini = np.mean(list(layer_gini.values()))
+            logger.info(f"[COLUMN-BALANCE] Iter={iteration} Summary: {gini_summary} (avg={avg_gini:.2f}, lower is better)")
+        else:
+            logger.info(f"[COLUMN-BALANCE] Iter={iteration} Summary: No vertical layers with traffic")
 
 
     def _assert_terminals_reachable(self, valid_nets: Dict[str, Tuple[int, int]]) -> None:

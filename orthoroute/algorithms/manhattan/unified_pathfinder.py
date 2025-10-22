@@ -1117,10 +1117,10 @@ class ROIExtractor:
                 max_z = max(max_z, max(seed_layers))
 
         # Add corridor buffer perpendicular to main direction
-        min_x = max(0, min_x - corridor_buffer)
-        max_x = min(self.lattice.x_steps - 1, max_x + corridor_buffer)
-        min_y = max(0, min_y - corridor_buffer)
-        max_y = min(self.lattice.y_steps - 1, max_y + corridor_buffer)
+        min_x = int(max(0, min_x - corridor_buffer))
+        max_x = int(min(self.lattice.x_steps - 1, max_x + corridor_buffer))
+        min_y = int(max(0, min_y - corridor_buffer))
+        max_y = int(min(self.lattice.y_steps - 1, max_y + corridor_buffer))
 
         # Add layer margin (clamp to inner layers only - exclude outer layers 0 and layers-1)
         min_z = max(1, min_z - layer_margin)
@@ -1137,8 +1137,8 @@ class ROIExtractor:
 
         # L-Path 1: Horizontal first, then vertical (src → (dst.x, src.y) → dst)
         # Horizontal segment: from src.x to dst.x (at src.y with buffer)
-        horiz1_min_y = max(0, src_y - corridor_buffer)
-        horiz1_max_y = min(y_steps - 1, src_y + corridor_buffer)
+        horiz1_min_y = int(max(0, src_y - corridor_buffer))
+        horiz1_max_y = int(min(y_steps - 1, src_y + corridor_buffer))
 
         for z in range(min_z, max_z + 1):
             for y in range(horiz1_min_y, horiz1_max_y + 1):
@@ -1147,8 +1147,8 @@ class ROIExtractor:
                     roi_nodes_set.add(node_idx)
 
         # Vertical segment: from src.y to dst.y (at dst.x with buffer)
-        vert1_min_x = max(0, dst_x - corridor_buffer)
-        vert1_max_x = min(x_steps - 1, dst_x + corridor_buffer)
+        vert1_min_x = int(max(0, dst_x - corridor_buffer))
+        vert1_max_x = int(min(x_steps - 1, dst_x + corridor_buffer))
 
         for z in range(min_z, max_z + 1):
             for y in range(min_y, max_y + 1):
@@ -1158,8 +1158,8 @@ class ROIExtractor:
 
         # L-Path 2: Vertical first, then horizontal (src → (src.x, dst.y) → dst)
         # Vertical segment: from src.y to dst.y (at src.x with buffer)
-        vert2_min_x = max(0, src_x - corridor_buffer)
-        vert2_max_x = min(x_steps - 1, src_x + corridor_buffer)
+        vert2_min_x = int(max(0, src_x - corridor_buffer))
+        vert2_max_x = int(min(x_steps - 1, src_x + corridor_buffer))
 
         for z in range(min_z, max_z + 1):
             for y in range(min_y, max_y + 1):
@@ -1168,8 +1168,8 @@ class ROIExtractor:
                     roi_nodes_set.add(node_idx)
 
         # Horizontal segment: from src.x to dst.x (at dst.y with buffer)
-        horiz2_min_y = max(0, dst_y - corridor_buffer)
-        horiz2_max_y = min(y_steps - 1, dst_y + corridor_buffer)
+        horiz2_min_y = int(max(0, dst_y - corridor_buffer))
+        horiz2_max_y = int(min(y_steps - 1, dst_y + corridor_buffer))
 
         for z in range(min_z, max_z + 1):
             for y in range(horiz2_min_y, horiz2_max_y + 1):
@@ -1454,6 +1454,52 @@ class ROIExtractor:
 
         return roi_nodes, global_to_roi
 
+    def _check_roi_connectivity(self, src: int, dst: int, roi_nodes, roi_indptr, roi_indices) -> bool:
+        """Fast BFS to check if src can reach dst in ROI (~1ms check vs 50-100ms failed GPU routing)."""
+        from collections import deque
+        import numpy as np
+
+        # Convert to set for O(1) lookup
+        if isinstance(roi_nodes, np.ndarray):
+            roi_set = set(roi_nodes.tolist() if hasattr(roi_nodes, 'tolist') else roi_nodes)
+        elif hasattr(roi_nodes, 'get'):  # CuPy
+            roi_set = set(roi_nodes.get().tolist())
+        else:
+            roi_set = set(roi_nodes) if not isinstance(roi_nodes, set) else roi_nodes
+
+        if src not in roi_set or dst not in roi_set:
+            return False
+
+        # Convert to NumPy if CuPy
+        if hasattr(roi_indptr, 'get'):
+            roi_indptr = roi_indptr.get()
+        if hasattr(roi_indices, 'get'):
+            roi_indices = roi_indices.get()
+
+        # BFS from src to dst
+        visited = {src}
+        queue = deque([src])
+        nodes_explored = 0
+
+        while queue:
+            u = queue.popleft()
+            nodes_explored += 1
+
+            if u == dst:
+                return True
+
+            # Early termination
+            if nodes_explored > len(roi_set) * 0.5:
+                break
+
+            for ei in range(int(roi_indptr[u]), int(roi_indptr[u + 1])):
+                v = int(roi_indices[ei])
+                if v in roi_set and v not in visited:
+                    visited.add(v)
+                    queue.append(v)
+
+        return False
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DIJKSTRA WITH ROI
@@ -1709,6 +1755,15 @@ class PathFinderRouter:
         # Rip tracking and pres_fac freezing (Fix 5)
         self._last_ripped: Set[str] = set()
         self._freeze_pres_fac_until: int = 0
+
+        # Connectivity check cache (optimization to avoid redundant BFS checks)
+        self._connectivity_cache: Dict[Tuple[int, int, int], bool] = {}  # (src, dst, roi_hash) -> is_connected
+        self._connectivity_stats = {
+            'checks_performed': 0,
+            'cache_hits': 0,
+            'disconnected_found': 0,
+            'time_saved_ms': 0.0
+        }
 
         # Legacy attributes for compatibility
         self._instance_tag = f"PF-{int(time.time() * 1000) % 100000}"
@@ -2983,6 +3038,64 @@ class PathFinderRouter:
                     net_type = "SHORT" if manhattan_dist < 125 else "LONG"
                     logger.info(f"[GEOMETRIC-ROI] Net {net_id}: {net_type} ({manhattan_dist} steps, buffer={corridor_buffer}) → ROI ({len(roi_nodes):,} nodes)")
 
+
+                # CONNECTIVITY CHECK: Fast BFS to detect disconnected src-dst BEFORE expensive GPU routing
+                # Only check for iteration 2+ when using ROI extraction (iter 1 uses full graph so always connected)
+                if self.iteration > 1 and len(roi_nodes) > 0:
+                    conn_start = time.time()
+
+                    # Simple hash of ROI for caching (sample first 100 nodes to avoid expensive hashing)
+                    roi_sample = tuple(sorted(roi_nodes[:min(100, len(roi_nodes))].tolist() if hasattr(roi_nodes, 'tolist') else roi_nodes[:min(100, len(roi_nodes))]))
+                    cache_key = (src, dst, hash(roi_sample))
+
+                    # Check cache first
+                    if cache_key in self._connectivity_cache:
+                        is_connected = self._connectivity_cache[cache_key]
+                        self._connectivity_stats['cache_hits'] += 1
+                        logger.debug(f"[CONNECTIVITY] {net_id}: Cache hit (connected={is_connected})")
+                    else:
+                        # Perform BFS connectivity check
+                        is_connected = self.roi_extractor._check_roi_connectivity(src, dst, roi_nodes, shared_indptr, shared_indices)
+                        self._connectivity_cache[cache_key] = is_connected
+                        self._connectivity_stats['checks_performed'] += 1
+
+                        conn_time_ms = (time.time() - conn_start) * 1000
+
+                        if is_connected:
+                            logger.debug(f"[CONNECTIVITY] {net_id}: ✓ Connected in {conn_time_ms:.1f}ms")
+                        else:
+                            logger.warning(f"[CONNECTIVITY] {net_id}: ✗ Not connected in ROI ({len(roi_nodes):,} nodes), checked in {conn_time_ms:.1f}ms")
+                            self._connectivity_stats['disconnected_found'] += 1
+                            self._connectivity_stats['time_saved_ms'] += 50.0  # Estimated GPU time saved
+
+                    # If not connected, widen ROI and re-check
+                    if not is_connected:
+                        logger.warning(f"[CONNECTIVITY] {net_id}: Widening ROI due to disconnection")
+
+                        # Widen corridor buffer significantly
+                        wider_buffer = corridor_buffer * 2.0
+                        wider_layer_margin = layer_margin + 2
+
+                        # Re-extract with wider ROI
+                        roi_nodes, global_to_roi = self.roi_extractor.extract_roi_geometric(
+                            src, dst, corridor_buffer=wider_buffer, layer_margin=wider_layer_margin, portal_seeds=portal_seeds
+                        )
+
+                        # Re-check connectivity with wider ROI
+                        roi_sample_wide = tuple(sorted(roi_nodes[:min(100, len(roi_nodes))].tolist() if hasattr(roi_nodes, 'tolist') else roi_nodes[:min(100, len(roi_nodes))]))
+                        cache_key_wide = (src, dst, hash(roi_sample_wide))
+
+                        is_connected_wide = self.roi_extractor._check_roi_connectivity(src, dst, roi_nodes, shared_indptr, shared_indices)
+                        self._connectivity_cache[cache_key_wide] = is_connected_wide
+
+                        if is_connected_wide:
+                            logger.info(f"[CONNECTIVITY] {net_id}: ✓ Connected after widening to {len(roi_nodes):,} nodes")
+                        else:
+                            logger.error(f"[CONNECTIVITY] {net_id}: ✗ Still disconnected after widening, skipping GPU routing")
+                            # Skip this net - it cannot be routed in current ROI
+                            batch_metadata.append((net_id, False, None, None, None))
+                            continue
+
                 # ROI extraction complete (iteration-aware: full-graph for iter1, L-corridor for iter2+)
                 roi_extract_time += time.time() - roi_start
 
@@ -2990,16 +3103,6 @@ class PathFinderRouter:
                 csr_start = time.time()
                 roi_size = len(roi_nodes)
                 roi_sizes.append(roi_size)  # [FIX-5] Track for stats
-                roi_src = int(global_to_roi[src])
-                roi_dst = int(global_to_roi[dst])
-
-                if roi_src < 0 or roi_dst < 0:
-                    batch_metadata.append((net_id, False, None, None, None))
-                    continue
-
-                # [FIX-7] Keep full-graph CSR + bitmap (fast!) but ADD bitmap checking to kernels!
-                # The bitmap approach avoids expensive CPU CSR extraction
-                # Just need to make GPU kernels actually CHECK the bitmap before relaxing edges
 
                 # Use full-graph CSR (already on GPU, no extraction needed)
                 roi_indptr = shared_indptr
@@ -3314,6 +3417,17 @@ class PathFinderRouter:
                 logger.info(f"  GPU Memory: {used_gb:.2f}GB used / {total_gb:.2f}GB allocated")
         except Exception as e:
             logger.debug(f"Could not query GPU memory: {e}")
+
+        # Connectivity check statistics (iteration 2+ only)
+        if self.iteration > 1 and self._connectivity_stats['checks_performed'] > 0:
+            stats = self._connectivity_stats
+            logger.info(f"[CONNECTIVITY-STATS] Iteration {self.iteration}:")
+            logger.info(f"  Checks performed: {stats['checks_performed']}")
+            logger.info(f"  Cache hits: {stats['cache_hits']}")
+            logger.info(f"  Disconnected nets found: {stats['disconnected_found']}")
+            logger.info(f"  Estimated GPU time saved: {stats['time_saved_ms']:.0f}ms ({stats['time_saved_ms']/1000:.1f}s)")
+            if stats['disconnected_found'] > 0:
+                logger.info(f"  Avoided {stats['disconnected_found']} doomed GPU routing attempts!")
 
         return total_routed, total_failed
 

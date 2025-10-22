@@ -18,7 +18,12 @@ except ImportError:
     CUPY_AVAILABLE = False
 
 from types import SimpleNamespace
-from ....domain.models.board import Board, Pad
+
+# Prefer local light interfaces; fall back to monorepo types if available
+try:
+    from ....domain.models.board import Board as BoardLike, Pad
+except Exception:  # pragma: no cover - plugin environment
+    from ..types import BoardLike, Pad
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +41,7 @@ class RoiExtractorMixin:
     - nodes: dict of node data
     """
 
-    def _extract_roi_subgraph_cpu(self, min_x: float, max_x: float, min_y: float, max_y: float):
+    def _extract_roi_subgraph_cpu(self, min_x: float, max_x: float, min_y: float, max_y: float, current_net: str = ""):
         """CPU-based ROI (Region of Interest) extraction with complete subgraph construction.
 
         Extracts a subgraph containing all nodes and edges within the specified
@@ -48,33 +53,50 @@ class RoiExtractorMixin:
             max_x (float): Maximum X coordinate of ROI bounding box in mm
             min_y (float): Minimum Y coordinate of ROI bounding box in mm
             max_y (float): Maximum Y coordinate of ROI bounding box in mm
+            current_net (str, optional): Current net name for owner-aware keepout filtering. Defaults to ""
 
         Returns:
-            Tuple[List[int], Dict[int, int], Tuple[cp.ndarray, cp.ndarray, cp.ndarray]]:
+            Tuple[List[int], Dict[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]]:
                 - roi_nodes: List of global node indices within the ROI
                 - global_to_local: Mapping from global to local node indices
                 - (roi_indptr, roi_indices, roi_weights): CSR sparse matrix representation
-                  of the ROI subgraph on GPU for downstream processing
+                  of the ROI subgraph for downstream processing
 
         Note:
             - Performs spatial filtering using node coordinates
             - Constructs complete CSR representation preserving edge weights
-            - Returns GPU arrays for compatibility with pathfinding algorithms
+            - Returns NumPy arrays; caller can up-convert for GPU when needed
             - More reliable but slower than GPU-based extraction
             - Returns empty arrays if no nodes found within ROI bounds
+            - Applies owner-aware keepout filtering if enabled
         """
         logger.debug(f"[CPU-ROI] Extracting ROI bounds: ({min_x:.2f}, {min_y:.2f}) to ({max_x:.2f}, {max_y:.2f})")
 
         # Find nodes within ROI bounds using CPU operations
         roi_nodes = []
+        nodes_before_keepout = 0
         for node_idx, coords in enumerate(self.node_coordinates):
             x, y = coords[0], coords[1]
             if min_x <= x <= max_x and min_y <= y <= max_y:
+                nodes_before_keepout += 1
+
+                # Owner-aware keepout filtering
+                if bool(getattr(self.config, "enable_buried_via_keepouts", False)) and hasattr(self, "_via_keepouts_map"):
+                    x_idx, y_idx, z_idx = self.lattice.xyz_from_gid(node_idx)
+                    owner = self._via_keepouts_map.get((z_idx, x_idx, y_idx))
+                    if owner and owner != current_net:
+                        continue  # Skip this node - owned by another net's buried via
+
                 roi_nodes.append(node_idx)
 
         if len(roi_nodes) == 0:
             logger.debug(f"[CPU-ROI] No nodes found in ROI")
-            return [], {}, (cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32), cp.array([], dtype=cp.float32))
+            return [], {}, (np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.float32))
+
+        # Log keepout filtering results
+        removed = nodes_before_keepout - len(roi_nodes)
+        if removed > 0:
+            logger.info(f"[ROI-KEEPOUT] net={current_net} removed {removed} nodes due to buried via keepouts")
 
         logger.debug(f"[CPU-ROI] Found {len(roi_nodes)} nodes in ROI")
 
@@ -103,17 +125,17 @@ class RoiExtractorMixin:
 
             roi_row_ptr.append(roi_row_ptr[-1] + local_edges_count)
 
-        # Convert to CuPy arrays for compatibility with GPU code paths
-        roi_indices = cp.array(roi_edges, dtype=cp.int32) if roi_edges else cp.array([], dtype=cp.int32)
-        roi_indptr = cp.array(roi_row_ptr, dtype=cp.int32)
-        roi_data = cp.array(roi_weights, dtype=cp.float32) if roi_weights else cp.array([], dtype=cp.float32)
+        # Return NumPy arrays in CPU path; caller can up-convert when using GPU
+        roi_indices = np.array(roi_edges, dtype=np.int32) if roi_edges else np.array([], dtype=np.int32)
+        roi_indptr = np.array(roi_row_ptr, dtype=np.int32)
+        roi_data = np.array(roi_weights, dtype=np.float32) if roi_weights else np.array([], dtype=np.float32)
 
         logger.debug(f"[CPU-ROI] Extracted {len(roi_nodes)} nodes, {len(roi_edges)} edges")
 
         return roi_nodes, global_to_local, (roi_indptr, roi_indices, roi_data)
 
 
-    def _extract_roi_subgraph_gpu(self, min_x: float, max_x: float, min_y: float, max_y: float):
+    def _extract_roi_subgraph_gpu(self, min_x: float, max_x: float, min_y: float, max_y: float, current_net: str = ""):
         """GPU-accelerated ROI extraction using optimized spatial indexing.
 
         High-performance GPU-based extraction of ROI subgraphs using custom
@@ -125,6 +147,7 @@ class RoiExtractorMixin:
             max_x (float): Maximum X coordinate of ROI bounding box in mm
             min_y (float): Minimum Y coordinate of ROI bounding box in mm
             max_y (float): Maximum Y coordinate of ROI bounding box in mm
+            current_net (str, optional): Current net name for owner-aware keepout filtering. Defaults to ""
 
         Returns:
             Tuple[List[int], Dict[int, int], Tuple[cp.ndarray, cp.ndarray, cp.ndarray]]:
@@ -167,7 +190,7 @@ class RoiExtractorMixin:
         gpu_roi_disabled = DISABLE_GPU_ROI
         if gpu_roi_disabled:
             logger.debug(f"[GPU-ROI-DISABLED] Using CPU ROI extraction fallback")
-            return self._extract_roi_subgraph_cpu(min_x, max_x, min_y, max_y)
+            return self._extract_roi_subgraph_cpu(min_x, max_x, min_y, max_y, current_net)
 
         roi_node_mask = self._roi_workspace  # Pre-allocated workspace
         roi_node_mask.fill(False)  # Reset
@@ -261,7 +284,29 @@ class RoiExtractorMixin:
                 logger.error(f"[CUDA] extract_roi_nodes kernel error code={err} → forcing CPU fallback for this net")
                 # Return empty ROI so caller falls back cleanly
                 return [], {}, (cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32), cp.array([], dtype=cp.float32))
-        
+
+        # Owner-aware keepout filtering for GPU path
+        # Apply buried via keepouts by filtering the bitmap before extraction
+        removed = 0
+        if bool(getattr(self.config, "enable_buried_via_keepouts", False)) and hasattr(self, "_via_keepouts_map"):
+            # Get indices of all nodes in the bitmap
+            candidate_node_indices = cp.where(roi_node_mask)[0]
+
+            # Transfer to CPU for keepout map lookup (keepout map is on CPU)
+            candidate_nodes_cpu = candidate_node_indices.get()
+
+            # Filter nodes based on keepout ownership
+            for gid in candidate_nodes_cpu:
+                x_idx, y_idx, z_idx = self.lattice.xyz_from_gid(int(gid))
+                owner = self._via_keepouts_map.get((z_idx, x_idx, y_idx))
+                if owner and owner != current_net:
+                    # Clear this node from the bitmap
+                    roi_node_mask[gid] = False
+                    removed += 1
+
+        if removed > 0:
+            logger.info(f"[ROI-KEEPOUT] net={current_net} removed {removed} nodes (bitmap) due to buried via keepouts")
+
         # Count total nodes found (single GPU reduction)
         total_nodes_found = int(cp.sum(roi_node_mask))
         logger.debug(f"  ROI DEBUG: Found {total_nodes_found} nodes in bounding box ({min_x:.1f},{min_y:.1f}) to ({max_x:.1f},{max_y:.1f})")
@@ -427,7 +472,7 @@ class RoiExtractorMixin:
             return (cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32),
                     (cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.float32)))
 
-        roi_nodes_list, roi_node_map_dict, roi_adj_data = self._extract_roi_subgraph_gpu(min_x, max_x, min_y, max_y)
+        roi_nodes_list, roi_node_map_dict, roi_adj_data = self._extract_roi_subgraph_gpu(min_x, max_x, min_y, max_y, net_id)
 
         now = time.time()
         if now - last_hb > 1.0:
@@ -1538,6 +1583,16 @@ class RoiExtractorMixin:
             with self._roi_stream:
                 for i, (net_id, (source_idx, sink_idx)) in enumerate(batch):
                     logger.info(f"DEBUG: Pre-launching ROI extraction {i+1}/{len(batch)}: {net_id}")
+
+                    # Apply round-robin layer bias for first iterations (when symmetry matters most)
+                    # DISABLED AGAIN: Still hitting slow CPU fallback (7-8s per net)
+                    # TODO: Implement as kernel-side bias (expert suggestion A) for true speed
+                    if False and self.current_iteration <= 3:
+                        try:
+                            self._apply_roundrobin_layer_bias_fast(net_id, source_idx)
+                        except Exception as e:
+                            logger.warning(f"[ROUNDROBIN] Failed to apply bias for {net_id}: {e}")
+
                     # Launch async ROI extraction (will be ready when main stream needs it)
                     roi_data = self._extract_single_roi_data_async(net_id, source_idx, sink_idx)
                     roi_futures.append((net_id, roi_data))
@@ -1558,6 +1613,14 @@ class RoiExtractorMixin:
         if not roi_futures:
             for i, (net_id, (source_idx, sink_idx)) in enumerate(batch):
                 logger.info(f"DEBUG: Processing net {i+1}/{len(batch)}: {net_id}")
+
+                # Apply round-robin layer bias for first iterations (when symmetry matters most)
+                if self.current_iteration <= 3:
+                    try:
+                        self._apply_roundrobin_layer_bias(net_id, source_idx)
+                    except Exception as e:
+                        logger.warning(f"[ROUNDROBIN] Failed to apply bias for {net_id}: {e}")
+
                 roi_data = self._extract_single_roi_data(net_id, source_idx, sink_idx)
                 if roi_data:
                     roi_data_list.append(roi_data)
@@ -1660,18 +1723,35 @@ class RoiExtractorMixin:
                 
             source_coords = self.node_coordinates[source_idx]
             sink_coords = self.node_coordinates[sink_idx]
-            
+
             # Progressive margin expansion strategy for failed extractions
             margin_attempts = [5.0, 10.0, 20.0, 40.0, 80.0]  # Increased max margin for debugging
             base_margin = getattr(self, '_roi_margin', margin_attempts[0])
-            
+
             roi_nodes, roi_node_map, roi_adj_data = None, None, None
-            
+
             for attempt, margin in enumerate(margin_attempts):
                 min_x = min(source_coords[0], sink_coords[0]) - margin
-                max_x = max(source_coords[0], sink_coords[0]) + margin  
+                max_x = max(source_coords[0], sink_coords[0]) + margin
                 min_y = min(source_coords[1], sink_coords[1]) - margin
                 max_y = max(source_coords[1], sink_coords[1]) + margin
+
+                # FIX #7: Adaptive corridor widening on stalemates
+                # Check if this net has repeated failures and widen X-corridor if needed
+                if hasattr(self, 'net_fail_streak') and hasattr(self.config, 'corridor_widen_fail_threshold'):
+                    fail_streak = self.net_fail_streak.get(net_id, 0)
+                    if fail_streak >= self.config.corridor_widen_fail_threshold:
+                        # Calculate widening in mm based on grid pitch
+                        widen_cols = getattr(self.config, 'corridor_widen_delta_cols', 2)
+                        widen_mm = widen_cols * self.config.grid_pitch
+
+                        # Apply widening to X-corridor (lateral expansion)
+                        old_x_min, old_x_max = min_x, max_x
+                        min_x = min_x - widen_mm
+                        max_x = max_x + widen_mm
+
+                        # Log corridor widening event
+                        logger.info(f"[ROI-WIDEN] {net_id} -> X-corridor widened from [{old_x_min:.2f}, {old_x_max:.2f}] to [{min_x:.2f}, {max_x:.2f}] after {fail_streak} failures (+{widen_cols} cols = {widen_mm:.2f}mm)")
                 
                 # Ensure minimum ROI size (at least 2*margin in each dimension)
                 if (max_x - min_x) < 2 * margin:
@@ -1689,9 +1769,9 @@ class RoiExtractorMixin:
                     logger.error(f"Net {net_id}: source_idx={source_idx} or sink_idx={sink_idx} >= node_count={node_count}")
                     return None
                 
-                # Extract ROI subgraph using optimized GPU spatial index  
+                # Extract ROI subgraph using optimized GPU spatial index
                 try:
-                    roi_nodes, roi_node_map, roi_adj_data = self._extract_roi_subgraph_gpu(min_x, max_x, min_y, max_y)
+                    roi_nodes, roi_node_map, roi_adj_data = self._extract_roi_subgraph_gpu(min_x, max_x, min_y, max_y, net_id)
                 except Exception as e:
                     logger.error(f"Net {net_id}: ROI extraction failed with error: {str(e)}")
                     import traceback
@@ -2720,10 +2800,10 @@ class RoiExtractorMixin:
         # Get source/sink coordinates
         src_x, src_y, src_layer = coords_cpu[source_idx][:3]
         sink_x, sink_y, sink_layer = coords_cpu[sink_idx][:3]
-        
+
         # Calculate adaptive margin based on airwire length
         adaptive_margin = self._calculate_adaptive_roi_margin(source_idx, sink_idx, margin_mm)
-        
+
         # Calculate net bounding box with adaptive margin
         min_x = min(src_x, sink_x) - adaptive_margin
         max_x = max(src_x, sink_x) + adaptive_margin
@@ -2731,6 +2811,12 @@ class RoiExtractorMixin:
         max_y = max(src_y, sink_y) + adaptive_margin
         min_layer = min(src_layer, sink_layer)
         max_layer = max(src_layer, sink_layer)
+
+        # FIX #7: Adaptive corridor widening on stalemates (legacy method)
+        # This method appears to be a legacy fallback; also apply widening here for consistency
+        # Note: source_idx is an int, but we need a net_id string for lookup
+        # This method doesn't receive net_id, so widening won't apply here automatically
+        # The main widening happens in the primary ROI extraction path above
         
         # Find all nodes within ROI
         roi_nodes = set()
@@ -2770,7 +2856,179 @@ class RoiExtractorMixin:
             spatial_shape = self.spatial_indptr.shape if hasattr(self.spatial_indptr, 'shape') else len(self.spatial_indptr)
             logger.info(f"ROI DEBUG: spatial_indptr_shape={spatial_shape}")
         logger.info(f"ROI subgraph: {len(roi_nodes)} nodes within {margin_mm}mm margin")
-        
+
         return roi_nodes
-    
+
+    def _widen_roi_adaptive(self, src: int, dst: int, current_roi_nodes: np.ndarray,
+                            level: int = 1, portal_seeds=None) -> Tuple[np.ndarray, np.ndarray, dict]:
+        """Adaptive ROI widening ladder with connectivity guarantees.
+
+        Implements a progressive widening strategy to handle disconnected ROIs:
+        Level 0: Narrow L-corridor (current/initial)
+        Level 1: Wider L-corridor (2x margin)
+        Level 2: Generous bbox (4x margin)
+        Level 3: Full graph (last resort)
+
+        Args:
+            src: Source node global index
+            dst: Destination node global index
+            current_roi_nodes: Current ROI nodes that failed
+            level: Widening level (0-3)
+            portal_seeds: Optional portal seed nodes for ROI expansion
+
+        Returns:
+            Tuple of (roi_nodes, global_to_roi, metadata_dict)
+
+        Note:
+            - Level 0 returns current_roi_nodes unchanged (already tried)
+            - Levels 1-2 use geometric extraction with increased margins
+            - Level 3 uses full graph as last resort
+            - Each level guarantees connectivity before use
+        """
+        if level == 0:
+            # Current narrow corridor (already tried)
+            logger.debug(f"[ROI-WIDEN] Level 0: Using current ROI ({len(current_roi_nodes)} nodes)")
+            # Need to build global_to_roi mapping
+            global_to_roi = np.full(self.N, -1, dtype=np.int32)
+            for i, node in enumerate(current_roi_nodes):
+                global_to_roi[node] = i
+            return current_roi_nodes, global_to_roi, {'level': 0}
+
+        elif level == 1:
+            # Wider L-corridor: double the margin
+            margin_factor = getattr(self.config, 'roi_widen_factor', 2.0)
+            base_margin = getattr(self.config, 'BASE_ROI_MARGIN_MM', 4.0)
+
+            # Calculate corridor buffer based on manhattan distance
+            src_x, src_y, src_z = self.lattice.idx_to_coord(src)
+            dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
+            manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
+
+            if manhattan_dist < 125:
+                corridor_buffer = int(80 * margin_factor)  # 2x margin for short nets
+                layer_margin = 6
+            else:
+                corridor_buffer = int(min(150, int(manhattan_dist * 0.5) + 60) * margin_factor)
+                layer_margin = 8
+
+            logger.info(f"[ROI-WIDEN] Level 1: Wider L-corridor (buffer={corridor_buffer}, layer_margin={layer_margin})")
+
+            # Extract wider ROI using geometric extraction
+            roi_nodes, global_to_roi = self.roi_extractor.extract_roi_geometric(
+                src, dst, corridor_buffer=corridor_buffer, layer_margin=layer_margin,
+                portal_seeds=portal_seeds
+            )
+
+            logger.info(f"[ROI-WIDEN] Level 1: Extracted {len(roi_nodes):,} nodes (vs {len(current_roi_nodes):,} in level 0)")
+            return roi_nodes, global_to_roi, {'level': 1, 'buffer': corridor_buffer}
+
+        elif level == 2:
+            # Generous bbox with 4x margin
+            margin_factor = getattr(self.config, 'roi_widen_factor', 2.0) ** 2  # 4x for level 2
+
+            src_x, src_y, src_z = self.lattice.idx_to_coord(src)
+            dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst)
+            manhattan_dist = abs(dst_x - src_x) + abs(dst_y - src_y)
+
+            if manhattan_dist < 125:
+                corridor_buffer = int(80 * margin_factor)
+                layer_margin = 8
+            else:
+                corridor_buffer = int(min(200, int(manhattan_dist * 0.75) + 80) * margin_factor)
+                layer_margin = 10
+
+            logger.info(f"[ROI-WIDEN] Level 2: Generous bbox (buffer={corridor_buffer}, layer_margin={layer_margin})")
+
+            roi_nodes, global_to_roi = self.roi_extractor.extract_roi_geometric(
+                src, dst, corridor_buffer=corridor_buffer, layer_margin=layer_margin,
+                portal_seeds=portal_seeds
+            )
+
+            logger.info(f"[ROI-WIDEN] Level 2: Extracted {len(roi_nodes):,} nodes")
+            return roi_nodes, global_to_roi, {'level': 2, 'buffer': corridor_buffer}
+
+        else:  # level >= 3
+            # Full graph (last resort)
+            full_nodes = np.arange(self.N, dtype=np.int32)
+            global_to_roi = np.arange(self.N, dtype=np.int32)  # Identity mapping
+            logger.info(f"[ROI-WIDEN] Level 3: Full graph ({len(full_nodes):,} nodes)")
+            return full_nodes, global_to_roi, {'level': 3}
+
+    def _check_roi_connectivity(self, src: int, dst: int, roi_nodes: np.ndarray,
+                                roi_indptr: np.ndarray, roi_indices: np.ndarray) -> bool:
+        """Fast BFS to check if src can reach dst in ROI.
+
+        This is a critical optimization that prevents wasting GPU cycles on nets
+        where src and dst are in different connected components. A quick CPU BFS
+        (~1ms) can save 50-100ms of failed GPU routing.
+
+        Args:
+            src: Source node index (global)
+            dst: Destination node index (global)
+            roi_nodes: Array or set of node indices in the ROI
+            roi_indptr: CSR indptr array (global graph)
+            roi_indices: CSR indices array (global graph)
+
+        Returns:
+            True if dst is reachable from src within the ROI, False otherwise
+
+        Note:
+            - Takes ~1ms for typical ROI (much faster than GPU routing a doomed net)
+            - Uses global CSR graph but only explores nodes in roi_nodes
+            - Returns False if src or dst not in ROI
+        """
+        from collections import deque
+
+        # Convert to set for O(1) lookup if needed
+        if isinstance(roi_nodes, np.ndarray):
+            roi_set = set(roi_nodes.tolist() if hasattr(roi_nodes, 'tolist') else roi_nodes)
+        elif isinstance(roi_nodes, set):
+            roi_set = roi_nodes
+        else:
+            # Handle CuPy arrays
+            if hasattr(roi_nodes, 'get'):
+                roi_set = set(roi_nodes.get().tolist())
+            else:
+                roi_set = set(roi_nodes)
+
+        if src not in roi_set or dst not in roi_set:
+            logger.debug(f"[CONNECTIVITY] src={src} or dst={dst} not in ROI")
+            return False
+
+        # Convert CSR arrays to numpy if needed (CuPy -> NumPy)
+        if hasattr(roi_indptr, 'get'):
+            roi_indptr = roi_indptr.get()
+        if hasattr(roi_indices, 'get'):
+            roi_indices = roi_indices.get()
+
+        # BFS from src to dst
+        visited = {src}
+        queue = deque([src])
+        nodes_explored = 0
+
+        while queue:
+            u = queue.popleft()
+            nodes_explored += 1
+
+            if u == dst:
+                logger.debug(f"[CONNECTIVITY] ✓ Connected: explored {nodes_explored} nodes")
+                return True
+
+            # Early termination if we've explored too many nodes (probable disconnected)
+            if nodes_explored > len(roi_set) * 0.5:
+                break
+
+            # Explore neighbors using global CSR graph
+            start_idx = int(roi_indptr[u])
+            end_idx = int(roi_indptr[u + 1])
+
+            for ei in range(start_idx, end_idx):
+                v = int(roi_indices[ei])
+                if v in roi_set and v not in visited:
+                    visited.add(v)
+                    queue.append(v)
+
+        logger.debug(f"[CONNECTIVITY] ✗ Not connected: explored {nodes_explored}/{len(roi_set)} nodes")
+        return False  # dst not reachable from src
+
 

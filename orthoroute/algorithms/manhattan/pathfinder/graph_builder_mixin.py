@@ -18,7 +18,12 @@ except ImportError:
     CUPY_AVAILABLE = False
 
 from types import SimpleNamespace
-from ....domain.models.board import Board, Pad
+
+# Prefer local light interfaces; fall back to monorepo types if available
+try:
+    from ....domain.models.board import Board as BoardLike, Pad
+except Exception:  # pragma: no cover - plugin environment
+    from ..types import BoardLike, Pad
 
 logger = logging.getLogger(__name__)
 
@@ -444,5 +449,34 @@ class GraphBuilderMixin:
 
         # Keep CSR lookup in sync to prevent index space mismatches
         self._build_edge_lookup_from_csr()
+
+
+    def _disable_incident_track_edges(self, z: int, x: int, y: int, keepout_weight: float) -> int:
+        """
+        For the grid node (x,y,z), set an effectively infinite weight on any
+        incident H/V track edges so no trace may pass that point.
+        """
+        disabled = 0
+        u = self.lattice.node_idx(x, y, z)
+        # gather neighbor nodes in H/V directions (respect lattice bounds)
+        nbrs = []
+        for dx, dy in ((+1, 0), (-1, 0), (0, +1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            if self.lattice.in_bounds(nx, ny):
+                nbrs.append(self.lattice.node_idx(nx, ny, z))
+        for v in nbrs:
+            # edge_lookup stores both (u,v) and (v,u)
+            idx = self.edge_lookup.get((u, v))
+            if idx is None:
+                continue
+            # Identify track edges by layer discipline (same z) — only block tracks
+            # (via edges are z1!=z2 and not touched here)
+            self.graph_state["weights_cpu"][idx] = keepout_weight
+            # also block reverse edge to maintain symmetry
+            r_idx = self.edge_lookup.get((v, u))
+            if r_idx is not None:
+                self.graph_state["weights_cpu"][r_idx] = keepout_weight
+            disabled += 1 + (1 if r_idx is not None else 0)
+        return disabled
 
 

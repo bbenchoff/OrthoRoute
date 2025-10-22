@@ -18,7 +18,12 @@ except ImportError:
     CUPY_AVAILABLE = False
 
 from types import SimpleNamespace
-from ....domain.models.board import Board, Pad
+
+# Prefer local light interfaces; fall back to monorepo types if available
+try:
+    from ....domain.models.board import Board as BoardLike, Pad
+except Exception:  # pragma: no cover - plugin environment
+    from ..types import BoardLike, Pad
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +107,9 @@ class DiagnosticsMixin:
                 logger.info(f"  ... and {pair_count-5} more transitions")
 
         # Via cost and caps
-        VIA_COST_LOCAL = VIA_COST
-        VIA_CAP = VIA_CAPACITY_PER_NET
-        logger.info(f"Via configuration: cost={VIA_COST}, cap_per_net={VIA_CAP}")
+        VIA_COST_LOCAL = float(getattr(self.config, "via_cost", 0.0))
+        VIA_CAP = int(getattr(self.config, "via_capacity_per_net", 0))
+        logger.info(f"Via configuration: cost={VIA_COST_LOCAL}, cap_per_net={VIA_CAP}")
 
         # Grid and bounds
         logger.info(f"Grid pitch: {self.config.grid_pitch}mm")

@@ -18,7 +18,12 @@ except ImportError:
     CUPY_AVAILABLE = False
 
 from types import SimpleNamespace
-from ....domain.models.board import Board, Pad
+
+# Prefer local light interfaces; fall back to monorepo types if available
+try:
+    from ....domain.models.board import Board as BoardLike, Pad, Bounds
+except Exception:  # pragma: no cover - plugin environment
+    from ..types import BoardLike, Pad, Bounds
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +41,7 @@ class LatticeBuilderMixin:
     - nodes: dict of node data
     """
 
-    def build_routing_lattice(self, board: Board) -> bool:
+    def build_routing_lattice(self, board: BoardLike) -> bool:
         """
         OPTIMIZED lattice building with spatial indexing
         Replaces both FastLatticeBuilder and LatticeBuilder
@@ -47,9 +52,8 @@ class LatticeBuilderMixin:
         # 1. Fast bounds calculation
         bounds_tuple = self._calculate_bounds_fast(board)
         min_x, min_y, max_x, max_y = bounds_tuple
-        
+
         # Create proper Bounds object for spatial indexing
-        from ...domain.models.board import Bounds
         self._board_bounds = Bounds(min_x, min_y, max_x, max_y)
         
         logger.info(f"Board bounds: ({min_x}, {min_y}, {max_x}, {max_y})")
@@ -158,7 +162,7 @@ class LatticeBuilderMixin:
         return ok
     
 
-    def _calculate_bounds_fast(self, board: Board) -> Tuple[float, float, float, float]:
+    def _calculate_bounds_fast(self, board: BoardLike) -> Tuple[float, float, float, float]:
         """Fast bounds calculation with airwire-constrained routing area"""
 
         # ENHANCEMENT: Calculate airwire bounding box + margin for efficient routing
@@ -317,10 +321,10 @@ class LatticeBuilderMixin:
                                         (to_idx, from_idx, escape_cost * self.geometry.pitch)])
 
         # Create inter-layer via connections with configurable cost and legal transitions
-        VIA_COST_LOCAL = VIA_COST  # Via cost penalty
-        VIA_CAP_PER_NET = VIA_CAPACITY_PER_NET
+        VIA_COST_LOCAL = float(getattr(self.config, "via_cost", 0.0))
+        VIA_CAP_PER_NET = int(getattr(self.config, "via_capacity_per_net", 0))
 
-        logger.info(f"Via configuration: cost={VIA_COST}, cap_per_net={VIA_CAP_PER_NET}")
+        logger.info(f"Via configuration: cost={VIA_COST_LOCAL}, cap_per_net={VIA_CAP_PER_NET}")
 
         # Build legal layer transitions from KiCad stackup rules
         self.allowed_layer_pairs = self._derive_allowed_layer_pairs(layers)
@@ -342,7 +346,7 @@ class LatticeBuilderMixin:
                 for from_layer, to_layer in self.allowed_layer_pairs:
                     from_idx = self.geometry.node_index(x_idx, y_idx, from_layer)
                     to_idx = self.geometry.node_index(x_idx, y_idx, to_layer)
-                    edges.extend([(from_idx, to_idx, VIA_COST), (to_idx, from_idx, VIA_COST)])
+                    edges.extend([(from_idx, to_idx, VIA_COST_LOCAL), (to_idx, from_idx, VIA_COST_LOCAL)])
                     via_edges_created += 2
 
         logger.info(f"Created {via_edges_created:,} via edges (bidirectional) for legal transitions")
@@ -353,6 +357,47 @@ class LatticeBuilderMixin:
 
         # Verify lattice correctness using geometry system
         self._verify_lattice_correctness_geometry()
+
+
+    def _legal_via_pairs(self, z_count: int) -> List[Tuple[int, int]]:
+        """
+        Returns legal (z1,z2) pairs for via edges.
+        If config.allow_any_layer_via is True, allow any pair (z1 != z2).
+        Otherwise, fall back to adjacent-only short hops.
+        """
+        if bool(getattr(self.config, "allow_any_layer_via", False)):
+            pairs = []
+            for z1 in range(1, z_count + 1):
+                for z2 in range(1, z_count + 1):
+                    if z1 != z2:
+                        lo, hi = (z1, z2) if z1 < z2 else (z2, z1)
+                        pairs.append((lo, hi))
+            return sorted(set(pairs))
+        # fallback: adjacent layers only
+        pairs: List[Tuple[int, int]] = []
+        for z1 in range(1, z_count + 1):
+            for z2 in (z1 - 1, z1 + 1):
+                if 1 <= z2 <= z_count:
+                    pairs.append((min(z1, z2), max(z1, z2)))
+        return sorted(set(pairs))
+
+
+    def _derive_allowed_layer_pairs(self, layers: int) -> List[Tuple[int, int]]:
+        """
+        Derive allowed layer pairs for via transitions.
+        Uses _legal_via_pairs to determine which layer transitions are allowed.
+        """
+        # Get legal via pairs (0-indexed for internal use)
+        raw_pairs = self._legal_via_pairs(layers)
+
+        # Convert from 1-indexed to 0-indexed if needed
+        # Check if pairs are already 0-indexed by looking at the values
+        if raw_pairs and all(pair[0] >= 1 and pair[1] >= 1 for pair in raw_pairs):
+            # Pairs are 1-indexed, convert to 0-indexed
+            return [(z1 - 1, z2 - 1) for z1, z2 in raw_pairs]
+        else:
+            # Pairs are already 0-indexed
+            return raw_pairs
 
 
     def _verify_lattice_correctness_geometry(self):

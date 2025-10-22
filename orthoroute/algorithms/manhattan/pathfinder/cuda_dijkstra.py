@@ -1055,6 +1055,18 @@ class CUDADijkstra:
             atomicAnd(&words[idx >> 5], ~(1u << (idx & 31)));
         }
 
+        // Atomic min for 64-bit unsigned integers (cycle-proof relaxation)
+        __device__ __forceinline__
+        unsigned long long atomicMin64(unsigned long long* address, unsigned long long val) {
+            unsigned long long old = *address;
+            unsigned long long assumed;
+            do {
+                assumed = old;
+                old = atomicCAS(address, assumed, (val < assumed) ? val : assumed);
+            } while (assumed != old);
+            return old;
+        }
+
         // Phase 4: ROI bounding box check for persistent kernel
         __device__ __forceinline__
         bool in_roi_persistent(int nx, int ny, int nz, int roi_idx,
@@ -1072,73 +1084,85 @@ class CUDADijkstra:
             const int* parent_val, const unsigned short* parent_stamp, unsigned short gen,
             int* stage_path, int* stage_count, int max_path_len,
             // Add lattice dimensions for coordinate decoding
-            int Nx, int Ny, int Nz
+            int Nx, int Ny, int Nz,
+            // NEW: Add best_key for atomic parent extraction and dist_val for monotonicity check
+            const unsigned long long* best_key, const float* dist_val, int roi_idx, int stride
         ) {
             int path_len = 0;
             int curr = dst;
 
             // Walk backwards from dst to src
             while (curr != src && curr != -1 && path_len < max_path_len) {
-                if (parent_stamp[curr] == gen) {
-                    int parent_node = parent_val[curr];
+                // Decode parent from lower 32 bits of atomic key (NEW: cycle-proof method)
+                const unsigned long long curr_key = best_key[roi_idx * stride + curr];
+                int parent_node = (int)(curr_key & 0xFFFFFFFFu);
 
-                    // MANHATTAN VALIDATION: Check parent->child adjacency
-                    if (parent_node != -1 && parent_node != src) {
-                        // Decode current node coordinates
-                        const int plane_size = Nx * Ny;
-                        const int z_curr = curr / plane_size;
-                        const int remainder_curr = curr - (z_curr * plane_size);
-                        const int y_curr = remainder_curr / Nx;
-                        const int x_curr = remainder_curr - (y_curr * Nx);
+                // MONOTONICITY CHECK: Verify distance decreases (catches cycles and race conditions)
+                if (parent_node != -1 && parent_node != src) {
+                    const float curr_dist = dist_val[curr];
+                    const float parent_dist = dist_val[parent_node];
 
-                        // Decode parent node coordinates
-                        const int z_par = parent_node / plane_size;
-                        const int remainder_par = parent_node - (z_par * plane_size);
-                        const int y_par = remainder_par / Nx;
-                        const int x_par = remainder_par - (y_par * Nx);
+                    if (!(parent_dist < curr_dist)) {
+                        // Distance not decreasing - cycle or race condition detected!
+                        atomicExch(stage_count, -4);  // Error code: non-monotonic path
+                        return;
+                    }
+                }
 
-                        // Check adjacency
-                        const int dx = abs(x_curr - x_par);
-                        const int dy = abs(y_curr - y_par);
-                        const int dz = abs(z_curr - z_par);
+                // MANHATTAN VALIDATION: Check parent->child adjacency
+                if (parent_node != -1 && parent_node != src) {
+                    // Decode current node coordinates
+                    const int plane_size = Nx * Ny;
+                    const int z_curr = curr / plane_size;
+                    const int remainder_curr = curr - (z_curr * plane_size);
+                    const int y_curr = remainder_curr / Nx;
+                    const int x_curr = remainder_curr - (y_curr * Nx);
 
-                        // Validate Manhattan legality
-                        if (dz != 0) {
-                            // Via jump - must have same X,Y
-                            if (dx != 0 || dy != 0) {
-                                // Non-adjacent via - corrupt parent!
-                                atomicExch(stage_count, -2);  // Error code: invalid parent
-                                return;
-                            }
-                        } else if ((dx + dy) != 1) {
-                            // Same layer - must be adjacent
+                    // Decode parent node coordinates
+                    const int z_par = parent_node / plane_size;
+                    const int remainder_par = parent_node - (z_par * plane_size);
+                    const int y_par = remainder_par / Nx;
+                    const int x_par = remainder_par - (y_par * Nx);
+
+                    // Check adjacency
+                    const int dx = abs(x_curr - x_par);
+                    const int dy = abs(y_curr - y_par);
+                    const int dz = abs(z_curr - z_par);
+
+                    // Validate Manhattan legality
+                    if (dz != 0) {
+                        // Via jump - must have same X,Y
+                        if (dx != 0 || dy != 0) {
+                            // Non-adjacent via - corrupt parent!
                             atomicExch(stage_count, -2);  // Error code: invalid parent
                             return;
-                        } else {
-                            // Check layer direction discipline
-                            const bool is_h_layer = (z_curr % 2) == 1;  // Odd layers = horizontal
-                            if (is_h_layer && dy != 0) {
-                                // H-layer violation
-                                atomicExch(stage_count, -2);  // Error code: invalid parent
-                                return;
-                            } else if (!is_h_layer && dx != 0) {
-                                // V-layer violation
-                                atomicExch(stage_count, -2);  // Error code: invalid parent
-                                return;
-                            }
+                        }
+                    } else if ((dx + dy) != 1) {
+                        // Same layer - must be adjacent
+                        atomicExch(stage_count, -2);  // Error code: invalid parent
+                        return;
+                    } else {
+                        // Check layer direction discipline
+                        const bool is_h_layer = (z_curr % 2) == 1;  // Odd layers = horizontal
+                        if (is_h_layer && dy != 0) {
+                            // H-layer violation
+                            atomicExch(stage_count, -2);  // Error code: invalid parent
+                            return;
+                        } else if (!is_h_layer && dx != 0) {
+                            // V-layer violation
+                            atomicExch(stage_count, -2);  // Error code: invalid parent
+                            return;
                         }
                     }
-
-                    // Store (net_id, node) packed into 32 bits
-                    int pos = atomicAdd(stage_count, 1);
-                    if (pos < max_path_len * 512) {  // Safety limit
-                        stage_path[pos] = (net_id << 24) | curr;  // 8-bit net ID + 24-bit node
-                    }
-                    curr = parent_node;
-                    path_len++;
-                } else {
-                    break;  // Invalid stamp - path broken
                 }
+
+                // Store (net_id, node) packed into 32 bits
+                int pos = atomicAdd(stage_count, 1);
+                if (pos < max_path_len * 512) {  // Safety limit
+                    stage_path[pos] = (net_id << 24) | curr;  // 8-bit net ID + 24-bit node
+                }
+                curr = parent_node;
+                path_len++;
             }
         }
 
@@ -1191,7 +1215,16 @@ class CUDADijkstra:
             // ROI bitmaps for neighbor validation
             const unsigned int* roi_bitmap, // (K, bitmap_words) per ROI - neighbor must be in bitmap!
             const int bitmap_words,         // Words per ROI bitmap
-            const int use_bitmap            // 1 = enforce bitmap, 0 = bbox-only (iteration 1 mode)
+            const int use_bitmap,           // 1 = enforce bitmap, 0 = bbox-only (iteration 1 mode)
+            // NEW: Round-robin layer bias parameters (Fix #5)
+            const int* pref_layer,          // (K,) preferred even layer per ROI
+            const int* src_x_coord,         // (K,) source x-coordinate per ROI
+            const int window_cols,          // Bias window size (columns, ~8mm)
+            const float rr_alpha,           // Bias strength (0.0 = disabled, 0.12 typical)
+            // NEW: Jitter parameters (Fix #8)
+            const float jitter_eps,         // Jitter magnitude (0.001 typical, 0.0 = disabled)
+            // NEW: Atomic key for cycle-proof relaxation
+            unsigned long long* best_key    // (K * dist_val_stride) 64-bit atomic keys
         ) {
             // Thread ID and total threads
             const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1206,6 +1239,13 @@ class CUDADijkstra:
             // Shared memory for block-level coordination
             __shared__ int local_queue_size;
             __shared__ int local_output_reset;
+
+            // Kernel version banner (print once at start)
+            if (tid == 0 && iteration == 0) {
+                printf("[KERNEL-VERSION] v3.0 with RR+jitter+atomic-parent+stride-fix\\n");
+                if (rr_alpha > 0.0f) printf("[KERNEL-RR] ACTIVE alpha=%.3f window=%d\\n", rr_alpha, window_cols);
+                if (jitter_eps > 0.0f) printf("[KERNEL-JITTER] ACTIVE eps=%.6f\\n", jitter_eps);
+            }
 
             while (iteration < MAX_ITERATIONS) {
                 // Select queues based on ping-pong flag
@@ -1283,7 +1323,8 @@ class CUDADijkstra:
                             roi_idx, src, dst,
                             parent_val, parent_stamp, generation,
                             stage_path, stage_count, 1000,
-                            Nx, Ny, Nz  // Add lattice dimensions for validation
+                            Nx, Ny, Nz,  // Add lattice dimensions for validation
+                            best_key, dist_val, roi_idx, dist_val_stride  // NEW: Pass atomic key for parent extraction
                         );
                         continue;
                     }
@@ -1307,8 +1348,43 @@ class CUDADijkstra:
                             if (nbr_in_bitmap == 0) continue;  // Neighbor not in ROI bitmap
                         }
 
-                        const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
-                        const float g_new = node_dist + edge_cost;
+                        float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
+
+                        // === ROUND-ROBIN LAYER BIAS (Fix #5) ===
+                        // Apply bias only if rr_alpha > 0 (early iterations 1-3)
+                        if (rr_alpha > 0.0f) {
+                            // Decode coordinates for bias calculation
+                            const int plane_size = Nx * Ny;
+                            const int z_node = node / plane_size;
+                            const int x_node = (node % plane_size) % Nx;
+                            const int z_neighbor = neighbor / plane_size;
+                            const bool is_vertical = (z_neighbor != z_node);
+
+                            // Only bias vertical edges on even (routing) layers within window
+                            if (is_vertical && (z_node & 1) == 0) {
+                                int dx = x_node - src_x_coord[roi_idx];
+                                if (dx < 0) dx = -dx;
+
+                                if (dx <= window_cols) {
+                                    const int pref_z = pref_layer[roi_idx];
+                                    const float m = (z_node == pref_z) ? (1.0f - rr_alpha) : (1.0f + rr_alpha);
+                                    edge_cost *= m;
+                                }
+                            }
+                        }
+
+                        // Add deterministic jitter based on edge topology (Fix #8)
+                        float jitter = 0.0f;
+                        if (jitter_eps > 0.0f) {
+                            // Unique per-edge jitter: hash(node, neighbor, roi_idx)
+                            unsigned int hash = (unsigned int)node * 73856093u
+                                              ^ (unsigned int)neighbor * 19349663u
+                                              ^ (unsigned int)roi_idx * 83492791u;
+                            // Map to [-1, 1]
+                            float normalized = (float)(hash & 0x7FFFFFu) / (float)0x7FFFFFu * 2.0f - 1.0f;
+                            jitter = jitter_eps * normalized;
+                        }
+                        const float g_new = node_dist + edge_cost + jitter;
 
                         // Decode neighbor coordinates (needed for both ROI and A*)
                         // Only decode if we have valid lattice dimensions
@@ -1348,30 +1424,33 @@ class CUDADijkstra:
                             f_new = g_new + h;
                         }
 
-                        // Get current distance using stamps
-                        float old_dist = dist_get(
-                            dist_val,
-                            dist_stamp,
-                            generation,
-                            neighbor
-                        );
+                        // === ATOMIC 64-BIT KEY RELAXATION (Cycle-Proof) ===
+                        // Build 64-bit key = (cost_scaled << 32) | parent_id
+                        // Upper 32 bits: scaled integer distance (includes jitter!)
+                        // Lower 32 bits: parent node ID
+                        // This ensures atomic update of both dist and parent, preventing race conditions
+                        const float SCALE = 1e6f;  // Preserves 1e-3 jitter precision
+                        const unsigned int cost_scaled = __float2uint_rn(g_new * SCALE);
+                        const unsigned long long new_key =
+                            ((unsigned long long)cost_scaled << 32) | (unsigned int)node;
 
-                        // If improved, update distance and parent using stamps
-                        if (g_new + 1e-8f < old_dist) {
-                            // Atomic update for distance (using slice-local index)
-                            const float atomic_old = atomicMinFloat(&dist_val[neighbor], g_new);
+                        // Atomic winner-takes-all on the 64-bit key
+                        unsigned long long* key_ptr = &best_key[roi_idx * dist_val_stride + neighbor];
+                        const unsigned long long old_key = atomicMin64(key_ptr, new_key);
 
-                            // Update stamp and parent if we won the race
-                            if (g_new + 1e-8f < atomic_old) {
-                                dist_stamp[neighbor] = generation;
-                                parent_set(parent_val, parent_stamp, generation, neighbor, node);
+                        // Only the winning thread updates dist/stamps and enqueues
+                        // Parent is already in best_key, don't write separately!
+                        if (new_key < old_key) {
+                            // We won! Update distance and stamp (parent is in key)
+                            dist_val[neighbor] = g_new;
+                            dist_stamp[neighbor] = generation;
+                            // NOTE: parent_val/parent_stamp NO LONGER WRITTEN - parent is in best_key!
 
-                                // Add to output queue using atomic counter
-                                int queue_pos = atomicAdd(sz_out, 1);
-                                if (queue_pos < max_queue_size) {
-                                    // Pack (roi, node) into 32 bits: 8-bit ROI + 24-bit node
-                                    q_out[queue_pos] = (roi_idx << 24) | neighbor;
-                                }
+                            // Add to output queue using atomic counter
+                            int queue_pos = atomicAdd(sz_out, 1);
+                            if (queue_pos < max_queue_size) {
+                                // Pack (roi, node) into 32 bits: 8-bit ROI + 24-bit node
+                                q_out[queue_pos] = (roi_idx << 24) | neighbor;
                             }
                         }
                     }
@@ -3248,6 +3327,66 @@ class CUDADijkstra:
             logger.error("[PERSISTENT-KERNEL] Falling back to iterative kernel")
             return -1
 
+    def _prepare_roundrobin_params(self, roi_batch: List[Tuple], data: dict, current_iteration: int) -> Tuple:
+        """Prepare round-robin bias + jitter parameters for GPU kernel.
+
+        Computes preferred layer and source x-coordinate for each ROI in the batch.
+        Returns tiny device arrays and scalars for kernel.
+        """
+        import numpy as np
+
+        K = len(roi_batch)
+        Nx = data['Nx']
+        Ny = data['Ny']
+        plane_size = Nx * Ny
+
+        # Get layer count
+        layer_count = self.lattice.layers if self.lattice else 18
+        even_layers = [z for z in range(layer_count) if (z & 1) == 0]
+
+        pref_layers = []
+        src_x_coords = []
+
+        # For each ROI, compute preferred layer and source x
+        for i, roi in enumerate(roi_batch):
+            src_idx = roi[0]
+
+            # Hash to pick preferred even layer
+            h = ((i + 1) * 0x9E3779B9) & 0xffffffff
+            pref_z = even_layers[h % len(even_layers)] if even_layers else 0
+            pref_layers.append(pref_z)
+
+            # Decode source x-coordinate
+            src_x = (src_idx % plane_size) % Nx
+            src_x_coords.append(src_x)
+
+        # Upload to GPU
+        pref_layers_gpu = cp.asarray(pref_layers, dtype=cp.int32)
+        src_x_coords_gpu = cp.asarray(src_x_coords, dtype=cp.int32)
+
+        # Compute parameters based on iteration
+        pitch = self.lattice.pitch if self.lattice and hasattr(self.lattice, 'pitch') else 0.4
+        window_cols = int(8.0 / pitch)
+
+        if current_iteration <= 3:
+            rr_alpha = 0.12
+            jitter_eps = 0.001
+            logger.info(f"[RR-ENABLE] YES - iteration {current_iteration} <= 3")
+            logger.info(f"[ROUNDROBIN-PARAMS] iteration={current_iteration}, rr_alpha={rr_alpha}, window_cols={window_cols}")
+            logger.info(f"[ROUNDROBIN-KERNEL] Active for iteration {current_iteration}: alpha={rr_alpha}, window={window_cols} cols")
+            logger.debug(f"[RR-SAMPLE] First 5 ROIs: pref_layers={pref_layers[:min(5,K)]}, src_x={src_x_coords[:min(5,K)]}")
+        else:
+            rr_alpha = 0.0
+            jitter_eps = 0.001  # Jitter always on
+            logger.debug(f"[RR-ENABLE] NO - iteration {current_iteration} > 3")
+            logger.debug(f"[ROUNDROBIN-KERNEL] RR disabled for iteration {current_iteration}, jitter still active")
+
+        logger.info(f"[JITTER-ENABLE] YES - jitter_eps={jitter_eps}")
+        logger.info(f"[JITTER-PARAMS] jitter_eps={jitter_eps}")
+        logger.info(f"[JITTER-KERNEL] jitter_eps={jitter_eps} (breaks ties, prevents elevator shafts)")
+
+        return pref_layers_gpu, src_x_coords_gpu, rr_alpha, window_cols, jitter_eps
+
     def route_batch_persistent(self, roi_batch: List[Tuple], use_stamps: bool = True) -> List[Optional[List[int]]]:
         """
         AGENT B1: Single-launch persistent routing for entire batch.
@@ -3393,6 +3532,27 @@ class CUDADijkstra:
             # Get use_bitmap flag from data dict
             use_bitmap_flag = 1 if data.get('use_bitmap', True) else 0
 
+            # Prepare round-robin bias + jitter parameters (Fixes #5 and #8)
+            pref_layers_gpu, src_x_coords_gpu, rr_alpha, window_cols, jitter_eps = self._prepare_roundrobin_params(
+                roi_batch, data, self.current_iteration if hasattr(self, 'current_iteration') else 1
+            )
+
+            # Pre-launch verification logging
+            logger.info(f"[KERNEL-LAUNCH] About to launch stamped kernel with:")
+            logger.info(f"  rr_alpha={float(rr_alpha)}, window_cols={int(window_cols)}")
+            logger.info(f"  jitter_eps={float(jitter_eps)}")
+            logger.info(f"  pref_layers shape={pref_layers_gpu.shape}, dtype={pref_layers_gpu.dtype}")
+            logger.info(f"  src_x_coords shape={src_x_coords_gpu.shape}, dtype={src_x_coords_gpu.dtype}")
+
+            # Allocate and initialize 64-bit atomic keys
+            INF_KEY = cp.uint64((0x7f800000 << 32) | 0xffffffff)
+            best_key = cp.full((K, pool_stride), INF_KEY, dtype=cp.uint64)
+            zero_bits = cp.uint32(cp.asarray(cp.float32(0.0)).view(cp.uint32))
+            SRC_KEY = cp.uint64((cp.uint64(zero_bits) << 32) | 0xffffffff)
+            for i in range(K):
+                best_key[i, srcs[i]] = SRC_KEY
+            logger.info(f"[ATOMIC-KEY] Initialized 64-bit keys for {K} ROIs")
+
             args = (
                 queue_a, queue_b, size_a, size_b, max_queue_size,
                 K, max_roi_size,
@@ -3415,7 +3575,16 @@ class CUDADijkstra:
                 data['roi_minz'], data['roi_maxz'],
                 data['roi_bitmaps'].ravel(),  # ROI bitmaps for neighbor validation
                 data['bitmap_words'],          # Words per bitmap
-                use_bitmap_flag                # 1 = enforce bitmap, 0 = bbox-only
+                use_bitmap_flag,               # 1 = enforce bitmap, 0 = bbox-only
+                # NEW: Round-robin bias parameters (Fix #5)
+                pref_layers_gpu,               # (K,) preferred even layer per ROI
+                src_x_coords_gpu,              # (K,) source x-coordinate per ROI
+                cp.int32(window_cols),         # Bias window size (columns)
+                cp.float32(rr_alpha),          # Bias strength (0.0 = disabled)
+                # NEW: Jitter parameters (Fix #8)
+                cp.float32(jitter_eps),        # Jitter magnitude (0.001 typical)
+                # NEW: Atomic key for cycle-proof relaxation
+                best_key.ravel()               # (K * pool_stride) 64-bit atomic keys
             )
 
             block_size = 256

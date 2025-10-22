@@ -1,9 +1,11 @@
 """
-Data types and structures for Manhattan routing
+Data types and structures for Manhattan routing.
+Also provides light runtime-checked interfaces (BoardLike, Bounds)
+so this package doesn't depend on a monorepo.
 """
 
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Set, Any, Union
+from typing import Dict, List, Tuple, Optional, Set, Any, Union, Protocol, runtime_checkable
 from dataclasses import dataclass
 
 # Occupancy kind constants
@@ -14,6 +16,24 @@ KEEPOUT = 3
 
 # Unit conversion constant
 IU_PER_MM = 1_000_000.0
+
+# --- Light interfaces for plugin-facing code ---------------------------------
+@dataclass
+class Bounds:
+    """Axis-aligned board bounds in millimeters."""
+    min_x: float
+    min_y: float
+    max_x: float
+    max_y: float
+
+@runtime_checkable
+class BoardLike(Protocol):
+    """Minimal board protocol the router expects at runtime.
+    Any object with these attributes/methods will work (e.g., KiCad adapter).
+    """
+    layer_count: int
+    def get_bounds(self) -> Tuple[float, float, float, float]: ...
+    def get_all_pads(self) -> List['Pad']: ...
 
 @dataclass
 class Pad:
