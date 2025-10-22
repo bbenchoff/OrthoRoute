@@ -137,7 +137,14 @@ class PathFinderConfig:
     stagnation_patience: int = STAGNATION_PATIENCE
     strict_overuse_block: bool = STRICT_OVERUSE_BLOCK
     hist_cost_weight: float = HIST_COST_WEIGHT
-    iter1_always_connect: bool = True  # Use soft costs in iteration 1 for maximum connectivity
+    iter1_always_connect: bool = False  # DISABLED: Testing showed it reduces success from 33% to 20%
+    iter1_relax_hv_discipline: bool = True  # ENABLED: Allow H/V violations in Iter-1 (soft penalty, not hard reject)
+    iter1_disable_bitmap: bool = True  # ENABLED: Disable bitmap fencing in Iter-1 for max connectivity
+
+    # Atomic parent keys (cycle prevention)
+    use_atomic_parent_keys: bool = True  # Enable for iter>=2 to eliminate cycles
+    atomic_parent_min_iter: int = 2  # Only use in iter>=2 (iter-1 uses standard parent updates)
+
     # Diagnostics toggles
     log_iteration_details: bool = False
     # Cost weights

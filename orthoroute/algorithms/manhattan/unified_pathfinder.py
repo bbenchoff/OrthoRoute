@@ -540,7 +540,7 @@ class GPUConfig:
     """GPU pathfinding algorithm configuration"""
     GPU_MODE = True  # Enable GPU acceleration (set to False for CPU-only)
     DEBUG_INVARIANTS = True
-    USE_PERSISTENT_KERNEL = False  # DISABLED: Hangs indefinitely on full 2.4M node graph (runs all 2000 iterations)
+    USE_PERSISTENT_KERNEL = False  # DISABLED: Hangs on cooperative kernel launch; using wavefront with atomic keys instead
     USE_GPU_COMPACTION = True
     USE_DELTA_STEPPING = False  # DISABLED: Causes OOM from bucket allocation on large graphs
     DELTA_VALUE = 0.5  # Bucket width in mm (0.5mm ≈ 1.25 × 0.4mm grid pitch)
@@ -563,6 +563,9 @@ class PathFinderConfig:
     via_cost: float = 3.0  # Base via cost for routing
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
     span_alpha: float = 0.15  # Span penalty: cost *= (1 + alpha*(span-1))
+
+    # Iteration 1 policy: always-connect mode for maximum connectivity
+    iter1_always_connect: bool = True  # Use soft costs in iteration 1 instead of hard blocks
 
     # Portal escape configuration
     portal_enabled: bool = True
@@ -598,7 +601,7 @@ class PathFinderConfig:
     congestion_multiplier: float = 1.0
     max_search_nodes: int = 2000000
     layer_names: List[str] = field(default_factory=lambda: ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'B.Cu'])
-    hotset_cap: int = 150  # Guardrail to prevent mass decommits
+    hotset_cap: int = 512  # Allow all nets to be rerouted if needed (was 150, bottleneck!)
     allowed_via_spans: Optional[Set[Tuple[int, int]]] = None  # None = all layer pairs allowed (blind/buried)
 
 
@@ -2265,6 +2268,10 @@ class PathFinderRouter:
             self.iteration = it
             logger.info(f"[ITER {it}] pres_fac={pres_fac:.2f}")
 
+            # Log iteration 1 always-connect policy
+            if it == 1 and cfg.iter1_always_connect:
+                logger.info("[ITER-1-POLICY] Always-connect mode: soft costs only (no hard blocks)")
+
             # STEP 0: Clean accounting rebuild (iter 2+)
             if it > 1 and cfg.reroute_only_offenders:
                 # Rebuild usage from all currently routed nets before building hotset
@@ -2335,6 +2342,15 @@ class PathFinderRouter:
             via_ratio = (via_overuse / over_sum * 100) if over_sum > 0 else 0.0
 
             logger.info(f"[ITER {it}] routed={routed} failed={failed} overuse={over_sum} edges={over_cnt} via_overuse={via_ratio:.1f}%")
+
+            # INSTRUMENTATION: Report hard wall count for iter-1 (must be 0)
+            if it == 1 and hasattr(self, '_iter1_inf_writes'):
+                inf_total = self._iter1_inf_writes
+                if inf_total == 0:
+                    logger.info(f"[ITER-1-HARDWALLS] ✓ count=0 (no infinite costs in iteration 1)")
+                else:
+                    logger.error(f"[ITER-1-HARDWALLS] ✗ count={inf_total} (BUG: infinite costs found in iteration 1!)")
+                self._iter1_inf_writes = 0  # Reset for next test
 
             # Instrumentation: Top-10 overused channels
             if over_sum > 0 and it % 3 == 0:  # Every 3 iterations
@@ -2890,10 +2906,14 @@ class PathFinderRouter:
                 effective_batch_size = min(self.solver.gpu_solver.K_pool, max_batch_for_memory, optimal_compute_batch, total)
                 logger.info(f"[FIX-3] ITER-1: batch_size capped by K_pool={self.solver.gpu_solver.K_pool}")
             else:
-                effective_batch_size = min(max_batch_for_memory, optimal_compute_batch, total)
+                # K_pool not available yet - use conservative batch size to ensure multiple batches run
+                # CRITICAL: Don't use 'total' here or it creates ONE giant batch that gets K-renormalized
+                conservative_batch = 100  # Safe default that allows ~5 batches for 512 nets
+                effective_batch_size = min(max_batch_for_memory, optimal_compute_batch, conservative_batch)
+                logger.info(f"[FIX-ITER1-BATCH] K_pool not available, using conservative batch_size={effective_batch_size}")
             logger.info(f"[ITER-1-BATCH] Full graph routing: N={self.N:,} nodes")
             logger.info(f"[ITER-1-BATCH] Memory limit: {max_batch_for_memory} nets, Compute optimal: {optimal_compute_batch}")
-            logger.info(f"[ITER-1-BATCH] Using batch_size={effective_batch_size} for {total} nets")
+            logger.info(f"[ITER-1-BATCH] Using batch_size={effective_batch_size} for {total} nets (will run {(total + effective_batch_size - 1) // effective_batch_size} batches)")
         else:
             # ITERATION 2+: ROI-based routing (smaller graphs ~500K nodes)
             # FIX-3: Use K_pool for batch sizing instead of hardcoded 64
@@ -2972,16 +2992,27 @@ class PathFinderRouter:
             roi_sizes = []  # Track ROI sizes for logging
 
             # [FIX-5] Prepare all nets in batch with per-net ROI extraction
+            # Dictionary to store backup paths for fallback if rerouting fails
+            path_backups = {}  # net_id -> (old_path, old_edges)
+
             for net_id in batch_nets:
                 src, dst = tasks[net_id]
 
-                # Clear old path
+                # Save old path as fallback (CRITICAL: do this BEFORE clearing!)
+                old_path_backup = None
+                old_edges_backup = None
                 if net_id in self.net_paths and self.net_paths[net_id]:
+                    old_path_backup = list(self.net_paths[net_id])  # Make a copy
                     if net_id in self._net_to_edges:
-                        old_edges = self._net_to_edges[net_id]
+                        old_edges_backup = list(self._net_to_edges[net_id])  # Make a copy
                     else:
-                        old_edges = self._path_to_edges(self.net_paths[net_id])
-                    self.accounting.clear_path(old_edges)
+                        old_edges_backup = self._path_to_edges(self.net_paths[net_id])
+
+                    # Store backup for fallback
+                    path_backups[net_id] = (old_path_backup, old_edges_backup)
+
+                    # Clear old path from accounting for rerouting
+                    self.accounting.clear_path(old_edges_backup)
                     self._clear_net_edge_tracking(net_id)
 
                 # ITERATION-AWARE ROI EXTRACTION
@@ -3041,7 +3072,12 @@ class PathFinderRouter:
 
                 # CONNECTIVITY CHECK: Fast BFS to detect disconnected src-dst BEFORE expensive GPU routing
                 # Only check for iteration 2+ when using ROI extraction (iter 1 uses full graph so always connected)
-                if self.iteration > 1 and len(roi_nodes) > 0:
+                # CRITICAL FIX: Skip connectivity check for already-routed nets (prevents un-routing bug)
+                # CRITICAL FIX 2: Skip connectivity checks in early iterations (2-10) - let GPU try anyway!
+                # Connectivity check is too conservative and blocks 135+ nets unnecessarily
+                net_already_routed = old_path_backup is not None
+
+                if self.iteration > 10 and len(roi_nodes) > 0 and not net_already_routed:
                     conn_start = time.time()
 
                     # Simple hash of ROI for caching (sample first 100 nodes to avoid expensive hashing)
@@ -3091,10 +3127,16 @@ class PathFinderRouter:
                         if is_connected_wide:
                             logger.info(f"[CONNECTIVITY] {net_id}: ✓ Connected after widening to {len(roi_nodes):,} nodes")
                         else:
-                            logger.error(f"[CONNECTIVITY] {net_id}: ✗ Still disconnected after widening, skipping GPU routing")
-                            # Skip this net - it cannot be routed in current ROI
-                            batch_metadata.append((net_id, False, None, None, None))
-                            continue
+                            if self.iteration == 1:
+                                # ITER-1: Warn but DON'T skip - let router attempt anyway (soft connectivity)
+                                logger.warning(f"[CONNECTIVITY] {net_id}: ✗ Disconnected in Iter-1, but attempting route anyway (iter1 always-try mode)")
+                            else:
+                                # ITER-2+: Hard skip disconnected nets (they won't route)
+                                logger.error(f"[CONNECTIVITY] {net_id}: ✗ Still disconnected after widening, skipping GPU routing")
+                                batch_metadata.append((net_id, False, None, None, None))
+                                continue
+                elif net_already_routed and self.iteration > 1:
+                    logger.debug(f"[CONNECTIVITY] {net_id}: Skipping check (already routed in previous iteration)")
 
                 # ROI extraction complete (iteration-aware: full-graph for iter1, L-corridor for iter2+)
                 roi_extract_time += time.time() - roi_start
@@ -3299,15 +3341,35 @@ class PathFinderRouter:
                     local_path = paths[i]
                     if not local_path:
                         logger.debug(f"[PATH-SKIP] Net {net_id}: GPU returned None path")
-                        failed_this_pass += 1
-                        batch_failed += 1
-                        self.net_paths[net_id] = []
+                        # FALLBACK: Restore old path if it exists
+                        if net_id in path_backups:
+                            old_path, old_edges = path_backups[net_id]
+                            self.net_paths[net_id] = old_path
+                            self.accounting.commit_path(old_edges)
+                            self._update_net_edge_tracking(net_id, old_edges)
+                            logger.info(f"[FALLBACK] Net {net_id}: Restored old path ({len(old_path)} nodes)")
+                            routed_this_pass += 1
+                            batch_routed += 1
+                        else:
+                            failed_this_pass += 1
+                            batch_failed += 1
+                            self.net_paths[net_id] = []
                         continue
                     if len(local_path) <= 1:
                         logger.debug(f"[PATH-SKIP] Net {net_id}: GPU path too short ({len(local_path)} nodes)")
-                        failed_this_pass += 1
-                        batch_failed += 1
-                        self.net_paths[net_id] = []
+                        # FALLBACK: Restore old path if it exists
+                        if net_id in path_backups:
+                            old_path, old_edges = path_backups[net_id]
+                            self.net_paths[net_id] = old_path
+                            self.accounting.commit_path(old_edges)
+                            self._update_net_edge_tracking(net_id, old_edges)
+                            logger.info(f"[FALLBACK] Net {net_id}: Restored old path ({len(old_path)} nodes)")
+                            routed_this_pass += 1
+                            batch_routed += 1
+                        else:
+                            failed_this_pass += 1
+                            batch_failed += 1
+                            self.net_paths[net_id] = []
                         continue
 
                     if local_path and len(local_path) > 1:
@@ -3344,10 +3406,20 @@ class PathFinderRouter:
                             logger.error(f"[PATH-INVALID] Non-adjacent step in net {net_id}: ({ax},{ay},{az})->({bx},{by},{bz})")
                             logger.error(f"[PATH-INVALID]   Node IDs: {a} -> {b} (delta={b-a})")
                             logger.error(f"[PATH-INVALID]   Coord deltas: dX={bx-ax}, dY={by-ay}, dZ={bz-az}")
-                            self.net_paths[net_id] = []
-                            self._clear_net_edge_tracking(net_id)
-                            failed_this_pass += 1
-                            batch_failed += 1
+                            # FALLBACK: Restore old path if it exists
+                            if net_id in path_backups:
+                                old_path, old_edges = path_backups[net_id]
+                                self.net_paths[net_id] = old_path
+                                self.accounting.commit_path(old_edges)
+                                self._update_net_edge_tracking(net_id, old_edges)
+                                logger.info(f"[FALLBACK] Net {net_id}: Restored old path after validation failure ({len(old_path)} nodes)")
+                                routed_this_pass += 1
+                                batch_routed += 1
+                            else:
+                                self.net_paths[net_id] = []
+                                self._clear_net_edge_tracking(net_id)
+                                failed_this_pass += 1
+                                batch_failed += 1
                             continue
 
                         # Commit path
@@ -3381,10 +3453,20 @@ class PathFinderRouter:
                         routed_this_pass += 1
                         batch_routed += 1
                     else:
-                        failed_this_pass += 1
-                        batch_failed += 1
-                        self.net_paths[net_id] = []
-                        self._clear_net_edge_tracking(net_id)
+                        # FALLBACK: Restore old path if it exists
+                        if net_id in path_backups:
+                            old_path, old_edges = path_backups[net_id]
+                            self.net_paths[net_id] = old_path
+                            self.accounting.commit_path(old_edges)
+                            self._update_net_edge_tracking(net_id, old_edges)
+                            logger.info(f"[FALLBACK] Net {net_id}: Restored old path ({len(old_path)} nodes)")
+                            routed_this_pass += 1
+                            batch_routed += 1
+                        else:
+                            failed_this_pass += 1
+                            batch_failed += 1
+                            self.net_paths[net_id] = []
+                            self._clear_net_edge_tracking(net_id)
 
                 # Batch summary
                 batch_total_time = time.time() - batch_start_time

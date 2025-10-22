@@ -590,14 +590,23 @@ class NegotiationMixin:
         cap   = self.edge_capacity
         hist  = self.edge_history
         base  = self.edge_base_cost
-        legal = getattr(self, "edge_dir_mask", None)
-        # normalize to a NumPy bool array (CPU or GPU)
-        if legal is None:
-            legal = np.ones_like(base, dtype=bool)
+
+        # ITER-1 FIX: Ignore direction mask entirely in iteration 1
+        # The lattice enforces H/V discipline at graph construction (asserts 0 wrong-direction edges)
+        # So we can't relax it with soft costs - the edges don't exist!
+        # In iter-1, treat ALL edges as legal for maximum connectivity
+        if self.config.iter1_always_connect and self.current_iteration == 1:
+            legal = np.ones_like(base, dtype=bool)  # All edges legal in iter-1
+            logger.debug(f"[ITER-1-DISCIPLINE] Ignoring direction mask (all {legal.sum()} edges treated as legal)")
         else:
-            if hasattr(legal, "get"):  # CuPy → NumPy
-                legal = legal.get()
-            legal = legal.astype(bool, copy=False)
+            legal = getattr(self, "edge_dir_mask", None)
+            # normalize to a NumPy bool array (CPU or GPU)
+            if legal is None:
+                legal = np.ones_like(base, dtype=bool)
+            else:
+                if hasattr(legal, "get"):  # CuPy → NumPy
+                    legal = legal.get()
+                legal = legal.astype(bool, copy=False)
 
         # Ensure numpy, not device arrays
         if hasattr(usage, "get"): usage = usage.get()
@@ -629,6 +638,14 @@ class NegotiationMixin:
             # Soft-block overused edges (capacity violations)
             over_mask = usage > cap
             total[over_mask] *= illegal_penalty
+
+            # INSTRUMENTATION: Count hard walls (must be 0 in iter-1)
+            inf_count = int(np.isinf(total).sum())
+            if not hasattr(self, '_iter1_inf_writes'):
+                self._iter1_inf_writes = 0
+            self._iter1_inf_writes += inf_count
+            if inf_count > 0:
+                logger.warning(f"[ITER-1-HARDWALLS] BUG: Found {inf_count} infinite costs in iteration 1!")
         else:
             # Iterations 2+: Use hard blocks (infinity costs) to enforce constraints
             # Hard-block illegal edges
