@@ -1264,7 +1264,8 @@ class OrthoRouteMainWindow(QMainWindow):
         layers_scroll.setWidgetResizable(True)
         layers_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         layers_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        layers_scroll.setMaximumHeight(400)
+        layers_scroll.setMinimumHeight(200)  # Ensure reasonable minimum height
+        layers_scroll.setMaximumHeight(600)  # Increased from 400 to show more layers
 
         # Container widget for checkboxes
         self.layers_container = QWidget()
