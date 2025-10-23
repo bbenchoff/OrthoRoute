@@ -345,9 +345,10 @@ class PadEscapePlanner:
                 gap_fill_spacing = 3  # Create portals every 3 grid steps in gaps
                 gap_threshold = 3     # Only fill gaps larger than 3 grid steps
 
-                # Entry layer for gap-filling portals (use vertical layer for Y-routing)
-                # Use layer 2 (first vertical layer) for gap portals
-                gap_entry_layer = 2 if self.lattice.layers > 2 else 1
+                # Entry layer for gap-filling portals (distribute across all routing layers)
+                # Use random layer selection to encourage even layer utilization
+                gap_routing_layers = list(range(1, self.lattice.layers))
+                gap_entry_layer = random.choice(gap_routing_layers) if gap_routing_layers else 1
 
                 logger.info(f"[GAP-FILL] Checking for gaps in portal distribution (threshold={gap_threshold} steps)")
 
@@ -438,6 +439,14 @@ class PadEscapePlanner:
             if len(x_bins) > 1:
                 max_gap = max(x_bins[i+1] - x_bins[i] for i in range(len(x_bins)-1))
                 logger.info(f"[PORTAL-DISTRIBUTION] Largest gap between portal columns: {max_gap} grid steps")
+
+        # Log portal layer distribution
+        if hasattr(self, '_layer_counts') and self._layer_counts:
+            logger.info(f"[PORTAL-LAYERS] Distribution across {len(self._layer_counts)} layers:")
+            for layer in sorted(self._layer_counts.keys()):
+                count = self._layer_counts[layer]
+                pct = (count / len(self.portals)) * 100 if self.portals else 0
+                logger.info(f"[PORTAL-LAYERS]   Layer {layer}: {count} portals ({pct:.1f}%)")
 
         # Build reverse lookup: pad_id -> net_id
         pad_to_net = {}
@@ -627,14 +636,19 @@ class PadEscapePlanner:
         portal_count = 0
 
         for pad_id, y_idx, direction, delta_steps, pad_x, pad_y, pad_layer in planned_escapes:
-            # CRITICAL FIX: Portals MUST land on vertical layers only!
-            # Escape stubs go in Y direction, so portals need layers with Y-edges (2,4,6,8,10)
-            # Horizontal layers (1,3,5,7,9,11) have NO vertical edges → unreachable!
-            VERTICAL_LAYERS = [2, 4, 6, 8, 10]
-            available_vertical_layers = [L for L in VERTICAL_LAYERS if L < self.lattice.layers]
-            if not available_vertical_layers:
-                available_vertical_layers = [2]  # Fallback to layer 2
-            entry_layer = random.choice(available_vertical_layers)
+            # LAYER SPREADING FIX: Distribute portals across ALL routing layers (both H and V)
+            # This encourages use of all available routing channels, not just vertical layers
+            # Previous code restricted to vertical layers only, causing empty horizontal channels
+            # With blind/buried vias, PathFinder can route efficiently between any layer pair
+            ALL_ROUTING_LAYERS = list(range(1, self.lattice.layers))  # Skip layer 0 (F.Cu)
+            if not ALL_ROUTING_LAYERS:
+                ALL_ROUTING_LAYERS = [1, 2]  # Fallback for minimal layer count
+            entry_layer = random.choice(ALL_ROUTING_LAYERS)
+
+            # DEBUG: Log layer assignment for verification
+            if not hasattr(self, '_layer_counts'):
+                self._layer_counts = {}
+            self._layer_counts[entry_layer] = self._layer_counts.get(entry_layer, 0) + 1
 
             # Try progressively shorter lengths, then opposite direction
             portal = None

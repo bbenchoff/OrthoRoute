@@ -117,11 +117,11 @@ class PathFinderConfig:
     enable_buried_via_keepouts: bool = True   # block intermediate layers at the (x,y) column
     keepout_weight: float = 1e9                # effectively "INF" for track edges touching a blocked node
     via_span_alpha: float = 0.08               # Small penalty for long via spans (reduces shaft congestion)
-    # Column spreading parameters (to prevent "elevator shaft" congestion)
-    column_spread_alpha: float = 0.25          # Fraction of overuse that leaks sideways (expert tuning: wider, gentler)
-    column_spread_radius: int = 3              # Columns ±N get diffused history cost (expert tuning: wider spread)
+    # Column spreading parameters (to prevent "elevator shaft" congestion and fill empty channels)
+    column_spread_alpha: float = 0.5           # Fraction of overuse that leaks sideways (increased for better spreading)
+    column_spread_radius: int = 5              # Columns ±N get diffused history cost (wider spread to fill gaps)
     first_vertical_roundrobin_alpha: float = 0.12  # Nudge for round-robin layer selection (optimized)
-    column_present_beta: float = 0.12          # Soft-cap slope for column occupancy (expert tuning: stronger pressure)
+    column_present_beta: float = 0.25          # Soft-cap slope for column occupancy (stronger pressure for spreading)
     corridor_widen_delta_cols: int = 2         # Columns to add when widening ROI
     corridor_widen_fail_threshold: int = 2     # Consecutive failures before widening
     column_jitter_eps: float = 1e-3            # Tiny deterministic jitter per column
