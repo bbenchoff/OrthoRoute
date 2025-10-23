@@ -342,8 +342,8 @@ class PadEscapePlanner:
 
             if len(portal_x_coords) > 1:
                 gap_portals_created = 0
-                gap_fill_spacing = 3  # Create portals every 3 grid steps in gaps
-                gap_threshold = 3     # Only fill gaps larger than 3 grid steps
+                gap_fill_spacing = 1  # DENSE: Create portals every 1 grid step to fully utilize vertical space
+                gap_threshold = 2     # AGGRESSIVE: Fill any gap larger than 2 grid steps
 
                 # Entry layer for gap-filling portals (distribute across all routing layers)
                 # Use random layer selection to encourage even layer utilization

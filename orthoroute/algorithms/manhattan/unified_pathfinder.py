@@ -553,11 +553,11 @@ class GPUConfig:
 
 class PathFinderConfig:
     """PathFinder algorithm parameters - TUNED FOR FAST CONVERGENCE"""
-    max_iterations: int = 30  # Increased from 10 to allow full convergence
+    max_iterations: int = 30  # Standard iteration count
     # AGGRESSIVE CONVERGENCE SCHEDULE:
     pres_fac_init: float = 1.0   # Start gentle
     pres_fac_mult: float = 2.0   # Double each iteration (was 1.8)
-    pres_fac_max: float = 64.0   # Cap at 64× (was 1000.0)
+    pres_fac_max: float = 64.0   # Cap at 64×
     hist_gain: float = 2.5
     grid_pitch: float = 0.4
     via_cost: float = 1.0  # Cheap vias encourage spreading into empty vertical channels (was 3.0)
