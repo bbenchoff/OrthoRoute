@@ -3049,19 +3049,25 @@ class PathFinderRouter:
                 global_to_roi = np.arange(self.N, dtype=np.int32)  # Identity mapping
                 logger.debug(f"[FULLGRAPH-MODE] Net {net_id}: Using full graph ({self.N} nodes) for access to all vertical channels")
 
+                # Define corridor_buffer and layer_margin for full-graph mode (needed if connectivity check triggers)
+                corridor_buffer = 80  # Default value
+                layer_margin = 5      # Default value
+
                 if batch_num == 0 and self.iteration > 1:  # Log first batch only (skip iter1 full-graph)
                     net_type = "SHORT" if manhattan_dist < 125 else "LONG"
                     logger.info(f"[GEOMETRIC-ROI] Net {net_id}: {net_type} ({manhattan_dist} steps, buffer={corridor_buffer}) → ROI ({len(roi_nodes):,} nodes)")
 
 
                 # CONNECTIVITY CHECK: Fast BFS to detect disconnected src-dst BEFORE expensive GPU routing
-                # Only check for iteration 2+ when using ROI extraction (iter 1 uses full graph so always connected)
+                # PERFORMANCE FIX: Skip connectivity check when using full-graph mode (always connected!)
+                # Only check for iteration 2+ when using ACTUAL ROI extraction (not full graph)
                 # CRITICAL FIX: Skip connectivity check for already-routed nets (prevents un-routing bug)
                 # CRITICAL FIX 2: Skip connectivity checks in early iterations (2-10) - let GPU try anyway!
                 # Connectivity check is too conservative and blocks 135+ nets unnecessarily
                 net_already_routed = old_path_backup is not None
+                using_full_graph = (len(roi_nodes) >= self.N - 10)  # Full graph = always connected
 
-                if self.iteration > 10 and len(roi_nodes) > 0 and not net_already_routed:
+                if self.iteration > 10 and len(roi_nodes) > 0 and not net_already_routed and not using_full_graph:
                     conn_start = time.time()
 
                     # Simple hash of ROI for caching (sample first 100 nodes to avoid expensive hashing)
