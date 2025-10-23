@@ -263,7 +263,7 @@ class RoutingThread(QThread):
             name=filename,
             components=components,
             nets=nets,
-            layer_count=12  # F.Cu + 10 internal + B.Cu
+            layer_count=board_data.get('layers', 2)  # Dynamic from KiCad file
         )
         
         # Store airwires as a custom attribute for RRG routing
@@ -3120,7 +3120,7 @@ class OrthoRouteMainWindow(QMainWindow):
             name=filename,
             components=components,
             nets=nets,
-            layer_count=12  # F.Cu + 10 internal + B.Cu
+            layer_count=board_data.get('layers', 2)  # Dynamic from KiCad file
         )
         
         # Store airwires as a custom attribute for RRG routing
