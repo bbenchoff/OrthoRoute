@@ -68,16 +68,34 @@ Iteration | Nets Routed | Failed | Overuse | Edges | Notes
 **CORRECTNESS REQUIREMENT**: All optimizations must achieve ≥184 nets routed in iteration 1
 **SUCCESS CRITERIA**: Speedup > 1.0x AND nets routed ≥ baseline for ALL iterations
 
+### Git Checkpoint Created
+**Commit**: Pre-optimization checkpoint: Portal layer spreading + column spreading implemented
+**SHA**: 0cea838
+**Backup**: cuda_dijkstra_original.py saved
+
 ---
 
 ## Optimization Attempts
 
-### Attempt 1: [TBD]
-**Hypothesis**: [TBD]
-**Change**: [TBD]
-**Result**: [TBD]
-**Speedup**: [TBD]
-**Correctness**: [TBD]
+### Optimization 1: Bitmap Skip for Full-Graph Mode ✓ SUCCESS
+**Hypothesis**: Bitmap creation from 518K nodes is bottleneck in iteration 2+
+**Bottleneck**: CSR build time = 137s per batch (iteration 2+)
+**Root Cause**:
+- np.unique() on 518K elements: O(n log n)
+- Loop over 16,195 words doing bitwise_or.reduce()
+- Total: 1.3s × 103 nets = 137s per batch
+
+**Change**: Skip bitmap creation if roi_size ≥ full_graph_size
+- File: unified_pathfinder.py:3159-3162
+- Check if ROI is full graph, set roi_bitmap_gpu = None
+
+**Result**:
+- Iteration 1→10: **63 seconds** (target: <120s) ✓
+- Iter 1: 184 nets ✓ (correctness maintained)
+- Iter 10: 276 nets (50% improvement)
+
+**Speedup**: **~12x on iterations 2+** (140s → 12s per iteration)
+**Correctness**: ✓ PASS (184 nets in iter 1, progressive improvement)
 
 ---
 

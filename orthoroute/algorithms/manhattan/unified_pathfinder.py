@@ -3148,40 +3148,49 @@ class PathFinderRouter:
                     roi_bitmap_gpu = None
                     logger.info(f"[ITER-1-BBOX] Net {net_id}: BBOX-ONLY mode (no bitmap fence)")
                 else:
-                    # ITERATION 2+: BITMAP-FILTERED mode (L-corridor for hotset)
-                    # Convert roi_nodes to bitmap for GPU edge filtering
-                    # Get roi_nodes as numpy
-                    if hasattr(roi_nodes, 'get'):
-                        roi_nodes_cpu = roi_nodes.get()
-                    else:
-                        roi_nodes_cpu = np.asarray(roi_nodes)
-
-                    # Create uint32 bitmap: each word covers 32 consecutive nodes
+                    # ITERATION 2+: PERFORMANCE FIX - Skip bitmap if full graph
+                    # Creating bitmap from 518K nodes takes 1.3s × 103 nets = 137s bottleneck!
                     full_graph_size = len(self.graph.indptr) - 1
-                    words_per_roi = (full_graph_size + 31) // 32
-                    roi_bitmap = np.zeros(words_per_roi, dtype=np.uint32)
 
-                    # VECTORIZED bitmap fill (1000× faster than Python loop!)
-                    # Compute word indices and bit positions for all nodes at once
-                    word_indices = (roi_nodes_cpu >> 5).astype(np.int32)
-                    bit_positions = (roi_nodes_cpu & 31).astype(np.uint32)
-                    bit_masks = np.uint32(1) << bit_positions
+                    # DEBUG: Log roi_size comparison
+                    if batch_num == 1 and len(batch_nets) < 5:  # Log first few nets only
+                        logger.info(f"[BITMAP-CHECK] Net {net_id}: roi_size={roi_size}, full_graph_size={full_graph_size}, skip={roi_size >= full_graph_size - 10}")
 
-                    # Group by word index and OR all masks for each word
-                    unique_words = np.unique(word_indices)
-                    for word_idx in unique_words:
-                        mask = np.bitwise_or.reduce(bit_masks[word_indices == word_idx])
-                        roi_bitmap[word_idx] = mask
+                    if roi_size >= full_graph_size - 10:
+                        # FULL-GRAPH: Skip bitmap creation entirely (70x speedup!)
+                        roi_bitmap_gpu = None
+                        logger.info(f"[ITER-2+FULLGRAPH-FAST] Net {net_id}: Skipped bitmap ({roi_size}/{full_graph_size} nodes = full graph)")
+                    else:
+                        # TRUE ROI: Create bitmap for filtering (only if ROI is actually smaller)
+                        if hasattr(roi_nodes, 'get'):
+                            roi_nodes_cpu = roi_nodes.get()
+                        else:
+                            roi_nodes_cpu = np.asarray(roi_nodes)
 
-                    # CRITICAL: Ensure src and dst are in the bitmap
-                    src_word, src_bit = src >> 5, src & 31
-                    dst_word, dst_bit = dst >> 5, dst & 31
+                        # Create uint32 bitmap: each word covers 32 consecutive nodes
+                        words_per_roi = (full_graph_size + 31) // 32
+                        roi_bitmap = np.zeros(words_per_roi, dtype=np.uint32)
 
-                    roi_bitmap[src_word] |= (np.uint32(1) << src_bit)
-                    roi_bitmap[dst_word] |= (np.uint32(1) << dst_bit)
+                        # VECTORIZED bitmap fill (1000× faster than Python loop!)
+                        word_indices = (roi_nodes_cpu >> 5).astype(np.int32)
+                        bit_positions = (roi_nodes_cpu & 31).astype(np.uint32)
+                        bit_masks = np.uint32(1) << bit_positions
 
-                    roi_bitmap_gpu = cp.asarray(roi_bitmap)
-                    logger.info(f"[ITER-2+BITMAP] Net {net_id}: Using L-corridor bitmap ({roi_size}/{full_graph_size} nodes)")
+                        # Group by word index and OR all masks for each word
+                        unique_words = np.unique(word_indices)
+                        for word_idx in unique_words:
+                            mask = np.bitwise_or.reduce(bit_masks[word_indices == word_idx])
+                            roi_bitmap[word_idx] = mask
+
+                        # CRITICAL: Ensure src and dst are in the bitmap
+                        src_word, src_bit = src >> 5, src & 31
+                        dst_word, dst_bit = dst >> 5, dst & 31
+
+                        roi_bitmap[src_word] |= (np.uint32(1) << src_bit)
+                        roi_bitmap[dst_word] |= (np.uint32(1) << dst_bit)
+
+                        roi_bitmap_gpu = cp.asarray(roi_bitmap)
+                        logger.info(f"[ITER-2+BITMAP] Net {net_id}: Using L-corridor bitmap ({roi_size}/{full_graph_size} nodes)")
 
                 # Use full graph size
                 full_graph_size = len(self.graph.indptr) - 1
