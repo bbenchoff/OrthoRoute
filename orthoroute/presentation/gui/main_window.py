@@ -1508,7 +1508,10 @@ class OrthoRouteMainWindow(QMainWindow):
     def update_layers_panel(self, layers: list):
         """Populate the layers panel with checkboxes for each layer"""
         if not hasattr(self, 'layers_container_layout'):
+            logger.warning(f"update_layers_panel: No layers_container_layout attribute")
             return
+
+        logger.info(f"update_layers_panel: Creating checkboxes for {len(layers)} layers: {layers}")
 
         # Clear existing checkboxes
         while self.layers_container_layout.count():
