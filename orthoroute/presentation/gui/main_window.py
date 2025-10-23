@@ -1007,12 +1007,15 @@ class OrthoRouteMainWindow(QMainWindow):
         self.status_label = None
         self.gpu_status = None
         self.routing_result = None
-        
+
+        # Initialize KiCad color scheme (needed for layers panel)
+        self.color_scheme = KiCadColorScheme()
+
         # Initialize window
         self.setWindowTitle("OrthoRoute - PCB Autorouter")
         self.setMinimumSize(1200, 800)
         self.resize(1800, 800)
-        
+
         # Detect GPU status
         self.detect_gpu_status()
         
