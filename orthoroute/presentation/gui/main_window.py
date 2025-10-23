@@ -1775,7 +1775,8 @@ class OrthoRouteMainWindow(QMainWindow):
                 except Exception as e:
                     logger.warning(f"Iteration callback failed: {e}")
 
-            pf.route_multiple_nets(board.nets, progress_cb=progress_cb, iteration_cb=iteration_cb)
+            # Capture routing result to check for convergence
+            routing_result = pf.route_multiple_nets(board.nets, progress_cb=progress_cb, iteration_cb=iteration_cb)
             self.log_to_gui("✓ Net routing complete", "SUCCESS")
 
             # 3) Emit geometry -> update viewer
@@ -1786,7 +1787,47 @@ class OrthoRouteMainWindow(QMainWindow):
             if hasattr(self, 'pcb_viewer') and self.pcb_viewer:
                 self.pcb_viewer.update_routing(geom.tracks, geom.vias)
 
-            # 4) Handle no copper emitted case
+            # 4) Check convergence status and show appropriate dialog
+            if routing_result and not routing_result.get('success', True):
+                # UNCONVERGENCE: Show detailed failure dialog
+                failed_nets = routing_result.get('failed_nets', 0)
+                total_nets = len(board.nets)
+                fail_percentage = (failed_nets / total_nets * 100) if total_nets > 0 else 0
+                overuse_edges = routing_result.get('overuse_edges', 0)
+                overuse_sum = routing_result.get('overuse_sum', 0)
+                layer_rec = routing_result.get('layer_recommendation', {})
+
+                # Build dialog message
+                dialog_msg = f"Your board did not converge because there are too few routing layers.\n\n"
+                dialog_msg += f"ROUTING INCOMPLETE: {failed_nets}/{total_nets} nets failed ({fail_percentage:.1f}%)\n"
+                dialog_msg += f"  Overuse: {overuse_edges} edges with {overuse_sum} total conflicts\n\n"
+
+                if layer_rec.get('needs_more', False):
+                    dialog_msg += f"  RECOMMENDATION: Add {layer_rec.get('additional', 0)} more layers "
+                    dialog_msg += f"(→{layer_rec.get('recommended_total', 0)} total)\n\n"
+                    dialog_msg += f"  Reason: {layer_rec.get('reason', 'Insufficient routing capacity')}"
+                else:
+                    dialog_msg += f"  Note: Current layer count appears adequate.\n"
+                    dialog_msg += f"  Convergence may improve with tuning or may have reached practical limit."
+
+                QMessageBox.warning(
+                    self,
+                    "Unconvergence Alert",
+                    dialog_msg
+                )
+            elif tracks > 0 or vias > 0:
+                # SUCCESS: Show convergence success dialog
+                QMessageBox.information(
+                    self,
+                    "Converged!",
+                    f"Routing completed successfully!\n\n"
+                    f"Results:\n"
+                    f"  • {tracks} tracks placed\n"
+                    f"  • {vias} vias placed\n\n"
+                    f"All nets routed with zero overuse."
+                )
+
+            # 5) Handle no copper emitted case (different from unconvergence)
             if tracks == 0 and vias == 0:
                 self.log_to_gui("⚠️ No copper emitted - analyzing reasons...", "WARNING")
 
@@ -1813,13 +1854,14 @@ class OrthoRouteMainWindow(QMainWindow):
                     except Exception as smoke_e:
                         self.log_to_gui(f"❌ Smoke route error: {smoke_e}", "ERROR")
 
-                # Show detailed dialog if still no copper
+                # Show detailed dialog if still no copper (this is a setup issue, not convergence)
                 if tracks == 0 and vias == 0:
                     failure_text = "\n".join([f"• {reason}" for reason in failure_reasons])
-                    QMessageBox.information(
+                    QMessageBox.warning(
                         self,
                         "No Copper Generated",
-                        f"Autorouting completed but no copper was generated.\n\n"
+                        f"Routing completed but no copper was generated.\n\n"
+                        f"This indicates a board setup issue, not a convergence problem.\n\n"
                         f"Possible reasons:\n{failure_text}\n\n"
                         f"Try:\n"
                         f"• Check that nets have at least 2 pads\n"
@@ -1827,7 +1869,7 @@ class OrthoRouteMainWindow(QMainWindow):
                         f"• Use Tools → Quick Smoke Route for basic connectivity test"
                     )
             else:
-                # 5) Success case - Final UI
+                # 6) Log completion (dialog already shown above)
                 self.log_to_gui(f"✅ Routing completed: {tracks} tracks, {vias} vias", "SUCCESS")
 
             self.status_label.setText(f"Autoroute complete: {tracks} tracks, {vias} vias")
