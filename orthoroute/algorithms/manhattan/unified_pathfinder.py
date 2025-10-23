@@ -560,7 +560,7 @@ class PathFinderConfig:
     pres_fac_max: float = 64.0   # Cap at 64× (was 1000.0)
     hist_gain: float = 2.5
     grid_pitch: float = 0.4
-    via_cost: float = 3.0  # Base via cost for routing
+    via_cost: float = 1.0  # Cheap vias encourage spreading into empty vertical channels (was 3.0)
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
     span_alpha: float = 0.15  # Span penalty: cost *= (1 + alpha*(span-1))
 
@@ -3041,29 +3041,13 @@ class PathFinderRouter:
                         logger.debug(f"[PORTAL-ROUTING] Net {net_id}: src portal at layer {s_portal.entry_layer}, dst portal at layer {d_portal.entry_layer}")
 
                 # ITERATION-AWARE ROI EXTRACTION
-                # Iteration 1: Use FULL GRAPH (bbox-only, no ROI extraction)
-                # Iteration 2+: Use L-corridor ROI (bitmap-filtered for hotset)
+                # ALL ITERATIONS: Use FULL GRAPH (bbox-only) to allow access to empty vertical channels
+                # L-corridor was excluding available routing capacity (empty columns visible in screenshots)
 
-                if self.iteration == 1:
-                    # ITERATION 1: FULL-GRAPH mode (no ROI extraction)
-                    # Use entire graph with generous bbox constraints
-                    roi_nodes = np.arange(self.N, dtype=np.int32)  # All nodes
-                    global_to_roi = np.arange(self.N, dtype=np.int32)  # Identity mapping
-                    logger.debug(f"[ITER-1-FULLGRAPH] Net {net_id}: Using full graph ({self.N} nodes)")
-                else:
-                    # ITERATION 2+: L-CORRIDOR mode with bitmap filtering
-                    # Extract geometric ROI to avoid processing blocked regions
-                    if manhattan_dist < 125:
-                        corridor_buffer = 80  # 32mm @ 0.4mm pitch
-                        layer_margin = 5
-                    else:
-                        corridor_buffer = min(150, int(manhattan_dist * 0.5) + 60)
-                        layer_margin = 6
-
-                    # Extract L-corridor ROI (portal_seeds and src/dst already set above)
-                    roi_nodes, global_to_roi = self.roi_extractor.extract_roi_geometric(
-                        src, dst, corridor_buffer=corridor_buffer, layer_margin=layer_margin, portal_seeds=portal_seeds
-                    )
+                # Use entire graph with bbox constraints (allows nets to spread into empty channels)
+                roi_nodes = np.arange(self.N, dtype=np.int32)  # All nodes
+                global_to_roi = np.arange(self.N, dtype=np.int32)  # Identity mapping
+                logger.debug(f"[FULLGRAPH-MODE] Net {net_id}: Using full graph ({self.N} nodes) for access to all vertical channels")
 
                 if batch_num == 0 and self.iteration > 1:  # Log first batch only (skip iter1 full-graph)
                     net_type = "SHORT" if manhattan_dist < 125 else "LONG"

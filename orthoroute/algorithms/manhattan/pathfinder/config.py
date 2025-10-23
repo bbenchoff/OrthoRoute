@@ -38,7 +38,7 @@ STRICT_CAPACITY = True             # Enforce strict capacity constraints
 REROUTE_ONLY_OFFENDERS = True      # Reroute only offending nets in incremental mode
 
 # Via and Routing Parameters
-VIA_COST = 6.0  # make vias hurt enough to avoid pogo-sticking
+VIA_COST = 1.0  # Cheap vias encourage spreading into empty vertical channels (was 6.0)
 VIA_CAPACITY_PER_NET = 999         # Via capacity limit per net
 STORE_REMAP_ON_RESIZE = 0          # Edge store remapping behavior
 
