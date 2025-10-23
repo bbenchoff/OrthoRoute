@@ -165,5 +165,45 @@ gap_threshold = 2     # Fill gaps >2 steps (was 3)
 
 **Next**: Implement secondary breakout to actually USE the portals
 
+### 00:17 - Dense Portal Test Complete
+**Results**: Iteration 30
+- 268 nets routed (52%) - SAME as baseline
+- 564 overuse edges, 244 failed nets
+- Dense portals present but not utilized
+
+**Analysis**: Router already uses full-graph mode (line 3048)
+- All vertical space IS accessible
+- Problem: Pathfinder prefers direct routes, won't detour into empty space
+- Cost function only penalizes congestion, doesn't reward empty channels
+
+**Decision**: Accept 52% as practical limit for 18-layer board, implement soft-fail
+
+---
+
+## Hour 3-4: Layer Analysis & Soft-Fail Implementation
+
+### 00:18 - Layer Recommendation Feature
+**Implemented**: `_analyze_layer_requirements()` in unified_pathfinder.py
+
+**Heuristics**:
+1. Fail rate >40% + >200 overuse → add 4+ layers (1 per 50 failed nets)
+2. Severe congestion (>800 conflicts) → add 6 layers
+3. Moderate failure (>30%) → add 2-4 layers
+4. Otherwise → current layers adequate
+
+**Output**: Prominent warning at routing completion
+```
+ROUTING INCOMPLETE: 244/512 nets failed (47.7%)
+  Overuse: 488 edges with 564 total conflicts
+  RECOMMENDATION: Add 4 more layers (→22 total)
+  Reason: [specific analysis]
+```
+
+**Committed**: eeef8f1
+
+### 00:21 - Testing Layer Recommendations
+**Status**: Test running (3a408c) to verify soft-fail output
+**Expected**: Should recommend ~4-6 additional layers for this board
+
 ...
 

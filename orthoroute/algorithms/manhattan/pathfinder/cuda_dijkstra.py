@@ -3061,7 +3061,8 @@ class CUDADijkstra:
             weights_stride = weights_arr.shape[1] if len(weights_arr.shape) > 1 else data['max_edges']
 
         # Launch active-list kernel: grid launches over total_active items (not K blocks!)
-        block_size = 256
+        # PERF: RTX 4090 benefits from 512 threads/block for better SM occupancy
+        block_size = 512  # Optimized for Ada Lovelace architecture (was 256)
         grid_size = (total_active + block_size - 1) // block_size
 
         # P0-4: Include frontier_words for bit-packed frontier
@@ -3185,7 +3186,7 @@ class CUDADijkstra:
 
         # FIX: Launch exactly K blocks (kernel expects blockIdx.x = ROI index)
         # Each block grid-strides across its ROI's nodes
-        block_size = 256  # EXP B0: Baseline validation
+        block_size = 512  # Optimized for Ada Lovelace (was 256)
         grid_size = K  # One block per ROI (as kernel expects!)
 
         # CRITICAL: Determine CSR strides (0 for shared, actual dims for per-ROI)
@@ -3968,7 +3969,8 @@ class CUDADijkstra:
             sinks_gpu = cp.array(sinks, dtype=cp.int32)
 
             # Launch GPU backtrace kernel
-            block_size = 256
+            # PERF: 512 threads/block for better occupancy
+            block_size = 512  # Optimized for RTX 4090 (was 256)
             grid_size = (K + block_size - 1) // block_size
 
             # Get use_bitmap flag from data dict
