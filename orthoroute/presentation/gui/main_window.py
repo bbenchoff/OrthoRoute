@@ -1788,6 +1788,7 @@ class OrthoRouteMainWindow(QMainWindow):
                 self.pcb_viewer.update_routing(geom.tracks, geom.vias)
 
             # 4) Check convergence status and show appropriate dialog
+            showed_convergence_dialog = False
             if routing_result and not routing_result.get('success', True):
                 # UNCONVERGENCE: Show detailed failure dialog
                 failed_nets = routing_result.get('failed_nets', 0)
@@ -1815,6 +1816,7 @@ class OrthoRouteMainWindow(QMainWindow):
                     "Unconvergence Alert",
                     dialog_msg
                 )
+                showed_convergence_dialog = True
             elif tracks > 0 or vias > 0:
                 # SUCCESS: Show convergence success dialog
                 QMessageBox.information(
@@ -1826,9 +1828,11 @@ class OrthoRouteMainWindow(QMainWindow):
                     f"  • {vias} vias placed\n\n"
                     f"All nets routed with zero overuse."
                 )
+                showed_convergence_dialog = True
 
             # 5) Handle no copper emitted case (different from unconvergence)
-            if tracks == 0 and vias == 0:
+            # Only show this if we didn't already explain the problem with an unconvergence dialog
+            if tracks == 0 and vias == 0 and not showed_convergence_dialog:
                 self.log_to_gui("⚠️ No copper emitted - analyzing reasons...", "WARNING")
 
                 # Analyze why no copper was generated
