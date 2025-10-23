@@ -1198,8 +1198,8 @@ class ROIExtractor:
 
         roi_nodes = np.array(list(roi_nodes_set), dtype=np.int32)
 
-        # Cap ROI size if enormous (750K is ~18% of a 4M node graph, allows large inter-bank nets)
-        max_nodes = getattr(self, "max_roi_nodes", 750_000)  # [FIX-8] Increased from 500K to 750K - 53% of nets need >500K
+        # Cap ROI size if enormous (300K is ~58% of graph, balances speed vs connectivity)
+        max_nodes = getattr(self, "max_roi_nodes", 300_000)  # Reduced from 750K to prevent hangs on massive ROIs
         if roi_nodes.size > max_nodes:
             logger.warning(f"Geometric ROI {roi_nodes.size:,} > {max_nodes:,}, truncating to {max_nodes} (keeping {len(must_keep_nodes)} critical nodes)")
 
