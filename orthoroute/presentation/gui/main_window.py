@@ -1255,7 +1255,7 @@ class OrthoRouteMainWindow(QMainWindow):
 
         layout.addWidget(board_info_group)
 
-        # Layers visibility group (dynamic, scrollable)
+        # Layers visibility group (dynamic, scrollable, fills remaining space)
         layers_group = QGroupBox("Layers")
         layers_layout = QVBoxLayout(layers_group)
 
@@ -1265,7 +1265,29 @@ class OrthoRouteMainWindow(QMainWindow):
         layers_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         layers_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         layers_scroll.setMinimumHeight(200)  # Ensure reasonable minimum height
-        layers_scroll.setMaximumHeight(600)  # Increased from 400 to show more layers
+
+        # Style the scrollbar to be thicker and more visible
+        layers_scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: #2b2b2b;
+                width: 16px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #555555;
+                min-height: 30px;
+                border-radius: 8px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #666666;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
 
         # Container widget for checkboxes
         self.layers_container = QWidget()
@@ -1276,10 +1298,9 @@ class OrthoRouteMainWindow(QMainWindow):
         layers_scroll.setWidget(self.layers_container)
         layers_layout.addWidget(layers_scroll)
 
-        layout.addWidget(layers_group)
+        layout.addWidget(layers_group, stretch=1)  # Give it stretch factor to fill available space
 
-        # Add stretch to push everything to top
-        layout.addStretch()
+        # No addStretch() - let Layers panel expand to bottom
 
         # Store reference to layers group for updating
         self.layers_group = layers_group
