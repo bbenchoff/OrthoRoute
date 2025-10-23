@@ -572,6 +572,12 @@ class PathFinderConfig:
     pres_fac_mult: float = 2.0   # Double each iteration (was 1.8) - exponential pressure
     pres_fac_max: float = 64.0   # Cap at 64× (prevents instability, DO NOT EXCEED)
     hist_gain: float = 2.5       # Historical congestion weight (permanent penalty)
+
+    # CRITICAL: Length vs Completion Trade-off
+    base_cost_weight: float = 0.3  # Weight for path length penalty (1.0=optimize length, 0.01=optimize completion)
+    # Setting this to 0.01-0.1 makes router prefer completion over short paths,
+    # enabling use of empty vertical channels. Lower values = more detours, higher completion.
+
     grid_pitch: float = 0.4
     via_cost: float = 1.0  # Cheap vias encourage spreading into empty vertical channels (was 3.0)
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
@@ -829,16 +835,18 @@ class EdgeAccountant:
 
         self.history += increment
 
-    def update_costs(self, base_costs, pres_fac: float, hist_weight: float = 1.0, add_jitter: bool = True, via_cost_multiplier: float = 1.0):
+    def update_costs(self, base_costs, pres_fac: float, hist_weight: float = 1.0, add_jitter: bool = True, via_cost_multiplier: float = 1.0, base_cost_weight: float = 0.01):
         """
-        total = base * via_multiplier + pres_fac*overuse + hist_weight*history + epsilon_jitter
+        total = (base * via_multiplier * base_weight) + pres_fac*overuse + hist_weight*history + epsilon_jitter
         Jitter breaks ties and prevents oscillation in equal-cost paths.
         Via cost multiplier enables late-stage via annealing.
+        Base cost weight controls length vs completion trade-off (lower = prefer completion over short paths).
         """
         over = self.xp.maximum(0, self.present - self.capacity)
 
-        # Apply via cost multiplier to base costs (allows annealing)
-        adjusted_base = base_costs * via_cost_multiplier
+        # Apply both via multiplier and base weight to base costs
+        # base_cost_weight < 1.0 makes router prefer completion over short paths
+        adjusted_base = base_costs * via_cost_multiplier * base_cost_weight
         self.total_cost = adjusted_base + pres_fac * over + hist_weight * self.history
 
         # Add per-edge epsilon jitter to break ties (stable across iterations)
@@ -2320,7 +2328,8 @@ class PathFinderRouter:
 
             self.accounting.update_costs(
                 self.graph.base_costs, pres_fac, cfg.hist_cost_weight,
-                via_cost_multiplier=via_cost_mult
+                via_cost_multiplier=via_cost_mult,
+                base_cost_weight=cfg.base_cost_weight
             )
 
             # STEP 3: Route (hotset incremental after iter 1)
@@ -2606,7 +2615,8 @@ class PathFinderRouter:
             via_cost_mult = 0.3  # Much lower via cost for detail pass
             self.accounting.update_costs(
                 self.graph.base_costs, pres_fac, cfg.hist_cost_weight * 1.5,
-                via_cost_multiplier=via_cost_mult
+                via_cost_multiplier=via_cost_mult,
+                base_cost_weight=cfg.base_cost_weight
             )
 
             # Build hotset (capped at 60 for detail pass)
@@ -2713,8 +2723,9 @@ class PathFinderRouter:
         ordered_nets = self._order_nets_by_difficulty(tasks)
 
         # Compute costs once per iteration (not per net) - major performance win
-        # Note: via_cost_multiplier is already baked into base costs at iteration start
-        self.accounting.update_costs(self.graph.base_costs, pres_fac, cfg.hist_cost_weight)
+        # Note: via_cost_multiplier and base_cost_weight are applied here
+        self.accounting.update_costs(self.graph.base_costs, pres_fac, cfg.hist_cost_weight,
+                                     base_cost_weight=cfg.base_cost_weight)
         costs = self.accounting.total_cost.get() if self.accounting.use_gpu else self.accounting.total_cost
 
         # GPU Batching: Route multiple nets in parallel if GPU available
