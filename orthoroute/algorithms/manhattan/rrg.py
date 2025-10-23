@@ -245,7 +245,7 @@ class PathFinderRouter:
         self._register_escape_routes_as_tap_nodes()
         
         self.parallel_router = GPUPathFinderRouter(self.gpu_rrg, self.config)
-        logger.error("PathFinder initialized with PARALLEL GPU PathFinder (FIXED VERSION)")
+        logger.info("PathFinder initialized with PARALLEL GPU PathFinder (FIXED VERSION)")
         
     def route_single_net(self, request: RouteRequest) -> RouteResult:
         """Route single net using GPU wavefront pathfinding with F.Cu escape routing"""
@@ -725,7 +725,7 @@ class PathFinderRouter:
     
     def route_all_nets(self, requests: List[RouteRequest]) -> Dict[str, RouteResult]:
         """Route all nets using PARALLEL PathFinder with proper tap node expansion"""
-        logger.error(f"FIXED RRG PATHFINDER: Using parallel PathFinder for {len(requests)} nets")
+        logger.info(f"FIXED RRG PATHFINDER: Using parallel PathFinder for {len(requests)} nets")
         
         # Use parallel PathFinder instead of broken wavefront
         routes = self.parallel_router.route_all_nets_parallel(requests)
@@ -746,7 +746,7 @@ class PathFinderRouter:
                     via_count=via_count,
                     layer_changes=via_count
                 )
-                logger.error(f"PARALLEL SUCCESS: Net {net_id} routed with {len(path_nodes)} nodes -> {len(segments)} segments")
+                logger.info(f"PARALLEL SUCCESS: Net {net_id} routed with {len(path_nodes)} nodes -> {len(segments)} segments")
             else:  # Failed to route
                 results[net_id] = RouteResult(
                     success=False,
@@ -767,8 +767,8 @@ class PathFinderRouter:
         if not self.gpu_rrg:
             logger.error("Cannot register escape routes: GPU RRG not initialized")
             return
-            
-        logger.error("RRG: Registering escape route nodes as tap nodes for PathFinder...")
+
+        logger.info("RRG: Registering escape route nodes as tap nodes for PathFinder...")
         
         # Find all escape route nodes (vertical and dogleg endpoints)
         tap_count = 0
@@ -780,16 +780,16 @@ class PathFinderRouter:
                 # Register as tap node
                 self.gpu_rrg.tap_nodes[node_id] = node_idx
                 tap_count += 1
-        
-        logger.error(f"RRG TAP NODE REGISTRATION: Registered {tap_count} escape route nodes as tap nodes")
+
+        logger.info(f"RRG TAP NODE REGISTRATION: Registered {tap_count} escape route nodes as tap nodes")
     
     def _convert_path_to_segments(self, path_nodes: List, net_id: str) -> List:
         """Convert PathFinder path nodes to display segments"""
         if not path_nodes or len(path_nodes) < 2:
             return []
-        
+
         segments = []
-        logger.error(f"SEGMENT CONVERSION: Converting {len(path_nodes)} path nodes for {net_id}")
+        logger.debug(f"SEGMENT CONVERSION: Converting {len(path_nodes)} path nodes for {net_id}")
         
         # Create simple segments between consecutive nodes  
         for i in range(len(path_nodes) - 1):

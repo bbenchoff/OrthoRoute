@@ -552,13 +552,26 @@ class GPUConfig:
 
 
 class PathFinderConfig:
-    """PathFinder algorithm parameters - TUNED FOR FAST CONVERGENCE"""
-    max_iterations: int = 30  # Standard iteration count
+    """PathFinder algorithm parameters - TUNED FOR FAST CONVERGENCE
+
+    Core convergence mechanism: Pathfinder uses negotiated congestion routing where
+    edge costs increase based on usage (present) and history. The cost function is:
+        total_cost = base + pres_fac*overuse + hist_gain*history
+
+    Key parameters for tuning:
+    - pres_fac: Present congestion penalty (increases each iteration)
+    - hist_gain: Historical congestion penalty (permanent after each iteration)
+    - via_cost: Vertical movement penalty (lower = more layer exploration)
+
+    WARNING: Cost function modifications are HIGH-RISK. Small changes can cause
+    20%+ convergence regression. Prefer infrastructure improvements over tuning.
+    """
+    max_iterations: int = 30  # Standard iteration count (30 iters ≈ 2-3 min runtime)
     # AGGRESSIVE CONVERGENCE SCHEDULE:
-    pres_fac_init: float = 1.0   # Start gentle
-    pres_fac_mult: float = 2.0   # Double each iteration (was 1.8)
-    pres_fac_max: float = 64.0   # Cap at 64×
-    hist_gain: float = 2.5
+    pres_fac_init: float = 1.0   # Start gentle (iteration 1)
+    pres_fac_mult: float = 2.0   # Double each iteration (was 1.8) - exponential pressure
+    pres_fac_max: float = 64.0   # Cap at 64× (prevents instability, DO NOT EXCEED)
+    hist_gain: float = 2.5       # Historical congestion weight (permanent penalty)
     grid_pitch: float = 0.4
     via_cost: float = 1.0  # Cheap vias encourage spreading into empty vertical channels (was 3.0)
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
