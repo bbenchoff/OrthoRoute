@@ -58,12 +58,29 @@ class LayerAnalyzer:
             'reason': needs_more_layers['reason']
         }
 
-    def _get_layer_edges(self, layer_idx: int, graph) -> List:
+    def _get_layer_edges(self, layer_idx: int, graph, lattice) -> List:
         """Get all edges belonging to a specific layer"""
-        # Simplified: assume edges are organized by layer in graph structure
-        # In real implementation, filter based on node coordinates
         layer_edges = []
-        # TODO: Implement actual layer filtering based on graph structure
+
+        # Iterate through graph CSR structure and filter by layer
+        for src_node in range(len(graph.indptr) - 1):
+            # Get layer of source node
+            if hasattr(lattice, 'idx_to_coord'):
+                try:
+                    _, _, src_z = lattice.idx_to_coord(src_node)
+                    if src_z == layer_idx:
+                        # Add horizontal/vertical edges on this layer
+                        start_idx = graph.indptr[src_node]
+                        end_idx = graph.indptr[src_node + 1]
+                        for edge_idx in range(start_idx, end_idx):
+                            dst_node = graph.indices[edge_idx]
+                            _, _, dst_z = lattice.idx_to_coord(dst_node)
+                            # Same-layer edges (H/V tracks)
+                            if dst_z == layer_idx:
+                                layer_edges.append(edge_idx)
+                except:
+                    pass
+
         return layer_edges
 
     def _calculate_layer_recommendation(self, layer_stats: Dict, total_overuse: int) -> Dict:

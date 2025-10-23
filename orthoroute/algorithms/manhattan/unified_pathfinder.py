@@ -2482,14 +2482,74 @@ class PathFinderRouter:
             if detail_result['success']:
                 return detail_result
 
+        # SOFT-FAIL: Analyze if more layers needed
+        layer_recommendation = self._analyze_layer_requirements(failed, over_cnt, over_sum)
+
+        logger.warning("="*80)
+        logger.warning(f"ROUTING INCOMPLETE: {failed}/{len(tasks)} nets failed ({failed/len(tasks)*100:.1f}%)")
+        logger.warning(f"  Overuse: {over_cnt} edges with {over_sum} total conflicts")
+        if layer_recommendation['needs_more']:
+            logger.warning(f"  RECOMMENDATION: Add {layer_recommendation['additional']} more layers (→{layer_recommendation['recommended_total']} total)")
+            logger.warning(f"  Reason: {layer_recommendation['reason']}")
+        else:
+            logger.warning(f"  Current layer count ({self.lattice.layers}) appears adequate")
+            logger.warning(f"  Convergence may improve with tuning or may have reached practical limit")
+        logger.warning("="*80)
+
         return {
             'success': False,
             'error_code': 'ROUTING-FAILED',
             'message': f'{failed} unrouted, {over_cnt} overused',
             'overuse_sum': over_sum,
             'overuse_edges': over_cnt,
-            'failed_nets': failed
+            'failed_nets': failed,
+            'layer_recommendation': layer_recommendation
         }
+
+    def _analyze_layer_requirements(self, failed_nets: int, overuse_edges: int, overuse_sum: int) -> Dict:
+        """Analyze if board needs more layers based on routing failures"""
+        current_layers = self.lattice.layers
+        total_nets = len(self.net_pad_ids)
+
+        # Calculate failure rate and congestion density
+        fail_rate = failed_nets / max(1, total_nets)
+        congestion_per_edge = overuse_sum / max(1, overuse_edges) if overuse_edges > 0 else 0
+
+        # Heuristics for layer requirement
+        if fail_rate > 0.4 and overuse_edges > 200:
+            # High failure rate with significant congestion
+            # Estimate: 1 layer per 50 failed nets
+            additional = max(4, int(failed_nets / 50))
+            return {
+                'needs_more': True,
+                'additional': additional,
+                'recommended_total': current_layers + additional,
+                'reason': f'High failure rate ({fail_rate*100:.1f}%) with {overuse_edges} congested edges suggests insufficient layer capacity'
+            }
+        elif overuse_sum > 800 and overuse_edges > 400:
+            # Severe congestion even with partial routing
+            return {
+                'needs_more': True,
+                'additional': 6,
+                'recommended_total': current_layers + 6,
+                'reason': f'Severe congestion ({overuse_sum} conflicts across {overuse_edges} edges) indicates board density exceeds layer capacity'
+            }
+        elif fail_rate > 0.3:
+            # Moderate failure, try 2-4 more layers
+            additional = 4 if fail_rate > 0.35 else 2
+            return {
+                'needs_more': True,
+                'additional': additional,
+                'recommended_total': current_layers + additional,
+                'reason': f'Moderate routing failure ({fail_rate*100:.1f}%) suggests {additional} additional layers may help'
+            }
+        else:
+            return {
+                'needs_more': False,
+                'additional': 0,
+                'recommended_total': current_layers,
+                'reason': f'Failure rate ({fail_rate*100:.1f}%) and overuse ({overuse_edges} edges) within acceptable range for current layer count'
+            }
 
     def _detail_pass(self, tasks: Dict[str, Tuple[int, int]], initial_overuse: int, initial_edges: int) -> Dict:
         """
