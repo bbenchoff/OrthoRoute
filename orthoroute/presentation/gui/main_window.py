@@ -336,9 +336,8 @@ class PCBViewer(QWidget):
         self.show_zones = True
         self.show_keepouts = True
         
-        # Layer visibility
-        self.visible_layers = set(['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'In5.Cu', 
-                                  'In6.Cu', 'In7.Cu', 'In8.Cu', 'In9.Cu', 'In10.Cu', 'B.Cu'])
+        # Layer visibility tracking (will be updated when board loads with actual layer names)
+        self.visible_layers = set()  # Start empty, will be populated from board_data['layer_names']
         
         self.setMinimumSize(800, 600)
         self.setMouseTracking(True)
@@ -346,6 +345,15 @@ class PCBViewer(QWidget):
     def set_board_data(self, board_data: Dict[str, Any]):
         """Set the board data to display"""
         self.board_data = board_data
+
+        # Initialize visible_layers from board data (all layers visible by default)
+        if board_data and 'layer_names' in board_data:
+            self.visible_layers = set(board_data['layer_names'])
+            logger.info(f"PCBViewer: Initialized {len(self.visible_layers)} visible layers from board data")
+        elif not self.visible_layers:
+            # Fallback to 2-layer board
+            self.visible_layers = set(['F.Cu', 'B.Cu'])
+
         self.fit_to_view()
         self.update()
         
@@ -1231,56 +1239,56 @@ class OrthoRouteMainWindow(QMainWindow):
         return panel
         
     def create_right_panel(self) -> QWidget:
-        """Create the right information panel - matching original layout"""
+        """Create the right information panel with Board Info and Layers"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        
-        # Nets list group
-        nets_group = QGroupBox("Nets")
-        nets_layout = QVBoxLayout(nets_group)
-        
-        self.nets_tree = QTreeWidget()
-        self.nets_tree.setHeaderLabels(["Net Name", "Pads", "Status"])
-        self.nets_tree.setMaximumHeight(300)
-        nets_layout.addWidget(self.nets_tree)
-        
-        layout.addWidget(nets_group)
-        
-        # Board information group
+
+        # Board information group (at top)
         board_info_group = QGroupBox("Board Information")
         board_info_layout = QVBoxLayout(board_info_group)
-        
+
         self.board_info_label = QLabel("Loading board information...")
         board_info_layout.addWidget(self.board_info_label)
-        
+
         layout.addWidget(board_info_group)
-        
-        # PathFinder Live Statistics Widget
-        self.pathfinder_stats = PathFinderStatsWidget()
-        layout.addWidget(self.pathfinder_stats)
-        
-        # Real-time Routing Log Widget
-        log_group = QGroupBox("Routing Log")
-        log_layout = QVBoxLayout(log_group)
-        
-        self.routing_log = QTextEdit()
-        self.routing_log.setReadOnly(True)
-        self.routing_log.setMaximumHeight(200)
-        self.routing_log.setFont(QFont("Consolas", 9))  # Monospace font for logs
-        self.routing_log.setStyleSheet("""
-            QTextEdit {
-                background-color: #1e1e1e;
-                color: #d4d4d4;
-                border: 1px solid #3e3e3e;
-            }
-        """)
-        log_layout.addWidget(self.routing_log)
-        
-        layout.addWidget(log_group)
-        
+
+        # Layers visibility group (dynamic, scrollable)
+        layers_group = QGroupBox("Layers")
+        layers_layout = QVBoxLayout(layers_group)
+
+        # Scrollable area for layer checkboxes
+        layers_scroll = QScrollArea()
+        layers_scroll.setWidgetResizable(True)
+        layers_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        layers_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        layers_scroll.setMaximumHeight(400)
+
+        # Container widget for checkboxes
+        self.layers_container = QWidget()
+        self.layers_container_layout = QVBoxLayout(self.layers_container)
+        self.layers_container_layout.setContentsMargins(5, 5, 5, 5)
+        self.layers_container_layout.setSpacing(2)
+
+        layers_scroll.setWidget(self.layers_container)
+        layers_layout.addWidget(layers_scroll)
+
+        layout.addWidget(layers_group)
+
         # Add stretch to push everything to top
         layout.addStretch()
-        
+
+        # Store reference to layers group for updating
+        self.layers_group = layers_group
+        self.layer_checkboxes = {}
+
+        # Create stub widgets that other code expects but hide them
+        self.nets_tree = QTreeWidget()
+        self.nets_tree.setVisible(False)
+        self.pathfinder_stats = PathFinderStatsWidget()
+        self.pathfinder_stats.setVisible(False)
+        self.routing_log = QTextEdit()
+        self.routing_log.setVisible(False)
+
         return panel
         
     def setup_status_bar(self):
@@ -1471,18 +1479,18 @@ class OrthoRouteMainWindow(QMainWindow):
     
     # Additional methods for full original functionality
     def update_layer_visibility_menu(self):
-        """Update layer visibility menu with actual board layers"""
+        """Update layer visibility menu and panel with actual board layers"""
         if not hasattr(self, 'layers_menu'):
             return
-            
+
         # Clear existing actions
         self.layers_menu.clear()
         self.layer_actions = {}
-        
-        # Get layers from board data - assume 12 copper layers for now
-        layers = ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'In5.Cu', 
-                 'In6.Cu', 'In7.Cu', 'In8.Cu', 'In9.Cu', 'In10.Cu', 'B.Cu']
-        
+
+        # Get layers from board data (dynamic from KiCad file)
+        layers = self.board_data.get('layer_names', ['F.Cu', 'B.Cu'])
+
+        # Update menu
         for layer in layers:
             action = QAction(layer, self)
             action.setCheckable(True)
@@ -1490,7 +1498,52 @@ class OrthoRouteMainWindow(QMainWindow):
             action.triggered.connect(lambda checked, l=layer: self.toggle_layer_visibility(l, checked))
             self.layer_actions[layer] = action
             self.layers_menu.addAction(action)
-    
+
+        # Update layers panel checkboxes
+        self.update_layers_panel(layers)
+
+    def update_layers_panel(self, layers: list):
+        """Populate the layers panel with checkboxes for each layer"""
+        if not hasattr(self, 'layers_container_layout'):
+            return
+
+        # Clear existing checkboxes
+        while self.layers_container_layout.count():
+            child = self.layers_container_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        self.layer_checkboxes = {}
+
+        # Create checkbox for each layer with color indicator
+        for layer_name in layers:
+            # Create horizontal layout for checkbox + color indicator
+            layer_widget = QWidget()
+            layer_layout = QHBoxLayout(layer_widget)
+            layer_layout.setContentsMargins(0, 0, 0, 0)
+            layer_layout.setSpacing(8)
+
+            # Checkbox
+            checkbox = QCheckBox(layer_name)
+            checkbox.setChecked(True)  # Default to visible
+            checkbox.toggled.connect(lambda checked, l=layer_name: self.toggle_layer_visibility(l, checked))
+
+            # Color indicator square
+            color = self.color_scheme.get_layer_color(layer_name)
+            color_label = QLabel("  ")
+            color_label.setStyleSheet(f"background-color: {color.name()}; border: 1px solid #888; min-width: 20px; min-height: 16px; max-width: 20px; max-height: 16px;")
+            color_label.setToolTip(f"Layer color: {color.name()}")
+
+            layer_layout.addWidget(color_label)
+            layer_layout.addWidget(checkbox)
+            layer_layout.addStretch()
+
+            self.layers_container_layout.addWidget(layer_widget)
+            self.layer_checkboxes[layer_name] = checkbox
+
+        # Add stretch at bottom
+        self.layers_container_layout.addStretch()
+
     # Event handler methods
     def on_algorithm_changed(self, algorithm_text: str):
         """Handle algorithm selection change"""
@@ -1506,8 +1559,9 @@ class OrthoRouteMainWindow(QMainWindow):
             self.pcb_viewer.update()
             
     def toggle_layer_visibility(self, layer: str, checked: bool):
-        """Handle layer visibility changes"""
+        """Handle layer visibility changes - sync between menu, panel, and viewer"""
         logger.info(f"Layer {layer}: {'visible' if checked else 'hidden'}")
+
         # Update PCB viewer layer visibility
         if self.pcb_viewer:
             if checked:
@@ -1515,6 +1569,18 @@ class OrthoRouteMainWindow(QMainWindow):
             else:
                 self.pcb_viewer.visible_layers.discard(layer)
             self.pcb_viewer.update()
+
+        # Sync menu action state (if exists)
+        if hasattr(self, 'layer_actions') and layer in self.layer_actions:
+            self.layer_actions[layer].blockSignals(True)
+            self.layer_actions[layer].setChecked(checked)
+            self.layer_actions[layer].blockSignals(False)
+
+        # Sync panel checkbox state (if exists)
+        if hasattr(self, 'layer_checkboxes') and layer in self.layer_checkboxes:
+            self.layer_checkboxes[layer].blockSignals(True)
+            self.layer_checkboxes[layer].setChecked(checked)
+            self.layer_checkboxes[layer].blockSignals(False)
 
     def focus_on_net(self):
         """Focus on specific net for debugging"""

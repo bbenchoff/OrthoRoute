@@ -248,10 +248,10 @@ class RichKiCadInterface:
             drc_rules = self._extract_drc_rules(board)
             logger.info(f"Extracted DRC rules: {len(drc_rules.get('netclasses', {}))} netclasses")
             
-            # Get layer count
-            layer_count = self._get_layer_count(board)
+            # Get layer count and names
+            layer_count, layer_names = self._get_layer_info(board)
             logger.info(f"Large backplane detected ({len(pads)} pads), using {layer_count} copper layers")
-            
+
             # Build comprehensive board data
             board_data = {
                 'filename': filename,
@@ -265,6 +265,7 @@ class RichKiCadInterface:
                 'width': width,
                 'height': height,
                 'layers': layer_count,
+                'layer_names': layer_names,
                 'drc_rules': drc_rules
             }
             
@@ -543,8 +544,12 @@ class RichKiCadInterface:
                 
         return airwires
 
-    def _get_layer_count(self, board) -> int:
-        """Get the number of copper layers using KiCad API with multiple detection methods"""
+    def _get_layer_info(self, board) -> tuple:
+        """Get copper layer count and names using KiCad API with multiple detection methods
+
+        Returns:
+            Tuple of (layer_count: int, layer_names: List[str])
+        """
 
         # Method 1: Use BoardStackup layers API with material_name (MOST RELIABLE)
         try:
@@ -561,33 +566,37 @@ class RichKiCadInterface:
                     layer_names = [getattr(l, 'user_name', f'Layer{i}') for i, l in enumerate(copper_layers)]
                     logger.info(f"Got layer count from BoardStackup.material_name: {layer_count} copper layers")
                     logger.info(f"Copper layers: {layer_names}")
-                    return layer_count
+                    return (layer_count, layer_names)
         except Exception as e:
             logger.warning(f"BoardStackup material_name detection failed: {e}")
 
-        # Method 2: Use direct IPC API for copper layer count
+        # Method 2: Use direct IPC API for copper layer count (returns count only, generate names)
         try:
             layer_count = _ipc_retry(board.get_copper_layer_count, "get_copper_layer_count", max_retries=3, sleep_s=0.5)
             if layer_count and layer_count > 0:
                 logger.info(f"Got layer count from IPC API: {layer_count} copper layers")
-                return layer_count
+                # Generate standard layer names
+                layer_names = self._generate_layer_names(layer_count)
+                return (layer_count, layer_names)
             else:
                 logger.warning(f"Method 2 returned invalid layer count: {layer_count}")
         except Exception as e:
             logger.warning(f"Method 2 failed - IPC copper layer count: {e}")
 
-        # Method 2: Try to get layer stack
+        # Method 3: Try to get layer stack
         try:
             stackup = _ipc_retry(board.get_stackup, "get_stackup", max_retries=3, sleep_s=0.5)
             if stackup and isinstance(stackup, (list, tuple)):
                 copper_layers = [layer for layer in stackup if 'Cu' in str(layer)]
                 if copper_layers:
-                    logger.info(f"Got layer count from stackup: {len(copper_layers)}")
-                    return len(copper_layers)
+                    layer_count = len(copper_layers)
+                    logger.info(f"Got layer count from stackup: {layer_count}")
+                    layer_names = self._generate_layer_names(layer_count)
+                    return (layer_count, layer_names)
         except Exception as e:
-            logger.debug(f"Method 2 failed - stackup: {e}")
-        
-        # Method 3: Try to detect from layer names
+            logger.debug(f"Method 3 failed - stackup: {e}")
+
+        # Method 4: Try to detect from layer names
         try:
             # Common approach - try to get layers info
             layers_info = _ipc_retry(board.get_layers, "get_layers", max_retries=3, sleep_s=0.5)
@@ -598,14 +607,14 @@ class RichKiCadInterface:
                     copper_layers = [layer for layer in layers_info if 'Cu' in str(layer)]
                 else:
                     copper_layers = []
-                    
+
                 if copper_layers:
                     logger.info(f"Got layer count from layers info: {len(copper_layers)}")
-                    return len(copper_layers)
+                    return (len(copper_layers), copper_layers)
         except Exception as e:
-            logger.debug(f"Method 3 failed - layers info: {e}")
-        
-        # Method 4: Try common layer names (KiCad standard)
+            logger.debug(f"Method 4 failed - layers info: {e}")
+
+        # Method 5: Try common layer names (KiCad standard) by probing
         try:
             standard_layers = [
                 'F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'In5.Cu',
@@ -615,7 +624,7 @@ class RichKiCadInterface:
                 'In24.Cu', 'In25.Cu', 'In26.Cu', 'In27.Cu', 'In28.Cu', 'In29.Cu',
                 'In30.Cu', 'B.Cu'
             ]
-            
+
             detected_layers = []
             for layer_name in standard_layers:
                 try:
@@ -625,24 +634,35 @@ class RichKiCadInterface:
                         detected_layers.append(layer_name)
                 except:
                     continue  # Layer doesn't exist
-            
+
             if len(detected_layers) >= 2:  # At least F.Cu and B.Cu
                 logger.info(f"Detected layers by probing: {detected_layers}")
-                return len(detected_layers)
+                return (len(detected_layers), detected_layers)
                 
         except Exception as e:
             logger.debug(f"Method 4 failed - layer probing: {e}")
         
-        # Method 5: DISABLED - Do not use pad count heuristics (unreliable)
-        # Instead, fail loudly so we know the API detection isn't working
+        # Fallback: Default to 2 layers but log the issue
         logger.error("CRITICAL: All layer count detection methods failed!")
         logger.error("This means board.get_copper_layer_count() is not working")
         logger.error("Check KiCad version (requires 9.0.5+) and IPC API connection")
-        
-        # Fallback: Default to 2 layers but log the issue
         logger.warning("Could not detect layer count using any method - defaulting to 2 layers")
         logger.warning("This may cause routing to fail on multi-layer boards!")
-        return 2
+        return (2, ['F.Cu', 'B.Cu'])
+
+    def _generate_layer_names(self, layer_count: int) -> list:
+        """Generate standard KiCad layer names for given layer count"""
+        if layer_count == 2:
+            return ['F.Cu', 'B.Cu']
+        elif layer_count < 2:
+            return ['F.Cu']  # Should never happen
+        else:
+            # Generate: F.Cu, In1.Cu, In2.Cu, ..., In(N-2).Cu, B.Cu
+            layers = ['F.Cu']
+            for i in range(1, layer_count - 1):
+                layers.append(f'In{i}.Cu')
+            layers.append('B.Cu')
+            return layers
 
     def _extract_drc_rules(self, board) -> Dict:
         """Extract design rules and netclasses using IPC API (proper method)"""
