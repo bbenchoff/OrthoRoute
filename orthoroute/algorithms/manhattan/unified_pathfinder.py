@@ -3019,6 +3019,8 @@ class PathFinderRouter:
                     logger.info(f"[GPU-BATCH] Clamping batch_size {effective_batch_size} -> K_pool {k_cap}")
                     effective_batch_size = k_cap
 
+        # Stock behavior - no batch cap
+
         routed_this_pass = 0
         failed_this_pass = 0
 
@@ -3051,7 +3053,7 @@ class PathFinderRouter:
         logger.info(f"[HYBRID-BATCH] Separated into {len(short_nets)} SHORT nets (<50mm) and {len(long_nets)} LONG nets (≥50mm)")
         logger.info(f"[HYBRID-BATCH] Will route SHORT nets first (fast ROI), then LONG nets (full graph)")
 
-        # Reorder: SHORT nets first, then LONG nets
+        # Reorder: SHORT nets first, then LONG nets (no shuffling for baseline)
         ordered_nets = short_nets + long_nets
 
         # Process nets in large batches
@@ -3125,15 +3127,11 @@ class PathFinderRouter:
                         logger.debug(f"[PORTAL-ROUTING] Net {net_id}: src portal at layer {s_portal.entry_layer}, dst portal at layer {d_portal.entry_layer}")
 
                 # ITERATION-AWARE ROI EXTRACTION
-                # ALL ITERATIONS: Use FULL GRAPH (bbox-only) to allow access to empty vertical channels
-                # L-corridor was excluding available routing capacity (empty columns visible in screenshots)
-
-                # Use entire graph with bbox constraints (allows nets to spread into empty channels)
+                # Use full graph for fast routing (baseline/stock behavior)
                 roi_nodes = np.arange(self.N, dtype=np.int32)  # All nodes
                 global_to_roi = np.arange(self.N, dtype=np.int32)  # Identity mapping
-                logger.debug(f"[FULLGRAPH-MODE] Net {net_id}: Using full graph ({self.N} nodes) for access to all vertical channels")
 
-                # Define corridor_buffer and layer_margin for full-graph mode (needed if connectivity check triggers)
+                # Define corridor_buffer and layer_margin for connectivity check
                 corridor_buffer = 80  # Default value
                 layer_margin = 5      # Default value
 

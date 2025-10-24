@@ -327,10 +327,11 @@ class PadEscapePlanner:
 
         logger.info(f"Planned {portal_count} portals using column-based approach")
 
-        # STEP 3.5: Fill gaps in portal distribution (Option A - Simple interpolation)
-        # After column-based portal generation, detect and fill gaps > 3 grid steps
-        logger.info(f"[GAP-FILL] Starting gap-filling check (have {len(self.portals)} portals)")
-        if self.portals:
+        # STEP 3.5: Fill gaps in portal distribution (DISABLED)
+        # Gap-filling portals didn't solve blank bands and just add visual clutter
+        # DISABLED: Set gap_threshold impossibly high so this never triggers
+        logger.info(f"[GAP-FILL] Gap-filling DISABLED (portals didn't improve spreading)")
+        if False:  # Disabled
             logger.info(f"[GAP-FILL] self.portals exists with {len(self.portals)} items")
             # Get sorted list of X-coordinates with portals
             try:
