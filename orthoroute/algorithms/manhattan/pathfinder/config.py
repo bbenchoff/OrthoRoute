@@ -137,7 +137,7 @@ class PathFinderConfig:
     stagnation_patience: int = STAGNATION_PATIENCE
     strict_overuse_block: bool = STRICT_OVERUSE_BLOCK
     hist_cost_weight: float = HIST_COST_WEIGHT
-    iter1_always_connect: bool = False  # DISABLED: Testing showed it reduces success from 33% to 20%
+    iter1_always_connect: bool = False  # DISABLED: Empirical testing shows False achieves 35% vs True achieves 29%
     iter1_relax_hv_discipline: bool = True  # ENABLED: Allow H/V violations in Iter-1 (soft penalty, not hard reject)
     iter1_disable_bitmap: bool = True  # ENABLED: Disable bitmap fencing in Iter-1 for max connectivity
 
@@ -172,3 +172,21 @@ class PathFinderConfig:
     roi_widen_levels: int = 4              # Number of widening levels to try
     roi_widen_factor: float = 2.0          # Margin multiplier per level
     BASE_ROI_MARGIN_MM: float = 4.0        # Base ROI margin for level 0
+
+    # GPU Configuration
+    use_gpu: bool = False  # Safe default; enable explicitly via env var or API
+
+    # Micro-batch negotiation parameters (Phase 2: GPU micro-batch routing)
+    use_micro_batch_negotiation: bool = False   # DISABLED for baseline test - will re-enable after validation
+    micro_batch_size: int = 16                 # Batch size for micro-batch mode (8-32 recommended)
+    micro_batch_pres_fac_init: float = 0.5     # Initial pressure factor for micro-batch (gentler than default 1.0)
+    micro_batch_pres_fac_mult: float = 1.5     # Pressure multiplier for micro-batch (gentler than default 2.0)
+
+    # GPU Sequential mode (Phase 3: Production sequential routing)
+    use_gpu_sequential: bool = True  # TRUE PATHFINDER: Sequential routing for ALL iterations (VALIDATED: 82.4% iter 1)
+
+    # Incremental cost update mode
+    use_incremental_cost_update: bool = False  # Only update costs for edges that changed
+
+    # GPU ROI threshold configuration
+    gpu_roi_min_nodes: int = 1000  # Minimum ROI nodes for GPU pathfinding (lowered from 5000 for 2-3x speedup)

@@ -2032,7 +2032,7 @@ class CUDADijkstra:
             # Log progress periodically
             if iteration % 100 == 0 and iteration > 0:
                 active_count = int(active_mask.sum())
-                #                 logger.debug(f"[CUDA] Iteration {iteration}: {active_count}/{num_pairs} pairs active")
+                logger.debug(f"[CUDA] Iteration {iteration}: {active_count}/{num_pairs} pairs active")
 
         # Reconstruct paths
         paths = []
@@ -3533,7 +3533,7 @@ class CUDADijkstra:
             rr_alpha = 0.0
             jitter_eps = 0.001  # Jitter always on
             logger.debug(f"[RR-ENABLE] NO - iteration {current_iteration} > 3")
-            #             logger.debug(f"[ROUNDROBIN-KERNEL] RR disabled for iteration {current_iteration}, jitter still active")
+            logger.debug(f"[ROUNDROBIN-KERNEL] RR disabled for iteration {current_iteration}, jitter still active")
 
         logger.info(f"[JITTER-ENABLE] YES - jitter_eps={jitter_eps}")
         logger.info(f"[JITTER-PARAMS] jitter_eps={jitter_eps}")
@@ -4775,8 +4775,8 @@ class CUDADijkstra:
             logger.warning(f"[CUDA-ROI] ROI subgraph has NO edges - disconnected graph")
             return None
 
-        #         logger.debug(f"[CUDA-ROI] Routing in ROI: src={roi_src}, dst={roi_dst}, "
-        #                     f"roi_size={roi_size}, edges={total_edges}")
+        logger.debug(f"[CUDA-ROI] Routing in ROI: src={roi_src}, dst={roi_dst}, "
+                    f"roi_size={roi_size}, edges={total_edges}")
 
         # Call GPU Near-Far on ROI subgraph
         # Create complete 13-element tuple: (src, dst, indptr, indices, weights, roi_size,

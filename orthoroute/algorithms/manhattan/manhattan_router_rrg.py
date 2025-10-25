@@ -110,18 +110,24 @@ class ManhattanRRGRoutingEngine(RoutingEngine):
                     max_search_nodes=30000,  # Optimized limit
                     mode="multi_roi_bidirectional",  # Use Multi-ROI Parallel Bidirectional A* PathFinder
                     roi_parallel=True,  # Enable K concurrent ROI processing
-                    
+
                     # Performance & Convergence optimizations
                     delta_multiplier=5.0,  # Start with 5x grid pitch for speed (4x-6x range)
                     adaptive_delta=True,   # Enable adaptive delta tuning
                     congestion_cost_mult=1.3,  # Enhanced congestion penalty (vs default 1.2)
-                    
+
                     # GPU Kernel & Memory optimizations
                     enable_memory_compaction=True,  # Compact ROI arrays for coalesced access
                     memory_alignment=128,           # 128-byte alignment for optimal coalescing
                     enable_profiling=False,         # Enable for Nsight profiling (set True for analysis)
                     warp_analysis=False,            # Enable for warp divergence analysis
-                    
+
+                    # PHASE 3: Micro-batch negotiation parameters
+                    use_micro_batch_negotiation=True,  # Enable micro-batch mode with gentler pressure
+                    micro_batch_size=16,               # Process 16 nets per micro-batch
+                    micro_batch_pres_fac_init=0.5,     # Start with gentle pressure (same as initial_pres_fac)
+                    micro_batch_pres_fac_mult=1.5,     # Gentler escalation (vs 2.0 standard)
+
                     # Instrumentation & Logging (enabled by default)
                     enable_instrumentation=True,   # Enable detailed metrics collection and CSV export
                     csv_export_path="pathfinder_metrics.csv",

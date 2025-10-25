@@ -2,7 +2,6 @@
 import sys
 import os
 import logging
-import logging.handlers
 from typing import Optional
 
 # Add the package to Python path
@@ -50,7 +49,7 @@ class KiCadPlugin:
             level=logging.DEBUG,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.handlers.RotatingFileHandler('orthoroute_plugin.log', maxBytes=10_000_000, backupCount=3, encoding='utf-8', delay=True),
+                logging.FileHandler('orthoroute_plugin.log'),
                 logging.StreamHandler()
             ]
         )

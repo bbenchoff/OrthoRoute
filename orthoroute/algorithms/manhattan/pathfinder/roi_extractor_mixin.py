@@ -1342,10 +1342,27 @@ class RoiExtractorMixin:
             # Source and sink indices (local to ROI)
             roi_source = int(packed_data['srcs_flat'][roi_idx] - node_start)
             roi_sink = int(packed_data['sinks_flat'][roi_idx] - node_start)
-            
-            # Add to batch
-            roi_batch.append((roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size))
-        
+
+            # CRITICAL FIX: Add bitmap and bbox to match 13-element tuple format
+            # Extract bbox from roi_meta if available, otherwise use placeholder values
+            roi_bitmap = roi_meta.get('bitmap', None)  # None = no bitmap filtering
+            bbox_minx = int(roi_meta.get('bbox_minx', 0))
+            bbox_maxx = int(roi_meta.get('bbox_maxx', 999999))
+            bbox_miny = int(roi_meta.get('bbox_miny', 0))
+            bbox_maxy = int(roi_meta.get('bbox_maxy', 999999))
+            bbox_minz = int(roi_meta.get('bbox_minz', 0))
+            bbox_maxz = int(roi_meta.get('bbox_maxz', 999999))
+
+            # Add to batch with complete 13-element tuple
+            roi_tuple = (roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size,
+                        roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz)
+
+            # Validate tuple format before adding to batch
+            if len(roi_tuple) != 13:
+                raise ValueError(f"ROI tuple length mismatch: {len(roi_tuple)} != 13 (expected 13-element format)")
+
+            roi_batch.append(roi_tuple)
+
         logger.debug(f"Multi-ROI batch prepared: {len(roi_batch)} ROI graphs ready for parallel processing")
         
         # [PACKER INTEGRITY CHECKS] (as suggested by user)
@@ -2521,7 +2538,9 @@ class RoiExtractorMixin:
         WEIGHTS = cp.zeros(total_edges, dtype=cp.float32)
         
         # Pack CSR data with optimal memory layout
-        for i, (roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size) in enumerate(roi_batch):
+        # Unpack 13-element tuples (only need first 6 elements)
+        for i, roi_tuple in enumerate(roi_batch):
+            roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size = roi_tuple[:6]
             node_start = int(node_off[i])
             edge_start = int(edge_off[i])
             
@@ -2539,8 +2558,9 @@ class RoiExtractorMixin:
                 WEIGHTS[edge_start:edge_start+len(weights_slice)] = weights_slice
         
         # ROI metadata arrays
-        src = cp.array([roi_source for roi_source, _, _, _, _, _ in roi_batch], dtype=cp.int32)
-        sink = cp.array([roi_sink for _, roi_sink, _, _, _, _ in roi_batch], dtype=cp.int32)
+        # Unpack 13-element tuples (only need first 2 elements for src/sink)
+        src = cp.array([roi_tuple[0] for roi_tuple in roi_batch], dtype=cp.int32)
+        sink = cp.array([roi_tuple[1] for roi_tuple in roi_batch], dtype=cp.int32)
         
         # State arrays (flat with offset indexing)
         DIST = cp.full(total_nodes, cp.float32(cp.inf), dtype=cp.float32)

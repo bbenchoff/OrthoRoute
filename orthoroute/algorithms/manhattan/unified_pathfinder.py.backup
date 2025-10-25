@@ -1554,11 +1554,10 @@ class SimpleDijkstra:
 
         # Use GPU if ROI is large enough and GPU solver available
         roi_size = len(roi_nodes) if hasattr(roi_nodes, '__len__') else roi_nodes.shape[0]
-        gpu_threshold = getattr(self.config, 'gpu_roi_min_nodes', 1000)
-        use_gpu = hasattr(self, 'gpu_solver') and self.gpu_solver and roi_size > gpu_threshold
+        use_gpu = hasattr(self, 'gpu_solver') and self.gpu_solver and roi_size > self.config.gpu_roi_min_nodes
 
         if use_gpu:
-            logger.info(f"[GPU] Using GPU pathfinding for ROI size={roi_size} (threshold={gpu_threshold})")
+            logger.info(f"[GPU] Using GPU pathfinding for ROI size={roi_size} (threshold={self.config.gpu_roi_min_nodes})")
             try:
                 path = self.gpu_solver.find_path_roi_gpu(src, dst, costs, roi_nodes, global_to_roi)
                 if path:
@@ -1759,21 +1758,15 @@ class PathFinderRouter:
 
         env_sequential = os.getenv("SEQUENTIAL_ALL")
         if env_sequential is not None:
-            if hasattr(self.config, 'use_gpu_sequential'):
-                self.config.use_gpu_sequential = env_sequential == "1"
-            else:
-                setattr(self.config, 'use_gpu_sequential', env_sequential == "1")
+            self.config.use_gpu_sequential = env_sequential == "1"
 
         env_incremental = os.getenv("INCREMENTAL_COST_UPDATE")
         if env_incremental is not None:
-            if hasattr(self.config, 'use_incremental_cost_update'):
-                self.config.use_incremental_cost_update = env_incremental == "1"
-            else:
-                setattr(self.config, 'use_incremental_cost_update', env_incremental == "1")
+            self.config.use_incremental_cost_update = env_incremental == "1"
 
         # Log final configuration
         logger.info(f"[CONFIG] use_gpu={self.config.use_gpu}")
-        logger.info(f"[CONFIG] use_gpu_sequential={getattr(self.config, 'use_gpu_sequential', True)}")
+        logger.info(f"[CONFIG] use_gpu_sequential={self.config.use_gpu_sequential}")
         logger.info(f"[CONFIG] use_incremental_cost_update={getattr(self.config, 'use_incremental_cost_update', False)}")
 
         self.lattice: Optional[Lattice3D] = None
@@ -2220,8 +2213,7 @@ class PathFinderRouter:
             Dict of routing results
         """
         logger.info(f"=== Route {len(requests)} nets ===")
-        gpu_threshold = getattr(self.config, 'gpu_roi_min_nodes', 1000)
-        logger.info(f"[GPU-THRESHOLD] GPU pathfinding enabled for ROIs with > {gpu_threshold} nodes")
+        logger.info(f"[GPU-THRESHOLD] GPU pathfinding enabled for ROIs with > {self.config.gpu_roi_min_nodes} nodes")
 
         tasks = self._parse_requests(requests)
 
@@ -3050,6 +3042,21 @@ class PathFinderRouter:
         total_failed = len(all_tasks) - total_routed
 
         return total_routed, total_failed
+
+    def _route_all_batched_gpu(self, ordered_nets: List[str], tasks: Dict, all_tasks: Dict,
+                                costs, pres_fac: float, roi_margin_bonus: float) -> Tuple[int, int]:
+        """DISABLED: Batched GPU routing breaks PathFinder's sequential cost update requirement.
+        
+        PathFinder MUST update costs after each net to converge properly.
+        See FRIDAYSUMMARY.md for details.
+        
+        Use SEQUENTIAL_ALL=1 environment variable to force sequential mode.
+        """
+        raise NotImplementedError(
+            "Batched GPU mode is disabled. PathFinder requires sequential routing with "
+            "cost updates after each net. Use sequential routing instead. "
+            "Set SEQUENTIAL_ALL=1 to ensure sequential mode."
+        )
 
     def _retarget_portals_for_net(self, net_id: str):
         """Retarget portals when a net fails repeatedly"""

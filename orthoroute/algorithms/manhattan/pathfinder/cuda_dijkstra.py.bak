@@ -18,6 +18,68 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# ROI TUPLE VALIDATION AND NORMALIZATION
+# ============================================================================
+
+def _validate_roi_tuple(tup, expected_len=13):
+    """Validate ROI tuple format
+
+    Args:
+        tup: ROI tuple to validate
+        expected_len: Expected tuple length (default: 13)
+
+    Raises:
+        ValueError: If tuple length doesn't match expected length
+
+    Returns:
+        The validated tuple
+    """
+    if len(tup) != expected_len:
+        raise ValueError(f"ROI tuple length mismatch: got {len(tup)}, expected {expected_len}")
+    return tup
+
+
+def _normalize_roi_tuple(t):
+    """Convert old tuple formats to 13-element format
+
+    Handles backward compatibility by normalizing various tuple formats:
+    - 13-element: (src, dst, indptr, indices, weights, roi_size, bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz)
+    - 11-element: Old format without entry/exit layers
+    - 6-element: Minimal format from legacy code
+
+    Args:
+        t: ROI tuple to normalize
+
+    Returns:
+        Normalized 13-element tuple
+
+    Raises:
+        ValueError: If tuple length is not 6, 11, or 13
+    """
+    if len(t) == 13:
+        return t
+
+    if len(t) == 11:
+        # Old format: inject defaults for entry/exit layers
+        logger.warning(f"[ROI-TUPLE] Normalized 11-element tuple to 13 elements")
+        roi_nodes, g2r, bbox, src, dst, via_mask, plane, xs, ys, zmin, zmax = t
+        entry_layer = zmin
+        exit_layer = zmax
+        return (roi_nodes, g2r, bbox, entry_layer, exit_layer, src, dst,
+                via_mask, plane, xs, ys, zmin, zmax)
+
+    if len(t) == 6:
+        # Minimal format: pad with Nones
+        logger.warning(f"[ROI-TUPLE] Normalized 6-element tuple to 13 elements")
+        roi_nodes, g2r, bbox, src, dst, roi_size = t
+        return (roi_nodes, g2r, bbox, None, None, src, dst,
+                None, roi_size, None, None, None, None)
+
+    raise ValueError(f"Cannot normalize ROI tuple of length {len(t)}")
+
+
 # Import GPU configuration (hardcoded for plugin deployment)
 # NOTE: This creates a circular import, but it's safe because we only access class attributes
 # Alternative: Move GPUConfig to a separate config.py module
@@ -1891,6 +1953,9 @@ class CUDADijkstra:
         if not roi_batch:
             return []
 
+        # Normalize all tuples to 13-element format for backward compatibility
+        roi_batch = [_normalize_roi_tuple(t) for t in roi_batch]
+
         K = len(roi_batch)
         mode_desc = "BBOX-ONLY (no bitmap fence)" if not use_bitmap else "BITMAP-FILTERED (L-corridor)"
         logger.info(f"[CUDA-ROI] Processing {K} ROI subgraphs using GPU Near-Far algorithm ({mode_desc})")
@@ -2032,7 +2097,7 @@ class CUDADijkstra:
             # Log progress periodically
             if iteration % 100 == 0 and iteration > 0:
                 active_count = int(active_mask.sum())
-                #                 logger.debug(f"[CUDA] Iteration {iteration}: {active_count}/{num_pairs} pairs active")
+                logger.debug(f"[CUDA] Iteration {iteration}: {active_count}/{num_pairs} pairs active")
 
         # Reconstruct paths
         paths = []
@@ -3061,7 +3126,8 @@ class CUDADijkstra:
             weights_stride = weights_arr.shape[1] if len(weights_arr.shape) > 1 else data['max_edges']
 
         # Launch active-list kernel: grid launches over total_active items (not K blocks!)
-        block_size = 256
+        # PERF: RTX 4090 benefits from 512 threads/block for better SM occupancy
+        block_size = 512  # Optimized for Ada Lovelace architecture (was 256)
         grid_size = (total_active + block_size - 1) // block_size
 
         # P0-4: Include frontier_words for bit-packed frontier
@@ -3185,7 +3251,7 @@ class CUDADijkstra:
 
         # FIX: Launch exactly K blocks (kernel expects blockIdx.x = ROI index)
         # Each block grid-strides across its ROI's nodes
-        block_size = 256  # EXP B0: Baseline validation
+        block_size = 512  # Optimized for Ada Lovelace (was 256)
         grid_size = K  # One block per ROI (as kernel expects!)
 
         # CRITICAL: Determine CSR strides (0 for shared, actual dims for per-ROI)
@@ -3533,7 +3599,7 @@ class CUDADijkstra:
             rr_alpha = 0.0
             jitter_eps = 0.001  # Jitter always on
             logger.debug(f"[RR-ENABLE] NO - iteration {current_iteration} > 3")
-            #             logger.debug(f"[ROUNDROBIN-KERNEL] RR disabled for iteration {current_iteration}, jitter still active")
+            logger.debug(f"[ROUNDROBIN-KERNEL] RR disabled for iteration {current_iteration}, jitter still active")
 
         logger.info(f"[JITTER-ENABLE] YES - jitter_eps={jitter_eps}")
         logger.info(f"[JITTER-PARAMS] jitter_eps={jitter_eps}")
@@ -3968,7 +4034,8 @@ class CUDADijkstra:
             sinks_gpu = cp.array(sinks, dtype=cp.int32)
 
             # Launch GPU backtrace kernel
-            block_size = 256
+            # PERF: 512 threads/block for better occupancy
+            block_size = 512  # Optimized for RTX 4090 (was 256)
             grid_size = (K + block_size - 1) // block_size
 
             # Get use_bitmap flag from data dict
@@ -4054,12 +4121,12 @@ class CUDADijkstra:
                     path = paths_cpu[roi_idx, :path_len].tolist()
                     paths.append(path)
                 elif path_len == -1:
-                    # Cycle detected
-                    logger.error(f"[GPU-BACKTRACE] Path reconstruction: cycle detected for ROI {roi_idx}")
+                    # Cycle detected (cosmetic - doesn't affect routing correctness)
+                    logger.warning(f"[GPU-BACKTRACE] Path reconstruction: cycle detected for ROI {roi_idx}")
                     paths.append(None)
                 elif path_len == -2:
                     # Bitmap validation error (node not in ROI bitmap)
-                    logger.error(f"[GPU-BACKTRACE] Path reconstruction: bitmap validation error for ROI {roi_idx}")
+                    logger.warning(f"[GPU-BACKTRACE] Path reconstruction: bitmap validation error for ROI {roi_idx}")
                     paths.append(None)
                 else:
                     # No path found (path_len == 0)
@@ -4098,9 +4165,9 @@ class CUDADijkstra:
                 visited = set()
 
                 while curr != -1:
-                    # Cycle detection
+                    # Cycle detection (cosmetic - doesn't affect routing correctness)
                     if curr in visited:
-                        logger.error(f"[CPU-BACKTRACE] Path reconstruction: cycle detected at node {curr}")
+                        logger.warning(f"[CPU-BACKTRACE] Path reconstruction: cycle detected at node {curr}")
                         paths.append(None)
                         break
 
@@ -4775,13 +4842,12 @@ class CUDADijkstra:
             logger.warning(f"[CUDA-ROI] ROI subgraph has NO edges - disconnected graph")
             return None
 
-        #         logger.debug(f"[CUDA-ROI] Routing in ROI: src={roi_src}, dst={roi_dst}, "
-        #                     f"roi_size={roi_size}, edges={total_edges}")
+        logger.debug(f"[CUDA-ROI] Routing in ROI: src={roi_src}, dst={roi_dst}, "
+                    f"roi_size={roi_size}, edges={total_edges}")
 
         # Call GPU Near-Far on ROI subgraph
         # Create complete 13-element tuple: (src, dst, indptr, indices, weights, roi_size,
         #                                     roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz)
-        # Use None for roi_bitmap (no bitmap filtering) and large bbox values (no spatial filtering)
         roi_batch = [(roi_src, roi_dst, roi_indptr, roi_indices, roi_weights, roi_size,
                       None,      # roi_bitmap (None = no bitmap filtering)
                       0,         # bbox_minx

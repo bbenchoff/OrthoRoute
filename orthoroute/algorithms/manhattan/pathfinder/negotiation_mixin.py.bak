@@ -1284,7 +1284,7 @@ class NegotiationMixin:
         # Apply multipliers to vertical edges on GPU (vectorized)
         self._apply_column_multipliers_gpu(col_mult, plane_size, x_steps, y_steps, layer_count)
 
-        #         logger.debug(f"[ROUNDROBIN] net={net_id} applied bias via column multipliers (window={window_cols} cols)")
+        logger.debug(f"[ROUNDROBIN] net={net_id} applied bias via column multipliers (window={window_cols} cols)")
 
     def _apply_column_multipliers_gpu(self, col_mult: np.ndarray, plane_size: int,
                                       x_steps: int, y_steps: int, layer_count: int) -> None:
@@ -1425,7 +1425,7 @@ class NegotiationMixin:
         else:
             self.edge_total_cost = edge_costs
 
-        #         logger.debug(f"[ROUNDROBIN-CPU] Modified {modified_count} via edges")
+        logger.debug(f"[ROUNDROBIN-CPU] Modified {modified_count} via edges")
 
     def _apply_roundrobin_layer_bias(self, net_id: str, source_idx: int) -> int:
         """Apply round-robin layer preference for first vertical run near source portal.
@@ -1541,7 +1541,7 @@ class NegotiationMixin:
         else:
             self.edge_total_cost = edge_costs
 
-        #         logger.debug(f"[ROUNDROBIN] net={net_id} modified {modified_count} via edges near source")
+        logger.debug(f"[ROUNDROBIN] net={net_id} modified {modified_count} via edges near source")
 
         return preferred_z
 

@@ -646,27 +646,30 @@ class PathfindingMixin:
 
     def _gpu_dijkstra_multi_roi_csr(self, roi_batch, max_iters: int = 10_000_000):
         """Multi-ROI GPU Dijkstra - saturates GPU SMs with parallel ROI processing
-        
+
         Args:
-            roi_batch: List of tuples [(roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size), ...]
+            roi_batch: List of tuples [(roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size,
+                                       roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz), ...]
             max_iters: Maximum iterations per ROI
-        
+
         Returns:
             List of paths (one per ROI, None if unreachable)
         """
         if not roi_batch:
             return []
-        
+
         num_rois = len(roi_batch)
         logger.debug(f"Multi-ROI GPU Dijkstra: Processing {num_rois} ROIs in parallel")
-        
+
         # Extract ROI data
         roi_sources = []
         roi_sinks = []
         roi_sizes = []
         max_roi_size = 0
-        
-        for roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size in roi_batch:
+
+        # Unpack 13-element tuples (bitmap and bbox ignored for this function)
+        for roi_tuple in roi_batch:
+            roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size = roi_tuple[:6]
             roi_sources.append(roi_source)
             roi_sinks.append(roi_sink)
             roi_sizes.append(roi_size)
@@ -1047,8 +1050,9 @@ class PathfindingMixin:
             for roi_idx in range(num_rois):
                 if not active_rois[roi_idx]:
                     continue
-                
-                roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size = roi_batch[roi_idx]
+
+                # Unpack 13-element tuple (only need first 6 elements)
+                roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size = roi_batch[roi_idx][:6]
                 
                 # Check if this ROI has open nodes
                 roi_open_set = open_set_batch[roi_idx, :roi_size]
@@ -1261,19 +1265,20 @@ class PathfindingMixin:
 
     def _gpu_dijkstra_multi_roi_bidirectional_astar(self, roi_batch, max_iters: int = 10_000_000):
         """Multi-ROI GPU Bidirectional A* PathFinder for parallel processing of multiple routing problems
-        
+
         Processes multiple ROI graphs simultaneously using bidirectional A* search with Manhattan
         distance heuristic. Each ROI searches from both source and sink to meet in the middle.
-        
+
         Args:
-            roi_batch: List of (roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size) tuples
+            roi_batch: List of (roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size,
+                               roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz) tuples
             max_iters: Maximum iterations per ROI per direction
-            
+
         Returns:
             List of paths (or None for failed routes) for each ROI
         """
         num_rois = len(roi_batch)
-        max_roi_size = max(roi_size for _, _, _, _, _, roi_size in roi_batch)
+        max_roi_size = max(roi_tuple[5] for roi_tuple in roi_batch)  # roi_size is 6th element
         
         # Initialize batch state arrays on GPU
         inf = cp.float32(cp.inf)
@@ -1319,8 +1324,9 @@ class PathfindingMixin:
             for roi_idx in range(num_rois):
                 if not active_rois[roi_idx]:
                     continue
-                    
-                roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size = roi_batch[roi_idx]
+
+                # Unpack 13-element tuple (only need first 6 elements)
+                roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size = roi_batch[roi_idx][:6]
                 
                 # Alternate between forward and backward search
                 if waves % 2 == 0:
@@ -1810,8 +1816,10 @@ class PathfindingMixin:
         roi_sinks = []
         roi_sizes = []
         max_roi_size = 0
-        
-        for roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size in roi_batch:
+
+        # Unpack 13-element tuples (bitmap and bbox ignored for this function)
+        for roi_tuple in roi_batch:
+            roi_source, roi_sink, roi_indptr, roi_indices, roi_weights, roi_size = roi_tuple[:6]
             roi_sources.append(roi_source)
             roi_sinks.append(roi_sink)
             roi_sizes.append(roi_size)
