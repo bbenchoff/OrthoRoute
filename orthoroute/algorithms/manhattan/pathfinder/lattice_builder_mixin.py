@@ -355,31 +355,44 @@ class LatticeBuilderMixin:
         self.node_count = self.geometry.x_steps * self.geometry.y_steps * layers
         logger.info(f"Created {len(edges):,} edges")
 
+        # DIAGNOSTICS: Verify full stackup and via policy
+        logger.info(f"[STACKUP] Nz={layers}, routing_layers={list(range(1, layers + 1))}")
+        logger.info(f"[VIA-POLICY] allow_any={getattr(self.config, 'allow_any_layer_via', False)}, "
+                   f"keepouts={getattr(self.config, 'enable_buried_via_keepouts', True)}, "
+                   f"via_cost={VIA_COST_LOCAL}, via_pairs={len(self.allowed_layer_pairs)}, "
+                   f"expected_all_pairs={layers * (layers - 1) // 2}")
+
         # Verify lattice correctness using geometry system
         self._verify_lattice_correctness_geometry()
 
 
     def _legal_via_pairs(self, z_count: int) -> List[Tuple[int, int]]:
         """
-        Returns legal (z1,z2) pairs for via edges.
+        Returns legal (z1,z2) pairs for via edges (unordered - bidirectional added by caller).
         If config.allow_any_layer_via is True, allow any pair (z1 != z2).
         Otherwise, fall back to adjacent-only short hops.
         """
-        if bool(getattr(self.config, "allow_any_layer_via", False)):
+        allow_any = bool(getattr(self.config, "allow_any_layer_via", True))  # DEFAULT TRUE for full blind/buried
+        expected_all = z_count * (z_count - 1) // 2  # C(z_count, 2)
+        logger.info(f"[VIA-PAIRS] allow_any_layer_via={allow_any}, z_count={z_count}, expected_all_pairs={expected_all}")
+
+        if allow_any:
+            # FULL BLIND/BURIED: Allow any-to-any layer transitions (unordered pairs)
             pairs = []
             for z1 in range(1, z_count + 1):
-                for z2 in range(1, z_count + 1):
-                    if z1 != z2:
-                        lo, hi = (z1, z2) if z1 < z2 else (z2, z1)
-                        pairs.append((lo, hi))
-            return sorted(set(pairs))
-        # fallback: adjacent layers only
+                for z2 in range(z1 + 1, z_count + 1):  # Only z2 > z1 for unordered
+                    pairs.append((z1, z2))
+            logger.info(f"[VIA-PAIRS] Generated {len(pairs)} all-to-all pairs (full blind/buried enabled)")
+            if len(pairs) != expected_all:
+                logger.warning(f"[VIA-PAIRS] Pair count mismatch! Got {len(pairs)}, expected {expected_all}")
+            return pairs
+
+        # FALLBACK: Adjacent layers only
         pairs: List[Tuple[int, int]] = []
-        for z1 in range(1, z_count + 1):
-            for z2 in (z1 - 1, z1 + 1):
-                if 1 <= z2 <= z_count:
-                    pairs.append((min(z1, z2), max(z1, z2)))
-        return sorted(set(pairs))
+        for z1 in range(1, z_count):  # z1 goes to z_count - 1
+            pairs.append((z1, z1 + 1))  # Only (z, z+1) for unordered adjacent
+        logger.info(f"[VIA-PAIRS] Generated {len(pairs)} adjacent-only pairs (fallback mode)")
+        return pairs
 
 
     def _derive_allowed_layer_pairs(self, layers: int) -> List[Tuple[int, int]]:

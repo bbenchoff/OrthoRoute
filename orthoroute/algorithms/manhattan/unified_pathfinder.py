@@ -573,12 +573,12 @@ class PathFinderConfig:
     WARNING: Cost function modifications are HIGH-RISK. Small changes can cause
     20%+ convergence regression. Prefer infrastructure improvements over tuning.
     """
-    max_iterations: int = 30  # Standard iteration count (30 iters ≈ 2-3 min runtime)
-    # AGGRESSIVE CONVERGENCE SCHEDULE:
+    max_iterations: int = 40  # Extended to give convergence more time
+    # CONVERGENCE SCHEDULE (TUNED FOR STABILITY):
     pres_fac_init: float = 1.0   # Start gentle (iteration 1)
-    pres_fac_mult: float = 2.0   # Double each iteration (was 1.8) - exponential pressure
-    pres_fac_max: float = 64.0   # Cap at 64× (prevents instability, DO NOT EXCEED)
-    hist_gain: float = 2.5       # Historical congestion weight (permanent penalty)
+    pres_fac_mult: float = 1.25  # Very gentle escalation (was 1.35 - still too fast!)
+    pres_fac_max: float = 512.0  # Higher ceiling (was 64 - too low!)
+    hist_gain: float = 1.8       # STRONG history to make detours permanent (was 1.2 - too weak!)
 
     # CRITICAL: Length vs Completion Trade-off
     base_cost_weight: float = 0.3  # Weight for path length penalty (1.0=optimize length, 0.01=optimize completion)
@@ -586,7 +586,7 @@ class PathFinderConfig:
     # enabling use of empty vertical channels. Lower values = more detours, higher completion.
 
     grid_pitch: float = 0.4
-    via_cost: float = 1.0  # Cheap vias encourage spreading into empty vertical channels (was 3.0)
+    via_cost: float = 0.7  # Cheaper vias to encourage layer hopping and redistribute load (was 1.0)
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
     span_alpha: float = 0.15  # Span penalty: cost *= (1 + alpha*(span-1))
 
@@ -949,13 +949,34 @@ class Lattice3D:
             return dx == 0 and dy == 1  # Vertical: only ±Y
 
     def get_legal_via_pairs(self, layer_count: int) -> set:
-        """Return set of legal (from_layer, to_layer) via pairs."""
-        # Adjacent pairs, but exclude outer layers (0 and layer_count-1)
+        """Return set of legal (from_layer, to_layer) via pairs for ROUTING LAYERS only (1 to layer_count-2)."""
+        # Check config for via policy (default to FULL blind/buried)
+        allow_any = True  # ALWAYS allow full blind/buried for convergence
+
+        # Only use internal routing layers (exclude outer layers 0 and layer_count-1)
+        routing_layers = list(range(1, layer_count - 1))
+        expected_all = len(routing_layers) * (len(routing_layers) - 1) // 2
+
+        logger.info(f"[VIA-PAIRS] layer_count={layer_count}, routing_layers={len(routing_layers)}, "
+                   f"allow_any={allow_any}, expected_all_pairs={expected_all}")
+
+        if allow_any:
+            # FULL BLIND/BURIED: Any routing layer to any other routing layer
+            legal_pairs = set()
+            for z1 in routing_layers:
+                for z2 in routing_layers:
+                    if z1 != z2:
+                        legal_pairs.add((z1, z2))
+            logger.info(f"[VIA-PAIRS] Generated {len(legal_pairs)} all-to-all pairs for {len(routing_layers)} routing layers")
+            return legal_pairs
+
+        # FALLBACK: Adjacent routing layers only
         legal_pairs = set()
-        # z runs 1 .. layer_count-3, pairs are (z, z+1) up to (layer_count-3, layer_count-2)
-        for z in range(1, layer_count - 2):
-            legal_pairs.add((z, z+1))
-            legal_pairs.add((z+1, z))
+        for i in range(len(routing_layers) - 1):
+            z1, z2 = routing_layers[i], routing_layers[i+1]
+            legal_pairs.add((z1, z2))
+            legal_pairs.add((z2, z1))
+        logger.info(f"[VIA-PAIRS] Generated {len(legal_pairs)} adjacent-only pairs (fallback mode)")
         return legal_pairs
 
     def node_idx(self, x: int, y: int, z: int) -> int:
@@ -991,16 +1012,12 @@ class Lattice3D:
             else:  # 'v'
                 edge_count += 2 * self.x_steps * (self.y_steps - 1)
 
-        # Count via edges
-        if allowed_via_spans is None:
-            # Full blind/buried: all layer pairs
-            via_pairs_per_xy = self.layers * (self.layers - 1) // 2
-        else:
-            via_pairs_per_xy = len(allowed_via_spans)
+        # Count via edges using ACTUAL legal pairs (not parameter guess)
+        legal_via_pairs_set = self.get_legal_via_pairs(self.layers)
+        via_edge_count = 2 * self.x_steps * self.y_steps * len(legal_via_pairs_set)
+        edge_count += via_edge_count
 
-        edge_count += 2 * self.x_steps * self.y_steps * via_pairs_per_xy
-
-        logger.info(f"Pre-allocating for {edge_count:,} edges")
+        logger.info(f"Pre-allocating for {edge_count:,} edges ({via_edge_count:,} via edges for {len(legal_via_pairs_set)} pairs)")
         graph = CSRGraph(use_gpu, edge_capacity=edge_count)
 
         # Build lateral edges (H/V discipline, exclude outer layers 0 and self.layers-1)
@@ -1034,15 +1051,12 @@ class Lattice3D:
                         graph.add_edge(u, v, self.pitch)
                         graph.add_edge(v, u, self.pitch)
 
-        # Build via edges with STRICT layer mask (no "all pairs allowed"!)
+        # Build via edges using the SAME legal pairs as pre-allocation
         via_count = 0
-
-        # Get legal via pairs (adjacent layers only for now)
-        legal_via_pairs = self.get_legal_via_pairs(self.layers)
 
         for x in range(self.x_steps):
             for y in range(self.y_steps):
-                for (z_from, z_to) in legal_via_pairs:
+                for (z_from, z_to) in legal_via_pairs_set:
                     # Only add if this specific pair is legal
                     span = abs(z_to - z_from)
                     span_alpha = 0.15
@@ -1055,10 +1069,12 @@ class Lattice3D:
                     via_count += 2
 
         # LOG what was built
-        logger.info(f"Vias: {via_count} edges using CONTROLLED via mask")
-        logger.info(f"Via policy: {len(legal_via_pairs)} layer pairs (NO 'all pairs allowed'!)")
-        for pair in sorted(list(legal_via_pairs))[:10]:
+        logger.info(f"Vias: {via_count} edges created")
+        logger.info(f"Via policy: {len(legal_via_pairs_set)} layer pairs (FULL BLIND/BURIED ENABLED!)")
+        for pair in sorted(list(legal_via_pairs_set))[:10]:
             logger.info(f"  Legal via: {pair[0]} ↔ {pair[1]}")
+        if len(legal_via_pairs_set) > 20:
+            logger.info(f"  ... and {len(legal_via_pairs_set) - 10} more pairs (showing first 10 only)")
 
         # Finalize the graph before validation (converts edge list to CSR format)
         graph.finalize(self.num_nodes)
@@ -1097,7 +1113,7 @@ class Lattice3D:
                 # Check if it's a via (different layers)
                 if z_u != z_v:
                     # Via edge - check if it's in legal pairs
-                    if (z_u, z_v) not in legal_via_pairs and (z_v, z_u) not in legal_via_pairs:
+                    if (z_u, z_v) not in legal_via_pairs_set and (z_v, z_u) not in legal_via_pairs_set:
                         logger.error(f"[MANHATTAN-VIOLATION] Illegal via: layer {z_u} ↔ {z_v} at ({x_u},{y_u})")
                         violations += 1
                 else:
@@ -1914,6 +1930,25 @@ class PathFinderRouter:
         E = len(self.graph.indices)
         self.accounting = EdgeAccountant(E, use_gpu=self.config.use_gpu and GPU_AVAILABLE)
 
+        # Via pooling arrays (CPU-only for now - critical for convergence with full blind/buried)
+        Nx, Ny, Nz = self.lattice.x_steps, self.lattice.y_steps, self.lattice.layers
+        self._Nx, self._Ny, self._Nz = Nx, Ny, Nz
+
+        if getattr(self.config, "via_column_pooling", True):
+            self.via_col_cap = np.full((Nx, Ny), int(getattr(self.config, "via_column_capacity", 4)), dtype=np.int16)
+            self.via_col_use = np.zeros((Nx, Ny), dtype=np.int16)
+            self.via_col_pres = np.zeros((Nx, Ny), dtype=np.float32)
+            logger.info(f"[VIA-POOL] Column pooling enabled: capacity={self.via_col_cap[0,0]} per (x,y)")
+
+        if getattr(self.config, "via_segment_pooling", True):
+            # Segments between routing layers (1..Nz-2): segment z→z+1 stored at index z-1
+            self._segZ = Nz - 2  # Number of routing layers
+            self.via_seg_cap = np.full((Nx, Ny, self._segZ), int(getattr(self.config, "via_segment_capacity", 1)), dtype=np.int8)
+            self.via_seg_use = np.zeros((Nx, Ny, self._segZ), dtype=np.int16)
+            self.via_seg_pres = np.zeros((Nx, Ny, self._segZ), dtype=np.float32)
+            self.via_seg_prefix = np.zeros((Nx, Ny, self._segZ), dtype=np.float32)
+            logger.info(f"[VIA-POOL] Segment pooling enabled: {self._segZ} segments (z=1..{Nz-2}), capacity={self.via_seg_cap[0,0,0]} per segment")
+
         self.solver = SimpleDijkstra(self.graph, self.lattice)
 
         # Add GPU solver if available
@@ -1949,6 +1984,9 @@ class PathFinderRouter:
 
         # Identify via edges for via-specific accounting
         self._identify_via_edges()
+
+        # Build via edge metadata for vectorized penalty application
+        self._build_via_edge_metadata()
 
         self._map_pads(board)
 
@@ -2359,6 +2397,211 @@ class PathFinderRouter:
 
         return tasks
 
+    def _accumulate_via_usage_for_path(self, node_path: List[int]):
+        """Accumulate via column and segment usage for a committed path"""
+        if not hasattr(self, 'via_col_use') and not hasattr(self, 'via_seg_use'):
+            return  # Pooling not enabled
+
+        idx_to_coord = self.lattice.idx_to_coord
+        col_pool = hasattr(self, 'via_col_use')
+        seg_pool = hasattr(self, 'via_seg_use')
+
+        for u, v in zip(node_path, node_path[1:]):
+            xu, yu, zu = idx_to_coord(u)
+            xv, yv, zv = idx_to_coord(v)
+
+            # Check if it's a vertical transition (same x,y, different z)
+            if xu == xv and yu == yv and zu != zv:
+                # Column pooling: increment total vias at this (x,y)
+                if col_pool:
+                    self.via_col_use[xu, yu] += 1
+
+                # Segment pooling: increment each segment crossed
+                if seg_pool:
+                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    # Clamp to routing layers: 1..Nz-2
+                    z_lo = max(1, min(z_lo, self._Nz - 2))
+                    z_hi = max(1, min(z_hi, self._Nz - 2))
+                    # Increment each segment z→z+1 in range [z_lo, z_hi)
+                    for z in range(z_lo, z_hi):
+                        seg_idx = z - 1  # Segment z→z+1 stored at index z-1
+                        if 0 <= seg_idx < self._segZ:
+                            self.via_seg_use[xu, yu, seg_idx] += 1
+
+    def _rebuild_via_usage_from_committed(self):
+        """Rebuild via column/segment usage from all currently committed net paths"""
+        if not hasattr(self, 'via_col_use') and not hasattr(self, 'via_seg_use'):
+            return
+
+        # Clear counters
+        if hasattr(self, 'via_col_use'):
+            self.via_col_use.fill(0)
+        if hasattr(self, 'via_seg_use'):
+            self.via_seg_use.fill(0)
+
+        # Rebuild from all committed paths
+        for net_id, node_path in self.net_paths.items():
+            if node_path and len(node_path) > 1:
+                self._accumulate_via_usage_for_path(node_path)
+
+    def _apply_via_pooling_penalties(self, pres_fac: float):
+        """Apply via column and segment pooling penalties to vertical edge costs (VECTORIZED)"""
+        import time
+        t0 = time.perf_counter()
+
+        if not hasattr(self, 'via_col_pres') and not hasattr(self, 'via_seg_pres'):
+            return
+
+        # Skip if no via overuse
+        if hasattr(self, 'via_col_pres') and np.max(self.via_col_pres) == 0:
+            if hasattr(self, 'via_seg_pres') and np.max(self.via_seg_pres) == 0:
+                return  # No via pooling penalties needed
+
+        # Check if metadata is available
+        if not hasattr(self, '_via_edge_metadata') or self._via_edge_metadata is None:
+            logger.warning("[VIA-POOL] Metadata not built, falling back to sequential")
+            self._apply_via_pooling_penalties_sequential(pres_fac)
+            return
+
+        col_weight = float(getattr(self.config, "via_column_weight", 1.0))
+        seg_weight = float(getattr(self.config, "via_segment_weight", 1.0))
+
+        # Get cost array
+        total_cost = self.accounting.total_cost
+        if self.accounting.use_gpu:
+            total_cost_cpu = total_cost.get()
+        else:
+            total_cost_cpu = total_cost
+
+        # Get precomputed metadata
+        via_edge_indices = self._via_edge_metadata['indices']
+        via_xy_coords = self._via_edge_metadata['xy_coords']
+        z_lo = self._via_edge_metadata['z_lo']
+        z_hi = self._via_edge_metadata['z_hi']
+
+        num_via_edges = len(via_edge_indices)
+        if num_via_edges == 0:
+            return
+
+        # Initialize penalties array
+        penalties = np.zeros(num_via_edges, dtype=np.float32)
+
+        # Vectorized column penalty computation
+        if hasattr(self, 'via_col_pres'):
+            col_penalties = self.via_col_pres[via_xy_coords[:, 0], via_xy_coords[:, 1]]
+            penalties += col_weight * col_penalties
+
+        # Vectorized segment penalty computation (using prefix sums)
+        if hasattr(self, 'via_seg_prefix'):
+            # Compute prefix indices for range queries
+            # Segment index mapping: z-1→z is stored at index z-2
+            hi_idx = z_hi - 2  # Index for upper bound
+            lo_idx = z_lo - 2  # Index for lower bound
+
+            # Create masks for valid indices
+            valid_mask = z_hi > z_lo  # Only process edges spanning multiple layers
+            hi_valid = (hi_idx >= 0) & (hi_idx < self._segZ)
+            lo_valid = (lo_idx >= 0) & (lo_idx < self._segZ)
+
+            # Fetch prefix values with bounds checking
+            pref_hi = np.zeros(num_via_edges, dtype=np.float32)
+            pref_lo = np.zeros(num_via_edges, dtype=np.float32)
+
+            # Use advanced indexing for valid entries
+            if np.any(hi_valid):
+                valid_hi_edges = hi_valid
+                pref_hi[valid_hi_edges] = self.via_seg_prefix[
+                    via_xy_coords[valid_hi_edges, 0],
+                    via_xy_coords[valid_hi_edges, 1],
+                    hi_idx[valid_hi_edges]
+                ]
+
+            if np.any(lo_valid):
+                valid_lo_edges = lo_valid
+                pref_lo[valid_lo_edges] = self.via_seg_prefix[
+                    via_xy_coords[valid_lo_edges, 0],
+                    via_xy_coords[valid_lo_edges, 1],
+                    lo_idx[valid_lo_edges]
+                ]
+
+            # Compute segment penalties: prefix[hi] - prefix[lo]
+            seg_penalties = (pref_hi - pref_lo) * valid_mask
+            penalties += seg_weight * seg_penalties
+
+        # Apply penalties to cost array (vectorized)
+        penalty_mask = penalties > 0
+        total_cost_cpu[via_edge_indices[penalty_mask]] += pres_fac * penalties[penalty_mask]
+        penalties_applied = np.sum(penalty_mask)
+
+        # Update GPU if needed
+        if self.accounting.use_gpu:
+            self.accounting.total_cost[:] = cp.asarray(total_cost_cpu)
+
+        elapsed = time.perf_counter() - t0
+        if penalties_applied > 0:
+            logger.info(f"[VIA-POOL-PERF] Vectorized penalty application: {num_via_edges} edges, {penalties_applied} penalties in {elapsed:.3f}s")
+        else:
+            logger.debug(f"[VIA-POOL-PERF] No penalties applied ({num_via_edges} edges checked in {elapsed:.3f}s)")
+
+    def _apply_via_pooling_penalties_sequential(self, pres_fac: float):
+        """Sequential fallback for via pooling penalties (for debugging/comparison)"""
+        col_weight = float(getattr(self.config, "via_column_weight", 1.0))
+        seg_weight = float(getattr(self.config, "via_segment_weight", 1.0))
+
+        # Get cost array
+        total_cost = self.accounting.total_cost
+        if self.accounting.use_gpu:
+            total_cost_cpu = total_cost.get()
+        else:
+            total_cost_cpu = total_cost
+
+        # Get graph data
+        indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
+        indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
+
+        idx_to_coord = self.lattice.idx_to_coord
+        penalties_applied = 0
+
+        # Find via edge indices (where _via_edges is True)
+        via_edge_indices = np.where(self._via_edges)[0]
+
+        for ei in via_edge_indices:
+            u = int(np.searchsorted(indptr, ei, side='right') - 1)
+            if 0 <= u < len(indptr) - 1 and indptr[u] <= ei < indptr[u + 1]:
+                v = int(indices[ei])
+                xu, yu, zu = idx_to_coord(u)
+                xv, yv, zv = idx_to_coord(v)
+
+                penalty = 0.0
+
+                # Column penalty
+                if hasattr(self, 'via_col_pres'):
+                    penalty += col_weight * self.via_col_pres[xu, yu]
+
+                # Segment penalty (use prefix for fast range sum)
+                if hasattr(self, 'via_seg_prefix'):
+                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    z_lo = max(1, min(z_lo, self._Nz - 2))
+                    z_hi = max(1, min(z_hi, self._Nz - 2))
+                    if z_hi > z_lo:
+                        hi_idx = z_hi - 2
+                        lo_idx = z_lo - 2
+                        pref_hi = self.via_seg_prefix[xu, yu, hi_idx] if 0 <= hi_idx < self._segZ else 0.0
+                        pref_lo = self.via_seg_prefix[xu, yu, lo_idx] if 0 <= lo_idx < self._segZ else 0.0
+                        seg_sum = pref_hi - pref_lo
+                        penalty += seg_weight * seg_sum
+
+                if penalty > 0:
+                    total_cost_cpu[ei] += pres_fac * penalty
+                    penalties_applied += 1
+
+        # Update GPU if needed
+        if self.accounting.use_gpu:
+            self.accounting.total_cost[:] = cp.asarray(total_cost_cpu)
+
+        if penalties_applied > 0:
+            logger.debug(f"[VIA-POOL] Sequential: Applied pooling penalties to {penalties_applied} via edges")
+
     def _pathfinder_negotiation(self, tasks: Dict[str, Tuple[int, int]], progress_cb=None, iteration_cb=None) -> Dict:
         """CORE PATHFINDER ALGORITHM"""
         cfg = self.config
@@ -2399,6 +2642,23 @@ class PathFinderRouter:
             else:
                 # STEP 1: Refresh (iter 1 only, or if not using hotsets)
                 self.accounting.refresh_from_canonical()
+
+            # STEP 1.5: Rebuild via column/segment usage from committed paths
+            self._rebuild_via_usage_from_committed()
+
+            # STEP 1.6: Smooth via present costs and build segment prefix
+            alpha = float(getattr(cfg, "via_present_alpha", 0.6))
+            beta = float(getattr(cfg, "via_present_beta", 0.4))
+
+            if hasattr(self, 'via_col_use'):
+                over = np.maximum(0, self.via_col_use - self.via_col_cap).astype(np.float32)
+                self.via_col_pres = alpha * over + beta * self.via_col_pres
+
+            if hasattr(self, 'via_seg_use'):
+                over = np.maximum(0, self.via_seg_use - self.via_seg_cap).astype(np.float32)
+                self.via_seg_pres = alpha * over + beta * self.via_seg_pres
+                # Build cumulative prefix along z axis for fast range queries
+                np.cumsum(self.via_seg_pres, axis=2, out=self.via_seg_prefix)
 
             # STEP 2: Update costs (with history weight and via annealing)
             # Via policy: anneal via cost when pres_fac >= 64 (lowered to trigger earlier)
@@ -2453,6 +2713,9 @@ class PathFinderRouter:
                     base_cost_weight=cfg.base_cost_weight
                 )
 
+            # STEP 2.5: Apply via column/segment pooling penalties
+            self._apply_via_pooling_penalties(pres_fac)
+
             # STEP 3: Route (hotset incremental after iter 1)
             if cfg.reroute_only_offenders and it > 1:
                 # Pass ripped set to _build_hotset (Fix 2)
@@ -2463,6 +2726,16 @@ class PathFinderRouter:
                 self._last_ripped = set()
             else:
                 sub_tasks = tasks
+
+            # ANTI-OSCILLATION: Shuffle net order each iteration to break deterministic patterns
+            # This prevents the same nets from always winning/losing in the same order
+            if it > 1:
+                import random
+                net_ids = list(sub_tasks.keys())
+                random.seed(42 + it)  # Deterministic but different each iteration
+                random.shuffle(net_ids)
+                sub_tasks = {nid: sub_tasks[nid] for nid in net_ids}
+                logger.debug(f"[SHUFFLE] Randomized net order for iteration {it}")
 
             routed, failed = self._route_all(sub_tasks, all_tasks=tasks, pres_fac=pres_fac)
 
@@ -2504,6 +2777,28 @@ class PathFinderRouter:
                     logger.error(f"[ITER-1-HARDWALLS] ✗ count={inf_total} (BUG: infinite costs found in iteration 1!)")
                 self._iter1_inf_writes = 0  # Reset for next test
 
+            # Instrumentation: Via pooling statistics
+            if it % 5 == 0 and (hasattr(self, 'via_col_use') or hasattr(self, 'via_seg_use')):
+                if hasattr(self, 'via_col_use'):
+                    cols_used = np.sum(self.via_col_use > 0)
+                    cols_over = np.sum(self.via_col_use > self.via_col_cap)
+                    max_col_use = int(np.max(self.via_col_use))
+                    max_col_pres = float(np.max(self.via_col_pres))
+                    mean_col_pres = float(np.mean(self.via_col_pres[self.via_col_pres > 0])) if np.any(self.via_col_pres > 0) else 0.0
+                    logger.info(f"[VIA-POOL] Columns: used={cols_used}, over_cap={cols_over}, max_use={max_col_use}, max_pres={max_col_pres:.2f}, mean_pres={mean_col_pres:.2f}")
+
+                if hasattr(self, 'via_seg_use'):
+                    segs_used = np.sum(self.via_seg_use > 0)
+                    segs_over = np.sum(self.via_seg_use > self.via_seg_cap)
+                    max_seg_use = int(np.max(self.via_seg_use))
+                    max_seg_pres = float(np.max(self.via_seg_pres))
+                    max_seg_prefix = float(np.max(self.via_seg_prefix))
+                    logger.info(f"[VIA-POOL] Segments: used={segs_used}, over_cap={segs_over}, max_use={max_seg_use}, max_pres={max_seg_pres:.2f}, max_prefix={max_seg_prefix:.2f}")
+
+            # Instrumentation: Per-layer congestion breakdown
+            if over_sum > 0 and it % 5 == 0:  # Every 5 iterations
+                self._log_per_layer_congestion(over)
+
             # Instrumentation: Top-10 overused channels
             if over_sum > 0 and it % 3 == 0:  # Every 3 iterations
                 self._log_top_overused_channels(over, top_k=10)
@@ -2529,7 +2824,7 @@ class PathFinderRouter:
                 hist_gain_eff,
                 base_costs=self.graph.base_costs,
                 history_cap_multiplier=10.0,
-                decay_factor=0.98
+                decay_factor=float(getattr(cfg, "history_decay", 0.995))  # Gentle decay for stability
             )
 
             # Progress callback
@@ -3323,13 +3618,21 @@ class PathFinderRouter:
         # Sort by impact (highest first)
         scores.sort(reverse=True)
 
-        # ADAPTIVE CAP: scale with number of overused edges, not fixed cap
-        # Rule: allow ~2-4 nets per overused edge, but cap at config.hotset_cap
-        adaptive_cap = min(self.config.hotset_cap, max(64, 3 * len(over_idx)))
-        hotset = {nid for _, nid in scores[:adaptive_cap]}
+        # ADAPTIVE CAP: Target only worst offenders to prevent thrashing
+        # Conservative formula: cap at 80-120 nets based on overuse severity
+        # Old formula (3 * over_idx) was too generous and caused limit cycles
+        total_overuse = sum(float(over[ei]) for ei in over_idx)
+        adaptive_cap = min(self.config.hotset_cap, max(80, min(120, int(len(over_idx) / 150))))
+        hotset_list = [nid for _, nid in scores[:adaptive_cap]]
 
-        logger.info(f"[HOTSET] overuse_edges={len(over_idx)}, offenders={len(offenders)}, "
-                    f"unrouted={len(unrouted)}, cap={adaptive_cap} → hotset={len(hotset)}/{len(tasks)}")
+        # Shuffle hotset to break deterministic ordering (prevents same nets always winning/losing)
+        import random
+        rng = random.Random(42 + self.iteration)  # Deterministic but different each iteration
+        rng.shuffle(hotset_list)
+        hotset = set(hotset_list)
+
+        logger.info(f"[HOTSET] overuse_edges={len(over_idx)} total_overuse={int(total_overuse)}, "
+                    f"offenders={len(offenders)}, cap={adaptive_cap} → hotset={len(hotset)}/{len(tasks)} (shuffled)")
 
         return hotset
 
@@ -3370,6 +3673,112 @@ class PathFinderRouter:
                 logger.info(f"  {rank:2d}. {edge_type:5s} {layer_info:6s} "
                            f"({ux_mm:6.2f},{uy_mm:6.2f})→({vx_mm:6.2f},{vy_mm:6.2f}) "
                            f"overuse={overuse_val:.1f} nets={nets_on_edge}")
+
+    def _log_per_layer_congestion(self, over: np.ndarray):
+        """Log overuse breakdown by layer (horizontal) and via pairs (vertical)"""
+        indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
+        indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
+
+        # Initialize per-layer accumulators
+        layer_count = self.config.layer_count
+        overuse_horiz = {z: 0.0 for z in range(1, layer_count + 1)}
+        overuse_vert = {}  # Key: (z1, z2) for via pairs
+
+        # Accumulate overuse by edge type
+        for ei in range(len(over)):
+            if over[ei] <= 0:
+                continue
+
+            # Find source and dest nodes
+            u = int(np.searchsorted(indptr, ei, side='right') - 1)
+            if 0 <= u < len(indptr) - 1 and indptr[u] <= ei < indptr[u + 1]:
+                v = int(indices[ei])
+                _, _, uz = self.lattice.idx_to_coord(u)
+                _, _, vz = self.lattice.idx_to_coord(v)
+
+                if uz == vz:
+                    # Horizontal edge
+                    overuse_horiz[uz] = overuse_horiz.get(uz, 0.0) + float(over[ei])
+                else:
+                    # Via edge
+                    pair = (min(uz, vz), max(uz, vz))
+                    overuse_vert[pair] = overuse_vert.get(pair, 0.0) + float(over[ei])
+
+        # Log horizontal overuse by layer
+        total_horiz = sum(overuse_horiz.values())
+        if total_horiz > 0:
+            logger.info(f"[LAYER-CONGESTION] Horizontal overuse by layer:")
+            for z in sorted(overuse_horiz.keys()):
+                if overuse_horiz[z] > 0:
+                    pct = (overuse_horiz[z] / total_horiz) * 100
+                    logger.info(f"  Layer {z:2d}: {overuse_horiz[z]:7.1f} ({pct:5.1f}%)")
+
+        # Log vertical overuse by via pair
+        total_vert = sum(overuse_vert.values())
+        if total_vert > 0:
+            logger.info(f"[VIA-CONGESTION] Vertical overuse by layer pair:")
+            for (z1, z2), val in sorted(overuse_vert.items(), key=lambda x: x[1], reverse=True):
+                pct = (val / total_vert) * 100
+                logger.info(f"  L{z1}→L{z2}: {val:7.1f} ({pct:5.1f}%)")
+
+        return overuse_horiz  # Return for layer balancing
+
+    def _update_layer_bias(self, overuse_by_layer: dict, layer_bias: dict) -> dict:
+        """
+        Update layer bias based on overuse distribution to encourage load balancing.
+        Hot layers get positive bias (higher cost), cool layers get negative bias (lower cost).
+        Uses EMA to smooth changes and prevent whiplash.
+        """
+        if not overuse_by_layer or sum(overuse_by_layer.values()) == 0:
+            return layer_bias
+
+        # Calculate mean overuse (ignoring zero layers to avoid dilution)
+        nonzero_overuse = [v for v in overuse_by_layer.values() if v > 0]
+        if not nonzero_overuse:
+            return layer_bias
+
+        mu = sum(nonzero_overuse) / len(nonzero_overuse) + 1e-6
+
+        # Calculate normalized error for each layer (positive = hotter than average)
+        for z in overuse_by_layer.keys():
+            err = (overuse_by_layer[z] / mu) - 1.0
+            # EMA update with small gain (0.02) to prevent oscillation
+            # Multiply by small factor (0.05) for gentle nudging
+            old_bias = layer_bias.get(z, 0.0)
+            new_bias = 0.9 * old_bias + 0.1 * (0.05 * err)
+            layer_bias[z] = new_bias
+
+        # Log top 5 biases for debugging
+        top_biases = sorted(layer_bias.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+        if any(abs(bias) > 0.01 for _, bias in top_biases):
+            bias_str = ", ".join([f"L{z}:{bias:+.3f}" for z, bias in top_biases])
+            logger.info(f"[LAYER-BIAS] Top biases: {bias_str}")
+
+        return layer_bias
+
+    def _apply_layer_bias_to_costs(self, layer_bias: dict):
+        """Apply layer bias to edge costs (only horizontal edges on each layer)"""
+        if not layer_bias or not hasattr(self, '_layer_edges'):
+            return
+
+        # Get current costs
+        total_cost = self.accounting.total_cost
+        if self.accounting.use_gpu:
+            total_cost_cpu = total_cost.get()
+        else:
+            total_cost_cpu = total_cost
+
+        # Apply bias to each layer's horizontal edges
+        for z, bias in layer_bias.items():
+            if abs(bias) < 0.001:  # Skip negligible biases
+                continue
+            if z in self._layer_edges:
+                edge_indices = self._layer_edges[z]
+                total_cost_cpu[edge_indices] += bias
+
+        # Update GPU if needed
+        if self.accounting.use_gpu:
+            self.accounting.total_cost[:] = cp.asarray(total_cost_cpu)
 
     def _rip_top_k_offenders(self, k=20) -> Set[str]:
         """
@@ -3459,6 +3868,65 @@ class PathFinderRouter:
                 self._via_edges[ei] = (uz != vz)
 
         logger.info(f"Identified {int(self._via_edges.sum())} via edges")
+
+    def _build_via_edge_metadata(self):
+        """Precompute via edge metadata for vectorized penalty application"""
+        import time
+        t0 = time.perf_counter()
+
+        # Get via edge indices
+        via_edge_indices = np.where(self._via_edges)[0]
+        num_via_edges = len(via_edge_indices)
+
+        if num_via_edges == 0:
+            self._via_edge_metadata = None
+            return
+
+        # Get graph data
+        indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
+        indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
+
+        # Precompute u (source node) for each via edge using searchsorted
+        u_indices = np.searchsorted(indptr, via_edge_indices, side='right') - 1
+
+        # Get v (destination node) for each via edge
+        v_indices = indices[via_edge_indices]
+
+        # Convert to coordinates (vectorized)
+        plane_size = self.lattice.x_steps * self.lattice.y_steps
+
+        # u coordinates
+        xu = (u_indices % plane_size) % self.lattice.x_steps
+        yu = (u_indices % plane_size) // self.lattice.x_steps
+        zu = u_indices // plane_size
+
+        # v coordinates
+        xv = (v_indices % plane_size) % self.lattice.x_steps
+        yv = (v_indices % plane_size) // self.lattice.x_steps
+        zv = v_indices // plane_size
+
+        # For via edges, x,y should be same (sanity check in debug mode)
+        # Store just one (x,y) coordinate per via edge
+        via_xy_coords = np.stack([xu, yu], axis=1).astype(np.int32)
+
+        # Store z ranges (lo, hi) for each via edge
+        z_lo = np.minimum(zu, zv)
+        z_hi = np.maximum(zu, zv)
+
+        # Clamp z values to valid routing layers (1..Nz-2)
+        z_lo = np.clip(z_lo, 1, self.lattice.z_steps - 2)
+        z_hi = np.clip(z_hi, 1, self.lattice.z_steps - 2)
+
+        # Store metadata as a dictionary
+        self._via_edge_metadata = {
+            'indices': via_edge_indices.astype(np.int32),
+            'xy_coords': via_xy_coords,
+            'z_lo': z_lo.astype(np.int32),
+            'z_hi': z_hi.astype(np.int32),
+        }
+
+        elapsed = time.perf_counter() - t0
+        logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges in {elapsed:.3f}s")
 
     def _path_to_edges(self, node_path: List[int]) -> List[int]:
         """Nodes → edge indices via on-the-fly CSR scan (no dict needed)"""

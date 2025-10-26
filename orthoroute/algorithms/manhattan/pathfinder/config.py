@@ -19,16 +19,16 @@ GRID_PITCH = 0.4                    # Grid pitch in mm for routing lattice
 
 # PathFinder Algorithm Parameters
 BATCH_SIZE = 32                     # Number of nets processed per batch
-MAX_ITERATIONS = 30                 # Maximum PathFinder negotiation iterations
+MAX_ITERATIONS = 40                 # Maximum PathFinder negotiation iterations (extended for convergence)
 MAX_SEARCH_NODES = 50000            # Maximum nodes explored per net
 PER_NET_BUDGET_S = 0.5             # Time budget per net in seconds
 MAX_ROI_NODES = 20000              # Maximum nodes in Region of Interest
 
 # PathFinder Cost Parameters
 PRES_FAC_INIT = 1.0                # Initial present factor for congestion
-PRES_FAC_MULT = 1.35               # Present factor multiplier per iteration (gentler growth prevents oscillation)
-PRES_FAC_MAX = 512.0               # Maximum present factor cap (must be high enough to break stalemates)
-HIST_ACCUM_GAIN = 1.0              # Historical cost accumulation gain
+PRES_FAC_MULT = 1.25               # Very gentle multiplier (was 1.35 - still too fast)
+PRES_FAC_MAX = 512.0               # Maximum present factor cap (high ceiling)
+HIST_ACCUM_GAIN = 1.8              # Strong history to make detours permanent (was 1.0 - too weak)
 OVERUSE_EPS = 1e-6                 # Epsilon for overuse calculations
 
 # Algorithm Tuning Parameters
@@ -38,8 +38,8 @@ STRICT_CAPACITY = True             # Enforce strict capacity constraints
 REROUTE_ONLY_OFFENDERS = True      # Reroute only offending nets in incremental mode
 
 # Via and Routing Parameters
-VIA_COST = 1.0  # Cheap vias encourage spreading into empty vertical channels (was 6.0)
-VIA_CAPACITY_PER_NET = 999         # Via capacity limit per net
+VIA_COST = 0.7  # Cheaper vias to encourage layer hopping (was 1.0)
+VIA_CAPACITY_PER_NET = 8           # Via column capacity (multiple nets can share via shafts)
 STORE_REMAP_ON_RESIZE = 0          # Edge store remapping behavior
 
 # Performance and Safety Parameters
@@ -112,11 +112,21 @@ class PathFinderConfig:
     # Centralized via policy (used everywhere; avoid module-level lookups)
     via_cost: float = VIA_COST
     via_capacity_per_net: int = VIA_CAPACITY_PER_NET
-    # Blind/buried via policy
-    allow_any_layer_via: bool = True
-    enable_buried_via_keepouts: bool = True   # block intermediate layers at the (x,y) column
+    # Blind/buried via policy (FULL FLEXIBILITY FOR CONVERGENCE TEST)
+    allow_any_layer_via: bool = True  # TRUE: Allow any-to-any layer vias (full blind/buried)
+    enable_buried_via_keepouts: bool = False  # DISABLED: Hard-blocking intermediate layers causes convergence oscillation
     keepout_weight: float = 1e9                # effectively "INF" for track edges touching a blocked node
     via_span_alpha: float = 0.08               # Small penalty for long via spans (reduces shaft congestion)
+    # Via pooling controls (critical for convergence with full blind/buried)
+    via_column_pooling: bool = True            # Pool capacity per (x,y) column
+    via_column_capacity: int = 4               # Max vias per column (x,y)
+    via_segment_pooling: bool = False  # Temporarily disabled for speed test
+    via_segment_capacity: int = 1              # Max vias per segment (z→z+1) at (x,y)
+    via_present_alpha: float = 0.60            # Present smoothing (current weight)
+    via_present_beta: float = 0.40             # Present smoothing (previous weight)
+    via_column_weight: float = 1.0             # Column penalty scaling
+    via_segment_weight: float = 1.0            # Segment penalty scaling
+    history_decay: float = 0.995               # History decay factor (was 1.0 - too sticky)
     # Column spreading parameters (to prevent "elevator shaft" congestion and fill empty channels)
     column_spread_alpha: float = 0.5           # Fraction of overuse that leaks sideways (increased for better spreading)
     column_spread_radius: int = 5              # Columns ±N get diffused history cost (wider spread to fill gaps)
