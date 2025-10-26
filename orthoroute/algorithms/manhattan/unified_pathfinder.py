@@ -864,6 +864,31 @@ class EdgeAccountant:
             jitter = jitter * 1e-6  # tiny epsilon
             self.total_cost += jitter
 
+    def update_present_cost_only(self, pres_fac: float, base_costs):
+        """
+        FAST per-net cost update: Only recomputes present cost term (not history).
+        Called after EACH net routes to update costs for the NEXT net.
+        History cost only updates at END of iteration.
+
+        This is critical for PathFinder convergence!
+
+        Formula: total_cost = base_cost + pres_fac * overuse + history
+        """
+        # Recompute overuse with current occupancy
+        over = self.xp.maximum(0, self.present - self.capacity)
+
+        # Update total_cost: base + present_penalty + history
+        # Don't modify history here - only update present penalty based on current occupancy
+        self.total_cost = base_costs + pres_fac * over + self.history
+
+        # Log first few updates for debugging
+        if not hasattr(self, '_pernet_update_count'):
+            self._pernet_update_count = 0
+        self._pernet_update_count += 1
+        if self._pernet_update_count <= 3:
+            overuse_count = int(self.xp.sum(over > 0))
+            logger.info(f"[PER-NET-UPDATE #{self._pernet_update_count}] Overuse edges: {overuse_count}, pres_fac={pres_fac:.2f}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3D LATTICE
@@ -1546,6 +1571,9 @@ class SimpleDijkstra:
         self.N = len(self.indptr) - 1
         # Store plane_size for layer calculation
         self.plane_size = lattice.x_steps * lattice.y_steps if lattice else None
+        # Initialize path counters
+        self._gpu_path_count = 0
+        self._cpu_path_count = 0
 
     def find_path_roi(self, src: int, dst: int, costs, roi_nodes, global_to_roi) -> Optional[List[int]]:
         """Find shortest path within ROI subgraph using heap-based Dijkstra (O(E log V))"""
@@ -1554,7 +1582,7 @@ class SimpleDijkstra:
 
         # Use GPU if ROI is large enough and GPU solver available
         roi_size = len(roi_nodes) if hasattr(roi_nodes, '__len__') else roi_nodes.shape[0]
-        gpu_threshold = getattr(self.config, 'gpu_roi_min_nodes', 1000)
+        gpu_threshold = getattr(getattr(self, 'config', None), 'gpu_roi_min_nodes', 1000)
         use_gpu = hasattr(self, 'gpu_solver') and self.gpu_solver and roi_size > gpu_threshold
 
         if use_gpu:
@@ -2334,13 +2362,26 @@ class PathFinderRouter:
     def _pathfinder_negotiation(self, tasks: Dict[str, Tuple[int, int]], progress_cb=None, iteration_cb=None) -> Dict:
         """CORE PATHFINDER ALGORITHM"""
         cfg = self.config
-        pres_fac = cfg.pres_fac_init
+
+        # Load params into local variables with defaults (ensures new config values used)
+        pres_fac = float(getattr(cfg, 'pres_fac_init', 1.0))
+        pres_fac_mult = float(getattr(cfg, 'pres_fac_mult', 1.35))
+        pres_fac_max = float(getattr(cfg, 'pres_fac_max', 512.0))
+        hist_gain = float(getattr(cfg, 'hist_gain', 0.8))
+
+        # Allow env overrides for testing
+        pres_fac_mult = float(os.getenv('ORTHO_PRES_FAC_MULT', pres_fac_mult))
+        pres_fac_max = float(os.getenv('ORTHO_PRES_FAC_MAX', pres_fac_max))
+        hist_gain = float(os.getenv('ORTHO_HIST_GAIN', hist_gain))
+
         best_overuse = float('inf')
         stagnant = 0
+        prev_over_sum = float('inf')
 
         self._negotiation_ran = True
 
         logger.info(f"[NEGOTIATE] {len(tasks)} nets, {cfg.max_iterations} iters")
+        logger.info(f"[PARAMS] pres_fac_init={pres_fac:.2f} pres_fac_mult={pres_fac_mult:.2f} pres_fac_max={pres_fac_max:.0f} hist_gain={hist_gain:.2f}")
 
         for it in range(1, cfg.max_iterations + 1):
             self.iteration = it
@@ -2360,9 +2401,9 @@ class PathFinderRouter:
                 self.accounting.refresh_from_canonical()
 
             # STEP 2: Update costs (with history weight and via annealing)
-            # Late-stage via policy: anneal via cost when pres_fac >= 200
+            # Via policy: anneal via cost when pres_fac >= 64 (lowered to trigger earlier)
             via_cost_mult = 1.0
-            if pres_fac >= 200:
+            if pres_fac >= 64:
                 # Check if >70% of overuse is on vias
                 present = self.accounting.present.get() if self.accounting.use_gpu else self.accounting.present
                 cap = self.accounting.capacity.get() if self.accounting.use_gpu else self.accounting.capacity
@@ -2405,9 +2446,9 @@ class PathFinderRouter:
                         base_cost_weight=cfg.base_cost_weight
                     )
             else:
-                # FULL: Update all edges (default PathFinder behavior)
+                # FULL: Update all edges (default PathFinder behavior) - use local hist_gain
                 self.accounting.update_costs(
-                    self.graph.base_costs, pres_fac, cfg.hist_cost_weight,
+                    self.graph.base_costs, pres_fac, hist_gain,
                     via_cost_multiplier=via_cost_mult,
                     base_cost_weight=cfg.base_cost_weight
                 )
@@ -2478,9 +2519,14 @@ class PathFinderRouter:
                 pres_fac = min(pres_fac, 10.0)
                 logger.info(f"[CLEAN] Overuse=0, {len(unrouted)} unrouted left → freeze {len(placed)} nets, pres_fac={pres_fac:.2f}")
 
-            # STEP 5: History (with decay and clamping)
+            # STEP 5: History (use local hist_gain variable, optionally boost after iter 8)
+            hist_gain_eff = hist_gain
+            if it >= 8 and over_sum > 0:
+                # Strengthen history memory after learning phase
+                hist_gain_eff = min(1.2, hist_gain * 1.25)
+
             self.accounting.update_history(
-                cfg.hist_gain,
+                hist_gain_eff,
                 base_costs=self.graph.base_costs,
                 history_cap_multiplier=10.0,
                 decay_factor=0.98
@@ -2586,11 +2632,27 @@ class PathFinderRouter:
                 stagnant = 0
                 continue
 
-            # STEP 7: Escalate (but respect pres_fac freeze after rip - Fix 4)
+            # STEP 7: Escalate with anti-thrash damper
             if it <= getattr(self, "_freeze_pres_fac_until", 0):
                 logger.debug(f"[ITER {it}] Holding pres_fac={pres_fac:.2f} post-rip")
             else:
-                pres_fac = min(pres_fac * cfg.pres_fac_mult, cfg.pres_fac_max)
+                # Anti-thrash: simple stagnation counter
+                if over_sum >= 0.995 * prev_over_sum:
+                    # No real improvement
+                    stagnant += 1
+                else:
+                    stagnant = 0
+
+                if stagnant >= 2:
+                    # Brief backoff then resume
+                    pres_fac = max(1.0, pres_fac * 0.90)
+                    stagnant = 0  # Reset after backoff
+                    logger.info(f"[ANTI-THRASH] stagnant=2 → pres_fac reduced to {pres_fac:.2f}")
+                else:
+                    # Normal growth
+                    pres_fac = min(pres_fac * pres_fac_mult, pres_fac_max)
+
+                logger.debug(f"[ESCALATE] stagnant={stagnant} pres_fac={pres_fac:.2f}")
 
         # If we exited with low overuse (<100), run detail pass
         if 0 < over_sum <= 100:
@@ -2828,10 +2890,10 @@ class PathFinderRouter:
         # Order nets by difficulty: hardest first, with slight shuffle per iteration
         ordered_nets = self._order_nets_by_difficulty(tasks)
 
-        # CRITICAL: Use costs computed at iteration level (not per-net)
-        # Costs were updated in _pathfinder_negotiation() BEFORE calling _route_all()
-        # This ensures PathFinder's design: one cost update per iteration, not per net
-        costs = self.accounting.total_cost.get() if self.accounting.use_gpu else self.accounting.total_cost
+        # Start with costs from iteration-level update
+        # NOTE: For GPU, keep as CuPy array (don't .get() to CPU)
+        # Per-net updates will refresh this reference
+        costs = self.accounting.total_cost  # Keep on GPU if use_gpu=True
 
         # PathFinder design: Sequential routing with FIXED costs throughout iteration
         # Costs are updated ONCE per iteration (in _pathfinder_negotiation), not per net
@@ -2937,6 +2999,8 @@ class PathFinderRouter:
                                 # Commit path and continue to next net
                                 edge_indices = self._path_to_edges(path)
                                 self.accounting.commit_path(edge_indices)
+                                # NOTE: Do NOT update costs here! PathFinder requires fixed costs per iteration.
+
                                 self.net_paths[net_id] = path
                                 if entry_layer is not None and exit_layer is not None:
                                     self.net_portal_layers[net_id] = (entry_layer, exit_layer)
@@ -3097,7 +3161,10 @@ class PathFinderRouter:
 
             if path and len(path) > 1:
                 edge_indices = self._path_to_edges(path)
-                self.accounting.commit_path(edge_indices)  # bumps present for next nets
+                self.accounting.commit_path(edge_indices)  # bumps present for next iteration
+                # NOTE: Do NOT update costs here! PathFinder requires fixed costs per iteration.
+                # Costs are updated ONCE per iteration in _pathfinder_negotiation()
+
                 self.net_paths[net_id] = path
                 # Store portal entry/exit layers if using portals
                 if use_portals and entry_layer is not None and exit_layer is not None:

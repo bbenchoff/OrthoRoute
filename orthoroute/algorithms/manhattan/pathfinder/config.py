@@ -26,8 +26,8 @@ MAX_ROI_NODES = 20000              # Maximum nodes in Region of Interest
 
 # PathFinder Cost Parameters
 PRES_FAC_INIT = 1.0                # Initial present factor for congestion
-PRES_FAC_MULT = 2.0                # Present factor multiplier per iteration (faster growth breaks deadlocks)
-PRES_FAC_MAX = 512.0               # Maximum present factor cap
+PRES_FAC_MULT = 1.35               # Present factor multiplier per iteration (gentler growth prevents oscillation)
+PRES_FAC_MAX = 512.0               # Maximum present factor cap (must be high enough to break stalemates)
 HIST_ACCUM_GAIN = 1.0              # Historical cost accumulation gain
 OVERUSE_EPS = 1e-6                 # Epsilon for overuse calculations
 
@@ -98,10 +98,10 @@ class PathFinderConfig:
     max_iterations: int = MAX_ITERATIONS  # Alias for compatibility
     max_search_nodes: int = MAX_SEARCH_NODES
     pres_fac_init: float = PRES_FAC_INIT
-    pres_fac_mult: float = PRES_FAC_MULT
-    pres_fac_max: float = PRES_FAC_MAX
+    pres_fac_mult: float = PRES_FAC_MULT  # Now 1.35 from module constant
+    pres_fac_max: float = PRES_FAC_MAX    # Now 512.0 from module constant
     hist_accum_gain: float = HIST_ACCUM_GAIN
-    hist_gain: float = 2.5  # Alias for historical cost gain (unified_pathfinder uses this name)
+    hist_gain: float = 0.8  # Historical cost gain (0.6-1.0 range prevents ping-pong)
     overuse_eps: float = OVERUSE_EPS
     mode: str = "near_far"  # Use fast GPU ROI pathfinding with actual CUDA kernels
     roi_parallel: bool = False
