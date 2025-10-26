@@ -2206,6 +2206,21 @@ class PathFinderRouter:
 
         return seeds
 
+    def _build_routing_seeds(self, portal_seeds_list):
+        """
+        Convert portal seeds from (node_idx, cost) tuples to plain node_idx arrays.
+
+        Args:
+            portal_seeds_list: List of (node_idx, cost) tuples from _get_portal_seeds()
+
+        Returns:
+            np.int32 array of node indices
+        """
+        import numpy as np
+        if not portal_seeds_list:
+            return np.array([], dtype=np.int32)
+        # Extract just the node indices, ignore costs
+        return np.array([seed[0] for seed in portal_seeds_list], dtype=np.int32)
     def route_multiple_nets(self, requests: List, progress_cb=None, iteration_cb=None) -> Dict:
         """
         Main entry for routing multiple nets.
@@ -2873,6 +2888,70 @@ class PathFinderRouter:
                 else:
                     use_portals = False
 
+
+            # ═══════════════════════════════════════════════════════════════
+            # GPU SUPERSOURCE FAST PATH (ATTEMPT BEFORE ROI EXTRACTION)
+            # ═══════════════════════════════════════════════════════════════
+            # Try full-graph GPU pathfinding with supersource/supersink seeds
+            # This skips ROI extraction entirely and routes on full graph
+            # If it fails or GPU not available, fall back to standard ROI routing
+            
+            gpu_fast_path_used = False
+            if use_portals and hasattr(self.solver, 'gpu_solver') and self.solver.gpu_solver:
+                try:
+                    import numpy as np
+                    import cupy as cp
+                    
+                    # Check if costs are on GPU
+                    costs_on_gpu = hasattr(costs, 'device')
+                    
+                    if costs_on_gpu:
+                        logger.info(f"[GPU-SEEDS] Attempting GPU supersource routing for net {net_id}")
+                        
+                        # Convert portal seeds to plain node arrays
+                        src_node_array = self._build_routing_seeds(src_seeds)
+                        dst_node_array = self._build_routing_seeds(dst_targets)
+                        
+                        if len(src_node_array) > 0 and len(dst_node_array) > 0:
+                            # Call GPU supersource pathfinding
+                            gpu_start = time.time()
+                            path = self.solver.gpu_solver.find_path_fullgraph_gpu_seeds(
+                                costs=costs,
+                                src_seeds=src_node_array,
+                                dst_targets=dst_node_array,
+                                ub_hint=None
+                            )
+                            gpu_time = time.time() - gpu_start
+                            
+                            if path and len(path) > 1:
+                                logger.info(f"[GPU-SEEDS] SUCCESS! Path found in {gpu_time:.3f}s ({len(path)} nodes)")
+                                gpu_fast_path_used = True
+                                
+                                # Determine entry and exit layers from path
+                                if self.solver.plane_size:
+                                    entry_layer = path[0] // self.solver.plane_size
+                                    exit_layer = path[-1] // self.solver.plane_size
+                                else:
+                                    entry_layer = exit_layer = 0
+                                
+                                # Commit path and continue to next net
+                                edge_indices = self._path_to_edges(path)
+                                self.accounting.commit_path(edge_indices)
+                                self.net_paths[net_id] = path
+                                if entry_layer is not None and exit_layer is not None:
+                                    self.net_portal_layers[net_id] = (entry_layer, exit_layer)
+                                self._update_net_edge_tracking(net_id, edge_indices)
+                                routed_this_pass += 1
+                                continue  # Skip ROI extraction and CPU routing
+                            else:
+                                logger.info(f"[GPU-SEEDS] No path found, falling back to ROI routing")
+                        else:
+                            logger.warning(f"[GPU-SEEDS] Empty seed arrays, skipping GPU fast path")
+                except Exception as e:
+                    logger.warning(f"[GPU-SEEDS] GPU fast path failed: {e}, falling back to ROI routing")
+            
+            # If GPU fast path succeeded, we already continued to next net above
+            # Otherwise, proceed with standard ROI routing below
             # ═══════════════════════════════════════════════════════════════
             # HYBRID ROI/FULL-GRAPH ROUTING (BACKPLANE-OPTIMIZED)
             # ═══════════════════════════════════════════════════════════════
