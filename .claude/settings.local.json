@@ -44,7 +44,8 @@
       "Bash(set USE_GPU_COMPACTION=1)",
       "Bash(set GPU_MODE=1)",
       "Bash(ORTHO_CPU_ONLY=1 timeout 300 python main.py --test-manhattan)",
-      "Bash(ORTHO_CPU_ONLY=1 timeout 600 python main.py --test-manhattan)"
+      "Bash(ORTHO_CPU_ONLY=1 timeout 600 python main.py --test-manhattan)",
+      "Bash(git push:*)"
     ],
     "deny": [],
     "ask": [],

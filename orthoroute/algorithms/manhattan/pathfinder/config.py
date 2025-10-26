@@ -26,9 +26,9 @@ MAX_ROI_NODES = 20000              # Maximum nodes in Region of Interest
 
 # PathFinder Cost Parameters
 PRES_FAC_INIT = 1.0                # Initial present factor for congestion
-PRES_FAC_MULT = 1.25               # Very gentle multiplier (was 1.35 - still too fast)
+PRES_FAC_MULT = 1.15               # Very gentle multiplier (was 1.25 - reduced to stop oscillation)
 PRES_FAC_MAX = 512.0               # Maximum present factor cap (high ceiling)
-HIST_ACCUM_GAIN = 1.8              # Strong history to make detours permanent (was 1.0 - too weak)
+HIST_ACCUM_GAIN = 1.35             # Balanced history (was 1.8 - too aggressive, causes over-correction)
 OVERUSE_EPS = 1e-6                 # Epsilon for overuse calculations
 
 # Algorithm Tuning Parameters
@@ -117,16 +117,18 @@ class PathFinderConfig:
     enable_buried_via_keepouts: bool = False  # DISABLED: Hard-blocking intermediate layers causes convergence oscillation
     keepout_weight: float = 1e9                # effectively "INF" for track edges touching a blocked node
     via_span_alpha: float = 0.08               # Small penalty for long via spans (reduces shaft congestion)
-    # Via pooling controls (critical for convergence with full blind/buried)
-    via_column_pooling: bool = True            # Pool capacity per (x,y) column
-    via_column_capacity: int = 4               # Max vias per column (x,y)
-    via_segment_pooling: bool = False  # Temporarily disabled for speed test
-    via_segment_capacity: int = 1              # Max vias per segment (z→z+1) at (x,y)
+    # Via pooling controls (CORRECT MODEL: multiple non-overlapping vias at same x,y)
+    # Key insight: Multiple vias CAN coexist at (x,y) if their z-ranges don't overlap
+    # Example: In1→In3 and In5→In9 at same (x,y) is ALLOWED
+    via_column_pooling: bool = False           # DISABLED - not needed if segment enforcement is strict
+    via_column_capacity: int = 999             # Unlimited vias per (x,y) if non-overlapping
+    via_segment_pooling: bool = True           # ENABLED - enforces z-range non-overlap
+    via_segment_capacity: int = 1              # STRICT: only ONE via crosses each z→z+1 at (x,y)
     via_present_alpha: float = 0.60            # Present smoothing (current weight)
     via_present_beta: float = 0.40             # Present smoothing (previous weight)
-    via_column_weight: float = 1.0             # Column penalty scaling
-    via_segment_weight: float = 1.0            # Segment penalty scaling
-    history_decay: float = 0.995               # History decay factor (was 1.0 - too sticky)
+    via_column_weight: float = 0.30            # Column penalty scaling (not used if column pooling off)
+    via_segment_weight: float = 1.0            # Segment penalty scaling (was 0.9)
+    history_decay: float = 0.995               # History decay factor
     # Column spreading parameters (to prevent "elevator shaft" congestion and fill empty channels)
     column_spread_alpha: float = 0.5           # Fraction of overuse that leaks sideways (increased for better spreading)
     column_spread_radius: int = 5              # Columns ±N get diffused history cost (wider spread to fill gaps)

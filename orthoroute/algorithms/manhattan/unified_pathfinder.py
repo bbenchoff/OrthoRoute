@@ -574,11 +574,11 @@ class PathFinderConfig:
     20%+ convergence regression. Prefer infrastructure improvements over tuning.
     """
     max_iterations: int = 40  # Extended to give convergence more time
-    # CONVERGENCE SCHEDULE (TUNED FOR STABILITY):
+    # CONVERGENCE SCHEDULE (TUNED TO ELIMINATE OSCILLATION):
     pres_fac_init: float = 1.0   # Start gentle (iteration 1)
-    pres_fac_mult: float = 1.25  # Very gentle escalation (was 1.35 - still too fast!)
+    pres_fac_mult: float = 1.15  # Ultra-gentle escalation (was 1.25 - reduced to stop ringing)
     pres_fac_max: float = 512.0  # Higher ceiling (was 64 - too low!)
-    hist_gain: float = 1.8       # STRONG history to make detours permanent (was 1.2 - too weak!)
+    hist_gain: float = 1.35      # Balanced history (was 1.8 - too strong, caused over-correction)
 
     # CRITICAL: Length vs Completion Trade-off
     base_cost_weight: float = 0.3  # Weight for path length penalty (1.0=optimize length, 0.01=optimize completion)
@@ -3618,11 +3618,13 @@ class PathFinderRouter:
         # Sort by impact (highest first)
         scores.sort(reverse=True)
 
-        # ADAPTIVE CAP: Target only worst offenders to prevent thrashing
-        # Conservative formula: cap at 80-120 nets based on overuse severity
-        # Old formula (3 * over_idx) was too generous and caused limit cycles
+        # ADAPTIVE CAP: Scale with overuse severity to prevent both thrashing and stagnation
+        # Formula balances: enough rip-up to make progress, not so much we destabilize
         total_overuse = sum(float(over[ei]) for ei in over_idx)
-        adaptive_cap = min(self.config.hotset_cap, max(80, min(120, int(len(over_idx) / 150))))
+        base_target = max(64, min(180, len(over_idx) // 25))  # Scale with # of overused edges
+
+        # Adjust based on progress (optional: track prev_overuse for this)
+        adaptive_cap = min(self.config.hotset_cap, base_target)
         hotset_list = [nid for _, nid in scores[:adaptive_cap]]
 
         # Shuffle hotset to break deterministic ordering (prevents same nets always winning/losing)
@@ -3914,8 +3916,8 @@ class PathFinderRouter:
         z_hi = np.maximum(zu, zv)
 
         # Clamp z values to valid routing layers (1..Nz-2)
-        z_lo = np.clip(z_lo, 1, self.lattice.z_steps - 2)
-        z_hi = np.clip(z_hi, 1, self.lattice.z_steps - 2)
+        z_lo = np.clip(z_lo, 1, self.lattice.layers - 2)
+        z_hi = np.clip(z_hi, 1, self.lattice.layers - 2)
 
         # Store metadata as a dictionary
         self._via_edge_metadata = {
