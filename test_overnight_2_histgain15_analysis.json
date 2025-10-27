@@ -1,0 +1,79 @@
+{
+  "log_file": "test_overnight_2_histgain15.log",
+  "data": {
+    "iterations": [
+      {
+        "iteration": 1,
+        "hist_sum": 0.0,
+        "hist_max": 0.0,
+        "hist_mean": 0.0,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 0.0,
+        "overuse": 9495,
+        "edges": 7909,
+        "balance_ratio": 0.0
+      },
+      {
+        "iteration": 2,
+        "hist_sum": 0.0,
+        "hist_max": 0.0,
+        "hist_mean": 0.0,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 26396.0,
+        "overuse": 19088,
+        "edges": 13071,
+        "balance_ratio": 0.0
+      },
+      {
+        "iteration": 3,
+        "hist_sum": 497.0,
+        "hist_max": 0.9,
+        "hist_mean": 0.329,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 42234.0,
+        "overuse": 36998,
+        "edges": 16303,
+        "balance_ratio": 0.011
+      },
+      {
+        "iteration": 4,
+        "hist_sum": 4047.0,
+        "hist_max": 2.5,
+        "hist_mean": 0.461,
+        "pres_sum": 65992.0,
+        "pres_ema_sum": 51737.0,
+        "overuse": 34456,
+        "edges": 16145,
+        "balance_ratio": 0.078
+      },
+      {
+        "iteration": 5,
+        "hist_sum": 14452.0,
+        "hist_max": 5.8,
+        "hist_mean": 0.785,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 57439.0,
+        "overuse": 34559,
+        "edges": 16883,
+        "balance_ratio": 0.219
+      }
+    ],
+    "config": {
+      "pres_fac_init": 1.0,
+      "pres_fac_mult": 1.15,
+      "pres_fac_max": 512.0,
+      "hist_gain": 1.5
+    },
+    "final_status": null
+  },
+  "analysis": {
+    "converging": false,
+    "oscillating": false,
+    "diverging": true,
+    "history_growth_rate": 1.45,
+    "issues": [
+      "Diverging: overuse increasing significantly",
+      "Balance ratio too low: 0.219 (present dominating)"
+    ]
+  }
+}

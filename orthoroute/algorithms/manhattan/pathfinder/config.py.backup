@@ -24,11 +24,11 @@ MAX_SEARCH_NODES = 50000            # Maximum nodes explored per net
 PER_NET_BUDGET_S = 0.5             # Time budget per net in seconds
 MAX_ROI_NODES = 20000              # Maximum nodes in Region of Interest
 
-# PathFinder Cost Parameters (CONVERGENCE FIXES)
-PRES_FAC_INIT = 1.0  # Initial present factor for congestion
-PRES_FAC_MULT = 1.10  # Gentler exponential growth to keep history competitive (was 1.15)
-PRES_FAC_MAX = 8.0                 # Cap pres_fac (will be scaled by layer count)
-HIST_ACCUM_GAIN = 1.2  # Stronger history (was 1.1)
+# PathFinder Cost Parameters (OPTIMAL FROM TESTING)
+PRES_FAC_INIT = 1.0                # Initial present factor for congestion
+PRES_FAC_MULT = 1.25               # Sweet spot (1.15 too weak, 1.35 too strong)
+PRES_FAC_MAX = 512.0               # Maximum present factor cap (high ceiling)
+HIST_ACCUM_GAIN = 1.5              # Sweet spot (1.35 too weak, 1.8 too strong)
 OVERUSE_EPS = 1e-6                 # Epsilon for overuse calculations
 
 # Algorithm Tuning Parameters
@@ -72,8 +72,8 @@ ENABLE_INSTRUMENTATION = False     # Enable detailed instrumentation
 
 # Negotiation Parameters
 STAGNATION_PATIENCE = 5            # Iterations without improvement before stopping
-STRICT_OVERUSE_BLOCK = False       # Disable infinite cost blocks - use finite present cost only
-HIST_COST_WEIGHT = 10.0            # Weight for historical cost component (will be scaled by layer count)
+STRICT_OVERUSE_BLOCK = True        # Block overused edges with infinite cost
+HIST_COST_WEIGHT = 1.0             # Weight for historical cost component
 
 # Legacy compatibility - keep original constant names for existing code
 DEFAULT_BATCH_SIZE = BATCH_SIZE
@@ -101,7 +101,7 @@ class PathFinderConfig:
     pres_fac_mult: float = PRES_FAC_MULT  # Now 1.35 from module constant
     pres_fac_max: float = PRES_FAC_MAX    # Now 512.0 from module constant
     hist_accum_gain: float = HIST_ACCUM_GAIN
-    hist_gain: float = 0.2  # Historical cost gain (lowered for raw present - was 0.8 with present_ema)
+    hist_gain: float = 0.8  # Historical cost gain (0.6-1.0 range prevents ping-pong)
     overuse_eps: float = OVERUSE_EPS
     mode: str = "near_far"  # Use fast GPU ROI pathfinding with actual CUDA kernels
     roi_parallel: bool = False
@@ -128,7 +128,7 @@ class PathFinderConfig:
     via_present_beta: float = 0.40             # Present smoothing (previous weight)
     via_column_weight: float = 0.30            # Column penalty scaling (not used if column pooling off)
     via_segment_weight: float = 1.0            # Segment penalty scaling (was 0.9)
-    history_decay: float = 1.0                 # History decay factor (1.0 = no decay, full memory)
+    history_decay: float = 0.995               # History decay factor
     # Column spreading parameters (to prevent "elevator shaft" congestion and fill empty channels)
     column_spread_alpha: float = 0.5           # Fraction of overuse that leaks sideways (increased for better spreading)
     column_spread_radius: int = 5              # Columns ±N get diffused history cost (wider spread to fill gaps)

@@ -134,7 +134,7 @@ python build_ipc_plugin.py
 
 ##  Contributing
 
-We welcome contributions! Please see [`docs/contributing.md`](docs/contributing.md) for guidelines.
+Please see [`docs/contributing.md`](docs/contributing.md) for guidelines.
 
 If something's not working or you just don't like it, first please complain. Complaining about free stuff will actually force me to fix it. I would especially like to hear from you if you think it sucks.
 

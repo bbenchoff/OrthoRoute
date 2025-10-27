@@ -23,7 +23,8 @@ class PathFinderStatsWidget(QWidget):
         self.successful_routes = 0
         self.failed_routes = 0
         self.congestion_count = 0
-        
+        self.overuse_history = []  # Track last 3 iterations: [(iter, overuse_sum, overuse_edges), ...]
+
         self.setup_ui()
         
         # Timer for live updates
@@ -82,10 +83,13 @@ class PathFinderStatsWidget(QWidget):
         self.iteration_progress.setValue(0)
         layout.addWidget(self.iteration_progress)
         
-        # Status
-        self.status_label = QLabel("Idle")
-        self.status_label.setStyleSheet("QLabel { color: gray; }")
-        layout.addWidget(self.status_label)
+        # Overuse history display (last 3 iterations in table format)
+        overuse_font = QFont("Courier New", 9)  # Monospace for table alignment
+        self.overuse_label = QLabel("Waiting for routing...")
+        self.overuse_label.setFont(overuse_font)
+        self.overuse_label.setStyleSheet("QLabel { color: #333; background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; }")
+        self.overuse_label.setWordWrap(True)
+        layout.addWidget(self.overuse_label)
         
         return group
     
@@ -186,26 +190,41 @@ class PathFinderStatsWidget(QWidget):
         self.iteration_progress.setMaximum(max_iterations)
         self.iteration_progress.setValue(0)
         self.iteration_label.setText(f"0 / {max_iterations}")
-        self.status_label.setText("Initializing...")
-        self.status_label.setStyleSheet("QLabel { color: blue; }")
+        self.overuse_history = []  # Reset overuse history
+        self.overuse_label.setText("Initializing routing...")
         
         # Start timer
         self.update_timer.start()
         
-    def update_iteration(self, iteration: int, max_iterations: int, status: str = ""):
-        """Update current iteration progress"""
+    def update_iteration(self, iteration: int, max_iterations: int, overuse_sum: int = 0, overuse_edges: int = 0):
+        """Update current iteration progress with overuse data"""
         self.current_iteration = iteration
         self.iteration_progress.setValue(iteration)
         self.iteration_label.setText(f"{iteration} / {max_iterations}")
-        
-        if status:
-            self.status_label.setText(status)
-            if "converged" in status.lower():
-                self.status_label.setStyleSheet("QLabel { color: green; font-weight: bold; }")
-            elif "error" in status.lower():
-                self.status_label.setStyleSheet("QLabel { color: red; }")
-            else:
-                self.status_label.setStyleSheet("QLabel { color: blue; }")
+
+        # Track overuse history (keep last 3 iterations)
+        self.overuse_history.append((iteration, overuse_sum, overuse_edges))
+        if len(self.overuse_history) > 3:
+            self.overuse_history.pop(0)
+
+        # Build table display for last 3 iterations
+        if self.overuse_history:
+            lines = []
+            lines.append("┌─────────┬──────────┬────────┐")
+            lines.append("│  Iter   │ Overuse  │ Edges  │")
+            lines.append("├─────────┼──────────┼────────┤")
+
+            for iter_num, over_sum, over_edges in self.overuse_history:
+                # Format with proper spacing for alignment
+                iter_str = f"{iter_num:>5}"
+                over_str = f"{over_sum:>8,}"
+                edges_str = f"{over_edges:>6,}"
+                lines.append(f"│  {iter_str}  │ {over_str} │ {edges_str} │")
+
+            lines.append("└─────────┴──────────┴────────┘")
+
+            table_text = "\n".join(lines)
+            self.overuse_label.setText(table_text)
     
     def update_routing_stats(self, successful: int, failed: int):
         """Update routing success statistics"""
@@ -264,13 +283,12 @@ class PathFinderStatsWidget(QWidget):
     def finish_routing(self, success: bool, final_message: str = ""):
         """Finish routing session"""
         self.update_timer.stop()
-        
+
+        # Keep the overuse table visible, just update iteration label
         if success:
-            self.status_label.setText(final_message or "Routing completed successfully!")
-            self.status_label.setStyleSheet("QLabel { color: green; font-weight: bold; }")
+            self.iteration_label.setText(self.iteration_label.text() + " ✓")
         else:
-            self.status_label.setText(final_message or "Routing failed")
-            self.status_label.setStyleSheet("QLabel { color: red; font-weight: bold; }")
+            self.iteration_label.setText(self.iteration_label.text() + " ✗")
     
     def reset(self):
         """Reset all statistics"""
@@ -284,8 +302,8 @@ class PathFinderStatsWidget(QWidget):
         # Reset UI
         self.iteration_label.setText("0 / 50")
         self.iteration_progress.setValue(0)
-        self.status_label.setText("Idle")
-        self.status_label.setStyleSheet("QLabel { color: gray; }")
+        self.overuse_history = []
+        self.overuse_label.setText("Waiting for routing...")
         self.elapsed_lcd.display("00:00.00")
         self.success_label.setText("0")
         self.failed_label.setText("0")

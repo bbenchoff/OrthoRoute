@@ -532,10 +532,31 @@ class PCBViewer(QWidget):
         max_tracks_per_frame = 50000  # Reasonable limit per frame
         min_width = 0.0001
 
+        # Helper function to get layer z-order (back to front rendering)
+        def layer_order_key(track):
+            layer = track.get('layer', 'F.Cu')
+            if isinstance(layer, int):
+                return layer  # 0=F.Cu (front), higher numbers are deeper
+            elif layer == 'F.Cu':
+                return 999  # Draw last (on top)
+            elif layer == 'B.Cu':
+                return -1  # Draw first (on bottom)
+            elif layer.startswith('In'):
+                # Extract layer number from "In1.Cu", "In2.Cu", etc.
+                try:
+                    layer_num = int(layer[2:].split('.')[0])
+                    return layer_num  # Internal layers in order
+                except:
+                    return 0
+            return 0
+
+        # Sort tracks back-to-front (B.Cu, internal layers, F.Cu)
+        tracks_sorted = sorted(tracks, key=layer_order_key)
+
         drawn_tracks = 0
         culled_tracks = 0
 
-        for track in tracks:
+        for track in tracks_sorted:
             if drawn_tracks >= max_tracks_per_frame:
                 culled_tracks += 1
                 continue
@@ -824,10 +845,34 @@ class PCBViewer(QWidget):
                 visible_rect = QRectF(-1000, -1000, 2000, 2000)  # Large fallback area
         except:
             visible_rect = QRectF(-1000, -1000, 2000, 2000)  # Large fallback area
-        
+
+        # Helper function to get via z-order (internal vias drawn first, surface vias last)
+        def via_order_key(via):
+            start_layer = via.get('start_layer', via.get('from_layer', 'F.Cu'))
+            end_layer = via.get('end_layer', via.get('to_layer', 'B.Cu'))
+
+            # Convert to layer numbers
+            def layer_to_num(layer):
+                if layer == 'F.Cu':
+                    return 0
+                elif layer == 'B.Cu':
+                    return 999
+                elif layer.startswith('In'):
+                    try:
+                        return int(layer[2:].split('.')[0])
+                    except:
+                        return 50
+                return 50
+
+            # Vias are sorted by their deepest layer (higher = more internal)
+            return max(layer_to_num(start_layer), layer_to_num(end_layer))
+
+        # Sort vias back-to-front (internal vias first, surface vias last)
+        vias_sorted = sorted(vias, key=via_order_key, reverse=True)
+
         # Draw vias
         drawn_vias = 0
-        for via in vias:
+        for via in vias_sorted:
             try:
                 # Handle both coordinate formats
                 if 'position' in via:
@@ -1226,17 +1271,27 @@ class OrthoRouteMainWindow(QMainWindow):
         
         layout.addWidget(nets_stats_group)
         
-        # Progress group
+        # Progress group - Overuse history table
         progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout(progress_group)
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        progress_layout.addWidget(self.progress_bar)
-        
-        self.progress_label = QLabel("Ready")
-        progress_layout.addWidget(self.progress_label)
-        
+
+        # Overuse table showing last 3 iterations
+        from PyQt6.QtGui import QFont
+        overuse_font = QFont("Courier New", 9)  # Monospace for table alignment
+        self.overuse_table_label = QLabel("Waiting for routing to start...")
+        self.overuse_table_label.setFont(overuse_font)
+        self.overuse_table_label.setStyleSheet("""
+            QLabel {
+                color: #222;
+                background-color: #f5f5f5;
+                padding: 8px;
+                border: 1px solid #999;
+                border-radius: 4px;
+            }
+        """)
+        self.overuse_table_label.setWordWrap(False)
+        progress_layout.addWidget(self.overuse_table_label)
+
         layout.addWidget(progress_group)
         
         return panel
@@ -1813,22 +1868,8 @@ class OrthoRouteMainWindow(QMainWindow):
             # 2) Route nets with GUI progress callback
             self.log_to_gui("[PIPELINE] Step 4: Routing nets...", "INFO")
             def progress_cb(done, total, eta_s, *_, **__):
-                if self.progress_bar:
-                    self.progress_bar.setValue(int(100 * done / max(total, 1)))
-
-                    # Defensive ETA formatting: handle float or preformatted string
-                    eta_text = ""
-                    try:
-                        # if eta_s is numeric-ish, print "~X.Xs ETA"
-                        eta_val = float(eta_s)  # works for int/float or numeric-like str
-                        eta_text = f" (~{eta_val:.1f}s ETA)"
-                    except Exception:
-                        # if it's already a string (or None), append as-is (or nothing)
-                        if eta_s:
-                            # strip to keep things tidy if caller already included units
-                            eta_text = f" ({str(eta_s).strip()})"
-
-                    self.progress_bar.setFormat(f"{done}/{total} nets{eta_text}")
+                # Net routing progress (not used for overuse display)
+                pass
 
             # Store count of escape geometry before routing starts
             escape_track_count = len([t for t in self.board_data.get('tracks', []) if t])
@@ -1836,9 +1877,42 @@ class OrthoRouteMainWindow(QMainWindow):
             escape_tracks_list = self.board_data.get('tracks', [])[:escape_track_count]
             escape_vias_list = self.board_data.get('vias', [])[:escape_via_count]
 
-            def iteration_cb(iteration, routing_tracks, routing_vias):
-                """Iteration callback: update board_data and capture screenshot"""
+            # Track overuse history for last 3 iterations
+            overuse_history = []
+
+            def iteration_cb(iteration, routing_tracks, routing_vias, overuse_sum=0, overuse_edges=0):
+                """Iteration callback: update board_data, capture screenshot, and update progress with overuse info"""
                 try:
+                    # Track overuse for display in progress bar
+                    overuse_history.append((iteration, overuse_sum, overuse_edges))
+                    if len(overuse_history) > 3:
+                        overuse_history.pop(0)  # Keep only last 3
+
+                    # Update overuse table with last 3 iterations
+                    if len(overuse_history) > 0:
+                        # Build ASCII table
+                        lines = []
+                        lines.append("┌─────────┬───────────┬─────────┐")
+                        lines.append("│  Iter   │  Overuse  │  Edges  │")
+                        lines.append("├─────────┼───────────┼─────────┤")
+
+                        for iter_num, over_sum, over_edges in overuse_history:
+                            # Format with proper spacing for alignment
+                            iter_str = f"{iter_num:>5}"
+                            over_str = f"{over_sum:>9,}" if over_sum > 0 else f"{'0':>9}"
+                            edges_str = f"{over_edges:>7,}" if over_edges > 0 else f"{'0':>7}"
+                            lines.append(f"│  {iter_str}  │ {over_str} │ {edges_str} │")
+
+                        lines.append("└─────────┴───────────┴─────────┘")
+
+                        table_text = "\n".join(lines)
+                        self.overuse_table_label.setText(table_text)
+
+                    # Update PathFinder stats widget with overuse data
+                    if hasattr(self, 'pathfinder_stats') and self.pathfinder_stats:
+                        max_iters = getattr(pf.config, 'max_iterations', 40)
+                        self.pathfinder_stats.update_iteration(iteration, max_iters, overuse_sum, overuse_edges)
+
                     # Combine escape geometry with provisional routing geometry
                     self.board_data['tracks'] = escape_tracks_list + routing_tracks
                     self.board_data['vias'] = escape_vias_list + routing_vias
@@ -1853,7 +1927,7 @@ class OrthoRouteMainWindow(QMainWindow):
                     import os
                     disable_screenshots = os.environ.get('ORTHO_NO_SCREENSHOTS', '0') == '1'
                     screenshot_freq = int(os.environ.get('ORTHO_SCREENSHOT_FREQ', '1'))
-                    screenshot_scale = int(os.environ.get('ORTHO_SCREENSHOT_SCALE', '2'))
+                    screenshot_scale = int(os.environ.get('ORTHO_SCREENSHOT_SCALE', '8'))
 
                     # Only capture screenshots if enabled and at appropriate frequency
                     if not disable_screenshots and (iteration % screenshot_freq == 0):
@@ -1996,9 +2070,8 @@ class OrthoRouteMainWindow(QMainWindow):
     def _set_ui_busy(self, busy: bool, status_text: str = ""):
         """Set UI to busy state during routing"""
         self.route_preview_btn.setEnabled(not busy)
-        self.progress_bar.setVisible(busy)
         if busy:
-            self.progress_bar.setValue(0)
+            self.overuse_table_label.setText("Routing in progress...")
             if status_text:
                 self.status_label.setText(status_text)
         else:
@@ -2412,7 +2485,7 @@ class OrthoRouteMainWindow(QMainWindow):
         self.rollback_btn.setEnabled(False)
         self.replay_btn.setEnabled(False)
         self.route_preview_btn.setEnabled(True)
-        self.progress_bar.setVisible(False)
+        self.overuse_table_label.setText("Routing completed")
         self.status_label.setText("Routes applied successfully")
         
     def rollback_routes(self):
@@ -2427,7 +2500,7 @@ class OrthoRouteMainWindow(QMainWindow):
         self.rollback_btn.setEnabled(False)
         self.replay_btn.setEnabled(False)
         self.route_preview_btn.setEnabled(True)
-        self.progress_bar.setVisible(False)
+        self.overuse_table_label.setText("Ready for routing")
         self.status_label.setText("Routes discarded")
 
     def replay_routing(self):
@@ -2618,9 +2691,8 @@ class OrthoRouteMainWindow(QMainWindow):
             if self.current_net_index < len(self.routing_nets):
                 batch_size = min(50, len(self.routing_nets) - self.current_net_index)  # Show 50 nets per update
                 
-                # Update progress bar
-                progress = int((self.current_net_index / len(self.routing_nets)) * 100)
-                self.progress_bar.setValue(progress)
+                # Progress tracking (overuse table updated via iteration callback)
+                pass
                 
                 # Log nets in current batch for user feedback
                 for i in range(batch_size):
@@ -2767,7 +2839,6 @@ class OrthoRouteMainWindow(QMainWindow):
         logger.info(f"SUCCESS: Progressive routing complete: {self.routed_count}/{len(self.routing_nets)} nets routed in {elapsed_time:.1f}s")
         
         # Final GUI updates
-        self.progress_bar.setValue(100)
         self.status_label.setText(f"Routing complete: {self.routed_count}/{len(self.routing_nets)} nets routed")
         
         # Final visualization update
@@ -2787,9 +2858,7 @@ class OrthoRouteMainWindow(QMainWindow):
     
     def _on_routing_progress(self, current, total, status, tracks, vias):
         """Handle routing progress updates from the thread"""
-        # Update progress bar
-        progress = int((current / total) * 100) if total > 0 else 0
-        self.progress_bar.setValue(progress)
+        # Update status
         self.status_label.setText(f"{status} ({current}/{total})")
         
         # Update preview with new tracks/vias
@@ -2891,9 +2960,8 @@ class OrthoRouteMainWindow(QMainWindow):
         # Hide cancel button
         if hasattr(self, 'cancel_btn'):
             self.cancel_btn.setVisible(False)
-            
+
         # Update UI
-        self.progress_bar.setValue(100)
         self.commit_btn.setEnabled(True)
         self.rollback_btn.setEnabled(True)
         self.replay_btn.setEnabled(True)
@@ -2926,8 +2994,9 @@ class OrthoRouteMainWindow(QMainWindow):
             # Update iteration progress
             iteration = progress_data.get('iteration', 0)
             max_iterations = progress_data.get('max_iterations', 50)
-            status = progress_data.get('status', '')
-            self.pathfinder_stats.update_iteration(iteration, max_iterations, status)
+            overuse_sum = progress_data.get('overuse_sum', 0)
+            overuse_edges = progress_data.get('overuse_edges', 0)
+            self.pathfinder_stats.update_iteration(iteration, max_iterations, overuse_sum, overuse_edges)
             
         elif progress_type == 'routing_update':
             # Update routing statistics
@@ -2943,9 +3012,10 @@ class OrthoRouteMainWindow(QMainWindow):
         elif progress_type == 'convergence':
             # PathFinder converged
             iteration = progress_data.get('iteration', 0)
-            status = progress_data.get('status', 'Converged!')
             max_iterations = 50  # Default, will be updated by iteration_start
-            self.pathfinder_stats.update_iteration(iteration, max_iterations, status)
+            overuse_sum = progress_data.get('overuse_sum', 0)
+            overuse_edges = progress_data.get('overuse_edges', 0)
+            self.pathfinder_stats.update_iteration(iteration, max_iterations, overuse_sum, overuse_edges)
             
         elif progress_type == 'completion':
             # Routing completed
@@ -3021,7 +3091,7 @@ class OrthoRouteMainWindow(QMainWindow):
         self.commit_btn.setEnabled(False)
         self.rollback_btn.setEnabled(False)
         self.replay_btn.setEnabled(False)
-        self.progress_bar.setVisible(False)
+        self.overuse_table_label.setText("Waiting for routing to start...")
         self.status_label.setText("Ready")
     
     def log_to_gui(self, message: str, level: str = "INFO"):

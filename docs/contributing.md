@@ -504,7 +504,7 @@ This is a solo project but I'm unemployed, so:
 
 ### Code of Conduct:
 
-There is no code of conduct for a reason. I will kick out and ignore assholes. There will be no rule lawyering (rule chicanery?). I reserve the right to be arbitrary and capricious.  
+There is no code of conduct for a reason. I will kick out and/or ignore assholes. There will be no rule lawyering (rule chicanery?). I reserve the right to be arbitrary and capricious.  
 
 ---
 

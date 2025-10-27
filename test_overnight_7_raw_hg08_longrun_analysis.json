@@ -1,0 +1,133 @@
+{
+  "log_file": "test_overnight_7_raw_hg08_longrun.log",
+  "data": {
+    "iterations": [
+      {
+        "iteration": 1,
+        "hist_sum": 0.0,
+        "hist_max": 0.0,
+        "hist_mean": 0.0,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 0.0,
+        "overuse": 9495,
+        "edges": 7909,
+        "balance_ratio": 0.0
+      },
+      {
+        "iteration": 2,
+        "hist_sum": 7596.0,
+        "hist_max": 2.4,
+        "hist_mean": 0.96,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 26396.0,
+        "overuse": 18636,
+        "edges": 12973,
+        "balance_ratio": 0.25
+      },
+      {
+        "iteration": 3,
+        "hist_sum": 22505.0,
+        "hist_max": 4.8,
+        "hist_mean": 1.078,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 42234.0,
+        "overuse": 25886,
+        "edges": 15022,
+        "balance_ratio": 0.515
+      },
+      {
+        "iteration": 4,
+        "hist_sum": 43214.0,
+        "hist_max": 6.4,
+        "hist_mean": 1.204,
+        "pres_sum": 66000.0,
+        "pres_ema_sum": 51737.0,
+        "overuse": 35986,
+        "edges": 16526,
+        "balance_ratio": 0.835
+      },
+      {
+        "iteration": 5,
+        "hist_sum": 72002.0,
+        "hist_max": 6.4,
+        "hist_mean": 1.373,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 57442.0,
+        "overuse": 32622,
+        "edges": 16229,
+        "balance_ratio": 1.253
+      },
+      {
+        "iteration": 6,
+        "hist_sum": 98100.0,
+        "hist_max": 6.4,
+        "hist_mean": 1.429,
+        "pres_sum": 65994.0,
+        "pres_ema_sum": 60862.0,
+        "overuse": 30077,
+        "edges": 15769,
+        "balance_ratio": 1.402
+      },
+      {
+        "iteration": 7,
+        "hist_sum": 122162.0,
+        "hist_max": 6.4,
+        "hist_mean": 1.447,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 62915.0,
+        "overuse": 20201,
+        "edges": 14487,
+        "balance_ratio": 1.468
+      },
+      {
+        "iteration": 8,
+        "hist_sum": 138322.0,
+        "hist_max": 6.4,
+        "hist_mean": 1.398,
+        "pres_sum": 65991.0,
+        "pres_ema_sum": 64145.0,
+        "overuse": 24733,
+        "edges": 16051,
+        "balance_ratio": 1.418
+      },
+      {
+        "iteration": 9,
+        "hist_sum": 163055.0,
+        "hist_max": 7.0,
+        "hist_mean": 1.418,
+        "pres_sum": 65993.0,
+        "pres_ema_sum": 64884.0,
+        "overuse": 33600,
+        "edges": 16149,
+        "balance_ratio": 1.836
+      },
+      {
+        "iteration": 10,
+        "hist_sum": 196655.0,
+        "hist_max": 9.0,
+        "hist_mean": 1.5,
+        "pres_sum": 65994.0,
+        "pres_ema_sum": 65327.0,
+        "overuse": 32177,
+        "edges": 15862,
+        "balance_ratio": 2.444
+      }
+    ],
+    "config": {
+      "pres_fac_init": 1.0,
+      "pres_fac_mult": 1.15,
+      "pres_fac_max": 512.0,
+      "hist_gain": 0.8
+    },
+    "final_status": null
+  },
+  "analysis": {
+    "converging": false,
+    "oscillating": true,
+    "diverging": false,
+    "history_growth_rate": 1.6,
+    "issues": [
+      "Oscillating: overuse varying 8867 in last 3 iters"
+    ]
+  }
+}

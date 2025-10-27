@@ -509,6 +509,8 @@ except ImportError:
 # Local config
 from .pathfinder.config import PAD_CLEARANCE_MM
 from .pad_escape_planner import PadEscapePlanner, Portal
+from .board_analyzer import analyze_board_characteristics, BoardCharacteristics
+from .parameter_derivation import derive_routing_parameters, apply_derived_parameters, DerivedRoutingParameters
 
 # Optional GPU
 try:
@@ -574,11 +576,11 @@ class PathFinderConfig:
     20%+ convergence regression. Prefer infrastructure improvements over tuning.
     """
     max_iterations: int = 40  # Extended to give convergence more time
-    # CONVERGENCE SCHEDULE (OPTIMAL FROM EMPIRICAL TESTING):
+    # CONVERGENCE SCHEDULE (BALANCED BASED ON DIAGNOSTICS):
     pres_fac_init: float = 1.0   # Start gentle (iteration 1)
-    pres_fac_mult: float = 1.25  # Sweet spot (1.15 too weak, diverges to 10K)
-    pres_fac_max: float = 512.0  # Higher ceiling (was 64 - too low!)
-    hist_gain: float = 1.5       # Sweet spot (achieves 1.9K best, oscillates 2-6K)
+    pres_fac_mult: float = 1.10  # Gentler exponential to keep history competitive (was 1.15)
+    pres_fac_max: float = 8.0    # Cap to keep history competitive (was 512)
+    hist_gain: float = 0.2       # Lowered for raw present (was 0.8 with present_ema)
 
     # CRITICAL: Length vs Completion Trade-off
     base_cost_weight: float = 0.3  # Weight for path length penalty (1.0=optimize length, 0.01=optimize completion)
@@ -620,7 +622,7 @@ class PathFinderConfig:
     enable_profiling: bool = False
     enable_instrumentation: bool = False
     strict_overuse_block: bool = False
-    hist_cost_weight: float = 2.0  # Make chronic chokepoints more expensive
+    hist_cost_weight: float = 10.0  # Boost history weight to compete with present (was 2.0)
     log_iteration_details: bool = False
     acc_fac: float = 0.0
     phase_block_after: int = 2
@@ -748,24 +750,38 @@ class CSRGraph:
             # For each edge, determine its layer from source node
             # Vectorized approach: build array of source nodes for each edge
             edge_sources = np.zeros(E, dtype=np.int32)
+            edge_targets = np.zeros(E, dtype=np.int32)
             for u in range(num_nodes):
                 start, end = indptr[u], indptr[u+1]
                 if end > start:
                     edge_sources[start:end] = u
+                    edge_targets[start:end] = indices[start:end]
 
             # Compute layer for each edge: layer = source_node // plane_size
             self.edge_layer = (edge_sources // plane_size).astype(np.uint8)
+
+            # Compute edge_kind: 0 = horizontal/vertical (same layer), 1 = via (different layers)
+            source_layers = edge_sources // plane_size
+            target_layers = edge_targets // plane_size
+            self.edge_kind = (source_layers != target_layers).astype(np.uint8)
+
+            via_count = int(np.sum(self.edge_kind))
+            horiz_vert_count = E - via_count
             logger.info(f"[LAYER-MAP] Built edge→layer mapping: {E} edges, {num_layers} layers")
+            logger.info(f"[EDGE-KIND] Horizontal/Vertical={horiz_vert_count}, Via={via_count}")
         else:
             self.edge_layer = None
+            self.edge_kind = None
 
         if self.use_gpu:
             self.indptr = cp.asarray(indptr)
             self.indices = cp.asarray(indices)
             self.base_costs = cp.asarray(costs)
-            # Transfer edge_layer to GPU if it exists
+            # Transfer edge_layer and edge_kind to GPU if they exist
             if self.edge_layer is not None:
                 self.edge_layer_gpu = cp.asarray(self.edge_layer)
+            if self.edge_kind is not None:
+                self.edge_kind_gpu = cp.asarray(self.edge_kind)
         else:
             self.indptr = indptr
             self.indices = indices
@@ -789,6 +805,7 @@ class EdgeAccountant:
 
         self.canonical: Dict[int, int] = {}
         self.present = self.xp.zeros(num_edges, dtype=self.xp.float32)
+        self.present_ema = self.xp.zeros(num_edges, dtype=self.xp.float32)  # Smoothed present for stable convergence
         self.history = self.xp.zeros(num_edges, dtype=self.xp.float32)
         self.capacity = self.xp.ones(num_edges, dtype=self.xp.float32)
         self.total_cost = None
@@ -844,44 +861,139 @@ class EdgeAccountant:
             return False
         return True
 
-    def update_history(self, gain: float, base_costs=None, history_cap_multiplier=10.0, decay_factor=0.98):
+    def update_history(self, gain: float, base_costs=None, history_cap_multiplier=10.0, decay_factor=0.98, use_raw_present=False):
         """
         Update history with:
-        - Gentle decay: history *= 0.98 before adding increment
+        - Gentle decay: history *= 0.98 before adding increment (decay_factor param)
         - Clamping: increment capped at history_cap = 10 * base_cost
+        - Uses present_ema (smoothed) by default, or raw present if use_raw_present=True
         """
+        import logging
+        import sys
+        logger = logging.getLogger(__name__)
+
+        # DIAGNOSTIC: Log what's actually happening
+        if not hasattr(self, '_hist_update_count'):
+            self._hist_update_count = 0
+            print(f"### UPDATE_HISTORY: Initializing counter", file=sys.stderr, flush=True)
+        self._hist_update_count += 1
+
+        print(f"### UPDATE_HISTORY: Call #{self._hist_update_count} gain={gain:.3f} decay={decay_factor:.3f} cap_mult={history_cap_multiplier:.1f}", file=sys.stderr, flush=True)
+
+        # Always log first 5 calls
+        if self._hist_update_count <= 5:
+            # Before update
+            hist_before_max = float(self.history.max()) if self.history.size > 0 else 0.0
+            logger.error(f"[UPDATE-HISTORY CALLED] Call #{self._hist_update_count} START gain={gain:.3f}")
+
         # Apply gentle decay before adding new history
         self.history *= decay_factor
 
-        over = self.xp.maximum(0, self.present - self.capacity)
+        # Use smoothed present_ema by default, or raw present if requested
+        present_for_history = self.present if use_raw_present else self.present_ema
+        over = self.xp.maximum(0, present_for_history - self.capacity)
         increment = gain * over
 
         # Clamp per-edge history increment
         if base_costs is not None:
             history_cap = history_cap_multiplier * base_costs
+            increment_before_cap = increment.copy()
             increment = self.xp.minimum(increment, history_cap)
+
+            if self._hist_update_count <= 5:
+                # Check how many edges are being capped
+                capped_mask = increment_before_cap > history_cap
+                capped_count = int(self.xp.sum(capped_mask))
+                if capped_count > 0:
+                    logger.error(f"  [HIST-CAP] {capped_count} edges capped! avg_cap={float(history_cap.mean()):.3f}")
 
         self.history += increment
 
-    def update_costs(self, base_costs, pres_fac: float, hist_weight: float = 1.0, add_jitter: bool = True, via_cost_multiplier: float = 1.0, base_cost_weight: float = 0.01):
+        if self._hist_update_count <= 5:
+            # After update
+            hist_after_max = float(self.history.max())
+            incr_max = float(increment.max())
+            over_max = float(over.max())
+            over_mean = float(over[over > 0].mean()) if (over > 0).any() else 0.0
+            pres_max = float(present_for_history.max())
+            pres_ema_max = float(self.present_ema.max())
+            pres_raw_max = float(self.present.max())
+
+            logger.error(f"[UPDATE-HISTORY #{self._hist_update_count}]")
+            logger.error(f"  gain={gain:.3f} decay={decay_factor:.3f} cap_mult={history_cap_multiplier:.1f}")
+            logger.error(f"  use_raw_present={use_raw_present}")
+            logger.error(f"  present_raw_max={pres_raw_max:.1f} present_ema_max={pres_ema_max:.1f}")
+            logger.error(f"  overuse: max={over_max:.2f} mean={over_mean:.3f}")
+            logger.error(f"  increment: max={incr_max:.3f}")
+            logger.error(f"  history: before={hist_before_max:.3f} → after={hist_after_max:.3f}")
+            if base_costs is not None:
+                logger.error(f"  base_cost: mean={float(base_costs.mean()):.4f} max={float(base_costs.max()):.4f}")
+
+    def update_present_ema(self, beta: float = 0.60):
         """
-        total = (base * via_multiplier * base_weight) + pres_fac*overuse + hist_weight*history + epsilon_jitter
+        Update exponential moving average of present usage for stability.
+        Smooths bang-bang oscillations in overuse detection.
+
+        Args:
+            beta: EMA smoothing factor (higher = more smoothing, typically 0.6)
+        """
+        self.present_ema = beta * self.present + (1.0 - beta) * self.present_ema
+
+    def update_costs(
+        self,
+        base_costs,
+        pres_fac: float,
+        hist_weight: float = 1.0,
+        add_jitter: bool = True,
+        via_cost_multiplier: float = 1.0,
+        base_cost_weight: float = 0.01,
+        *,
+        edge_layer=None,          # np/cp array [E] with source layer per edge
+        layer_bias_per_layer=None,  # np/cp array [L] with multiplicative bias
+        edge_kind=None            # np/cp array [E] with 0=horiz/vert, 1=via
+    ):
+        """
+        total = (base * via_multiplier * base_weight * layer_bias) + pres_fac*overuse + hist_weight*history + epsilon_jitter
         Jitter breaks ties and prevents oscillation in equal-cost paths.
         Via cost multiplier enables late-stage via annealing.
         Base cost weight controls length vs completion trade-off (lower = prefer completion over short paths).
+        Layer bias: applied only to horizontal/vertical edges (not vias) to rebalance layer usage.
+        Uses present_ema (smoothed) instead of raw present to prevent bang-bang oscillation.
         """
-        over = self.xp.maximum(0, self.present - self.capacity)
+        xp = self.xp
+        # Use smoothed present (EMA) to prevent oscillation - critical for convergence
+        over = xp.maximum(0, self.present_ema - self.capacity)
 
-        # Apply both via multiplier and base weight to base costs
+        # Vectorized per-edge layer bias (single gather operation)
+        # Only apply to horizontal/vertical edges (edge_kind==0), not vias (edge_kind==1)
+        per_edge_bias = 1.0
+        if (edge_layer is not None) and (layer_bias_per_layer is not None) and (edge_kind is not None):
+            if self.use_gpu:
+                # Ensure arrays are on GPU
+                layer_bias = cp.asarray(layer_bias_per_layer) if not hasattr(layer_bias_per_layer, "get") else layer_bias_per_layer
+                edge_layer_arr = cp.asarray(edge_layer) if not hasattr(edge_layer, "get") else edge_layer
+                edge_kind_arr = cp.asarray(edge_kind) if not hasattr(edge_kind, "get") else edge_kind
+            else:
+                # NumPy arrays
+                layer_bias = layer_bias_per_layer
+                edge_layer_arr = edge_layer
+                edge_kind_arr = edge_kind
+
+            # Gather bias for each edge's layer
+            bias_factors = layer_bias[edge_layer_arr]
+            # Apply bias only to horizontal/vertical edges (edge_kind==0), set via edges to 1.0
+            per_edge_bias = xp.where(edge_kind_arr == 0, bias_factors, 1.0)
+
+        # Apply both via multiplier, base weight, and layer bias to base costs
         # base_cost_weight < 1.0 makes router prefer completion over short paths
-        adjusted_base = base_costs * via_cost_multiplier * base_cost_weight
+        adjusted_base = base_costs * via_cost_multiplier * base_cost_weight * per_edge_bias
         self.total_cost = adjusted_base + pres_fac * over + hist_weight * self.history
 
         # Add per-edge epsilon jitter to break ties (stable across iterations)
         if add_jitter:
             E = len(self.total_cost)
             # Use edge index modulo prime for deterministic jitter
-            jitter = self.xp.arange(E, dtype=self.xp.float32) % 9973
+            jitter = xp.arange(E, dtype=xp.float32) % 9973
             jitter = jitter * 1e-6  # tiny epsilon
             self.total_cost += jitter
 
@@ -895,8 +1007,8 @@ class EdgeAccountant:
 
         Formula: total_cost = base_cost + pres_fac * overuse + history
         """
-        # Recompute overuse with current occupancy
-        over = self.xp.maximum(0, self.present - self.capacity)
+        # Recompute overuse with current occupancy (using smoothed present_ema for consistency)
+        over = self.xp.maximum(0, self.present_ema - self.capacity)
 
         # Update total_cost: base + present_penalty + history
         # Don't modify history here - only update present penalty based on current occupancy
@@ -2292,6 +2404,9 @@ class PathFinderRouter:
                 base_via_cost = cfg.via_cost * (1.0 + cfg.span_alpha * (span - 1))
                 # Portal discount makes entry-layer vias cheap
                 cost = base_via_cost * cfg.portal_via_discount
+                # Apply layer-depart discount (encourages leaving hot layers)
+                depart_discount = self._via_depart_discount(portal.entry_layer, layer)
+                cost *= depart_discount
 
             seeds.append((node_idx, cost))
 
@@ -2625,7 +2740,7 @@ class PathFinderRouter:
                     z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
                     z_lo = max(1, min(z_lo, self._Nz - 2))
                     z_hi = max(1, min(z_hi, self._Nz - 2))
-                    if z_hi > z_lo:
+                    if z_hi >= z_lo:  # Allow equal (single-segment vias)
                         hi_idx = z_hi - 2
                         lo_idx = z_lo - 2
                         pref_hi = self.via_seg_prefix[xu, yu, hi_idx] if 0 <= hi_idx < self._segZ else 0.0
@@ -2645,14 +2760,43 @@ class PathFinderRouter:
             logger.debug(f"[VIA-POOL] Sequential: Applied pooling penalties to {penalties_applied} via edges")
 
     def _pathfinder_negotiation(self, tasks: Dict[str, Tuple[int, int]], progress_cb=None, iteration_cb=None) -> Dict:
-        """CORE PATHFINDER ALGORITHM"""
+        """CORE PATHFINDER ALGORITHM WITH AUTO-CONFIGURATION"""
         cfg = self.config
 
+        # ====================================================================
+        # STEP 0: AUTO-CONFIGURE FROM BOARD CHARACTERISTICS
+        # ====================================================================
+        # Analyze board and derive optimal parameters (no manual tuning!)
+        board_chars = analyze_board_characteristics(self.lattice, tasks)
+        derived_params = derive_routing_parameters(board_chars)
+
+        # Apply derived parameters to config (can be overridden by env vars)
+        apply_derived_parameters(cfg, derived_params)
+
+        # Store H/V layer assignments for later use
+        self.h_layers = board_chars.h_layers
+        self.v_layers = board_chars.v_layers
+
         # Load params into local variables with defaults (ensures new config values used)
+        # Scale parameters by layer count for self-tuning
+        n_sig_layers = self._Nz - 2  # Exclude F.Cu and B.Cu (layers 0 and Nz-1)
+
+        # Base parameters from config
         pres_fac = float(getattr(cfg, 'pres_fac_init', 1.0))
-        pres_fac_mult = float(getattr(cfg, 'pres_fac_mult', 1.35))
-        pres_fac_max = float(getattr(cfg, 'pres_fac_max', 512.0))
+        pres_fac_mult = float(getattr(cfg, 'pres_fac_mult', 1.15))
+        pres_fac_max_base = float(getattr(cfg, 'pres_fac_max', 8.0))
         hist_gain = float(getattr(cfg, 'hist_gain', 0.8))
+
+        # Scale by layer count (fewer layers = stronger penalties needed)
+        if n_sig_layers <= 12:
+            pres_fac_max = 6.0
+            hist_cost_weight_mult = 1.2  # 12.0 for few layers
+        elif n_sig_layers <= 20:
+            pres_fac_max = 8.0
+            hist_cost_weight_mult = 1.0  # 10.0
+        else:
+            pres_fac_max = 10.0
+            hist_cost_weight_mult = 0.8  # 8.0 for many layers
 
         # Allow env overrides for testing
         pres_fac_mult = float(os.getenv('ORTHO_PRES_FAC_MULT', pres_fac_mult))
@@ -2666,7 +2810,7 @@ class PathFinderRouter:
         self._negotiation_ran = True
 
         logger.info(f"[NEGOTIATE] {len(tasks)} nets, {cfg.max_iterations} iters")
-        logger.info(f"[PARAMS] pres_fac_init={pres_fac:.2f} pres_fac_mult={pres_fac_mult:.2f} pres_fac_max={pres_fac_max:.0f} hist_gain={hist_gain:.2f}")
+        logger.info(f"[PARAMS] layers={n_sig_layers} pres_fac_init={pres_fac:.2f} pres_fac_mult={pres_fac_mult:.2f} pres_fac_max={pres_fac_max:.0f} hist_gain={hist_gain:.2f} hist_weight={cfg.hist_cost_weight * hist_cost_weight_mult:.1f}")
 
         for it in range(1, cfg.max_iterations + 1):
             self.iteration = it
@@ -2711,6 +2855,22 @@ class PathFinderRouter:
                 present_cpu_cache = self.accounting.present
                 cap_cpu_cache = self.accounting.capacity
 
+            # STEP 1.7: Update present EMA for stable convergence
+            # Initialize present_ema on first iteration
+            if it == 1:
+                self.accounting.present_ema = self.accounting.present.copy()
+            # Heavy smoothing for stability (40% new, 60% old)
+            present_ema_beta = float(getattr(cfg, 'present_ema_beta', 0.40))
+            self.accounting.update_present_ema(beta=present_ema_beta)
+
+            # STEP 1.8: Compute layer bias for layer balancing
+            layer_bias = self._compute_layer_bias(
+                self.accounting, self.graph,
+                num_layers=self.lattice.layers,
+                alpha=0.88,  # Balanced smoothing
+                max_boost=1.80  # Conservative penalty (baseline from document)
+            )
+
             # STEP 2: Update costs (with history weight and via annealing)
             # Via policy: anneal via cost when pres_fac >= 64 (lowered to trigger earlier)
             via_cost_mult = 1.0
@@ -2736,6 +2896,12 @@ class PathFinderRouter:
                         via_cost_mult = 0.5
                         logger.info(f"[VIA POLICY] Late-stage annealing: via_cost *= 0.5")
 
+            # Get edge_layer and edge_kind for layer balancing
+            edge_layer_arr = (self.graph.edge_layer_gpu if self.accounting.use_gpu
+                            else self.graph.edge_layer) if hasattr(self.graph, 'edge_layer') else None
+            edge_kind_arr = (self.graph.edge_kind_gpu if self.accounting.use_gpu
+                           else self.graph.edge_kind) if hasattr(self.graph, 'edge_kind') else None
+
             # CRITICAL: Cost update ONCE per iteration (PathFinder design)
             # Toggle incremental updates via env var INCREMENTAL_COST_UPDATE=1
             if os.getenv("INCREMENTAL_COST_UPDATE") == "1" and hasattr(self, '_changed_edges_previous_iteration'):
@@ -2747,7 +2913,10 @@ class PathFinderRouter:
                         self.graph.base_costs, pres_fac,
                         hist_weight=cfg.hist_cost_weight,
                         via_cost_multiplier=via_cost_mult,
-                        base_cost_weight=cfg.base_cost_weight
+                        base_cost_weight=cfg.base_cost_weight,
+                        edge_layer=edge_layer_arr,
+                        layer_bias_per_layer=layer_bias,
+                        edge_kind=edge_kind_arr
                     )
                     logger.debug(f"[ITER {it}] Incremental cost update: {len(changed_edges)} edges")
                 else:
@@ -2755,41 +2924,35 @@ class PathFinderRouter:
                     self.accounting.update_costs(
                         self.graph.base_costs, pres_fac, cfg.hist_cost_weight,
                         via_cost_multiplier=via_cost_mult,
-                        base_cost_weight=cfg.base_cost_weight
+                        base_cost_weight=cfg.base_cost_weight,
+                        edge_layer=edge_layer_arr,
+                        layer_bias_per_layer=layer_bias,
+                        edge_kind=edge_kind_arr
                     )
             else:
-                # FULL: Update all edges (default PathFinder behavior) - use local hist_gain
+                # FULL: Update all edges (default PathFinder behavior) - use hist_cost_weight with layer scaling
+                hist_weight_scaled = cfg.hist_cost_weight * hist_cost_weight_mult
                 self.accounting.update_costs(
-                    self.graph.base_costs, pres_fac, hist_gain,
+                    self.graph.base_costs, pres_fac, hist_weight_scaled,
                     via_cost_multiplier=via_cost_mult,
-                    base_cost_weight=cfg.base_cost_weight
+                    base_cost_weight=cfg.base_cost_weight,
+                    edge_layer=edge_layer_arr,
+                    layer_bias_per_layer=layer_bias,
+                    edge_kind=edge_kind_arr
                 )
 
-            # Apply layer balancing (vectorized - single multiply, no loops!)
-            if hasattr(self, 'layer_bias') and hasattr(self.graph, 'edge_layer'):
-                if np.max(np.abs(self.layer_bias - 1.0)) > 0.01:  # Skip if all bias ≈ 1.0
-                    # Get cost array
-                    total_cost = self.accounting.total_cost
-                    if self.accounting.use_gpu:
-                        # Vectorized on CPU, then transfer back
-                        total_cost_cpu = total_cost.get()
-                        bias_factors = self.layer_bias[self.graph.edge_layer]  # Vectorized gather
-                        total_cost_cpu *= bias_factors  # Vectorized multiply
-                        self.accounting.total_cost[:] = cp.asarray(total_cost_cpu)
-                    else:
-                        # Pure NumPy vectorization
-                        bias_factors = self.layer_bias[self.graph.edge_layer]
-                        self.accounting.total_cost *= bias_factors
-
-                    logger.debug(f"[LAYER-BIAS] Applied bias factors to {len(bias_factors)} edges")
-
             # STEP 2.5: Apply via column/segment pooling penalties
-            # NOTE: Layer balancing disabled - sequential loop over 52M edges too slow
-            # TODO: Implement layer balancing in GPU kernel or vectorize
+            # NOTE: Layer balancing now enabled (vectorized, applied in update_costs)
             self._apply_via_pooling_penalties(pres_fac)
 
             # STEP 3: Route (hotset incremental after iter 1)
-            if cfg.reroute_only_offenders and it > 1:
+            # DIAGNOSTIC OVERRIDE: Test with hotset disabled
+            FORCE_ROUTE_ALL = False  # Set to False to restore hotset behavior (TESTING: hotset ENABLED)
+
+            if FORCE_ROUTE_ALL:
+                sub_tasks = tasks
+                logger.info(f"  [DIAGNOSTIC] Routing ALL {len(tasks)} nets every iteration (hotset DISABLED for testing)")
+            elif cfg.reroute_only_offenders and it > 1:
                 # Pass ripped set to _build_hotset (Fix 2)
                 offenders = self._build_hotset(tasks, ripped=getattr(self, "_last_ripped", set()))
                 sub_tasks = {k: v for k, v in tasks.items() if k in offenders}
@@ -2841,6 +3004,47 @@ class PathFinderRouter:
 
             logger.info(f"[ITER {it}] routed={routed} failed={failed} overuse={over_sum} edges={over_cnt} via_overuse={via_ratio:.1f}%")
 
+            # DIAGNOSTIC: Verify history is growing (not capped at 1.0)
+            if it <= 10:
+                hist_sum = float(self.accounting.history.sum())
+                hist_max = float(self.accounting.history.max())
+                hist_nonzero = self.accounting.history[self.accounting.history > 0]
+                hist_mean = float(hist_nonzero.mean()) if len(hist_nonzero) > 0 else 0.0
+                pres_sum = float(self.accounting.present.sum())
+                pres_ema_sum = float(self.accounting.present_ema.sum())
+
+                logger.error(f"[HISTORY-DEBUG] Iter {it}:")
+                logger.error(f"  hist_sum={hist_sum:.0f} hist_max={hist_max:.1f} hist_mean={hist_mean:.3f}")
+                logger.error(f"  pres_sum={pres_sum:.0f} pres_ema_sum={pres_ema_sum:.0f}")
+                logger.error(f"  overuse={over_sum} edges={over_cnt}")
+                logger.error(f"  hist/pres ratio: {hist_sum / (pres_fac * pres_ema_sum + 1e-9):.3f}")
+
+                if hist_max <= 1.1:
+                    logger.error(f"  ⚠️ HISTORY STILL CAPPED AT ~1.0! Cap multiplier fix didn't work!")
+                elif hist_max > 10.0:
+                    logger.error(f"  ✓ History growing properly (max={hist_max:.1f})")
+
+            # Convergence diagnostics (every 5 iterations)
+            if it % 5 == 0:
+                hist_sum = float(self.accounting.history.sum())
+                hist_max = float(self.accounting.history.max())
+                hist_mean = float(self.accounting.history.mean())
+                pres_ema_sum = float(self.accounting.present_ema.sum())
+                pres_ema_max = float(self.accounting.present_ema.max())
+
+                # Cost balance ratio (should be 0.5-2.0 for good convergence)
+                cost_ratio = hist_sum / (pres_fac * pres_ema_sum + 1e-9)
+
+                logger.info(f"[CONVERGENCE] pres_fac={pres_fac:.2f} hist_gain={hist_gain:.2f}")
+                logger.info(f"[CONVERGENCE] hist_sum={hist_sum:.0f} hist_max={hist_max:.1f} hist_mean={hist_mean:.3f}")
+                logger.info(f"[CONVERGENCE] pres_ema_sum={pres_ema_sum:.0f} pres_ema_max={pres_ema_max:.1f}")
+                logger.info(f"[CONVERGENCE] balance_ratio={cost_ratio:.3f} (target: 0.5-2.0)")
+
+                if cost_ratio < 0.1:
+                    logger.warning(f"[CONVERGENCE] ⚠️ Present costs dominating history! (ratio={cost_ratio:.3f})")
+                elif cost_ratio > 10.0:
+                    logger.warning(f"[CONVERGENCE] ⚠️ History costs dominating present! (ratio={cost_ratio:.3f})")
+
             # INSTRUMENTATION: Report hard wall count for iter-1 (must be 0)
             if it == 1 and hasattr(self, '_iter1_inf_writes'):
                 inf_total = self._iter1_inf_writes
@@ -2870,13 +3074,11 @@ class PathFinderRouter:
                     logger.info(f"[VIA-POOL] Segments: used={segs_used}, over_cap={segs_over}, max_use={max_seg_use}, max_pres={max_seg_pres:.2f}, max_prefix={max_seg_prefix:.2f}")
 
             # Instrumentation: Per-layer congestion breakdown
-            # OPTIMIZATION: Reduced frequency to every 10 iterations (0.5-1s speedup)
-            if over_sum > 0 and it % 10 == 0:  # Every 10 iterations
+            if over_sum > 0:  # Every iteration for detailed monitoring
                 self._log_per_layer_congestion(over)
 
             # Instrumentation: Top-10 overused channels
-            # OPTIMIZATION: Reduced frequency to every 10 iterations (0.5-1s speedup)
-            if over_sum > 0 and it % 10 == 0:  # Every 10 iterations
+            if over_sum > 0:  # Every iteration for detailed monitoring
                 self._log_top_overused_channels(over, top_k=10)
 
             # Update layer bias from horizontal overuse (EWMA for stability)
@@ -2891,12 +3093,23 @@ class PathFinderRouter:
                     pressure = layer_overuse / mean_overuse
 
                     # Target bias (1.0 = neutral, <1.0 = cheaper, >1.0 = more expensive)
-                    alpha = 0.08  # Gain for hot layers
+                    # Scale alpha by layer count: fewer layers need stronger balancing
+                    n_sig_layers = self._Nz - 2  # Exclude F.Cu and B.Cu
+                    if n_sig_layers <= 12:
+                        alpha = 0.20  # Strong balancing for sparse stacks
+                        bias_min, bias_max = 0.60, 1.80
+                    elif n_sig_layers <= 20:
+                        alpha = 0.12
+                        bias_min, bias_max = 0.75, 1.50
+                    else:
+                        alpha = 0.08
+                        bias_min, bias_max = 0.85, 1.20
+
                     target_bias = 1.0 + alpha * (pressure - 1.0)
 
                     # EWMA smoothing
                     self.layer_bias = 0.85 * self.layer_bias + 0.15 * target_bias
-                    self.layer_bias = np.clip(self.layer_bias, 0.85, 1.20)
+                    self.layer_bias = np.clip(self.layer_bias, bias_min, bias_max)
 
                     # Log top biases
                     top_layers = sorted(enumerate(self.layer_bias), key=lambda x: x[1], reverse=True)[:3]
@@ -2921,11 +3134,22 @@ class PathFinderRouter:
                 # Strengthen history memory after learning phase
                 hist_gain_eff = min(1.2, hist_gain * 1.25)
 
+            # TEST: Allow env override to disable history cap and use raw present
+            use_history_cap = os.getenv('ORTHO_NO_HISTORY_CAP', '0') == '0'
+            hist_base_costs = self.graph.base_costs if use_history_cap else None
+            hist_cap_mult = 100.0 if use_history_cap else 1.0  # unused if base_costs=None
+            # FIX: Use raw present for history (present_ema lags significantly in early iterations)
+            use_raw_present = True  # was: os.getenv('ORTHO_RAW_PRESENT_FOR_HIST', '0') == '1'
+
+            import sys
+            print(f"### BEFORE update_history: it={it} gain={hist_gain_eff:.3f} cap_mult={hist_cap_mult:.1f}", file=sys.stderr, flush=True)
+
             self.accounting.update_history(
                 hist_gain_eff,
-                base_costs=self.graph.base_costs,
-                history_cap_multiplier=10.0,
-                decay_factor=float(getattr(cfg, "history_decay", 0.995))  # Gentle decay for stability
+                base_costs=hist_base_costs,
+                history_cap_multiplier=hist_cap_mult,
+                decay_factor=float(getattr(cfg, "history_decay", 1.0)),  # No decay - full memory retention
+                use_raw_present=use_raw_present
             )
 
             # Progress callback
@@ -2936,8 +3160,7 @@ class PathFinderRouter:
                     pass
 
             # Iteration callback for screenshots (generate provisional geometry)
-            # OPTIMIZATION: Reduce screenshot frequency to every 10 iterations (15-20s speedup)
-            if iteration_cb and (it % 10 == 0):
+            if iteration_cb:
                 try:
                     # Generate current routing state for visualization
                     provisional_tracks, provisional_vias = self._generate_geometry_from_paths()
@@ -2987,7 +3210,7 @@ class PathFinderRouter:
                                     f"routed={len(provisional_tracks) - len(self._escape_tracks)} → "
                                     f"total={len(provisional_tracks)} tracks, {len(provisional_vias)} vias")
 
-                    iteration_cb(it, provisional_tracks, provisional_vias)
+                    iteration_cb(it, provisional_tracks, provisional_vias, over_sum, over_cnt)
                 except Exception as e:
                     logger.warning(f"[ITER {it}] Iteration callback failed: {e}")
 
@@ -3033,23 +3256,24 @@ class PathFinderRouter:
             if it <= getattr(self, "_freeze_pres_fac_until", 0):
                 logger.debug(f"[ITER {it}] Holding pres_fac={pres_fac:.2f} post-rip")
             else:
-                # Anti-thrash: simple stagnation counter
-                if over_sum >= 0.995 * prev_over_sum:
-                    # No real improvement
-                    stagnant += 1
-                else:
-                    stagnant = 0
+                # DISABLED: Anti-thrash backoff creates oscillation - use simple exponential growth
+                # if over_sum >= 0.995 * prev_over_sum:
+                #     stagnant += 1
+                # else:
+                #     stagnant = 0
+                # if stagnant >= 2:
+                #     pres_fac = max(1.0, pres_fac * 0.90)
+                #     stagnant = 0
+                #     logger.info(f"[ANTI-THRASH] stagnant=2 → pres_fac reduced to {pres_fac:.2f}")
+                # else:
+                #     pres_fac = min(pres_fac * pres_fac_mult, pres_fac_max)
 
-                if stagnant >= 2:
-                    # Brief backoff then resume
-                    pres_fac = max(1.0, pres_fac * 0.90)
-                    stagnant = 0  # Reset after backoff
-                    logger.info(f"[ANTI-THRASH] stagnant=2 → pres_fac reduced to {pres_fac:.2f}")
-                else:
-                    # Normal growth
-                    pres_fac = min(pres_fac * pres_fac_mult, pres_fac_max)
+                # Simple exponential growth - no backoff
+                pres_fac = min(pres_fac * pres_fac_mult, pres_fac_max)
+                logger.debug(f"[ESCALATE] pres_fac={pres_fac:.2f}")
 
-                logger.debug(f"[ESCALATE] stagnant={stagnant} pres_fac={pres_fac:.2f}")
+            # CRITICAL: Update prev_over_sum for next iteration's anti-thrash check
+            prev_over_sum = over_sum
 
         # If we exited with low overuse (<100), run detail pass
         if 0 < over_sum <= 100:
@@ -3067,21 +3291,30 @@ class PathFinderRouter:
             gpu_pct = (self._gpu_path_count / total_paths) * 100
             logger.info(f"[GPU-STATS] GPU: {self._gpu_path_count} paths ({gpu_pct:.1f}%), CPU: {self._cpu_path_count} paths ({100-gpu_pct:.1f}%)")
 
-        logger.warning("="*80)
-        logger.warning(f"ROUTING INCOMPLETE: {failed}/{len(tasks)} nets failed ({failed/len(tasks)*100:.1f}%)")
-        logger.warning(f"  Overuse: {over_cnt} edges with {over_sum} total conflicts")
-        if layer_recommendation['needs_more']:
-            logger.warning(f"  RECOMMENDATION: Add {layer_recommendation['additional']} more layers (→{layer_recommendation['recommended_total']} total)")
-            logger.warning(f"  Reason: {layer_recommendation['reason']}")
+        # Only show warning if routing is actually incomplete
+        if failed > 0 or over_sum > 0:
+            logger.warning("="*80)
+            logger.warning(f"ROUTING INCOMPLETE: {failed}/{len(tasks)} nets failed ({failed/len(tasks)*100:.1f}%)")
+            logger.warning(f"  Overuse: {over_cnt} edges with {over_sum} total conflicts")
+            if layer_recommendation['needs_more']:
+                logger.warning(f"  RECOMMENDATION: Add {layer_recommendation['additional']} more layers (→{layer_recommendation['recommended_total']} total)")
+                logger.warning(f"  Reason: {layer_recommendation['reason']}")
+            else:
+                logger.warning(f"  Current layer count ({self.lattice.layers}) appears adequate")
+                logger.warning(f"  Convergence may improve with tuning or may have reached practical limit")
+            logger.warning("="*80)
         else:
-            logger.warning(f"  Current layer count ({self.lattice.layers}) appears adequate")
-            logger.warning(f"  Convergence may improve with tuning or may have reached practical limit")
-        logger.warning("="*80)
+            logger.info("="*80)
+            logger.info(f"ROUTING COMPLETE: All {len(tasks)} nets routed successfully with zero overuse!")
+            logger.info("="*80)
+
+        # Determine success based on actual convergence
+        success = (failed == 0 and over_sum == 0)
 
         return {
-            'success': False,
-            'error_code': 'ROUTING-FAILED',
-            'message': f'{failed} unrouted, {over_cnt} overused',
+            'success': success,
+            'error_code': None if success else 'ROUTING-FAILED',
+            'message': 'Complete' if success else f'{failed} unrouted, {over_cnt} overused',
             'overuse_sum': over_sum,
             'overuse_edges': over_cnt,
             'failed_nets': failed,
@@ -3594,6 +3827,104 @@ class PathFinderRouter:
 
         return total_routed, total_failed
 
+    def _compute_layer_bias(self, accountant, graph, num_layers: int, alpha: float = 0.9, max_boost: float = 1.8):
+        """
+        Compute per-layer multiplicative bias (shape [L]) based on overuse distribution.
+        Hot layers get bias > 1.0, cool layers stay at 1.0.
+
+        Args:
+            accountant: EdgeAccountant with present/capacity arrays
+            graph: CSRGraph with edge_layer mapping
+            num_layers: Number of layers
+            alpha: EMA smoothing factor (0..1, higher = smoother)
+            max_boost: Maximum bias multiplier (1.0 to max_boost)
+
+        Returns:
+            Layer bias array or None if layer mapping unavailable
+        """
+        xp = accountant.xp
+
+        # Check if edge_layer mapping exists
+        edge_layer = getattr(graph, "edge_layer_gpu", None) if accountant.use_gpu else getattr(graph, "edge_layer", None)
+        if edge_layer is None:
+            return None
+
+        # Get overuse array - use smoothed present if available
+        present_for_bias = getattr(accountant, 'present_ema', accountant.present)
+        over = xp.maximum(0, present_for_bias - accountant.capacity)
+
+        # Sum overuse per layer (ONE bincount - very fast)
+        per_layer_over = xp.bincount(edge_layer, weights=over, minlength=num_layers)
+
+        # Normalize to create bias factors
+        maxv = float(per_layer_over.max().get() if accountant.use_gpu else per_layer_over.max())
+        if maxv <= 1e-9:
+            raw_bias = xp.ones(num_layers, dtype=xp.float32)
+        else:
+            shortfall = per_layer_over / maxv
+            # Baseline bias from document
+            raw_bias = 1.0 + 0.75 * shortfall  # Bias = 1.0 to 1.75
+
+        # EMA smoothing to prevent oscillation
+        if not hasattr(self, "_layer_bias_ema"):
+            self._layer_bias_ema = raw_bias.astype(xp.float32)
+        else:
+            self._layer_bias_ema = (alpha * self._layer_bias_ema + (1.0 - alpha) * raw_bias).astype(xp.float32)
+
+        # Clamp to prevent extreme penalties
+        self._layer_bias_ema = xp.clip(self._layer_bias_ema, 1.0, max_boost)
+
+        return self._layer_bias_ema
+
+    def _via_depart_discount(self, z_from: int, z_to: int) -> float:
+        """
+        Compute via cost discount for leaving hot layers.
+        Encourages routing to move off congested layers toward cooler layers.
+        AGGRESSIVE discounting to force layer spreading.
+
+        Args:
+            z_from: Source layer
+            z_to: Target layer
+
+        Returns:
+            Discount multiplier (0.2-1.0), lower = cheaper via
+        """
+        # Only apply discount if we have layer bias data
+        if not hasattr(self, '_layer_bias_ema') or self._layer_bias_ema is None:
+            return 1.0
+
+        # Get bias values (on CPU for simplicity, these are small arrays)
+        if hasattr(self._layer_bias_ema, 'get'):
+            bias_cpu = self._layer_bias_ema.get()
+        else:
+            bias_cpu = self._layer_bias_ema
+
+        if z_from >= len(bias_cpu) or z_to >= len(bias_cpu):
+            return 1.0
+
+        bf = float(bias_cpu[z_from])  # Source layer bias
+        bt = float(bias_cpu[z_to])    # Target layer bias
+
+        # Check if both layers have same orientation (both H or both V)
+        # Layers alternate: even=H, odd=V (or vice versa, depends on stackup)
+        same_orientation = (z_from % 2) == (z_to % 2)
+
+        # Calculate discount based on bias difference
+        delta = max(0.0, bf - bt)
+
+        if same_orientation and delta > 0.15:
+            # Moderate: If leaving hot H layer for cool H layer (or V→V), give good discount
+            # This encourages spreading within same routing direction
+            discount = 1.0 - min(0.45, 0.8 * delta)  # Up to 45% off
+        elif delta > 0.1:
+            # Standard: Leaving any hot layer for cooler layer
+            discount = 1.0 - min(0.35, 0.6 * delta)  # Up to 35% off
+        else:
+            # Small benefit
+            discount = 1.0 - min(0.15, 0.4 * delta)  # Up to 15% off
+
+        return max(0.55, discount)  # Never go below 0.55 (45% off maximum)
+
     def _retarget_portals_for_net(self, net_id: str):
         """Retarget portals when a net fails repeatedly"""
         if net_id not in self.net_pad_ids:
@@ -3678,14 +4009,25 @@ class PathFinderRouter:
         """
         Build hotset: ONLY nets touching overused edges, with adaptive capping.
         Prevents thrashing by limiting hotset size based on actual overuse.
+        Implements freeze-clean: nets clean for 3+ iterations are excluded from hotset.
         """
         if ripped is None:
             ripped = set()
 
         present = self.accounting.present.get() if self.accounting.use_gpu else self.accounting.present
         cap = self.accounting.capacity.get() if self.accounting.use_gpu else self.accounting.capacity
+        hist = self.accounting.history.get() if self.accounting.use_gpu else self.accounting.history
+
+        # Include history in hotset selection: edges are "hot" if they have present OR historical congestion
         over = np.maximum(0, present - cap)
-        over_idx = set(map(int, np.where(over > 0)[0]))
+        hot_edges = over + 0.1 * hist  # Gentle history influence (was 0.5 - too aggressive!)
+        over_idx = set(map(int, np.where(hot_edges > 0.5)[0]))  # Higher threshold to be more selective
+
+        # Initialize clean iteration tracking
+        if not hasattr(self, '_net_clean_iters'):
+            self._net_clean_iters = {}
+
+        freeze_after_clean = int(getattr(self.config, 'freeze_after_clean', 3))
 
         # NO OVERUSE CASE: only route unrouted nets
         if len(over_idx) == 0:
@@ -3698,6 +4040,22 @@ class PathFinderRouter:
         offenders = set()
         for ei in over_idx:
             offenders.update(self._edge_to_nets.get(ei, set()))
+
+        # Update clean iteration counters
+        for net_id in tasks.keys():
+            if net_id in offenders:
+                # Net is touching overused edges - reset counter
+                self._net_clean_iters[net_id] = 0
+            else:
+                # Net is clean - increment counter
+                self._net_clean_iters[net_id] = self._net_clean_iters.get(net_id, 0) + 1
+
+        # Filter out frozen nets (clean for freeze_after_clean+ iterations)
+        frozen_nets = {nid for nid in offenders if self._net_clean_iters.get(nid, 0) >= freeze_after_clean}
+        offenders -= frozen_nets
+
+        if frozen_nets:
+            logger.debug(f"[FREEZE-CLEAN] Excluded {len(frozen_nets)} nets clean for {freeze_after_clean}+ iterations")
 
         # Add ripped nets
         offenders |= ripped
@@ -3725,18 +4083,58 @@ class PathFinderRouter:
         total_overuse = sum(float(over[ei]) for ei in over_idx)
         base_target = max(64, min(180, len(over_idx) // 25))  # Scale with # of overused edges
 
+        # Track improvement trend for adaptive hotset sizing
+        if not hasattr(self, '_prev_overuse_for_hotset'):
+            self._prev_overuse_for_hotset = float('inf')
+
+        # DISABLED: Adaptive sizing creates disruption spikes when hotset enlarges
+        # delta = (self._prev_overuse_for_hotset - total_overuse) / max(1, self._prev_overuse_for_hotset)
+        # if delta < 0.02:  # <2% improvement - enlarge hotset (stuck, need more rip-up)
+        #     base_target = min(240, int(base_target * 1.25))
+        #     logger.debug(f"[HOTSET-TREND] Slow progress ({delta*100:.1f}%) → enlarging hotset to {base_target}")
+        # elif delta > 0.08:  # >8% improvement - shrink hotset (good progress, focus efforts)
+        #     base_target = max(64, int(base_target * 0.80))
+        #     logger.debug(f"[HOTSET-TREND] Good progress ({delta*100:.1f}%) → shrinking hotset to {base_target}")
+
+        # Use FIXED hotset size for stable convergence
+        base_target = 100  # Fixed size (20% of nets) - smaller for smoother convergence
+
+        self._prev_overuse_for_hotset = total_overuse
+
         # Adjust based on progress (optional: track prev_overuse for this)
         adaptive_cap = min(self.config.hotset_cap, base_target)
-        hotset_list = [nid for _, nid in scores[:adaptive_cap]]
 
-        # Shuffle hotset to break deterministic ordering (prevents same nets always winning/losing)
+        # 60/40 mix: 60% top scorers + 40% random to break phase-locking
         import random
-        rng = random.Random(42 + self.iteration)  # Deterministic but different each iteration
-        rng.shuffle(hotset_list)
-        hotset = set(hotset_list)
+        rng = random.Random(42 + self.iteration)
+
+        K_top = int(0.6 * adaptive_cap)
+        top_scorers = [nid for _, nid in scores[:K_top]]
+        rest = [nid for _, nid in scores[K_top:]]
+        K_random = min(adaptive_cap - K_top, len(rest))
+        random_sample = rng.sample(rest, K_random) if rest else []
+
+        hotset_list = top_scorers + random_sample
+
+        # Cooldown: exclude nets rerouted in previous iteration (prevents immediate re-routing)
+        if not hasattr(self, '_last_reroute_iter'):
+            self._last_reroute_iter = {}
+
+        hotset_with_cooldown = [nid for nid in hotset_list
+                                if self.iteration - self._last_reroute_iter.get(nid, -999) > 1]
+
+        # Update last reroute iteration for selected nets
+        for nid in hotset_with_cooldown:
+            self._last_reroute_iter[nid] = self.iteration
+
+        hotset = set(hotset_with_cooldown)
+
+        unique_frac = len(hotset - getattr(self, '_prev_hotset', set())) / max(1, len(hotset))
+        self._prev_hotset = hotset.copy()
 
         logger.info(f"[HOTSET] overuse_edges={len(over_idx)} total_overuse={int(total_overuse)}, "
-                    f"offenders={len(offenders)}, cap={adaptive_cap} → hotset={len(hotset)}/{len(tasks)} (shuffled)")
+                    f"offenders={len(offenders)}, cap={adaptive_cap} → hotset={len(hotset)}/{len(tasks)} "
+                    f"(60% top + 40% random, unique={unique_frac:.1%})")
 
         return hotset
 
@@ -3788,7 +4186,7 @@ class PathFinderRouter:
         overuse_horiz = {z: 0.0 for z in range(1, layer_count + 1)}
         overuse_vert = {}  # Key: (z1, z2) for via pairs
 
-        # Accumulate overuse by edge type
+        # Accumulate overuse by edge type using actual edge orientation
         for ei in range(len(over)):
             if over[ei] <= 0:
                 continue
@@ -3797,14 +4195,22 @@ class PathFinderRouter:
             u = int(np.searchsorted(indptr, ei, side='right') - 1)
             if 0 <= u < len(indptr) - 1 and indptr[u] <= ei < indptr[u + 1]:
                 v = int(indices[ei])
-                _, _, uz = self.lattice.idx_to_coord(u)
-                _, _, vz = self.lattice.idx_to_coord(v)
+                ux, uy, uz = self.lattice.idx_to_coord(u)
+                vx, vy, vz = self.lattice.idx_to_coord(v)
 
                 if uz == vz:
-                    # Horizontal edge
-                    overuse_horiz[uz] = overuse_horiz.get(uz, 0.0) + float(over[ei])
+                    # Same-layer edge - check actual orientation (H or V)
+                    dx = abs(vx - ux)
+                    dy = abs(vy - uy)
+                    # Only count as horizontal/vertical if it's actually a track (not a via)
+                    if dx > 0 and dy == 0:
+                        # Horizontal track (x changes, y constant)
+                        overuse_horiz[uz] = overuse_horiz.get(uz, 0.0) + float(over[ei])
+                    elif dy > 0 and dx == 0:
+                        # Vertical track (y changes, x constant) - DON'T count as horizontal!
+                        pass  # Skip vertical tracks in horizontal report
                 else:
-                    # Via edge
+                    # Via edge (changes layer)
                     pair = (min(uz, vz), max(uz, vz))
                     overuse_vert[pair] = overuse_vert.get(pair, 0.0) + float(over[ei])
 
