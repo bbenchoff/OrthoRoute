@@ -2884,18 +2884,19 @@ class PathFinderRouter:
                 overuse_by_layer = self._log_per_layer_congestion(over)  # Already returns dict
 
                 if overuse_by_layer and sum(overuse_by_layer.values()) > 0:
-                    # Compute pressure per layer (normalized)
+                    # Compute pressure per layer (normalized to mean)
                     layer_overuse = np.array([overuse_by_layer.get(z, 0.0) for z in range(self._Nz)])
-                    threshold = np.percentile(layer_overuse[layer_overuse > 0], 90) + 1e-6
-                    pressure = np.clip(layer_overuse / threshold, 0.0, 2.0)
+                    mean_overuse = np.mean(layer_overuse[layer_overuse > 0]) + 1e-9
+                    # Pressure ratio: >1.0 = hotter than average, <1.0 = cooler
+                    pressure = layer_overuse / mean_overuse
 
                     # Target bias (1.0 = neutral, <1.0 = cheaper, >1.0 = more expensive)
-                    alpha = 0.06  # Small gain for stability
+                    alpha = 0.08  # Gain for hot layers
                     target_bias = 1.0 + alpha * (pressure - 1.0)
 
                     # EWMA smoothing
                     self.layer_bias = 0.85 * self.layer_bias + 0.15 * target_bias
-                    self.layer_bias = np.clip(self.layer_bias, 0.90, 1.12)
+                    self.layer_bias = np.clip(self.layer_bias, 0.85, 1.20)
 
                     # Log top biases
                     top_layers = sorted(enumerate(self.layer_bias), key=lambda x: x[1], reverse=True)[:3]
