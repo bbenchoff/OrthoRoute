@@ -1,0 +1,47 @@
+PATHFINDER CONVERGENCE COMPARISON: segment_capacity=1 vs segment_capacity=2
+
+Legend: * = capacity=1 (current), # = capacity=2 (previous best)
+
+Overuse
+10,000 |                              *
+       |                          *
+ 9,000 |*                            *
+       |
+ 8,000 | *
+       |
+ 7,000 |   *                    *  *
+       |
+ 6,000 |     *              #
+       |           *  *  *
+ 5,000 |       *
+       |              *
+ 4,000 |                 *        #  #
+       |
+ 3,000 |                                  #
+       |                             #       #
+ 2,000 |                                #
+       |                                      #
+ 1,000 |
+       +------------------------------------------------
+       1   2   3   4   5   6   7   8   9  10  11  12  Iteration
+
+CAPACITY=1 (STRICT):
+- Best: 4,041 @ iter 10
+- Pattern: Initial descent, then GROWING oscillation/divergence
+- Via violations: 7 segments (minimal)
+- Horizontal overuse: 99.9% of problem
+
+CAPACITY=2 (BALANCED):
+- Best: 1,911 @ iter 8  (53% BETTER than capacity=1)
+- Pattern: Steady convergence with DAMPING oscillation
+- Via violations: Slightly higher but acceptable
+- Horizontal overuse: More evenly distributed
+
+KEY INSIGHT:
+Stricter via capacity (1) does NOT improve overall convergence.
+It reduces via flexibility → forces longer routes → increases horizontal congestion.
+
+The real bottleneck is HORIZONTAL TRACK CAPACITY (Layer 30: 16.5% of overuse),
+NOT via segments (only 0.1% of overuse).
+
+VERDICT: segment_capacity=2 is the optimal setting.

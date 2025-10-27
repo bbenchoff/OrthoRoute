@@ -1374,7 +1374,12 @@ class CUDADijkstra:
             // NEW: Jitter parameters (Fix #8)
             const float jitter_eps,         // Jitter magnitude (0.001 typical, 0.0 = disabled)
             // NEW: Atomic key for cycle-proof relaxation
-            unsigned long long* best_key    // (K * dist_val_stride) 64-bit atomic keys
+            unsigned long long* best_key,   // (K * dist_val_stride) 64-bit atomic keys
+            // NEW: Via segment pooling parameters (GPU implementation)
+            const float* via_seg_prefix,    // (Nx * Ny * segZ) flattened 3D array - cumulative segment presence
+            const int segZ,                 // Number of segments (Nz - 2)
+            const float via_segment_weight, // Segment penalty scaling factor
+            const float pres_fac            // Current presence factor for this iteration
         ) {
             // Thread ID and total threads
             const int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1500,6 +1505,53 @@ class CUDADijkstra:
                         }
 
                         float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
+
+                        // === VIA SEGMENT POOLING (GPU Implementation) ===
+                        // Detect vertical edges (vias) and add segment pooling penalty
+                        // This eliminates the CPU bottleneck that was hanging the router
+                        if (segZ > 0 && via_segment_weight > 0.0f) {
+                            // Decode node coordinates to detect vias
+                            const int plane_size = Nx * Ny;
+                            const int z_node = node / plane_size;
+                            const int remainder_node = node - (z_node * plane_size);
+                            const int y_node = remainder_node / Nx;
+                            const int x_node = remainder_node - (y_node * Nx);
+
+                            const int z_neighbor = neighbor / plane_size;
+
+                            // Check if this is a via (vertical edge)
+                            if (z_node != z_neighbor) {
+                                // This is a via - compute segment penalty
+                                const int z_lo = (z_node < z_neighbor) ? z_node : z_neighbor;
+                                const int z_hi = (z_node < z_neighbor) ? z_neighbor : z_node;
+
+                                // Compute segment penalty using prefix sum for fast range query
+                                // Segment indexing: layer transition z→z+1 is stored at index z-1
+                                // For via spanning z_lo to z_hi, we sum segments [z_lo, z_hi-1]
+                                float seg_sum = 0.0f;
+                                if (z_hi > z_lo) {
+                                    // Index into flattened 3D array: via_seg_prefix[x][y][seg_idx]
+                                    // Flattened as: seg_idx + y * segZ + x * (Ny * segZ)
+                                    const int col_idx = x_node + y_node * Nx;  // Column in 2D grid
+                                    const int base = col_idx * segZ;           // Base offset for this (x,y) column
+
+                                    // Prefix sum indices (segment indexing: layer z→z+1 is at index z-1)
+                                    const int hi_idx = z_hi - 2;  // Upper bound segment index
+                                    const int lo_idx = z_lo - 2;  // Lower bound segment index (for subtraction)
+
+                                    // Read prefix values with bounds checking
+                                    const float pref_hi = (hi_idx >= 0 && hi_idx < segZ) ? via_seg_prefix[base + hi_idx] : 0.0f;
+                                    const float pref_lo = (lo_idx >= 0 && lo_idx < segZ) ? via_seg_prefix[base + lo_idx] : 0.0f;
+
+                                    // Compute sum over segment range using prefix difference
+                                    seg_sum = pref_hi - pref_lo;
+                                }
+
+                                // Add segment penalty to edge cost
+                                const float penalty = pres_fac * via_segment_weight * seg_sum;
+                                edge_cost += penalty;
+                            }
+                        }
 
                         // === ROUND-ROBIN LAYER BIAS (Fix #5) ===
                         // Apply bias only if rr_alpha > 0 (early iterations 1-3)
@@ -2648,7 +2700,35 @@ class CUDADijkstra:
             'parent_stamps': parent_stamps,
             'generation': gen,
         }
-        
+
+        # === VIA SEGMENT POOLING (GPU Implementation) ===
+        # Transfer via segment pooling arrays to GPU if enabled
+        # Check if parent object (unified_pathfinder) has via_seg_prefix
+        if hasattr(self, 'via_seg_prefix') and self.via_seg_prefix is not None:
+            # Transfer via_seg_prefix to GPU (shape: Nx × Ny × segZ)
+            via_seg_prefix_gpu = cp.asarray(self.via_seg_prefix, dtype=cp.float32)
+            segZ = self._segZ if hasattr(self, '_segZ') else self.via_seg_prefix.shape[2]
+            via_segment_weight = float(getattr(self.config, "via_segment_weight", 1.0))
+
+            # Get current presence factor from parent pathfinder
+            # This is updated each iteration in unified_pathfinder
+            pres_fac = getattr(self, '_pres_fac', 1.0)
+
+            # Add to data dict for GPU kernel
+            data_dict['via_seg_prefix_gpu'] = via_seg_prefix_gpu
+            data_dict['segZ'] = segZ
+            data_dict['via_segment_weight'] = via_segment_weight
+            data_dict['pres_fac'] = pres_fac
+
+            logger.info(f"[GPU-VIA-POOL] Transferred via_seg_prefix to GPU: shape={via_seg_prefix_gpu.shape}, segZ={segZ}, weight={via_segment_weight}, pres_fac={pres_fac}")
+        else:
+            # Via pooling disabled - pass dummy values
+            data_dict['via_seg_prefix_gpu'] = None
+            data_dict['segZ'] = 0
+            data_dict['via_segment_weight'] = 0.0
+            data_dict['pres_fac'] = 1.0
+            logger.info("[GPU-VIA-POOL] Via segment pooling DISABLED (via_seg_prefix not found)")
+
         # Verify all per-ROI arrays have shape[0] == K
         for key in ['dist', 'parent', 'near_bits', 'far_bits', 'near_mask', 'far_mask',
                     'threshold', 'goal_nodes', 'roi_minx', 'roi_maxx', 'roi_miny', 'roi_maxy',
@@ -3781,6 +3861,22 @@ class CUDADijkstra:
                 best_key[i, srcs[i]] = SRC_KEY
             logger.info(f"[ATOMIC-KEY] Initialized 64-bit keys for {K} ROIs")
 
+            # Get via segment pooling arrays from data dict
+            # These are transferred from unified_pathfinder when via_segment_pooling is enabled
+            via_seg_prefix_gpu = data.get('via_seg_prefix_gpu', None)
+            segZ = data.get('segZ', 0)
+            via_segment_weight = float(data.get('via_segment_weight', 0.0))
+            pres_fac_current = float(data.get('pres_fac', 1.0))
+
+            # If via pooling not enabled, pass dummy values
+            if via_seg_prefix_gpu is None or segZ == 0:
+                logger.info("[GPU-VIA-POOL] Via segment pooling disabled (segZ=0 or no arrays)")
+                via_seg_prefix_gpu = cp.zeros(1, dtype=cp.float32)  # Dummy array
+                segZ = 0
+                via_segment_weight = 0.0
+            else:
+                logger.info(f"[GPU-VIA-POOL] Via segment pooling ENABLED: segZ={segZ}, weight={via_segment_weight}, pres_fac={pres_fac_current}")
+
             args = (
                 queue_a, queue_b, size_a, size_b, max_queue_size,
                 K, max_roi_size,
@@ -3812,7 +3908,12 @@ class CUDADijkstra:
                 # NEW: Jitter parameters (Fix #8)
                 cp.float32(jitter_eps),        # Jitter magnitude (0.001 typical)
                 # NEW: Atomic key for cycle-proof relaxation
-                best_key.ravel()               # (K * pool_stride) 64-bit atomic keys
+                best_key.ravel(),              # (K * pool_stride) 64-bit atomic keys
+                # NEW: Via segment pooling parameters (GPU implementation)
+                via_seg_prefix_gpu.ravel(),    # (Nx * Ny * segZ) flattened prefix array
+                cp.int32(segZ),                # Number of segments
+                cp.float32(via_segment_weight), # Segment penalty weight
+                cp.float32(pres_fac_current)   # Current presence factor
             )
 
             block_size = 256

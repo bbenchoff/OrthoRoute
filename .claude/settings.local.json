@@ -45,7 +45,8 @@
       "Bash(set GPU_MODE=1)",
       "Bash(ORTHO_CPU_ONLY=1 timeout 300 python main.py --test-manhattan)",
       "Bash(ORTHO_CPU_ONLY=1 timeout 600 python main.py --test-manhattan)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "WebFetch(domain:bbenchoff.github.io)"
     ],
     "deny": [],
     "ask": [],

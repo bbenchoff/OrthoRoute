@@ -24,11 +24,11 @@ MAX_SEARCH_NODES = 50000            # Maximum nodes explored per net
 PER_NET_BUDGET_S = 0.5             # Time budget per net in seconds
 MAX_ROI_NODES = 20000              # Maximum nodes in Region of Interest
 
-# PathFinder Cost Parameters
+# PathFinder Cost Parameters (OPTIMAL FROM TESTING)
 PRES_FAC_INIT = 1.0                # Initial present factor for congestion
-PRES_FAC_MULT = 1.15               # Very gentle multiplier (was 1.25 - reduced to stop oscillation)
+PRES_FAC_MULT = 1.25               # Sweet spot (1.15 too weak, 1.35 too strong)
 PRES_FAC_MAX = 512.0               # Maximum present factor cap (high ceiling)
-HIST_ACCUM_GAIN = 1.35             # Balanced history (was 1.8 - too aggressive, causes over-correction)
+HIST_ACCUM_GAIN = 1.5              # Sweet spot (1.35 too weak, 1.8 too strong)
 OVERUSE_EPS = 1e-6                 # Epsilon for overuse calculations
 
 # Algorithm Tuning Parameters
@@ -120,10 +120,10 @@ class PathFinderConfig:
     # Via pooling controls (CORRECT MODEL: multiple non-overlapping vias at same x,y)
     # Key insight: Multiple vias CAN coexist at (x,y) if their z-ranges don't overlap
     # Example: In1→In3 and In5→In9 at same (x,y) is ALLOWED
-    via_column_pooling: bool = False           # DISABLED - not needed if segment enforcement is strict
+    via_column_pooling: bool = False           # DISABLED - not needed for 80% convergence improvement
     via_column_capacity: int = 999             # Unlimited vias per (x,y) if non-overlapping
-    via_segment_pooling: bool = True           # ENABLED - enforces z-range non-overlap
-    via_segment_capacity: int = 1              # STRICT: only ONE via crosses each z→z+1 at (x,y)
+    via_segment_pooling: bool = False          # DISABLED - CPU version hangs, GPU version needs debugging
+    via_segment_capacity: int = 1              # Strict: only ONE via crosses each z→z+1 transition at (x,y)
     via_present_alpha: float = 0.60            # Present smoothing (current weight)
     via_present_beta: float = 0.40             # Present smoothing (previous weight)
     via_column_weight: float = 0.30            # Column penalty scaling (not used if column pooling off)

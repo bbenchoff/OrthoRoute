@@ -6,33 +6,28 @@
     <td align="left">
       <h2>OrthoRoute - GPU Accelerated Autorouting for KiCad</h2>
       <p><strong>OrthoRoute is a GPU-accelerated PCB autorouter that uses a Manhattan lattice and the PathFinder algorithm to route high-density boards. Built as a KiCad plugin using the IPC API, it handles complex designs with thousands of nets that make traditional push-and-shove routers give up.</strong></p>
-      <p><em>Never trust the autorouter, but at least this one is fast.</em></p>
       <p><em>Orthogonal! Non-trivial! Runs on GPUs! I live in San Francisco!</em></p>
+      <p><em>Never trust the autorouter, but at least this one is fast.</em></p>
     </td>
   </tr>
 </table>
-
-OrthoRoute is a GPU-accelerated PCB autorouter plugin for KiCad, designed to handle massive circuit boards that would be impractical to route by hand. Born out of necessity to route a backplane with 17,600 pads, OrthoRoute leverages CUDA cores to parallelize the most computationally intensive parts of PCB routing.
 
 A much more comprehensive explanation of the _why_ and _how_ of this repository is available on the [build log for this project](https://bbenchoff.github.io/pages/OrthoRoute.html).
 
 ## Key Features
 
-- GPU-Accelerated Routing: Uses CUDA/CuPy for wavefront expansion algorithms
-- Manhattan Routing: Specialized for orthogonal routing patterns (horizontal/vertical layer pairs)
+- GPU-Accelerated Routing: Uses CUDA/CuPy
+- Multiple Routing Algorithms
+  - Manhattan Routing: Specialized for orthogonal routing patterns (horizontal/vertical layer pairs)
+  - Lee's Wavefront: Traditional routing (experimental)
 - KiCad Integration: Built as a native KiCad plugin using the IPC API
 - Real-time Visualization: Interactive 2D board view with zoom, pan, and layer controls
-- Multi-layer Support: Handles complex multi-layer PCB designs
 
 ## Why GPU Acceleration?
 
 Traditional autorouters like FreeRouting can take hours or even days on large boards. OrthoRoute uses GPUs for the embarrassingly parallel parts of routing - specifically Lee's wavefront expansion algorithm - while handling constraints and decision-making on the CPU.
 
-For Manhattan routing patterns (the plugin's specialty), this approach is particularly effective because:
-
-- Traces follow predictable orthogonal patterns
-- Each layer has a dedicated direction (horizontal or vertical)
-- Geometric constraints make the problem highly parallelizable
+For Manhattan routing patterns (the plugin's specialty), this approach is particularly effective because geometric constraints make the problem highly parallelizable
 
 ## Technical Achievements
 
@@ -43,9 +38,8 @@ For Manhattan routing patterns (the plugin's specialty), this approach is partic
 - **Memory Efficient**: Optimized data structures reduce memory usage by 60% vs. dense matrices
 
 ### Routing Performance
-- **Large Board Capability**: Successfully routes 3,200+ pad backplanes with 512+ nets
-- **Sub-Minute Routing**: Complex boards route in under 60 seconds on modern GPUs
-- **Batch Processing**: Processes multiple nets in parallel using GPU streams
+- **Large Board Capability**: Successfully routes 16000+ pad backplanes with 8000+ nets
+- **Fast Routing**: Complex boards route in 10 minutes or less
 - **Validation Pipeline**: Comprehensive preflight checks and integrity validation
 
 ### Architecture Consolidation
@@ -73,13 +67,9 @@ _Testing / examples are the following_:
 
 ## Performance
 
-While general autorouting remains a complex constraint-satisfaction problem, OrthoRoute excels at:
+While general autorouting remains a complex constraint-satisfaction problem, OrthoRoute excels at large backplanes, manhattan-style routing requirements, and boards where traditional autorouters would take prohibitively long
 
-- Large backplanes with regular connector patterns
-- Manhattan-style routing requirements
-- Boards where traditional autorouters would take prohibitively long
-
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 - **KiCad 9.0+** with IPC API support
@@ -104,68 +94,25 @@ While general autorouting remains a complex constraint-satisfaction problem, Ort
 
 #### GUI Mode (Recommended)
 1. **Open your PCB** in KiCad 9.0+ with IPC API enabled
-2. **Launch OrthoRoute Plugin**:
-   ```bash
-   python main.py plugin
-   ```
+2. **Launch OrthoRoute Plugin** via the Plugin Manager
 3. **Route your nets** - OrthoRoute will automatically:
    - Extract board data via KiCad IPC API
-   - Build 3D routing lattice (6-layer Manhattan routing)
+   - Build 3D routing lattice (multi-layer Manhattan routing)
    - Map all pads to the routing graph
    - Route nets using GPU-accelerated PathFinder
 4. **Monitor progress** in the interactive PCB viewer
+5. **Import back to KiCad**
 
-#### CLI Mode
-```bash
-python main.py cli path/to/your/board.kicad_pcb
-```
+#### CLI Mode (For Development)
+1. **Navigate to the OrthoRoute Folder** Wherever it's installed via KiCad
+2. **Run from CLI**: `python main.py --test-manhattan`
 
-#### Features in Action
-- **Real-time visualization** of routing progress
-- **GPU acceleration** for large boards (3000+ pads)
-- **Unified pipeline** ensures CLI and GUI produce identical results
-- **Comprehensive logging** with performance metrics
-
-
-## 🏗️ Project Structure
-
-```
-OrthoRoute/
-├── orthoroute/                        # Main package
-│   ├── algorithms/                    # Routing algorithms
-│   │   └── manhattan/                 # Manhattan routing engine
-│   │       ├── unified_pathfinder.py  # Consolidated GPU PathFinder
-│   │       ├── manhattan_router_rrg.py # RRG-based routing
-│   │       ├── rrg.py                # Route Resource Graph
-│   │       └── graph_checks.py       # Validation and integrity checks
-│   ├── infrastructure/                # Core infrastructure
-│   │   ├── kicad/                    # KiCad integration
-│   │   │   └── rich_kicad_interface.py # IPC API interface
-│   │   └── gpu/                      # GPU acceleration
-│   ├── presentation/                 # User interfaces
-│   │   ├── gui/                     # PyQt6 GUI
-│   │   │   └── main_window.py       # Main interface
-│   │   ├── plugin/                  # KiCad plugin
-│   │   │   └── kicad_plugin.py      # Plugin entry point
-│   │   └── pipeline.py              # Unified routing pipeline
-│   └── domain/                      # Domain models and services
-├── main.py                          # CLI entry point
-├── graphics/                        # Icons and screenshots
-└── docs/                           # Documentation
-```
-
-## 🏗️ Building
+## Building
 
 ### Create Plugin Package
 ```bash
 python build_ipc_plugin.py
 ```
-
-### Development Build
-```bash
-python build.py --package development
-```
-
 
 ## Current Status
 
@@ -175,19 +122,15 @@ python build.py --package development
 - **GPU Acceleration**: CUDA-accelerated wavefront expansion and parallel processing
 - **KiCad Integration**: Full IPC API support for real-time board data extraction
 - **Interactive Visualization**: Real-time PCB viewer with routing progress updates
-- **Multi-Layer Support**: 6-layer Manhattan routing with proper layer assignment
 - **Graph Validation**: Preflight checks and lattice integrity validation
 
-### 🚧 Recently Completed
-- **CSR Dijkstra Validation**: Verified Compressed Sparse Row matrix operations
-- **Unified Pipeline**: Single routing pipeline shared between CLI and GUI interfaces
-- **Large Board Support**: Successfully routes complex backplanes (3200+ pads, 512+ nets)
-- **Performance Optimization**: Sub-minute routing for complex boards with GPU acceleration
 
 ### 🔄 In Development
 - **Advanced DRC Integration**: Enhanced design rule checking
-- **Geometry Export**: KiCad-compatible track and via generation
-- **Push-and-Shove**: Advanced routing conflict resolution
+- **Push-and-Shove**: Improving the 'traditional' autorouter
+- **Rip-up and Retry**: Did I mention the 'traditional' autorouter is crap?
+- **Differential Pairs**: Right now it's just single traces
+- **BGA Portal Escapes**: Modifying the current Manhattan escape routing to support BGA packages
 
 ##  Contributing
 
@@ -195,7 +138,7 @@ We welcome contributions! Please see [`docs/contributing.md`](docs/contributing.
 
 If something's not working or you just don't like it, first please complain. Complaining about free stuff will actually force me to fix it. I would especially like to hear from you if you think it sucks.
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
@@ -209,15 +152,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Discussions**: [GitHub Discussions](https://github.com/bbenchoff/OrthoRoute/discussions)
 - **Documentation**: [Project Wiki](https://github.com/bbenchoff/OrthoRoute/wiki)
 
-## Roadmap
-
-- [ ] Advanced routing algorithms (push-and-shove, differential pairs)
-- [ ] PCB stackup awareness and layer-specific routing
-- [ ] Design rule checking integration
-- [ ] Batch routing for multiple PCBs
-- [ ] Machine learning route optimization
-- [ ] Integration with external routing services
-
 ---
-
-**OrthoRoute** - Professional PCB autorouting for KiCad with modern GPU acceleration and official API integration.
