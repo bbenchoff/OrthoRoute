@@ -145,16 +145,15 @@ class CUDADijkstra:
         self.relax_kernel = cp.RawKernel(r'''
         extern "C" __global__
         void relax_edges_parallel(
-            const int K,              // Number of ROIs
-            const int max_roi_size,   // Max nodes per ROI
-            const int max_edges,      // Max edges per ROI
-            const bool* active,       // (K,) active mask
-            const int* min_nodes,     // (K,) current min node per ROI
-            const int* indptr,        // (K, max_roi_size+1) CSR indptr
-            const int* indices,       // (K, max_edges) CSR indices
-            const float* weights,     // (K, max_edges) CSR weights
-            float* dist,              // (K, max_roi_size) distances
-            int* parent               // (K, max_roi_size) parents
+            const int K,                      // Number of ROIs
+            const int max_roi_size,           // Max nodes per ROI
+            const int max_edges,              // Max edges per ROI
+            const bool* active,               // (K,) active mask
+            const int* min_nodes,             // (K,) current min node per ROI
+            const int* indptr,                // (K, max_roi_size+1) CSR indptr
+            const int* indices,               // (K, max_edges) CSR indices
+            const float* weights,             // (K, max_edges) CSR weights
+            unsigned long long* dist_parent   // (K, max_roi_size) packed: lower 32=dist, upper 32=parent
         ) {
             // Each CUDA thread processes one ROI
             int roi_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -167,7 +166,10 @@ class CUDADijkstra:
             int start = indptr[roi_idx * (max_roi_size + 1) + u];
             int end = indptr[roi_idx * (max_roi_size + 1) + u + 1];
 
-            float u_dist = dist[roi_idx * max_roi_size + u];
+            // Unpack u's distance from 64-bit key
+            unsigned long long u_key = dist_parent[roi_idx * max_roi_size + u];
+            unsigned int u_dist_bits = (unsigned int)(u_key & 0xFFFFFFFFULL);
+            float u_dist = __int_as_float(u_dist_bits);
 
             // Relax all neighbors of u
             for (int edge_idx = start; edge_idx < end; edge_idx++) {
@@ -175,14 +177,12 @@ class CUDADijkstra:
                 float cost = weights[roi_idx * max_edges + edge_idx];
                 float new_dist = u_dist + cost;
 
-                // Atomic min for distance update
-                float* dist_ptr = &dist[roi_idx * max_roi_size + v];
-                atomicMin((int*)dist_ptr, __float_as_int(new_dist));
+                // Pack new key: lower 32 bits = distance (as int), upper 32 bits = parent
+                unsigned int new_dist_bits = __float_as_int(new_dist);
+                unsigned long long new_key = ((unsigned long long)u << 32) | new_dist_bits;
 
-                // Update parent if we improved
-                if (dist[roi_idx * max_roi_size + v] == new_dist) {
-                    parent[roi_idx * max_roi_size + v] = u;
-                }
+                // Single atomic operation on 64-bit key - eliminates race condition!
+                atomicMin(&dist_parent[roi_idx * max_roi_size + v], new_key);
             }
         }
         ''', 'relax_edges_parallel')
@@ -5508,10 +5508,22 @@ class CUDADijkstra:
             logger.info(f"[GPU-SEEDS] Allocated stamp pools: N_max={N_max}")
             self.dist_val_pool = cp.full((1, N_max), cp.inf, dtype=cp.float32)
             self.parent_val_pool = cp.full((1, N_max), -1, dtype=cp.int32)
+            # Allocate 64-bit atomic key pool (cycle-proof parent updates)
+            INF_KEY = 0x7F800000FFFFFFFF  # float +inf (upper 32) | parent -1 (lower 32)
+            self.best_key_pool = cp.full((1, N_max), INF_KEY, dtype=cp.uint64)
 
         # Copy initial dist/parent into pools
         self.dist_val_pool[0, :num_nodes] = dist
         self.parent_val_pool[0, :num_nodes] = parent
+
+        # Initialize best_key_pool for source seeds with SRC_KEY (cost=0, parent=-1)
+        SRC_KEY = 0x00000000FFFFFFFF  # cost=0 (upper 32 bits) | parent=-1 (lower 32 bits)
+        INF_KEY = 0x7F800000FFFFFFFF  # +inf (upper 32 bits) | parent=-1 (lower 32 bits)
+        # Reset all keys to INF_KEY first
+        self.best_key_pool[0, :num_nodes] = INF_KEY
+        # Initialize source seeds with SRC_KEY
+        for seed in src_seeds_gpu:
+            self.best_key_pool[0, int(seed)] = SRC_KEY
 
         # Determine lattice dimensions for coordinate encoding
         # For full-graph routing: use linear layout
@@ -5562,7 +5574,7 @@ class CUDADijkstra:
             'use_astar': 0,
             'use_bitmap': False,  # Not using bitmap filtering
             'iter1_relax_hv': True,
-            'use_atomic_parent_keys': False,
+            'use_atomic_parent_keys': True,  # ENABLED: Eliminates parent pointer race condition cycles
         }
 
         max_iterations = 2000
@@ -5596,6 +5608,7 @@ class CUDADijkstra:
                 dst_targets_gpu,
                 self.dist_val_pool[0, :num_nodes],  # Use stamp pool slice
                 self.parent_val_pool[0, :num_nodes],  # Use stamp pool slice
+                self.best_key_pool[0, :num_nodes],  # Use best_key pool slice for atomic keys
                 frontier_words,
                 max_iterations=max_iterations
             )

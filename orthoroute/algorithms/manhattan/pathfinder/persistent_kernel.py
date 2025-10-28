@@ -35,6 +35,23 @@ __device__ float atomicMinFloat(float* addr, float value) {
     return __int_as_float(old);
 }
 
+// Atomic min for 64-bit keys (cycle-proof relaxation)
+__device__ unsigned long long atomicMin64(unsigned long long* address, unsigned long long val) {
+    unsigned long long old = *address;
+    unsigned long long assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address, assumed, (val < assumed) ? val : assumed);
+    } while (assumed != old);
+    return old;
+}
+
+// Pack distance and parent into 64-bit key for atomic operations
+__device__ __forceinline__ unsigned long long pack_key(float dist, int parent) {
+    unsigned int dist_bits = __float_as_uint(dist);
+    return ((unsigned long long)dist_bits << 32) | (unsigned long long)(unsigned int)parent;
+}
+
 extern "C" __global__
 void persistent_sssp_kernel(
     const int* indptr,                  // CSR indptr for full graph
@@ -47,6 +64,7 @@ void persistent_sssp_kernel(
     const int num_dsts,                 // Number of destinations
     float* dist,                        // Distance array (num_nodes,)
     int* parent,                        // Parent array (num_nodes,)
+    unsigned long long* best_key,       // 64-bit atomic keys (dist+parent packed)
     unsigned int* frontier_curr,        // Current frontier (bit-packed)
     unsigned int* frontier_next,        // Next frontier (bit-packed)
     const int frontier_words,           // Number of uint32 words for frontier
@@ -80,6 +98,8 @@ void persistent_sssp_kernel(
         if (seed >= 0 && seed < num_nodes) {
             dist[seed] = 0.0f;
             parent[seed] = -1;
+            // Initialize best_key with SRC_KEY (dist=0.0, parent=-1)
+            best_key[seed] = pack_key(0.0f, -1);
 
             // Add to frontier
             int word_idx = seed / 32;
@@ -131,13 +151,16 @@ void persistent_sssp_kernel(
                     float edge_cost = weights[e];
                     float g_new = node_dist + edge_cost;
 
-                    // Try to improve distance
-                    float old_dist = dist[neighbor];
-                    if (g_new >= old_dist) continue;
+                    // Pack new key with distance and parent
+                    unsigned long long new_key = pack_key(g_new, node);
 
-                    float old = atomicMinFloat(&dist[neighbor], g_new);
-                    if (g_new + 1e-8f < old) {
-                        // Update parent
+                    // Single atomic operation on 64-bit key - eliminates race condition!
+                    unsigned long long old_key = atomicMin64(&best_key[neighbor], new_key);
+
+                    // Only the winning thread proceeds
+                    if (new_key < old_key) {
+                        // We won! Update dist and parent arrays (for compatibility)
+                        dist[neighbor] = g_new;
                         atomicExch(&parent[neighbor], node);
 
                         // Add to next frontier
@@ -224,6 +247,7 @@ def launch_persistent_kernel(
     dst_targets_gpu,
     dist_gpu,
     parent_gpu,
+    best_key_gpu,
     frontier_words,
     max_iterations=2000
 ):
@@ -240,6 +264,7 @@ def launch_persistent_kernel(
         dst_targets_gpu: Destination targets array (CuPy int32)
         dist_gpu: Distance array (CuPy float32), pre-initialized to inf
         parent_gpu: Parent array (CuPy int32), pre-initialized to -1
+        best_key_gpu: 64-bit atomic key array (CuPy uint64), packed dist+parent
         frontier_words: Number of uint32 words for frontier
         max_iterations: Maximum iterations before timeout
 
@@ -285,6 +310,7 @@ def launch_persistent_kernel(
             num_dsts,
             dist_gpu,
             parent_gpu,
+            best_key_gpu,           # Added: 64-bit atomic keys for cycle-proof relaxation
             frontier_curr,
             frontier_next,
             frontier_words,

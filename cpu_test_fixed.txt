@@ -1,0 +1,574 @@
+2025-10-28 00:44:56,155 - orthoroute.shared.configuration.config_manager - INFO - Found existing config file: C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute.json
+2025-10-28 00:44:56,155 - orthoroute.shared.configuration.config_manager - INFO - Configuration loaded from: C:\Users\Benchoff\Documents\GitHub\OrthoRoute\orthoroute.json
+2025-10-28 00:44:56 - root - INFO - [LOG] Debug file handler added: orthoroute_debug.log
+2025-10-28 00:44:56 - root - INFO - [LOG] Console logging set to INFO level for clean demo output
+2025-10-28 00:44:56 - root - INFO - OrthoRoute logging initialized
+Starting automated Manhattan routing test...
+2025-10-28 00:44:56 - root - INFO - Starting automated Manhattan routing test...
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - CUDA GPU provider initialized for plugin
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - IPC adapter available
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - SWIG adapter available
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - File parser available
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - [ROUTER SELECTION] Selected router: unified_pathfinder
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - [ROUTER SELECTION] Loading UnifiedPathFinder (improved coordinate handling)
+2025-10-28 00:44:56 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - [EMERGENCY-CPU-ONLY] GPU disabled via EMERGENCY_CPU_ONLY flag - using CPU-only mode
+2025-10-28 00:44:56 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] use_gpu=False
+2025-10-28 00:44:56 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] use_gpu_sequential=True
+2025-10-28 00:44:56 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] use_incremental_cost_update=False
+2025-10-28 00:44:56 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - PathFinder (GPU=False, Portals=True)
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - [ROUTER SELECTION] Selected router: unified_pathfinder (instance=PF-96158)
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - [PIPELINE] UnifiedPathFinder created with instance_tag=PF-96158
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - [ROUTER SELECTION] Active routing engine: unified_pathfinder
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - OrthoRoute KiCad Plugin initialized
+Loading board from KiCad and starting GUI...
+Auto-starting routing process...
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - Loading board from KiCad using rich interface for GUI with autostart
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - Connecting to KiCad to get rich board data...
+2025-10-28 00:44:56 - pynng.nng - DEBUG - Pipe callback event 0
+2025-10-28 00:44:56 - pynng.nng - DEBUG - Pipe callback event 1
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Connected to KiCad IPC API and retrieved board
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - Connected to KiCad via rich IPC API
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracting comprehensive board data from KiCad...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Board filename: TestBackplane.kicad_pcb
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracting pads with detailed geometry...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Found 1604 pads using KiCad API
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Found 1604 pads - extracting with polygon shapes
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracting components...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Found 12 footprints using KiCad API
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracting existing tracks...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Found 0 tracks using KiCad API
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Loaded 0 existing tracks from KiCad
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracting zones...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Found 0 zones
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracting nets with connectivity...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Found 1088 nets with pads
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Created 512 routable nets (excluding 0 plane-connected nets)
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Calculating board dimensions...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Calculated bounds from pad positions: (196.2, 98.3) to (269.3, 195.5)
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Board dimensions calculated from geometry: 73.1 x 97.3 mm
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Generating airwires...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Generated 512 airwires from 512 nets
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO -   Including 0 partially routed nets
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO -   Filtered out 0 nets with copper pours
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracting DRC rules...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracting DRC rules using IPC API...
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - WARNING - IPC-based DRC extraction failed: No module named 'kicad'
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Using fallback DRC defaults
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracted DRC rules: 1 netclasses
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Got layer count from BoardStackup.material_name: 18 copper layers
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Copper layers: ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'In5.Cu', 'In6.Cu', 'In7.Cu', 'In8.Cu', 'In9.Cu', 'In10.Cu', 'In11.Cu', 'In12.Cu', 'In13.Cu', 'In14.Cu', 'In15.Cu', 'In16.Cu', 'B.Cu']
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Large backplane detected (1604 pads), using 18 copper layers
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO - Extracted board data: TestBackplane.kicad_pcb (73.1x97.3mm, 18 copper layers)
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO -   512 routable nets, 12 components, 0 tracks, 0 zones
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO -   Generated 512 airwires for visualization
+2025-10-28 00:44:56 - orthoroute.infrastructure.kicad.rich_kicad_interface - INFO -   Extracted 1 netclasses with design rules
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - Loaded rich board data from KiCad: 1604 pads, 1088 nets
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - Board layer stack: 18 copper layers detected
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - GPU detected and available for routing
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - All algorithms will use GPU acceleration with CPU fallback
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - PCBViewer: Initialized 18 visible layers from board data
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - update_layers_panel: Creating checkboxes for 18 layers: ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'In5.Cu', 'In6.Cu', 'In7.Cu', 'In8.Cu', 'In9.Cu', 'In10.Cu', 'In11.Cu', 'In12.Cu', 'In13.Cu', 'In14.Cu', 'In15.Cu', 'In16.Cu', 'B.Cu']
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - Board data loaded into GUI: 12 components, 0 tracks - starting progressive net processing
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - Using 512 airwires from KiCad interface (no regeneration needed)
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - Displaying ALL 1088 nets (no performance limits)
+2025-10-28 00:44:56 - orthoroute.presentation.plugin.kicad_plugin - INFO - OrthoRoute rich GUI launched successfully!
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks called: board_data has 0 tracks
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - No tracks to draw - returning early
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - _draw_vias: No vias to draw
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks called: board_data has 0 tracks
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - No tracks to draw - returning early
+2025-10-28 00:44:56 - orthoroute.presentation.gui.main_window - INFO - _draw_vias: No vias to draw
+2025-10-28 00:44:58 - orthoroute.presentation.plugin.kicad_plugin - INFO - AUTO-START: Triggering routing process...
+2025-10-28 00:44:58 - orthoroute.presentation.gui.main_window - INFO - Begin autorouting with Manhattan RRG
+2025-10-28 00:44:58 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks called: board_data has 0 tracks
+2025-10-28 00:44:58 - orthoroute.presentation.gui.main_window - INFO - No tracks to draw - returning early
+2025-10-28 00:44:58 - orthoroute.presentation.gui.main_window - INFO - _draw_vias: No vias to draw
+2025-10-28 00:44:58 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks called: board_data has 0 tracks
+2025-10-28 00:44:58 - orthoroute.presentation.gui.main_window - INFO - No tracks to draw - returning early
+2025-10-28 00:44:58 - orthoroute.presentation.gui.main_window - INFO - _draw_vias: No vias to draw
+DEBUG: Screenshot saved to debug_output/run_20251028_004458/01_board_with_airwires_20251028_004458_448.png (scale=8x)
+2025-10-28 00:44:59 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks called: board_data has 0 tracks
+2025-10-28 00:44:59 - orthoroute.presentation.gui.main_window - INFO - No tracks to draw - returning early
+2025-10-28 00:44:59 - orthoroute.presentation.gui.main_window - INFO - _draw_vias: No vias to draw
+2025-10-28 00:44:59 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks called: board_data has 0 tracks
+2025-10-28 00:44:59 - orthoroute.presentation.gui.main_window - INFO - No tracks to draw - returning early
+2025-10-28 00:45:00 - orthoroute.presentation.gui.main_window - INFO - _draw_vias: No vias to draw
+DEBUG: Screenshot saved to debug_output/run_20251028_004458/02_board_no_airwires_20251028_004459_939.png (scale=8x)
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: board_data keys: ['filename', 'pads', 'components', 'tracks', 'zones', 'nets', 'airwires', 'bounds', 'width', 'height', 'layers', 'layer_names', 'drc_rules', 'vias']
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: board_data['bounds'] = (196.2, 98.2725, 269.3, 195.5325)
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Creating Board object with layer_count=18
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Found 12 components in board_data
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Processing 1088 nets from board_data
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref keys: ['component', 'name', 'net_name', 'net_code', 'x', 'y', 'width', 'height', 'drill', 'layers', 'type']
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('name') = '1'
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('component') = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: extracted component_id = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Creating pad '1' at (260.447997, 126.9475) from pad_ref x=260.447997, y=126.9475
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref keys: ['component', 'name', 'net_name', 'net_code', 'x', 'y', 'width', 'height', 'drill', 'layers', 'type']
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('name') = '2'
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('component') = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: extracted component_id = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Creating pad '2' at (260.372997, 106.6225) from pad_ref x=260.372997, y=106.6225
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref keys: ['component', 'name', 'net_name', 'net_code', 'x', 'y', 'width', 'height', 'drill', 'layers', 'type']
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('name') = '2'
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('component') = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: extracted component_id = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Creating pad '2' at (260.447997, 130.2975) from pad_ref x=260.447997, y=130.2975
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref keys: ['component', 'name', 'net_name', 'net_code', 'x', 'y', 'width', 'height', 'drill', 'layers', 'type']
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('name') = '6'
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('component') = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: extracted component_id = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Creating pad '6' at (259.572996, 106.6225) from pad_ref x=259.572996, y=106.6225
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref keys: ['component', 'name', 'net_name', 'net_code', 'x', 'y', 'width', 'height', 'drill', 'layers', 'type']
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('name') = '3'
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: pad_ref.get('component') = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: extracted component_id = ''
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Creating pad '3' at (260.047995, 126.9475) from pad_ref x=260.047995, y=126.9475
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - WARNING - DEBUG: Orphaned pad '1' with component_id '' - not found in components_dict
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - WARNING - DEBUG: Orphaned pad '2' with component_id '' - not found in components_dict
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - WARNING - DEBUG: Orphaned pad '2' with component_id '' - not found in components_dict
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - WARNING - DEBUG: Orphaned pad '6' with component_id '' - not found in components_dict
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - WARNING - DEBUG: Orphaned pad '3' with component_id '' - not found in components_dict
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Creating generic component for 1600 orphaned pads
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Component pad counts: [('GENERIC_COMPONENT', 1600)]...
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - Created board with 512 routable nets, 1 components, 1600 total pads
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Pad assignment: 1600 assigned, 0 orphaned
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: Setting board._kicad_bounds = (196.2, 98.2725, 269.3, 195.5325)
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: After setting, hasattr(board, '_kicad_bounds') = True
+2025-10-28 00:45:01 - orthoroute.presentation.gui.main_window - INFO - DEBUG: board._kicad_bounds = (196.2, 98.2725, 269.3, 195.5325)
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - ================================================================================
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - PATHFINDER NEGOTIATED CONGESTION ROUTER - RUNTIME CONFIGURATION
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - ================================================================================
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] pres_fac_init    = 1.0
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] pres_fac_mult    = 1.12
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] pres_fac_max     = 8.0
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] hist_gain        = 0.2
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] via_cost         = 1.5
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] grid_pitch       = 0.4 mm
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] max_iterations   = 40
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CONFIG] stagnation_patience = 5
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - ================================================================================
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [BOUNDS] Extracted 1024 pads from 512 nets
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [BOUNDS] Pad area: (224.6, 103.3) to (260.4, 190.5)
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [BOUNDS] Final with 3.0mm margin: (221.6, 100.3) to (263.4, 193.5)
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Using 18 layers from board
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Lattice: 106×234×18 = 446,472 nodes
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [VIA-PAIRS] layer_count=18, routing_layers=16, allow_any=True, expected_all_pairs=120
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [VIA-PAIRS] Generated 240 all-to-all pairs for 16 routing layers
+2025-10-28 00:45:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Pre-allocating for 12,694,208 edges (11,905,920 via edges for 240 pairs)
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Vias: 11905920 edges created
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Via policy: 240 layer pairs (FULL BLIND/BURIED ENABLED!)
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 2
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 3
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 4
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 5
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 6
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 7
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 8
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 9
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 10
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Legal via: 1 ↔ 11
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   ... and 230 more pairs (showing first 10 only)
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Finalizing CSR: 12,694,208 edges from pre-allocated array
+2025-10-28 00:45:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Sorting 12,694,208 edges by source node...
+2025-10-28 00:45:12 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [CPU-SORT] Sort completed in 6.9 seconds
+2025-10-28 00:45:13 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [LAYER-MAP] Built edge→layer mapping: 12694208 edges, 18 layers
+2025-10-28 00:45:13 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [EDGE-KIND] Horizontal/Vertical=788288, Via=11905920
+2025-10-28 00:45:13 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - CSR: 446472 nodes, 12694208 edges
+2025-10-28 00:45:13 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [MANHATTAN-VALIDATION] Sampling 1000 edges to verify H/V discipline...
+2025-10-28 00:45:14 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [MANHATTAN-VALIDATION] All 1000 sampled edges are legal ✓
+2025-10-28 00:45:14 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [LAYER-BALANCE] Initialized for 18 layers
+2025-10-28 00:45:14 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [GPU-INIT] config.use_gpu=False, GPU_AVAILABLE=True, CUDA_DIJKSTRA_AVAILABLE=True
+2025-10-28 00:45:14 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [GPU-INIT] use_gpu_solver=False
+2025-10-28 00:45:14 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [GPU] CPU-only mode: config.use_gpu=False
+2025-10-28 00:45:15 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Identified 11905920 via edges
+2025-10-28 00:45:16 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [VIA-METADATA] Built metadata for 11905920 via edges in 1.158s
+2025-10-28 00:45:16 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Mapped 1600 pads (from ~1600)
+2025-10-28 00:45:16 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [VERIFY] Sample pad IDs: ['GENERIC_COMPONENT_1@260448,126948', 'GENERIC_COMPONENT_2@260373,106622', 'GENERIC_COMPONENT_2@260448,130298', 'GENERIC_COMPONENT_6@259573,106622', 'GENERIC_COMPONENT_3@260048,126948']
+2025-10-28 00:45:16 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - PadEscapePlanner initialized with random seed: 42
+2025-10-28 00:45:16 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Portal planning delegated to PadEscapePlanner (column-based, seed=42)
+2025-10-28 00:45:16 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - === Init complete ===
+2025-10-28 00:45:16 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - map_all_pads: Already mapped 1600 pads
+2025-10-28 00:45:16 - orthoroute.presentation.gui.main_window - INFO - [PORTAL] Pre-computed portals: 0 (from pad_escape_planner)
+2025-10-28 00:45:16 - orthoroute.presentation.gui.main_window - INFO - Attached 1604 GUI pads to board for DRC
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - Mapped 1600 pad geometries from GUI data
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - Planning escapes for 512 nets
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - Found 1024 pads attached to 512 routable nets
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - Collected 1024 pads for escape planning (deterministically sorted)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - Built spatial index in 0.00s (1600 pads → 143 grid cells)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - Planned 1024 portals using column-based approach
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [GAP-FILL] Gap-filling DISABLED (portals didn't improve spreading)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-DISTRIBUTION] 1024 portals across 65 unique X-coordinates
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-DISTRIBUTION] X-range: min=7, max=97
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-DISTRIBUTION] First 10 X-coords: [7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-DISTRIBUTION] Last 10 X-coords: [88, 89, 90, 91, 92, 93, 94, 95, 96, 97]
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-DISTRIBUTION] Largest gap between portal columns: 14 grid steps
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS] Distribution across 17 layers:
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 1: 48 portals (4.7%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 2: 67 portals (6.5%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 3: 52 portals (5.1%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 4: 63 portals (6.2%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 5: 63 portals (6.2%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 6: 41 portals (4.0%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 7: 48 portals (4.7%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 8: 81 portals (7.9%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 9: 57 portals (5.6%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 10: 70 portals (6.8%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 11: 55 portals (5.4%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 12: 66 portals (6.4%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 13: 66 portals (6.4%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 14: 64 portals (6.2%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 15: 72 portals (7.0%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 16: 56 portals (5.5%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - [PORTAL-LAYERS]   Layer 17: 55 portals (5.4%)
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - Generated 1024 escape geometries
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.pad_escape_planner - INFO - Final: 2048 escape stubs and 1024 portal vias
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Copied 1024 portals from escape planner to pathfinder
+2025-10-28 00:45:17 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Cached 2048 escape tracks and 1024 escape vias
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks called: board_data has 2048 tracks
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - First track: {'net': 'B08B10_015', 'layer': 'F.Cu', 'x1': 224.562987, 'y1': 103.2725, 'x2': 224.562987, 'y2': 104.23701300000005, 'width': 0.24, 'escape': True}
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - VIEWPORT DEBUG: visible_rect = (137.4, 73.8) -> (328.1, 220.0)
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - VIEWPORT DEBUG: zoom_level = 6.366
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - COORD VERIFY: Track (224.6,103.3)->(224.6,104.2) in_bounds=(True,True)
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - COORD VERIFY: Board bounds (196.2,98.3)->(269.3,195.5)
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #1: (224.6,103.3)->(224.6,104.2) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK DRAWN #1: (224.563,103.272) -> (224.563,104.237) width=0.24 layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #2: (224.6,104.2)->(224.4,104.4) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK DRAWN #2: (224.563,104.237) -> (224.400,104.400) width=0.24 layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #3: (224.6,106.6)->(224.6,105.8) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK DRAWN #3: (224.563,106.623) -> (224.563,105.763) width=0.24 layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #4: (224.6,105.8)->(224.4,105.6) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #5: (225.0,103.3)->(225.0,104.2) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks completed: drew 2048 tracks, culled 0 (viewport + limit), total 2048 available
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - _draw_vias called: board_data has 1024 vias
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - _draw_vias completed: drew 1024 vias out of 1024 available
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks called: board_data has 2048 tracks
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - First track: {'net': 'B08B10_015', 'layer': 'F.Cu', 'x1': 224.562987, 'y1': 103.2725, 'x2': 224.562987, 'y2': 104.23701300000005, 'width': 0.24, 'escape': True}
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - VIEWPORT DEBUG: visible_rect = (137.4, 73.8) -> (328.1, 220.0)
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - VIEWPORT DEBUG: zoom_level = 6.366
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - COORD VERIFY: Track (224.6,103.3)->(224.6,104.2) in_bounds=(True,True)
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - COORD VERIFY: Board bounds (196.2,98.3)->(269.3,195.5)
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #1: (224.6,103.3)->(224.6,104.2) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK DRAWN #1: (224.563,103.272) -> (224.563,104.237) width=0.24 layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #2: (224.6,104.2)->(224.4,104.4) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK DRAWN #2: (224.563,104.237) -> (224.400,104.400) width=0.24 layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #3: (224.6,106.6)->(224.6,105.8) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK DRAWN #3: (224.563,106.623) -> (224.563,105.763) width=0.24 layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #4: (224.6,105.8)->(224.4,105.6) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - TRACK COORDS #5: (225.0,103.3)->(225.0,104.2) layer=F.Cu
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - _draw_tracks completed: drew 2048 tracks, culled 0 (viewport + limit), total 2048 available
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - _draw_vias called: board_data has 1024 vias
+2025-10-28 00:45:17 - orthoroute.presentation.gui.main_window - INFO - _draw_vias completed: drew 1024 vias out of 1024 available
+DEBUG: Screenshot saved to debug_output/run_20251028_004458/03_board_with_escapes_20251028_004517_529.png (scale=8x)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - prepare_routing_runtime: Ready
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - === Route 512 nets ===
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [GPU-THRESHOLD] GPU pathfinding enabled for ROIs with > 1000 nodes
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [VERIFY] Parsed 512 tasks from 512 requests
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [VERIFY]   routable=512, trivial=0, unmapped=0, total_handled=512
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - ================================================================================
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - ANALYZING BOARD CHARACTERISTICS
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - ================================================================================
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Board: 41.9mm × 93.3mm
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Layers: 18 total, 16 signal
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Grid pitch: 0.4mm
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - H-layers: [1, 3, 5, 7] (4 layers)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - V-layers: [2, 4, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16] (12 layers)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Demand: 23.9% horizontal, 76.1% vertical
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Nets: 512
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Total HPWL: 14314mm
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Avg net length: 28.0mm
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Congestion ratio ρ = 0.160 (SPARSE)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO -   Demand: 18608mm (with 1.3× detour)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO -   Capacity: 116314mm (at 75% target)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Density: 0.1311 nets/mm²
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - Via flexibility: 100% of possible pairs allowed
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.board_analyzer - INFO - ================================================================================
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - ================================================================================
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - DERIVING ROUTING PARAMETERS
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - ================================================================================
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - Present schedule: mult=1.150, max=6.0
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - History: weight=10.0, gain=0.200, decay=1.000
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - Hotset: cap=128 (25% of 512 nets)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - Layer bias: α=0.120, range=[0.75, 1.50]
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - Via cost: 0.50 (flexibility=100%)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - Convergence: max_iters=30, patience=5
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - ================================================================================
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - STRATEGY: SPARSE (fast convergence)
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - ================================================================================
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - Applying derived parameters to config...
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.parameter_derivation - INFO - Parameters applied successfully
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [NEGOTIATE] 512 nets, 30 iters
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [PARAMS] layers=16 pres_fac_init=1.00 pres_fac_mult=1.15 pres_fac_max=6 hist_gain=0.20 hist_weight=10.0
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [LOGGING] Writing detailed iteration log to: C:\Users\Benchoff\Documents\GitHub\OrthoRoute\routing_log_20251028_004518.txt
+2025-10-28 00:45:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [ITER 1] pres_fac=1.00
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] _compute_layer_bias: per_layer_over stats: min=0.000000, max=0.000000, has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] _compute_layer_bias: maxv=0.000000
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] _compute_layer_bias: raw_bias stats: min=1.000000, max=1.000000, has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] _compute_layer_bias: FINAL bias stats: min=1.000000, max=1.000000, has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [SOLUTION 5] Applied initial route randomization jitter to break symmetry
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] update_costs: base_costs stats: min=0.380000, max=4.882496, has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] update_costs: per_edge_bias stats: min=1.000000, max=1.000000, has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] update_costs: adjusted_base stats (before adding present/hist): min=0.019000, max=0.244125, has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] update_costs: total_cost stats BEFORE nan_to_num: min=0.019000, max=0.244125, has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] Cost array stats AFTER update_costs (iter 1):
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG]   min=0.019003, max=0.254026
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG]   has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - ERROR - [GPU-DEBUG] Layer bias stats: min=1.000000, max=1.000000, has_nan=False, has_inf=False
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [ROUTING MODE] Using sequential routing for 512 nets (PathFinder algorithm)
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Routing net 1/512
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [HYBRID] Net B02B06_015: LONG (183 steps) → FULL GRAPH (446,472 nodes)
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [DEBUG] First net: portal_enabled=True, net_id=B02B06_015, use_portals=True
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [DEBUG]   src_seeds count=18, dst_targets count=18
+2025-10-28 00:45:19 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [DEBUG]   ROI size=446472
+2025-10-28 00:45:24 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 1/512 (B02B06_015): ROI=0.001s (size=446472), Portal=0.000s, Path=4.749s, Total=4.750s
+2025-10-28 00:45:29 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 2/512 (B01B05_013): ROI=0.001s (size=446472), Portal=0.000s, Path=4.638s, Total=4.640s
+2025-10-28 00:45:34 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 3/512 (B02B06_013): ROI=0.000s (size=446472), Portal=0.000s, Path=4.867s, Total=4.868s
+2025-10-28 00:45:39 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 4/512 (B01B05_011): ROI=0.001s (size=446472), Portal=0.000s, Path=4.829s, Total=4.830s
+2025-10-28 00:45:44 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 5/512 (B03B07_015): ROI=0.001s (size=446472), Portal=0.000s, Path=5.243s, Total=5.243s
+2025-10-28 00:45:49 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 6/512 (B02B06_011): ROI=0.001s (size=446472), Portal=0.000s, Path=4.857s, Total=4.858s
+2025-10-28 00:45:54 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 7/512 (B03B07_009): ROI=0.001s (size=446472), Portal=0.000s, Path=4.980s, Total=4.982s
+2025-10-28 00:45:58 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 8/512 (B00B04_015): ROI=0.001s (size=446472), Portal=0.000s, Path=4.767s, Total=4.769s
+2025-10-28 00:46:03 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 9/512 (B01B05_001): ROI=0.000s (size=446472), Portal=0.000s, Path=4.973s, Total=4.974s
+2025-10-28 00:46:09 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 10/512 (B03B07_011): ROI=0.001s (size=446472), Portal=0.000s, Path=5.173s, Total=5.175s
+2025-10-28 00:49:22 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Routing net 51/512
+2025-10-28 00:49:27 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 51/512 (B11B15_010): ROI=0.001s (size=446472), Portal=0.000s, Path=5.001s, Total=5.003s
+2025-10-28 00:52:14 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,656 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:52:14 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:52:15 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,652 > 50,000, truncating (preserving 2 critical nodes)
+2025-10-28 00:52:15 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 2/2 critical nodes preserved
+2025-10-28 00:52:30 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,999 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:52:31 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:52:31 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,995 > 50,000, truncating (preserving 2 critical nodes)
+2025-10-28 00:52:31 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 2/2 critical nodes preserved
+2025-10-28 00:52:37 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,352 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:52:37 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:52:38 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,348 > 50,000, truncating (preserving 2 critical nodes)
+2025-10-28 00:52:38 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 2/2 critical nodes preserved
+2025-10-28 00:52:44 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,766 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:52:44 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:52:45 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,762 > 50,000, truncating (preserving 2 critical nodes)
+2025-10-28 00:52:45 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 2/2 critical nodes preserved
+2025-10-28 00:52:50 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,839 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:52:51 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:52:51 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,835 > 50,000, truncating (preserving 2 critical nodes)
+2025-10-28 00:52:51 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 2/2 critical nodes preserved
+2025-10-28 00:52:52 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,279 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:52:52 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:52:53 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,288 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:52:53 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:52:59 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,695 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:52:59 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:04 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Routing net 101/512
+2025-10-28 00:53:05 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,527 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [HYBRID] Net B09B13_006: SHORT (124 steps) → ROI (50,000 nodes)
+2025-10-28 00:53:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 101/512 (B09B13_006): ROI=0.543s (size=50000), Portal=0.000s, Path=0.503s, Total=1.046s
+2025-10-28 00:53:06 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,280 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:06 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:12 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,360 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:12 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:13 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,536 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:13 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:14 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,280 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:14 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:15 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,773 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:15 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:16 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,552 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:16 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:17 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,911 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:17 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:18 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,527 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:19 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,094 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:19 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:20 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,656 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:20 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:21 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,645 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:21 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:23 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,861 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:23 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:23 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,382 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:23 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:24 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,734 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:24 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:25 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,360 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:25 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:26 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,142 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:26 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:27 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,271 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:27 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:28 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,920 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:28 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:29 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,472 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:29 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:30 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,335 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:30 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:31 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,079 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:31 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:33 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,142 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:33 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:34 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,015 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:34 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:35 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,206 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:35 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:36 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,167 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:36 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:37 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,591 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:37 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:38 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,255 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:38 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:39 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,752 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:39 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:40 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,943 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:40 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:41 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,143 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:41 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:42 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,503 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:42 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:43 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,606 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:43 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:44 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,967 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:44 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:45 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,431 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:45 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:46 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,472 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:46 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:47 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,503 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:47 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:48 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,382 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:48 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:49 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,150 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:49 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:50 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,615 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:50 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:51 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,726 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:51 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:53 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,390 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:53 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:54 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,886 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:54 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:55 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,367 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:55 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:57 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,446 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:57 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:58 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,645 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:58 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:58 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,191 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:58 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:53:59 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,109 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:53:59 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:01 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,279 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:01 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Routing net 151/512
+2025-10-28 00:54:02 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,462 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:02 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:02 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 151/512 (B05B07_007): ROI=0.517s (size=50000), Portal=0.000s, Path=0.595s, Total=1.112s
+2025-10-28 00:54:03 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,407 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:03 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:04 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,798 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:04 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:05 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,999 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:05 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:06 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,375 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:06 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:07 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,463 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:07 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:08 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,711 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:08 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:09 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,286 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:09 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:10 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,174 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:10 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:11 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,607 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:11 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:12 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,133 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:12 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:12 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,151 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:12 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:13 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,607 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:13 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:14 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,495 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:14 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:15 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,407 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:15 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:16 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,766 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:16 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:18 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,685 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:18 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,037 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:18 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:20 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,431 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:20 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:21 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,087 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:21 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:22 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,014 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:22 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:23 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,607 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:23 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:24 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,903 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:24 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:25 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 71,374 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:25 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:26 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 78,351 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:26 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:27 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,176 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:27 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:28 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,591 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:28 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:29 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,423 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:29 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:30 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 74,943 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:30 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:31 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 74,862 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:31 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:32 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 68,438 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:32 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:33 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,767 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:33 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:34 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,448 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:34 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:35 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 70,661 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:35 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:35 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,512 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:35 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:36 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 64,582 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:36 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:37 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,471 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:37 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:38 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,551 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:38 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:39 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 63,878 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:39 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:40 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,054 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:40 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:41 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,103 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:41 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:42 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,102 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:42 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:43 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 66,693 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:43 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:44 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 64,253 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:44 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:45 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 67,567 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:45 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:46 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 77,190 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:46 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:47 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 70,629 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:47 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:48 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 66,653 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:48 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:49 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 75,103 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:49 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:50 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 76,933 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:50 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:51 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO -   Routing net 201/512
+2025-10-28 00:54:51 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 64,878 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:51 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:51 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [HYBRID] Net B01B03_005: SHORT (70 steps) → ROI (50,000 nodes)
+2025-10-28 00:54:52 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - [TIMING] Net 201/512 (B01B03_005): ROI=0.445s (size=50000), Portal=0.000s, Path=0.471s, Total=0.917s
+2025-10-28 00:54:52 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 55,086 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:52 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:53 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 73,567 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:53 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved
+2025-10-28 00:54:54 - orthoroute.algorithms.manhattan.unified_pathfinder - WARNING - BFS ROI 69,437 > 50,000, truncating (preserving 36 critical nodes)
+2025-10-28 00:54:54 - orthoroute.algorithms.manhattan.unified_pathfinder - INFO - Verified 36/36 critical nodes preserved

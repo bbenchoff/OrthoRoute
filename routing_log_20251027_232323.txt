@@ -1,0 +1,27 @@
+================================================================================
+ORTHOROUTE PATHFINDER ROUTING LOG
+================================================================================
+
+Session Started: 2025-10-27 23:23:23
+
+BOARD CHARACTERISTICS:
+--------------------------------------------------------------------------------
+  Dimensions:      41.9mm × 93.3mm
+  Layer Count:     16
+  Signal Layers:   16
+  Net Count:       512
+  Grid Pitch:      0.4mm
+  Routing Density: 0.131 nets/mm²
+
+AUTO-DETECTED ROUTING PARAMETERS:
+--------------------------------------------------------------------------------
+  Strategy:        SPARSE (fast convergence)
+  Congestion (ρ):  0.160
+  pres_fac_init:   1.00
+  pres_fac_mult:   1.15
+  pres_fac_max:    6.0
+  hist_gain:       0.20
+  hist_weight:     10.0
+  via_cost:        0.50
+  max_iterations:  30
+
