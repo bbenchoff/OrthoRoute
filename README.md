@@ -27,7 +27,7 @@ A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository 
 
 ## Why GPU Acceleration?
 
-Traditional autorouters like FreeRouting can take hours or even days on large boards. OrthoRoute uses GPUs for the embarrassingly parallel parts of routing - specifically Lee's wavefront expansion algorithm - while handling constraints and decision-making on the CPU.
+Traditional autorouters like FreeRouting can take hours or even days on large boards. OrthoRoute uses GPUs for the embarrassingly parallel parts of routing - specifically the pathfinding and sparse matrix accounting - while handling constraints and decision-making on the CPU.
 
 For Manhattan routing patterns (the plugin's specialty), this approach is particularly effective because geometric constraints make the problem highly parallelizable
 
@@ -57,7 +57,7 @@ _Testing / examples are the following_:
 - [CSEduino v4](https://github.com/jpralves/cseduino/tree/master/boards/2-layer)
 - [Sacred65 keyboard PCB](https://github.com/LordsBoards/Sacred65)
 - [RP2040 Minimal board](https://datasheets.raspberrypi.com/rp2040/Minimal-KiCAD.zip)
-- [Thinking Machine Backplane](https://github.com/bbenchoff/OrthoRoute/)
+- [Really Complex Backplane](https://github.com/bbenchoff/OrthoRoute/TestBoards)
 
 ### Main Interface
 
