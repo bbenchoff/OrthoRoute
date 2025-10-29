@@ -129,8 +129,9 @@ I don't know what to tell you about this. I'll start an issue with KiCad or some
 
 ### Create Plugin Package
 ```bash
-python build_ipc_plugin.py
+python build.py
 ```
+Install via Plugin Manager
 
 ## Current Status
 
