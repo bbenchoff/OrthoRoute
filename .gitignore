@@ -41,7 +41,11 @@ immediate_*.py
 simplified_*.py
 gpu_parallelization.py
 .claude
+.claude/
+.claude/*
 .vscode
+.vscode/
+.vscode/*
 
 # Log files and temporary data
 *.log
