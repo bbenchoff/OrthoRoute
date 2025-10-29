@@ -43,6 +43,8 @@ from ...algorithms.manhattan.manhattan_router_rrg import ManhattanRRGRoutingEngi
 from ...algorithms.manhattan.rrg import RoutingConfig
 from ...infrastructure.gpu.cuda_provider import CUDAProvider
 from ...infrastructure.gpu.cpu_fallback import CPUProvider
+from kipy.board_types import Track, Via, PadStack, BoardLayer, ViaType
+from kipy.common_types import Vector2
 
 logger = logging.getLogger(__name__)
 
@@ -2477,16 +2479,98 @@ class OrthoRouteMainWindow(QMainWindow):
         """Apply routes to KiCad"""
         logger.info("SUCCESS: Committing routes to KiCad")
         self.status_label.setText("Applying routes to KiCad...")
-        
-        # TODO: Implement route application to KiCad
-        QMessageBox.information(self, "Apply Routes", "Route application to KiCad not yet implemented")
-        
-        self.commit_btn.setEnabled(False)
-        self.rollback_btn.setEnabled(False)
-        self.replay_btn.setEnabled(False)
-        self.route_preview_btn.setEnabled(True)
-        self.overuse_table_label.setText("Routing completed")
-        self.status_label.setText("Routes applied successfully")
+
+        try:
+            # Get routing solution from board_data
+            tracks = self.board_data.get('tracks', [])
+            vias = self.board_data.get('vias', [])
+
+            if not tracks and not vias:
+                QMessageBox.warning(self, "No Routes", "No routing solution to apply")
+                return
+
+            logger.info(f"Applying {len(tracks)} tracks and {len(vias)} vias to KiCad")
+
+            # Use existing KiCad connection
+            if not self.kicad_interface or not self.kicad_interface.board:
+                QMessageBox.critical(self, "Connection Error", "No active KiCad connection.")
+                logger.error("No kicad_interface.board available")
+                return
+
+            board = self.kicad_interface.board
+
+            # Get nets for lookup
+            board_nets = board.get_nets()
+            net_lookup = {net.name: net for net in board_nets}
+
+            # Layer string to BoardLayer enum
+            def layer_to_enum(layer_str):
+                layer_map = {'F.Cu': BoardLayer.BL_F_Cu, 'B.Cu': BoardLayer.BL_B_Cu}
+                for i in range(1, 31):
+                    layer_map[f'In{i}.Cu'] = getattr(BoardLayer, f'BL_In{i}_Cu')
+                return layer_map.get(layer_str, BoardLayer.BL_F_Cu)
+
+            # Start transaction
+            commit = board.begin_commit()
+
+            # Create Track objects
+            items = []
+            for track_data in tracks:
+                track = Track()
+                track.start = Vector2.from_xy_mm(track_data['x1'], track_data['y1'])
+                track.end = Vector2.from_xy_mm(track_data['x2'], track_data['y2'])
+                track.layer = layer_to_enum(track_data['layer'])
+                track.width = int(track_data.get('width', 0.2) * 1_000_000)  # Convert to nm
+                net_name = track_data.get('net', '')
+                if net_name in net_lookup:
+                    track.net = net_lookup[net_name]
+                items.append(track)
+
+            # Create Via objects
+            for via_data in vias:
+                via = Via()
+                via.position = Vector2.from_xy_mm(via_data['x'], via_data['y'])
+                via.diameter = int(via_data.get('diameter', 0.8) * 1_000_000)  # Convert to nm
+                via.drill_diameter = int(via_data.get('drill', 0.4) * 1_000_000)  # Convert to nm
+                net_name = via_data.get('net', '')
+                if net_name in net_lookup:
+                    via.net = net_lookup[net_name]
+
+                # Set blind/buried via layers
+                from_layer_str = via_data.get('start_layer', via_data.get('from_layer', 'F.Cu'))
+                to_layer_str = via_data.get('end_layer', via_data.get('to_layer', 'B.Cu'))
+                from_layer_enum = layer_to_enum(from_layer_str)
+                to_layer_enum = layer_to_enum(to_layer_str)
+
+                via.type = ViaType.VT_BLIND_BURIED
+                via.padstack.drill.start_layer = from_layer_enum
+                via.padstack.drill.end_layer = to_layer_enum
+
+                items.append(via)
+
+            # Batch create all items
+            board.create_items(items)
+
+            # Commit and save
+            board.push_commit(commit, f"OrthoRoute: {len(tracks)} tracks, {len(vias)} vias")
+            board.save()
+
+            QMessageBox.information(self, "Success",
+                                  f"Successfully applied routing to KiCad:\n"
+                                  f"• {len(tracks)} tracks\n"
+                                  f"• {len(vias)} vias\n\n"
+                                  f"You can apply again if needed.")
+            logger.info(f"✅ Applied {len(tracks)} tracks and {len(vias)} vias to KiCad")
+
+        except Exception as e:
+            logger.error(f"Error applying routes to KiCad: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to apply routes to KiCad:\n{e}")
+
+        # Keep button enabled for re-apply
+        self.overuse_table_label.setText("Routing completed - ready to apply")
+        self.status_label.setText("Routes applied - click 'Apply to KiCad' again if needed")
         
     def rollback_routes(self):
         """Discard calculated routes"""
