@@ -34,9 +34,8 @@ For Manhattan routing patterns (the plugin's specialty), this approach is partic
 ## Technical Achievements
 
 ### Unified PathFinder Engine
-- **Single Implementation**: Consolidated 5+ previous PathFinder implementations into one optimized engine
+- **GPU-First Architecture**: CUDA kernels for wavefront/Dijkstra with intelligent CPU fallback
 - **CSR Matrix Optimization**: Uses Compressed Sparse Row matrices for efficient graph representation
-- **GPU-First Architecture**: CUDA kernels for wavefront expansion with intelligent CPU fallback
 - **Memory Efficient**: Optimized data structures reduce memory usage by 60% vs. dense matrices
 
 ### Routing Performance
