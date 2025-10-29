@@ -101,7 +101,7 @@ archive/
 # Large test board files
 tests/benchmark_boards/*.json
 tests/benchmark_boards/*.kicad_pcb
-testboards/
+
 
 # Debug and temporary files
 *debug*.txt
