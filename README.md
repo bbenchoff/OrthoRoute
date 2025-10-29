@@ -7,12 +7,12 @@
       <h2>OrthoRoute - GPU Accelerated Autorouting for KiCad</h2>
       <p><strong>OrthoRoute is a GPU-accelerated PCB autorouter that uses a Manhattan lattice and the PathFinder algorithm to route high-density boards. Built as a KiCad plugin using the IPC API, it handles complex designs with thousands of nets that make traditional push-and-shove routers give up.</strong></p>
       <p><em>Orthogonal! Non-trivial! Runs on GPUs! I live in San Francisco!</em></p>
-      <p><em>Never trust the autorouter, but at least this one is fast.</em></p>
+      <p><em>Never trust the autorouter, but at least this one is fast. </em></p>
     </td>
   </tr>
 </table>
 
-A much more comprehensive explanation of the _why_ and _how_ of this repository is available on the [build log for this project](https://bbenchoff.github.io/pages/OrthoRoute.html).
+A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository is available on the [build log for this project](https://bbenchoff.github.io/pages/OrthoRoute.html).
 
 ## Key Features
 
