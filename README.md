@@ -14,7 +14,7 @@
 
 A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository is available on the [build log for this project](https://bbenchoff.github.io/pages/OrthoRoute.html).
 
-![Watch the video](https://www.youtube.com/watch?v=KXxxNQPTagA)
+[Watch the video](https://www.youtube.com/watch?v=KXxxNQPTagA)
 
 ## Key Features
 
