@@ -60,6 +60,12 @@ _Testing / examples are the following_:
 ### Main Interface
 
 <div align="center">
+  <img src="graphics/screenshots/TestBackplane.png" alt="OrthoRoute Interface" width="800">
+  <br>
+  <em>OrthoRoute plugin showing a successful Manhattan route</em>
+</div>
+
+<div align="center">
   <img src="graphics/screenshots/Screencap1-rpi.png" alt="OrthoRoute Interface" width="800">
   <br>
   <em>OrthoRoute plugin showing real-time PCB visualization with airwires and routing analysis</em>
@@ -106,6 +112,18 @@ While general autorouting remains a complex constraint-satisfaction problem, Ort
 #### CLI Mode (For Development)
 1. **Navigate to the OrthoRoute Folder** Wherever it's installed via KiCad
 2. **Run from CLI**: `python main.py --test-manhattan`
+
+#### There's something wrong with the KiCad IPC API
+
+For reasons I don't comprehend, the KiCad IPC API only works when the "Select Items" (the arrow pointer) is active and nothing is selected. The API doesn't work if you're trying to route tracks or drawing text. If you do, something like this message will pop up:
+
+<div align="center">
+  <img src="graphics/screenshots/EnableKiCadAPI.png" alt="OrthoRoute Error" width="600">
+  <br>
+  <em>The KiCad IPC API is not working</em>
+</div>
+
+I don't know what to tell you about this.
 
 ## Building
 
