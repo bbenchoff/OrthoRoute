@@ -2489,6 +2489,26 @@ class OrthoRouteMainWindow(QMainWindow):
                 QMessageBox.warning(self, "No Routes", "No routing solution to apply")
                 return
 
+            # Warn if applying provisional geometry with overuse
+            if hasattr(self, 'router') and self.router:
+                try:
+                    over_sum, over_cnt = self.router.accounting.compute_overuse(router_instance=self.router)
+                    if over_sum > 0:
+                        reply = QMessageBox.warning(
+                            self,
+                            "Routing Has Conflicts",
+                            f"⚠️ The routing did not fully converge.\n\n"
+                            f"Overuse: {over_sum} (on {over_cnt} edges)\n\n"
+                            f"This means some tracks/vias overlap and will cause DRC errors in KiCad.\n\n"
+                            f"Do you want to apply anyway?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.No
+                        )
+                        if reply == QMessageBox.StandardButton.No:
+                            return
+                except Exception as e:
+                    logger.warning(f"Could not check overuse status: {e}")
+
             logger.info(f"Applying {len(tracks)} tracks and {len(vias)} vias to KiCad")
 
             # Use existing KiCad connection
@@ -2509,6 +2529,50 @@ class OrthoRouteMainWindow(QMainWindow):
                 for i in range(1, 31):
                     layer_map[f'In{i}.Cu'] = getattr(BoardLayer, f'BL_In{i}_Cu')
                 return layer_map.get(layer_str, BoardLayer.BL_F_Cu)
+
+            # Export geometry to JSON for debugging/comparison with DRC
+            import json
+            from datetime import datetime
+
+            json_export = {
+                'metadata': {
+                    'timestamp': datetime.now().isoformat(),
+                    'board_name': getattr(board, 'filename', 'unknown'),
+                    'track_count': len(tracks),
+                    'via_count': len(vias),
+                },
+                'tracks': [],
+                'vias': []
+            }
+
+            for track_data in tracks:
+                json_export['tracks'].append({
+                    'net': track_data.get('net', ''),
+                    'layer': track_data['layer'],
+                    'start': {'x': track_data['x1'], 'y': track_data['y1']},
+                    'end': {'x': track_data['x2'], 'y': track_data['y2']},
+                    'width': track_data.get('width', 0.2),
+                    'is_escape': track_data.get('escape', False)
+                })
+
+            for via_data in vias:
+                json_export['vias'].append({
+                    'net': via_data.get('net', ''),
+                    'position': {'x': via_data['x'], 'y': via_data['y']},
+                    'from_layer': via_data.get('start_layer', via_data.get('from_layer', 'F.Cu')),
+                    'to_layer': via_data.get('end_layer', via_data.get('to_layer', 'B.Cu')),
+                    'diameter': via_data.get('diameter', 0.8),
+                    'drill': via_data.get('drill', 0.4),
+                    'is_escape': via_data.get('escape', False)
+                })
+
+            # Save to file
+            json_path = Path('debug_output') / f'kicad_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+            json_path.parent.mkdir(exist_ok=True)
+            with open(json_path, 'w') as f:
+                json.dump(json_export, f, indent=2)
+
+            logger.info(f"📄 Exported geometry to JSON: {json_path}")
 
             # Start transaction
             commit = board.begin_commit()

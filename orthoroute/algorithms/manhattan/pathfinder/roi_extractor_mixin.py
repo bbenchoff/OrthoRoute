@@ -80,12 +80,13 @@ class RoiExtractorMixin:
             if min_x <= x <= max_x and min_y <= y <= max_y:
                 nodes_before_keepout += 1
 
-                # Owner-aware keepout filtering
-                if bool(getattr(self.config, "enable_buried_via_keepouts", False)) and hasattr(self, "_via_keepouts_map"):
+                # Check via keepouts to prevent tracks routing through via locations
+                # This now uses via_keepouts_map which tracks ALL layers (not just intermediate)
+                if hasattr(self, "_via_keepouts_map") and self._via_keepouts_map:
                     x_idx, y_idx, z_idx = self.lattice.xyz_from_gid(node_idx)
                     owner = self._via_keepouts_map.get((z_idx, x_idx, y_idx))
                     if owner and owner != current_net:
-                        continue  # Skip this node - owned by another net's buried via
+                        continue  # Skip this node - owned by another net's via
 
                 roi_nodes.append(node_idx)
 
@@ -96,7 +97,7 @@ class RoiExtractorMixin:
         # Log keepout filtering results
         removed = nodes_before_keepout - len(roi_nodes)
         if removed > 0:
-            logger.info(f"[ROI-KEEPOUT] net={current_net} removed {removed} nodes due to buried via keepouts")
+            logger.info(f"[ROI-KEEPOUT] net={current_net} removed {removed} nodes due to via keepouts")
 
         logger.debug(f"[CPU-ROI] Found {len(roi_nodes)} nodes in ROI")
 
@@ -286,9 +287,10 @@ class RoiExtractorMixin:
                 return [], {}, (cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32), cp.array([], dtype=cp.float32))
 
         # Owner-aware keepout filtering for GPU path
-        # Apply buried via keepouts by filtering the bitmap before extraction
+        # Apply via keepouts by filtering the bitmap before extraction
+        # Now enforced for ALL vias (including escape vias) regardless of config flag
         removed = 0
-        if bool(getattr(self.config, "enable_buried_via_keepouts", False)) and hasattr(self, "_via_keepouts_map"):
+        if hasattr(self, "_via_keepouts_map") and self._via_keepouts_map:
             # Get indices of all nodes in the bitmap
             candidate_node_indices = cp.where(roi_node_mask)[0]
 
@@ -305,7 +307,7 @@ class RoiExtractorMixin:
                     removed += 1
 
         if removed > 0:
-            logger.info(f"[ROI-KEEPOUT] net={current_net} removed {removed} nodes (bitmap) due to buried via keepouts")
+            logger.info(f"[ROI-KEEPOUT] net={current_net} removed {removed} nodes due to via keepouts")
 
         # Count total nodes found (single GPU reduction)
         total_nodes_found = int(cp.sum(roi_node_mask))

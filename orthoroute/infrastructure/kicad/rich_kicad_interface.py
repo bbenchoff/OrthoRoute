@@ -120,7 +120,7 @@ class RichKiCadInterface:
             # Gather credentials if provided by KiCad runtime
             api_socket = os.environ.get('KICAD_API_SOCKET')
             api_token = os.environ.get('KICAD_API_TOKEN')
-            timeout_ms = 25000
+            timeout_ms = 120000  # 2 minutes - increased for large geometry commits (3000+ tracks/vias)
             if api_socket or api_token:
                 self.client = KiCad(socket_path=api_socket, kicad_token=api_token, timeout_ms=timeout_ms)
             else:

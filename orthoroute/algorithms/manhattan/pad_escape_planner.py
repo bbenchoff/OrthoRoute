@@ -1026,19 +1026,10 @@ class PadEscapePlanner:
                 'escape': True,  # Tag for easy identification
             })
 
-        # 2. Portal via stack (minimal: only from pad_layer to entry_layer)
-        if portal.pad_layer != entry_layer:
-            entry_layer_name = self.config.layer_names[entry_layer] if entry_layer < len(self.config.layer_names) else f"L{entry_layer}"
-
-            geometry.append({
-                'net': net_id,
-                'x': portal_x_mm,
-                'y': portal_y_mm,
-                'from_layer': pad_layer_name,
-                'to_layer': entry_layer_name,
-                'diameter': 0.25,  # hole (0.15) + 2×annular (0.05) = 0.25mm
-                'escape': True,  # Tag for easy identification
-                'drill': 0.15,     # hole diameter
-            })
+        # 2. Portal via is NOT created here!
+        # The escape planner only creates the F.Cu stub to the portal location.
+        # PathFinder will decide which layer to transition to and create the via
+        # from F.Cu to that layer based on routing needs.
+        # This ensures vias are only created where tracks actually connect.
 
         return geometry

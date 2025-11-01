@@ -201,17 +201,17 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
 
     if ρ < 0.8:
         stagnation_patience = 5
-        max_iterations = 30
+        max_iterations = 100  # Increased for better convergence
     elif ρ < 1.1:
         stagnation_patience = 6
-        max_iterations = 40
+        max_iterations = 100  # Increased for better convergence
     else:
         stagnation_patience = 8
-        max_iterations = 50
+        max_iterations = 100  # Increased for better convergence
 
     # Fewer layers also need more iterations (less flexibility)
     if L <= 12:
-        max_iterations = max(max_iterations, 45)
+        max_iterations = max(max_iterations, 100)  # Increased
         stagnation_patience = max(stagnation_patience, 7)
 
     logger.info(f"Convergence: max_iters={max_iterations}, patience={stagnation_patience}")

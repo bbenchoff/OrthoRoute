@@ -138,8 +138,10 @@ class CUDADijkstra:
 
         # PERFORMANCE: Persistent kernel (compiled on-demand)
         self._persistent_kernel = None
-        self._enable_persistent_kernel = True  # Enable for maximum performance
+        self._enable_persistent_kernel = False  # Disabled - persistent kernel doesn't support owner-aware bitmap
         self._persistent_kernel_version = 2  # Increment to recompile after bug fixes
+        # NOTE: Multi-launch wavefront_expand_all kernel HAS IN_BITMAP check, persistent doesn't
+        # TODO: Add bitmap support to persistent kernel for maximum performance
 
         # Compile CUDA kernel for parallel edge relaxation
         self.relax_kernel = cp.RawKernel(r'''
@@ -5444,7 +5446,8 @@ class CUDADijkstra:
         logger.info(f"[BIDIR-BATCH] Complete: {found}/{len(roi_batch)} paths found")
         return paths
 
-    def find_path_fullgraph_gpu_seeds(self, costs, src_seeds, dst_targets, ub_hint=None):
+    def find_path_fullgraph_gpu_seeds(self, costs, src_seeds, dst_targets, ub_hint=None, *,
+                                      allowed_bitmap=None, use_bitmap=False):
         """
         Multi-source/multi-sink SSSP using supersource seeding on full graph.
 
@@ -5453,6 +5456,8 @@ class CUDADijkstra:
             src_seeds: np.int32 array of source node IDs
             dst_targets: np.int32 array of destination node IDs
             ub_hint: Optional upper bound for early termination
+            allowed_bitmap: Optional uint32 bitmap for owner-aware node filtering
+            use_bitmap: Whether to enable bitmap filtering
 
         Returns:
             Path as list of global node indices from best source to best destination,
@@ -5538,9 +5543,33 @@ class CUDADijkstra:
         goal_z = 0
         goal_coords = cp.array([[goal_x, goal_y, goal_z]], dtype=cp.int32)  # (K=1, 3)
 
-        # Create bitmap (all bits set = no filtering)
+        # Create bitmap - owner-aware if provided, otherwise all-ones (no filtering)
         bitmap_words = (num_nodes + 31) // 32
-        roi_bitmaps = cp.full((1, bitmap_words), 0xFFFFFFFF, dtype=cp.uint32)
+        if allowed_bitmap is not None:
+            # Use provided owner-aware bitmap
+            roi_bitmaps = cp.asarray(allowed_bitmap, dtype=cp.uint32).reshape(1, -1)
+            bitmap_words = int(roi_bitmaps.shape[1])
+            use_bitmap = True
+
+            # CRITICAL: Force-allow source/dest seeds (prevents frontier empty!)
+            # This happens IN THE GPU CODE to guarantee seeds are always reachable
+            seed_nodes = cp.concatenate([cp.asarray(src_seeds, dtype=cp.int32),
+                                        cp.asarray(dst_targets, dtype=cp.int32)])
+
+            # Proper GPU array operations with correct dtypes
+            for seed in seed_nodes:
+                seed_int = int(seed)
+                word_idx = seed_int // 32
+                bit_idx = seed_int & 31
+                roi_bitmaps[0, word_idx] = roi_bitmaps[0, word_idx] | (cp.uint32(1) << bit_idx)
+
+            # Count allowed nodes for sanity
+            total_bits_set = int(cp.count_nonzero(roi_bitmaps))
+            logger.info(f"[GPU-SEEDS] Owner-aware bitmap: {bitmap_words} words, ~{total_bits_set} bits set, seeds force-allowed")
+        else:
+            # Default: all bits set (no filtering)
+            roi_bitmaps = cp.full((1, bitmap_words), 0xFFFFFFFF, dtype=cp.uint32)
+            use_bitmap = False
 
         # Ensure ALL CSR arrays are CuPy (on GPU)
         indptr_gpu = cp.asarray(self.indptr) if not isinstance(self.indptr, cp.ndarray) else self.indptr
@@ -5572,7 +5601,7 @@ class CUDADijkstra:
             'roi_bitmaps': roi_bitmaps,
             'bitmap_words': bitmap_words,
             'use_astar': 0,
-            'use_bitmap': False,  # Not using bitmap filtering
+            'use_bitmap': bool(use_bitmap),  # Owner-aware filtering if bitmap provided
             'iter1_relax_hv': True,
             'use_atomic_parent_keys': True,  # ENABLED: Eliminates parent pointer race condition cycles
         }

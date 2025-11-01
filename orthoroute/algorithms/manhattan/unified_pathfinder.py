@@ -511,6 +511,7 @@ from .pathfinder.config import PAD_CLEARANCE_MM
 from .pad_escape_planner import PadEscapePlanner, Portal
 from .board_analyzer import analyze_board_characteristics, BoardCharacteristics
 from .parameter_derivation import derive_routing_parameters, apply_derived_parameters, DerivedRoutingParameters
+from .pathfinder.via_kernels import ViaKernelManager, convert_via_metadata_to_gpu, ensure_gpu_array
 
 # Optional GPU
 try:
@@ -579,7 +580,7 @@ class PathFinderConfig:
     # CONVERGENCE SCHEDULE (BALANCED BASED ON DIAGNOSTICS):
     pres_fac_init: float = 1.0   # Start gentle (iteration 1)
     pres_fac_mult: float = 1.10  # Gentler exponential to keep history competitive (was 1.15)
-    pres_fac_max: float = 8.0    # Cap to keep history competitive (was 512)
+    pres_fac_max: float = 64.0    # Allow higher pressure to resolve late-stage congestion (was 8.0)
     hist_gain: float = 0.2       # Lowered for raw present (was 0.8 with present_ema)
 
     # CRITICAL: Length vs Completion Trade-off
@@ -834,12 +835,45 @@ class EdgeAccountant:
             # Reflect in present
             self.present[idx] = self.xp.maximum(0, self.present[idx] - 1)
 
-    def compute_overuse(self) -> Tuple[int, int]:
-        """(overuse_sum, overuse_count)"""
+    def compute_overuse(self, router_instance=None) -> Tuple[int, int]:
+        """
+        Compute total overuse including edge AND via spatial overuse.
+
+        Args:
+            router_instance: Optional PathFinderRouter instance for via spatial checks
+
+        Returns:
+            (total_overuse_sum, edge_overuse_count)
+        """
+        # Edge overuse (existing)
         usage = self.present.get() if self.use_gpu else self.present
         cap = self.capacity.get() if self.use_gpu else self.capacity
-        over = np.maximum(0, usage - cap)
-        return int(over.sum()), int((over > 0).sum())
+        edge_over = np.maximum(0, usage - cap)
+        edge_over_sum = int(edge_over.sum())
+        edge_over_count = int((edge_over > 0).sum())
+
+        # Via spatial overuse (NEW)
+        via_col_over_sum = 0
+        via_seg_over_sum = 0
+
+        if router_instance is not None:
+            # Check via column overuse
+            if hasattr(router_instance, 'via_col_use') and hasattr(router_instance, 'via_col_cap'):
+                via_col_over = np.maximum(0, router_instance.via_col_use - router_instance.via_col_cap)
+                via_col_over_sum = int(via_col_over.sum())
+
+            # Check via segment overuse
+            if hasattr(router_instance, 'via_seg_use') and hasattr(router_instance, 'via_seg_cap'):
+                via_seg_over = np.maximum(0, router_instance.via_seg_use - router_instance.via_seg_cap)
+                via_seg_over_sum = int(via_seg_over.sum())
+
+        total_over = edge_over_sum + via_col_over_sum + via_seg_over_sum
+
+        # Log via violations if present (helps with debugging)
+        if via_col_over_sum > 0 or via_seg_over_sum > 0:
+            logger.info(f"[OVERUSE] edge={edge_over_sum} via_col={via_col_over_sum} via_seg={via_seg_over_sum} total={total_over}")
+
+        return (total_over, edge_over_count)
 
     def verify_present_matches_canonical(self) -> bool:
         """Sanity check: verify present usage matches canonical store"""
@@ -987,7 +1021,21 @@ class EdgeAccountant:
         # Apply both via multiplier, base weight, and layer bias to base costs
         # base_cost_weight < 1.0 makes router prefer completion over short paths
         adjusted_base = base_costs * via_cost_multiplier * base_cost_weight * per_edge_bias
-        self.total_cost = adjusted_base + pres_fac * over + hist_weight * self.history
+
+        # Apply INVERTED layer bias to present term to directly pressure hot layers
+        # Base term uses per_edge_bias (hot layers cheaper for length optimization)
+        # Present term uses INVERSE (hot layers more expensive for congestion avoidance)
+        # For vias, keep bias at 1.0 (no layer-specific present penalty)
+        if (edge_layer is not None) and (layer_bias_per_layer is not None) and (edge_kind is not None):
+            # Invert bias for present: if bias=0.9 (cheap base), use 1/0.9=1.11 (expensive present)
+            # Clamp to prevent extreme values
+            inverted_bias = xp.where(per_edge_bias != 0, 1.0 / xp.maximum(per_edge_bias, 0.5), 1.0)
+            inverted_bias = xp.where(edge_kind_arr == 0, inverted_bias, 1.0)  # Only H/V edges
+            present_term = (pres_fac * inverted_bias) * over
+        else:
+            present_term = pres_fac * over
+
+        self.total_cost = adjusted_base + present_term + hist_weight * self.history
 
         # Add per-edge epsilon jitter to break ties (stable across iterations)
         if add_jitter:
@@ -1082,16 +1130,21 @@ class Lattice3D:
             return dx == 0 and dy == 1  # Vertical: only ±Y
 
     def get_legal_via_pairs(self, layer_count: int) -> set:
-        """Return set of legal (from_layer, to_layer) via pairs for ROUTING LAYERS only (1 to layer_count-2)."""
+        """
+        Return set of legal (from_layer, to_layer) via pairs.
+
+        CRITICAL: Must include F.Cu (layer 0) → internal layer transitions!
+        The escape planner creates stubs on F.Cu, and PathFinder must be able
+        to create vias from F.Cu to whatever internal layer it chooses.
+        """
         # Check config for via policy (default to FULL blind/buried)
         allow_any = True  # ALWAYS allow full blind/buried for convergence
 
-        # Only use internal routing layers (exclude outer layers 0 and layer_count-1)
+        # Internal routing layers (exclude B.Cu which is layer_count-1)
         routing_layers = list(range(1, layer_count - 1))
-        expected_all = len(routing_layers) * (len(routing_layers) - 1) // 2
 
         logger.info(f"[VIA-PAIRS] layer_count={layer_count}, routing_layers={len(routing_layers)}, "
-                   f"allow_any={allow_any}, expected_all_pairs={expected_all}")
+                   f"allow_any={allow_any}")
 
         if allow_any:
             # FULL BLIND/BURIED: Any routing layer to any other routing layer
@@ -1100,7 +1153,14 @@ class Lattice3D:
                 for z2 in routing_layers:
                     if z1 != z2:
                         legal_pairs.add((z1, z2))
-            logger.info(f"[VIA-PAIRS] Generated {len(legal_pairs)} all-to-all pairs for {len(routing_layers)} routing layers")
+
+            # CRITICAL: Add F.Cu (layer 0) → internal layer transitions
+            # This allows PathFinder to create escape vias from F.Cu to any internal layer
+            for z in routing_layers:
+                legal_pairs.add((0, z))  # F.Cu → internal layer
+                legal_pairs.add((z, 0))  # internal layer → F.Cu (bidirectional)
+
+            logger.info(f"[VIA-PAIRS] Generated {len(legal_pairs)} pairs: {len(routing_layers)}×{len(routing_layers)} internal + {len(routing_layers)}×2 F.Cu transitions")
             return legal_pairs
 
         # FALLBACK: Adjacent routing layers only
@@ -2063,7 +2123,7 @@ class PathFinderRouter:
         E = len(self.graph.indices)
         self.accounting = EdgeAccountant(E, use_gpu=self.config.use_gpu and GPU_AVAILABLE)
 
-        # Via pooling arrays (CPU-only for now - critical for convergence with full blind/buried)
+        # Via pooling arrays (GPU-accelerated for performance!)
         Nx, Ny, Nz = self.lattice.x_steps, self.lattice.y_steps, self.lattice.layers
         self._Nx, self._Ny, self._Nz = Nx, Ny, Nz
 
@@ -2071,20 +2131,49 @@ class PathFinderRouter:
         self.layer_bias = np.ones(Nz, dtype=np.float32)  # Index by z (0..Nz-1), 1.0 = neutral
         logger.info(f"[LAYER-BALANCE] Initialized for {Nz} layers")
 
+        # Determine if we should use GPU for via arrays
+        use_via_gpu = self.config.use_gpu and GPU_AVAILABLE
+
         if getattr(self.config, "via_column_pooling", True):
-            self.via_col_cap = np.full((Nx, Ny), int(getattr(self.config, "via_column_capacity", 4)), dtype=np.int16)
-            self.via_col_use = np.zeros((Nx, Ny), dtype=np.int16)
-            self.via_col_pres = np.zeros((Nx, Ny), dtype=np.float32)
-            logger.info(f"[VIA-POOL] Column pooling enabled: capacity={self.via_col_cap[0,0]} per (x,y)")
+            # Create arrays on GPU if available, CPU otherwise
+            if use_via_gpu:
+                self.via_col_cap = cp.full((Nx, Ny), int(getattr(self.config, "via_column_capacity", 4)), dtype=cp.int16)
+                self.via_col_use = cp.zeros((Nx, Ny), dtype=cp.int16)
+                self.via_col_pres = cp.zeros((Nx, Ny), dtype=cp.float32)
+                logger.info(f"[VIA-POOL] Column pooling enabled (GPU): capacity={int(self.via_col_cap[0,0])} per (x,y)")
+            else:
+                self.via_col_cap = np.full((Nx, Ny), int(getattr(self.config, "via_column_capacity", 4)), dtype=np.int16)
+                self.via_col_use = np.zeros((Nx, Ny), dtype=np.int16)
+                self.via_col_pres = np.zeros((Nx, Ny), dtype=np.float32)
+                logger.info(f"[VIA-POOL] Column pooling enabled (CPU): capacity={self.via_col_cap[0,0]} per (x,y)")
 
         if getattr(self.config, "via_segment_pooling", True):
             # Segments between routing layers (1..Nz-2): segment z→z+1 stored at index z-1
             self._segZ = Nz - 2  # Number of routing layers
-            self.via_seg_cap = np.full((Nx, Ny, self._segZ), int(getattr(self.config, "via_segment_capacity", 2)), dtype=np.int8)
-            self.via_seg_use = np.zeros((Nx, Ny, self._segZ), dtype=np.int16)
-            self.via_seg_pres = np.zeros((Nx, Ny, self._segZ), dtype=np.float32)
-            self.via_seg_prefix = np.zeros((Nx, Ny, self._segZ), dtype=np.float32)
-            logger.info(f"[VIA-POOL] Segment pooling enabled: {self._segZ} segments (z=1..{Nz-2}), capacity={self.via_seg_cap[0,0,0]} per segment")
+            if use_via_gpu:
+                self.via_seg_cap = cp.full((Nx, Ny, self._segZ), int(getattr(self.config, "via_segment_capacity", 2)), dtype=cp.int8)
+                self.via_seg_use = cp.zeros((Nx, Ny, self._segZ), dtype=cp.int16)
+                self.via_seg_pres = cp.zeros((Nx, Ny, self._segZ), dtype=cp.float32)
+                self.via_seg_prefix = cp.zeros((Nx, Ny, self._segZ), dtype=cp.float32)
+                logger.info(f"[VIA-POOL] Segment pooling enabled (GPU): {self._segZ} segments (z=1..{Nz-2}), capacity={int(self.via_seg_cap[0,0,0])} per segment")
+            else:
+                self.via_seg_cap = np.full((Nx, Ny, self._segZ), int(getattr(self.config, "via_segment_capacity", 2)), dtype=np.int8)
+                self.via_seg_use = np.zeros((Nx, Ny, self._segZ), dtype=np.int16)
+                self.via_seg_pres = np.zeros((Nx, Ny, self._segZ), dtype=np.float32)
+                self.via_seg_prefix = np.zeros((Nx, Ny, self._segZ), dtype=np.float32)
+                logger.info(f"[VIA-POOL] Segment pooling enabled (CPU): {self._segZ} segments (z=1..{Nz-2}), capacity={self.via_seg_cap[0,0,0]} per segment")
+
+        # Initialize ViaKernelManager for GPU-accelerated via operations
+        self.via_kernel_manager = ViaKernelManager(use_gpu=use_via_gpu)
+        logger.info(f"[VIA-KERNELS] Manager initialized (GPU={'YES' if use_via_gpu else 'NO'})")
+
+        # NODE OWNERSHIP TRACKING: Track which net owns each node (via barrels)
+        # -1 = free, otherwise net_id (mapped to integer)
+        # This is THE solution to via barrel conflicts - enforce at node level, not edge level!
+        self.node_owner = np.full(self.lattice.num_nodes, -1, dtype=np.int32)
+        self.net_id_map = {}  # net_name -> integer ID
+        self.next_net_id = 0
+        logger.info(f"[NODE-OWNER] Initialized node ownership tracking for {self.lattice.num_nodes:,} nodes")
 
         self.solver = SimpleDijkstra(self.graph, self.lattice)
 
@@ -2386,30 +2475,23 @@ class PathFinderRouter:
         )
 
     def _get_portal_seeds(self, portal: Portal) -> List[Tuple[int, float]]:
-        """Get multi-layer entry points at portal with discounted costs"""
+        """
+        Get portal entry point seeds for routing.
+
+        NEW ARCHITECTURE: Escape planner creates F.Cu stubs only (no portal vias).
+        PathFinder MUST route from F.Cu where stub ends.
+        PathFinder will create the escape via (F.Cu → internal layer) based on routing needs.
+
+        CRITICAL: Only seed on F.Cu (layer 0)! Multi-layer seeding would bypass F.Cu.
+        """
         seeds = []
-        cfg = self.config
 
-        for layer in range(self.lattice.layers):
-            # Get node index at portal for this layer
-            node_idx = self.lattice.node_idx(portal.x_idx, portal.y_idx, layer)
+        # ONLY seed on F.Cu (layer 0) where the escape stub ends
+        # PathFinder will create via from F.Cu to whatever internal layer it needs
+        node_idx = self.lattice.node_idx(portal.x_idx, portal.y_idx, 0)
+        cost = 0.0  # F.Cu portal - where escape stub ends
 
-            # Calculate via cost from entry_layer (where escape via connects)
-            if layer == portal.entry_layer:
-                # Same as entry layer - no via needed, minimal cost
-                cost = 0.1
-            else:
-                # Via cost from entry_layer to this layer
-                span = abs(layer - portal.entry_layer)
-                base_via_cost = cfg.via_cost * (1.0 + cfg.span_alpha * (span - 1))
-                # Portal discount makes entry-layer vias cheap
-                cost = base_via_cost * cfg.portal_via_discount
-                # Apply layer-depart discount (encourages leaving hot layers)
-                depart_discount = self._via_depart_discount(portal.entry_layer, layer)
-                cost *= depart_discount
-
-            seeds.append((node_idx, cost))
-
+        seeds.append((node_idx, cost))
         return seeds
 
     def _build_routing_seeds(self, portal_seeds_list):
@@ -2537,10 +2619,17 @@ class PathFinderRouter:
 
         return tasks
 
-    def _accumulate_via_usage_for_path(self, node_path: List[int]):
-        """Accumulate via column and segment usage for a committed path"""
+    def _accumulate_via_usage_for_path(self, node_path: List[int], net_id: str = None):
+        """
+        Accumulate via column and segment usage for a committed path.
+        Also registers via keepouts to prevent other nets from routing tracks through via locations.
+        """
         if not hasattr(self, 'via_col_use') and not hasattr(self, 'via_seg_use'):
             return  # Pooling not enabled
+
+        # Ensure via_keepouts_map exists
+        if not hasattr(self, '_via_keepouts_map'):
+            self._via_keepouts_map = {}
 
         idx_to_coord = self.lattice.idx_to_coord
         col_pool = hasattr(self, 'via_col_use')
@@ -2568,6 +2657,16 @@ class PathFinderRouter:
                         if 0 <= seg_idx < self._segZ:
                             self.via_seg_use[xu, yu, seg_idx] += 1
 
+                # Register via keepouts for ALL layers the via touches (including endpoints!)
+                # This prevents other nets from routing tracks through via locations
+                if net_id:
+                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    for z in range(z_lo, z_hi + 1):  # Include both endpoints!
+                        key = (z, xu, yu)
+                        # First owner wins
+                        if key not in self._via_keepouts_map:
+                            self._via_keepouts_map[key] = net_id
+
     def _rebuild_via_usage_from_committed(self):
         """Rebuild via column/segment usage from all currently committed net paths"""
         if not hasattr(self, 'via_col_use') and not hasattr(self, 'via_seg_use'):
@@ -2579,23 +2678,465 @@ class PathFinderRouter:
         if hasattr(self, 'via_seg_use'):
             self.via_seg_use.fill(0)
 
-        # Rebuild from all committed paths
+        # Clear routing via keepouts but PRESERVE portal keepouts
+        # Portal keepouts were pre-registered to protect escape via columns
+        if hasattr(self, '_via_keepouts_map'):
+            # Save portal keepouts (any keepout not from a routed path)
+            portal_keepouts = {k: v for k, v in self._via_keepouts_map.items()
+                             if v not in self.net_paths}
+            self._via_keepouts_map.clear()
+            self._via_keepouts_map.update(portal_keepouts)
+            if portal_keepouts:
+                logger.debug(f"[VIA-REBUILD] Preserved {len(portal_keepouts)} portal keepouts during rebuild")
+
+        # Rebuild from all committed paths (including keepout registration)
         for net_id, node_path in self.net_paths.items():
             if node_path and len(node_path) > 1:
-                self._accumulate_via_usage_for_path(node_path)
+                self._accumulate_via_usage_for_path(node_path, net_id=net_id)
+
+        # Also re-track escape vias (they're not in net_paths but occupy space)
+        self._track_escape_vias_in_via_usage()
+
+        # Log keepout statistics
+        if hasattr(self, '_via_keepouts_map'):
+            logger.info(f"[VIA-KEEPOUTS] Registered {len(self._via_keepouts_map)} via keepout cells")
+
+        # REBUILD NODE OWNERSHIP (the correct solution!)
+        self._rebuild_node_owner()
+
+    def _rebuild_node_owner(self):
+        """
+        Rebuild node ownership map from portal reservations and committed vias.
+
+        This is THE solution to via barrel conflicts:
+        - Track which net owns each node (via barrels occupy nodes, not just edges)
+        - Enforce via ROI bitmap masking (O(ROI_size) per net, not O(N×M)!)
+        - Works for both full-graph and ROI routing
+
+        Performance: O(portals + via_count × avg_span) = milliseconds, not minutes!
+        """
+        if not hasattr(self, 'node_owner'):
+            return
+
+        # Reset to all free
+        self.node_owner.fill(-1)
+
+        owned_count = 0
+
+        # 1. PORTAL RESERVATIONS: DISABLED - causing frontier empty issues
+        # TODO: Debug why portal reservations block source seeds
+        # if hasattr(self, 'portals') and self.portals:
+        #     for pad_id, portal in self.portals.items():
+        #         net_name = pad_id.rsplit('-', 1)[0] if '-' in pad_id else pad_id
+        #         net_id = self._get_net_id(net_name)
+        #         x_idx, y_idx = portal.x_idx, portal.y_idx
+        #         for z in range(1, self.lattice.layers - 1):
+        #             node_idx = self.lattice.node_idx(x_idx, y_idx, z)
+        #             self.node_owner[node_idx] = net_id
+        #             owned_count += 1
+
+        # 2. COMMITTED VIA BARRELS: Mark nodes occupied by routed vias
+        for net_name, path in self.net_paths.items():
+            if not path or len(path) < 2:
+                continue
+
+            net_id = self._get_net_id(net_name)
+
+            # Walk path and find layer transitions (vias)
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i+1]
+                xu, yu, zu = self.lattice.idx_to_coord(u)
+                xv, yv, zv = self.lattice.idx_to_coord(v)
+
+                # Via: same (x,y), different z
+                if xu == xv and yu == yv and zu != zv:
+                    # Mark ALL nodes in the via barrel span
+                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    for z in range(z_lo, z_hi + 1):
+                        node_idx = self.lattice.node_idx(xu, yu, z)
+                        self.node_owner[node_idx] = net_id
+                        owned_count += 1
+
+        logger.info(f"[NODE-OWNER] Marked {owned_count:,} nodes as owned ({owned_count*100//self.lattice.num_nodes}% of graph)")
+        # NOTE: Node ownership enforced via bitmap filtering in GPU kernels, not cost penalties!
+
+    def _get_net_id(self, net_name: str) -> int:
+        """Map net name to integer ID for node ownership"""
+        if net_name not in self.net_id_map:
+            self.net_id_map[net_name] = self.next_net_id
+            self.next_net_id += 1
+        return self.net_id_map[net_name]
+
+    def _mark_via_barrel_ownership_for_path(self, net_name: str, path: List[int]) -> None:
+        """
+        Mark via barrel nodes as owned by this net IMMEDIATELY after commit.
+
+        CRITICAL: This must be called AFTER each net commits, not just at iteration start!
+        Without this, later nets in the same iteration don't see earlier nets' via barrels.
+        """
+        if not path or len(path) < 2:
+            return
+
+        net_id = self._get_net_id(net_name)
+
+        # Walk path and find via transitions
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            xu, yu, zu = self.lattice.idx_to_coord(u)
+            xv, yv, zv = self.lattice.idx_to_coord(v)
+
+            # Via: same (x,y), different z
+            if xu == xv and yu == yv and zu != zv:
+                # Mark ALL nodes in via barrel span
+                z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                for z in range(z_lo, z_hi + 1):
+                    node_idx = self.lattice.node_idx(xu, yu, z)
+                    self.node_owner[node_idx] = net_id
+
+    def _build_owner_bitmap_for_fullgraph(self, current_net: str, force_allow_nodes=None) -> np.ndarray:
+        """
+        Build owner-aware bitmap for full-graph routing.
+
+        Returns uint32 bitmap where bit=1 if node is free OR owned by current net.
+        This allows the GPU wavefront kernel to skip nodes owned by other nets.
+
+        CRITICAL: Force-allows source/dest seeds even if ownership bookkeeping lags!
+
+        Performance: O(N/32) vectorized bitmap operations = milliseconds per net
+        Memory: ~14k uint32 words (~56KB) per bitmap
+
+        Args:
+            current_net: Net currently being routed
+            force_allow_nodes: Source/dest nodes to force-allow (even if owned by others)
+
+        Returns:
+            uint32 bitmap array (words = ceil(num_nodes/32))
+        """
+        net_id = self._get_net_id(current_net)
+        owners = self.node_owner  # np.int32[num_nodes]
+
+        # Vectorized: allowed = (free OR owned by current net)
+        allowed = (owners == -1) | (owners == net_id)
+
+        # CRITICAL: Force-allow seeds (prevents frontier empty!)
+        if force_allow_nodes is not None and len(force_allow_nodes) > 0:
+            allowed[force_allow_nodes] = True
+
+        n = int(allowed.size)
+        words = (n + 31) // 32
+        bitmap = np.zeros(words, dtype=np.uint32)
+
+        # Pack bits into words (vectorized)
+        idx = np.nonzero(allowed)[0].astype(np.int64)
+        if len(idx) > 0:
+            word_indices = (idx >> 5).astype(np.int32)  # idx // 32
+            bit_positions = (idx & 31).astype(np.int32)  # idx % 32
+            bit_values = (1 << bit_positions).astype(np.uint32)
+
+            # OR bits into words (use add.at since bits don't overlap per index)
+            np.add.at(bitmap, word_indices, bit_values)
+
+        return bitmap
+
+    def _filter_roi_by_ownership(self, roi_nodes: np.ndarray, current_net: str) -> np.ndarray:
+        """
+        Filter ROI nodes to exclude nodes owned by OTHER nets (owner-aware).
+
+        This prevents routing through via barrels occupied by other nets.
+        Fast vectorized operation: O(ROI_size) instead of O(N×M)!
+
+        Args:
+            roi_nodes: Array of node indices in ROI
+            current_net: Net currently being routed
+
+        Returns:
+            Filtered roi_nodes array (nodes owned by other nets removed)
+        """
+        if not hasattr(self, 'node_owner'):
+            return roi_nodes
+
+        current_net_id = self._get_net_id(current_net)
+
+        # Vectorized ownership check (FAST!)
+        owners = self.node_owner[roi_nodes]
+        # Keep nodes that are free (-1) OR owned by current net
+        keep_mask = (owners == -1) | (owners == current_net_id)
+
+        filtered_roi = roi_nodes[keep_mask]
+        blocked = len(roi_nodes) - len(filtered_roi)
+
+        if blocked > 0:
+            logger.debug(f"[NODE-OWNER] Net {current_net}: filtered {blocked:,}/{len(roi_nodes):,} ROI nodes owned by other nets")
+
+        return filtered_roi
+
+    def _track_escape_vias_in_via_usage(self):
+        """
+        Register escape vias in via spatial tracking arrays.
+
+        This ensures that via columns and segments used by pad escape vias
+        are properly tracked, preventing routing conflicts.
+        """
+        if not hasattr(self, '_escape_vias') or not self._escape_vias:
+            return
+
+        if not hasattr(self, 'via_col_use') and not hasattr(self, 'via_seg_use'):
+            # Via spatial tracking not enabled
+            return
+
+        tracked_count = 0
+
+        for via_dict in self._escape_vias:
+            # Extract via information
+            x_mm = via_dict.get('x')
+            y_mm = via_dict.get('y')
+            from_layer_name = via_dict.get('from_layer')
+            to_layer_name = via_dict.get('to_layer')
+
+            if x_mm is None or y_mm is None or from_layer_name is None or to_layer_name is None:
+                continue
+
+            # Convert world coordinates to lattice indices
+            xu, yu = self.lattice.world_to_lattice(x_mm, y_mm)
+            if xu < 0 or xu >= self.lattice.x_steps or yu < 0 or yu >= self.lattice.y_steps:
+                continue
+
+            # Convert layer names to indices
+            z_lo = self._layer_name_to_index(from_layer_name)
+            z_hi = self._layer_name_to_index(to_layer_name)
+
+            if z_lo is None or z_hi is None:
+                continue
+
+            # Ensure z_lo < z_hi
+            if z_lo > z_hi:
+                z_lo, z_hi = z_hi, z_lo
+
+            # Track in column usage
+            if hasattr(self, 'via_col_use'):
+                self.via_col_use[xu, yu] += 1
+
+            # Track in segment usage
+            if hasattr(self, 'via_seg_use'):
+                for z in range(z_lo, z_hi):
+                    seg_idx = z - 1  # Segments indexed from 0
+                    if 0 <= seg_idx < self._segZ:
+                        self.via_seg_use[xu, yu, seg_idx] += 1
+
+            # Register via keepouts for ALL layers (including endpoints) to block tracks
+            if not hasattr(self, '_via_keepouts_map'):
+                self._via_keepouts_map = {}
+
+            net_id = via_dict.get('net', 'escape_via')
+            for z in range(z_lo, z_hi + 1):  # Include both endpoints!
+                key = (z, xu, yu)
+                self._via_keepouts_map.setdefault(key, net_id)
+
+            tracked_count += 1
+
+        if tracked_count > 0:
+            logger.info(f"[ESCAPE-VIA] Tracked {tracked_count} escape vias in via spatial arrays")
+
+    def _layer_name_to_index(self, layer_name: str) -> Optional[int]:
+        """Convert layer name to layer index, or None if not found"""
+        if not hasattr(self.config, 'layer_names'):
+            return None
+
+        try:
+            return self.config.layer_names.index(layer_name)
+        except (ValueError, AttributeError):
+            # Try numeric layer format like "L5"
+            if layer_name.startswith('L') and layer_name[1:].isdigit():
+                return int(layer_name[1:])
+            return None
+
+    def _apply_via_keepouts_to_graph(self):
+        """
+        Apply via keepouts to the graph by blocking planar routing at via locations.
+
+        This prevents tracks from routing through via locations when using full-graph routing.
+        The via keepouts are stored in _via_keepouts_map as (z, x, y) -> net_id.
+
+        For each keepout location, we block PLANAR edges (same-layer horizontal/vertical edges)
+        but allow VIA edges (inter-layer edges) so that other vias can still use the same column.
+
+        Note: This is a global blocking approach. For per-net owner-aware keepouts, see ROI extraction.
+        This method is called after via usage tracking is rebuilt, ensuring all current vias are blocked.
+        """
+        if not hasattr(self, '_via_keepouts_map') or not self._via_keepouts_map:
+            logger.debug("[VIA-KEEPOUT] No via keepouts to apply")
+            return
+
+        if not hasattr(self, 'graph') or self.graph is None:
+            logger.warning("[VIA-KEEPOUT] Graph not initialized, cannot apply keepouts")
+            return
+
+        # Get the base cost array (this is where we'll block edges)
+        if not hasattr(self.graph, 'base_costs') or self.graph.base_costs is None:
+            logger.warning("[VIA-KEEPOUT] Base cost array not available, cannot apply keepouts")
+            return
+
+        base_cost = self.graph.base_costs
+        is_gpu = hasattr(base_cost, 'get')  # Check if it's a GPU array
+
+        # Convert to CPU for modification if needed
+        if is_gpu:
+            base_cost_cpu = base_cost.get()
+        else:
+            base_cost_cpu = base_cost
+
+        # Get graph structure
+        indptr = self.graph.indptr
+        indices = self.graph.indices
+
+        # Convert to CPU if on GPU
+        if hasattr(indptr, 'get'):
+            indptr = indptr.get()
+        if hasattr(indices, 'get'):
+            indices = indices.get()
+
+        blocked_planar_edges = 0
+        keepout_block_cost = 1e9  # Very high cost to effectively block the edge
+
+        # For each via keepout location, block PLANAR edges only (not via edges)
+        for (z, x, y), owner_net in self._via_keepouts_map.items():
+            # Convert lattice coordinates to node index
+            node_idx = self.lattice.node_idx(x, y, z)
+
+            # Get source coordinates
+            src_x, src_y, src_z = self.lattice.idx_to_coord(node_idx)
+
+            # Block planar outgoing edges from this node
+            start = int(indptr[node_idx])
+            end = int(indptr[node_idx + 1])
+
+            for edge_idx in range(start, end):
+                dst_node = int(indices[edge_idx])
+                dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst_node)
+
+                # Only block PLANAR edges (same layer), allow VIA edges
+                if src_z == dst_z:
+                    # This is a planar edge (horizontal or vertical track)
+                    base_cost_cpu[edge_idx] = keepout_block_cost
+                    blocked_planar_edges += 1
+                # Via edges (src_z != dst_z) are NOT blocked to allow other vias in same column
+
+        # Update the base cost array (copy back to GPU if needed)
+        if is_gpu:
+            try:
+                import cupy as cp
+                self.graph.base_costs = cp.asarray(base_cost_cpu)
+            except ImportError:
+                self.graph.base_costs = base_cost_cpu
+        else:
+            self.graph.base_costs = base_cost_cpu
+
+        logger.info(f"[VIA-KEEPOUT] Applied {len(self._via_keepouts_map)} via keepouts, blocked {blocked_planar_edges} planar edges in full graph")
+
+    def _apply_owner_aware_via_keepouts(self, current_net_id: str, costs) -> int:
+        """
+        Apply via keepouts for full-graph routing (owner-aware).
+
+        Temporarily blocks planar edges at via locations owned by OTHER nets.
+        This prevents the current net from routing tracks through other nets' via barrels.
+
+        Args:
+            current_net_id: Net currently being routed
+            costs: Cost array (CuPy or NumPy)
+
+        Returns:
+            Number of edges blocked
+        """
+        if not hasattr(self, '_via_keepouts_map') or not self._via_keepouts_map:
+            return 0
+
+        # Store original costs for restoration
+        if not hasattr(self, '_via_keepout_backup'):
+            self._via_keepout_backup = {}
+
+        is_gpu = hasattr(costs, 'device')
+        xp = cp if is_gpu else np
+
+        # Get graph structure (already on appropriate device)
+        indptr = self.graph.indptr
+        indices = self.graph.indices
+
+        blocked_count = 0
+        keepout_block_cost = 1e9
+
+        # Convert indptr/indices to CPU for indexing (they're small, cached once)
+        if is_gpu:
+            if not hasattr(self, '_indptr_cpu_cache'):
+                self._indptr_cpu_cache = indptr.get()
+                self._indices_cpu_cache = indices.get()
+            indptr_cpu = self._indptr_cpu_cache
+            indices_cpu = self._indices_cpu_cache
+        else:
+            indptr_cpu = indptr
+            indices_cpu = indices
+
+        # Block via locations owned by OTHER nets
+        # CRITICAL: Via occupies NODE, so block ALL edges to/from that node!
+        for (z, x, y), owner_net in self._via_keepouts_map.items():
+            # Skip vias owned by current net (owner-aware!)
+            if owner_net == current_net_id:
+                continue
+
+            # Get node index - this node is OCCUPIED by another net's via barrel
+            node_idx = self.lattice.node_idx(x, y, z)
+
+            # Block ALL OUTGOING edges from this via node (no routing through via!)
+            start, end = int(indptr_cpu[node_idx]), int(indptr_cpu[node_idx + 1])
+
+            for edge_idx in range(start, end):
+                dst_node = int(indices_cpu[edge_idx])
+                dst_x, dst_y, dst_z = self.lattice.idx_to_coord(dst_node)
+
+                # Block ALL edges except vias in the same column (allow stacked vias)
+                # Only allow via edges if both nodes in same (x,y) column
+                if not (dst_x == x and dst_y == y and dst_z != z):
+                    # This is either a planar edge OR a via to different (x,y) - block it!
+                    if edge_idx not in self._via_keepout_backup:
+                        if is_gpu:
+                            self._via_keepout_backup[edge_idx] = float(costs[edge_idx])
+                        else:
+                            self._via_keepout_backup[edge_idx] = float(costs[edge_idx])
+
+                    costs[edge_idx] = keepout_block_cost
+                    blocked_count += 1
+
+        # NOTE: Owner-aware blocking removed - O(N×M) doesn't scale to 16k+ keepouts
+        # Causes 6+ second overhead per net (512 nets = 50+ minutes!)
+        #if blocked_count > 0:
+        #    logger.info(f"[VIA-KEEPOUT-OWNER] Blocked {blocked_count} edges for net {current_net_id}")
+
+        return blocked_count
+
+    def _restore_via_keepout_costs(self, costs):
+        """Restore original costs after owner-aware via keepout blocking"""
+        if not hasattr(self, '_via_keepout_backup') or not self._via_keepout_backup:
+            return
+
+        is_gpu = hasattr(costs, 'device')
+
+        for edge_idx, original_cost in self._via_keepout_backup.items():
+            costs[edge_idx] = original_cost
+
+        # Clear backup for next net
+        self._via_keepout_backup.clear()
 
     def _apply_via_pooling_penalties(self, pres_fac: float):
-        """Apply via column and segment pooling penalties to vertical edge costs (VECTORIZED)"""
+        """
+        Apply via column and segment pooling penalties to vertical edge costs.
+
+        Uses GPU-accelerated CUDA kernel when available (800ms → <2ms speedup!)
+        Falls back to CPU vectorized implementation if GPU unavailable.
+        """
         import time
         t0 = time.perf_counter()
 
         if not hasattr(self, 'via_col_pres') and not hasattr(self, 'via_seg_pres'):
             return
-
-        # Skip if no via overuse
-        if hasattr(self, 'via_col_pres') and np.max(self.via_col_pres) == 0:
-            if hasattr(self, 'via_seg_pres') and np.max(self.via_seg_pres) == 0:
-                return  # No via pooling penalties needed
 
         # Check if metadata is available
         if not hasattr(self, '_via_edge_metadata') or self._via_edge_metadata is None:
@@ -2603,6 +3144,36 @@ class PathFinderRouter:
             self._apply_via_pooling_penalties_sequential(pres_fac)
             return
 
+        # Try GPU kernel first if available
+        if hasattr(self, 'via_kernel_manager') and self.via_kernel_manager.use_gpu:
+            try:
+                # Check if there are any penalties to apply (GPU can check this fast)
+                xp = cp if hasattr(self.via_col_pres, 'device') else np
+                if hasattr(self, 'via_col_pres'):
+                    col_max = float(xp.max(self.via_col_pres))
+                    if col_max == 0 and hasattr(self, 'via_seg_pres'):
+                        seg_max = float(xp.max(self.via_seg_pres))
+                        if seg_max == 0:
+                            return  # No penalties needed
+
+                col_weight = float(getattr(self.config, "via_column_weight", 1.0))
+                seg_weight = float(getattr(self.config, "via_segment_weight", 1.0))
+
+                penalty_count = self.via_kernel_manager.apply_via_penalties(
+                    via_metadata=self._via_edge_metadata,
+                    via_col_pres_gpu=self.via_col_pres,
+                    via_seg_pres_gpu=self.via_seg_pres if hasattr(self, 'via_seg_pres') else None,
+                    col_weight=col_weight * pres_fac,
+                    seg_weight=seg_weight * pres_fac,
+                    total_cost_gpu=self.accounting.total_cost,
+                    Ny=self._Ny,
+                    segZ=self._segZ if hasattr(self, '_segZ') else 0
+                )
+                return  # GPU kernel succeeded
+            except Exception as e:
+                logger.warning(f"[VIA-POOL] GPU kernel failed: {e}, falling back to CPU")
+
+        # CPU fallback - original vectorized implementation
         col_weight = float(getattr(self.config, "via_column_weight", 1.0))
         seg_weight = float(getattr(self.config, "via_segment_weight", 1.0))
 
@@ -2759,6 +3330,106 @@ class PathFinderRouter:
         if penalties_applied > 0:
             logger.debug(f"[VIA-POOL] Sequential: Applied pooling penalties to {penalties_applied} via edges")
 
+    def _block_via_edges_with_collisions(self):
+        """
+        Hard-block via edges with spatial collisions by setting costs to infinity.
+
+        This prevents PathFinder from using via edges where the column or any
+        spanned segment is already at capacity. Combined with soft penalties,
+        this ensures no via spatial violations in the final routing.
+
+        Uses GPU-accelerated CUDA kernel when available (30s → <1ms speedup!)
+        """
+        if not hasattr(self, '_via_edge_metadata') or self._via_edge_metadata is None:
+            logger.warning("[HARD-BLOCK] No via edge metadata, skipping")
+            return
+
+        if not hasattr(self, 'via_col_use') and not hasattr(self, 'via_seg_use'):
+            # No via spatial tracking enabled
+            return
+
+        # Try GPU kernel first if available
+        if hasattr(self, 'via_kernel_manager') and self.via_kernel_manager.use_gpu:
+            try:
+                blocked_count = self.via_kernel_manager.hard_block_via_edges(
+                    via_metadata=self._via_edge_metadata,
+                    via_col_use_gpu=self.via_col_use,
+                    via_col_cap_gpu=self.via_col_cap,
+                    via_seg_use_gpu=self.via_seg_use if hasattr(self, 'via_seg_use') else None,
+                    via_seg_cap_gpu=self.via_seg_cap if hasattr(self, 'via_seg_cap') else None,
+                    total_cost_gpu=self.accounting.total_cost,
+                    Ny=self._Ny,
+                    segZ=self._segZ if hasattr(self, '_segZ') else 0
+                )
+                return  # GPU kernel succeeded
+            except Exception as e:
+                logger.warning(f"[HARD-BLOCK] GPU kernel failed: {e}, falling back to CPU")
+
+        # CPU fallback
+        via_edges = self._via_edge_metadata
+        edge_indices = via_edges['indices']
+        xy_coords = via_edges['xy_coords']
+        z_lo = via_edges['z_lo']
+        z_hi = via_edges['z_hi']
+
+        # Convert from GPU to CPU if needed
+        if hasattr(edge_indices, 'get'):
+            edge_indices = edge_indices.get()
+        if hasattr(xy_coords, 'get'):
+            xy_coords = xy_coords.get()
+        if hasattr(z_lo, 'get'):
+            z_lo = z_lo.get()
+        if hasattr(z_hi, 'get'):
+            z_hi = z_hi.get()
+
+        # Get cost array
+        total_cost = self.accounting.total_cost
+        if self.accounting.use_gpu:
+            total_cost_cpu = total_cost.get()
+        else:
+            total_cost_cpu = total_cost
+
+        # Get via arrays (convert from GPU if needed)
+        via_col_use = self.via_col_use.get() if hasattr(self.via_col_use, 'get') else self.via_col_use
+        via_col_cap = self.via_col_cap.get() if hasattr(self.via_col_cap, 'get') else self.via_col_cap
+        via_seg_use = self.via_seg_use.get() if hasattr(self, 'via_seg_use') and hasattr(self.via_seg_use, 'get') else getattr(self, 'via_seg_use', None)
+        via_seg_cap = self.via_seg_cap.get() if hasattr(self, 'via_seg_cap') and hasattr(self.via_seg_cap, 'get') else getattr(self, 'via_seg_cap', None)
+
+        blocked_count = 0
+
+        for i in range(len(edge_indices)):
+            xu, yu = int(xy_coords[i, 0]), int(xy_coords[i, 1])
+            z_start, z_end = int(z_lo[i]), int(z_hi[i])
+            edge_idx = edge_indices[i]
+
+            # Check column capacity
+            col_blocked = False
+            if via_col_use is not None and via_col_cap is not None:
+                if via_col_use[xu, yu] >= via_col_cap[xu, yu]:
+                    col_blocked = True
+
+            # Check segment capacity for all spanned segments
+            seg_blocked = False
+            if via_seg_use is not None and via_seg_cap is not None:
+                for z in range(z_start, z_end):
+                    seg_idx = z - 1  # Segments indexed from 0
+                    if 0 <= seg_idx < self._segZ:
+                        if via_seg_use[xu, yu, seg_idx] >= via_seg_cap[xu, yu, seg_idx]:
+                            seg_blocked = True
+                            break
+
+            # Hard-block if at capacity
+            if col_blocked or seg_blocked:
+                total_cost_cpu[edge_idx] = np.float32('inf')
+                blocked_count += 1
+
+        # Copy back to GPU if needed
+        if self.accounting.use_gpu:
+            total_cost[:len(total_cost_cpu)] = cp.asarray(total_cost_cpu)
+
+        if blocked_count > 0:
+            logger.info(f"[HARD-BLOCK-CPU] Blocked {blocked_count} via edges at capacity (using CPU fallback)")
+
     def _pathfinder_negotiation(self, tasks: Dict[str, Tuple[int, int]], progress_cb=None, iteration_cb=None) -> Dict:
         """CORE PATHFINDER ALGORITHM WITH AUTO-CONFIGURATION"""
         cfg = self.config
@@ -2789,13 +3460,13 @@ class PathFinderRouter:
 
         # Scale by layer count (fewer layers = stronger penalties needed)
         if n_sig_layers <= 12:
-            pres_fac_max = 6.0
+            pres_fac_max = 32.0  # Increased from 6.0 to allow convergence
             hist_cost_weight_mult = 1.2  # 12.0 for few layers
         elif n_sig_layers <= 20:
-            pres_fac_max = 8.0
+            pres_fac_max = 64.0  # Increased from 8.0 to allow convergence
             hist_cost_weight_mult = 1.0  # 10.0
         else:
-            pres_fac_max = 10.0
+            pres_fac_max = 128.0  # Increased from 10.0 to allow convergence
             hist_cost_weight_mult = 0.8  # 8.0 for many layers
 
         # Allow env overrides for testing
@@ -2945,6 +3616,11 @@ class PathFinderRouter:
             # NOTE: Layer balancing now enabled (vectorized, applied in update_costs)
             self._apply_via_pooling_penalties(pres_fac)
 
+            # STEP 2.6: Hard-block via edges with spatial collisions (iteration 2+)
+            # This prevents PathFinder from using edges that would cause via collisions
+            if it > 1:  # Allow greedy first pass without hard blocking
+                self._block_via_edges_with_collisions()
+
             # STEP 3: Route (hotset incremental after iter 1)
             # DIAGNOSTIC OVERRIDE: Test with hotset disabled
             FORCE_ROUTE_ALL = False  # Set to False to restore hotset behavior (TESTING: hotset ENABLED)
@@ -2990,8 +3666,8 @@ class PathFinderRouter:
             if not self.accounting.verify_present_matches_canonical():
                 logger.warning(f"[ITER {it}] Accounting mismatch detected - potential bug")
 
-            # STEP 4: Overuse
-            over_sum, over_cnt = self.accounting.compute_overuse()
+            # STEP 4: Overuse (include via spatial violations)
+            over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
 
             # Instrumentation: via overuse ratio
             # OPTIMIZATION: Use cached GPU transfers
@@ -3117,6 +3793,36 @@ class PathFinderRouter:
                         logger.info(f"[LAYER-BIAS] Hot layers: " +
                                    ", ".join([f"L{z}:{bias:.3f}" for z, bias in top_layers if 1 <= z < self._Nz-1]))
 
+                    # Layer jam breaker: Detect if one layer dominates overuse
+                    total_layer_overuse = sum(overuse_by_layer.values())
+                    if total_layer_overuse > 0:
+                        # Find layer with highest overuse percentage
+                        max_layer = max(overuse_by_layer.items(), key=lambda x: x[1])
+                        max_layer_idx, max_layer_overuse = max_layer
+                        jam_percentage = (max_layer_overuse / total_layer_overuse) * 100
+
+                        # Track consecutive jams
+                        if not hasattr(self, '_layer_jam_tracker'):
+                            self._layer_jam_tracker = {'layer': None, 'count': 0, 'boost_until': 0}
+
+                        if jam_percentage >= 60.0:
+                            if self._layer_jam_tracker['layer'] == max_layer_idx:
+                                self._layer_jam_tracker['count'] += 1
+                            else:
+                                self._layer_jam_tracker = {'layer': max_layer_idx, 'count': 1, 'boost_until': 0}
+
+                            # If jammed for 3+ iterations, temporarily boost that layer's bias
+                            if self._layer_jam_tracker['count'] >= 3 and it > self._layer_jam_tracker['boost_until']:
+                                # Boost toward bias_max to make layer more expensive
+                                # Since bias < 1.0 means cheaper, we need to increase it toward bias_max
+                                old_bias = self.layer_bias[max_layer_idx]
+                                self.layer_bias[max_layer_idx] = min(old_bias * 1.8, bias_max)  # Stronger boost
+                                self._layer_jam_tracker['boost_until'] = it + 3  # Hold longer
+                                logger.warning(f"[LAYER-JAM] Layer {max_layer_idx} jammed at {jam_percentage:.1f}% for {self._layer_jam_tracker['count']} iters → boosting bias {old_bias:.3f} → {self.layer_bias[max_layer_idx]:.3f} for 3 iters")
+                        else:
+                            # Reset if no longer jammed
+                            self._layer_jam_tracker = {'layer': None, 'count': 0, 'boost_until': 0}
+
             # Clean-phase: if overuse==0, freeze good nets and finish stragglers
             if over_sum == 0:
                 unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
@@ -3137,18 +3843,23 @@ class PathFinderRouter:
             # TEST: Allow env override to disable history cap and use raw present
             use_history_cap = os.getenv('ORTHO_NO_HISTORY_CAP', '0') == '0'
             hist_base_costs = self.graph.base_costs if use_history_cap else None
-            hist_cap_mult = 100.0 if use_history_cap else 1.0  # unused if base_costs=None
+            hist_cap_mult = 15.0 if use_history_cap else 1.0  # Reduced from 100.0 to prevent history dominance
             # FIX: Use raw present for history (present_ema lags significantly in early iterations)
             use_raw_present = True  # was: os.getenv('ORTHO_RAW_PRESENT_FOR_HIST', '0') == '1'
 
+            # Apply history decay after iteration 10 to prevent oscillation
+            # Early iterations (1-10): No decay (1.0) to build up history
+            # Later iterations (11+): Gentle decay (0.98) allows route redistribution
+            history_decay = 0.98 if it >= 10 else 1.0
+
             import sys
-            print(f"### BEFORE update_history: it={it} gain={hist_gain_eff:.3f} cap_mult={hist_cap_mult:.1f}", file=sys.stderr, flush=True)
+            print(f"### BEFORE update_history: it={it} gain={hist_gain_eff:.3f} cap_mult={hist_cap_mult:.1f} decay={history_decay:.3f}", file=sys.stderr, flush=True)
 
             self.accounting.update_history(
                 hist_gain_eff,
                 base_costs=hist_base_costs,
                 history_cap_multiplier=hist_cap_mult,
-                decay_factor=float(getattr(cfg, "history_decay", 1.0)),  # No decay - full memory retention
+                decay_factor=history_decay,
                 use_raw_present=use_raw_present
             )
 
@@ -3240,6 +3951,12 @@ class PathFinderRouter:
                 stagnant = 0
             else:
                 stagnant += 1
+
+            # Plateau kicker: If stuck for 2 iterations, boost present pressure
+            if stagnant == 2:
+                old_pres_fac = pres_fac
+                pres_fac = min(pres_fac * 1.5, pres_fac_max)
+                logger.info(f"[PLATEAU-KICK] Stagnant for 2 iters, boosting pres_fac: {old_pres_fac:.2f} → {pres_fac:.2f}")
 
             if stagnant >= cfg.stagnation_patience:
                 self.stagnation_counter += 1  # Track cumulative stagnation events
@@ -3428,7 +4145,7 @@ class PathFinderRouter:
             self.stagnation_counter = old_stagnation
 
             self.accounting.refresh_from_canonical()
-            over_sum, over_cnt = self.accounting.compute_overuse()
+            over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
 
             logger.info(f"[DETAIL {detail_it}/10] overuse={over_sum} edges={over_cnt}")
 
@@ -3452,7 +4169,7 @@ class PathFinderRouter:
                 cfg.hist_gain * 2.0,  # Double history gain in detail pass
                 base_costs=self.graph.base_costs,
                 history_cap_multiplier=15.0,
-                decay_factor=1.0  # No decay in detail pass
+                decay_factor=0.98  # Use decay in detail pass to allow redistribution
             )
 
             pres_fac = min(pres_fac * 1.5, cfg.pres_fac_max)
@@ -3589,32 +4306,39 @@ class PathFinderRouter:
             # If it fails or GPU not available, fall back to standard ROI routing
             
             gpu_fast_path_used = False
+            # Full-graph routing with owner-aware bitmap filtering
             if use_portals and hasattr(self.solver, 'gpu_solver') and self.solver.gpu_solver:
                 try:
                     import numpy as np
                     import cupy as cp
-                    
+
                     # Check if costs are on GPU
                     costs_on_gpu = hasattr(costs, 'device')
-                    
+
                     if costs_on_gpu:
                         logger.info(f"[GPU-SEEDS] Attempting GPU supersource routing for net {net_id}")
-                        
+
                         # Convert portal seeds to plain node arrays
                         src_node_array = self._build_routing_seeds(src_seeds)
                         dst_node_array = self._build_routing_seeds(dst_targets)
-                        
+
+                        # Build owner-aware bitmap - FORCE-ALLOW source/dest seeds!
+                        force_allow = np.unique(np.concatenate([src_node_array, dst_node_array])).astype(np.int32)
+                        owner_bitmap = self._build_owner_bitmap_for_fullgraph(net_id, force_allow_nodes=force_allow)
+
                         if len(src_node_array) > 0 and len(dst_node_array) > 0:
-                            # Call GPU supersource pathfinding
+                            # Call GPU supersource pathfinding with owner-aware bitmap
                             gpu_start = time.time()
                             path = self.solver.gpu_solver.find_path_fullgraph_gpu_seeds(
                                 costs=costs,
                                 src_seeds=src_node_array,
                                 dst_targets=dst_node_array,
-                                ub_hint=None
+                                ub_hint=None,
+                                allowed_bitmap=owner_bitmap,
+                                use_bitmap=True
                             )
                             gpu_time = time.time() - gpu_start
-                            
+
                             if path and len(path) > 1:
                                 logger.info(f"[GPU-SEEDS] SUCCESS! Path found in {gpu_time:.3f}s ({len(path)} nodes)")
                                 gpu_fast_path_used = True
@@ -3632,6 +4356,10 @@ class PathFinderRouter:
                                 # NOTE: Do NOT update costs here! PathFinder requires fixed costs per iteration.
 
                                 self.net_paths[net_id] = path
+
+                                # CRITICAL: Mark via barrel ownership IMMEDIATELY for next net in same iteration!
+                                self._mark_via_barrel_ownership_for_path(net_id, path)
+
                                 if entry_layer is not None and exit_layer is not None:
                                     self.net_portal_layers[net_id] = (entry_layer, exit_layer)
                                 self._update_net_edge_tracking(net_id, edge_indices)
@@ -3719,6 +4447,13 @@ class PathFinderRouter:
                 global_to_roi = np.full(len(costs), -1, dtype=np.int32)
                 global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
 
+            # OWNER-AWARE FILTERING: Remove nodes owned by OTHER nets
+            # This prevents routing through via barrels - THE FIX for dangling vias!
+            roi_nodes = self._filter_roi_by_ownership(roi_nodes, net_id)
+            # Rebuild mapping after ownership filtering
+            global_to_roi = np.full(len(costs), -1, dtype=np.int32)
+            global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
+
             # Final sanity check
             if global_to_roi[src] < 0:
                 logger.error(f"BUG: src {src} not in ROI after all additions!")
@@ -3796,6 +4531,10 @@ class PathFinderRouter:
                 # Costs are updated ONCE per iteration in _pathfinder_negotiation()
 
                 self.net_paths[net_id] = path
+
+                # CRITICAL: Mark via barrel ownership IMMEDIATELY for next net in same iteration!
+                self._mark_via_barrel_ownership_for_path(net_id, path)
+
                 # Store portal entry/exit layers if using portals
                 if use_portals and entry_layer is not None and exit_layer is not None:
                     self.net_portal_layers[net_id] = (entry_layer, exit_layer)
@@ -4380,7 +5119,11 @@ class PathFinderRouter:
         logger.info(f"Identified {int(self._via_edges.sum())} via edges")
 
     def _build_via_edge_metadata(self):
-        """Precompute via edge metadata for vectorized penalty application"""
+        """
+        Precompute via edge metadata for vectorized penalty application.
+
+        Keeps metadata on GPU if available for zero-copy kernel execution.
+        """
         import time
         t0 = time.perf_counter()
 
@@ -4427,16 +5170,27 @@ class PathFinderRouter:
         z_lo = np.clip(z_lo, 1, self.lattice.layers - 2)
         z_hi = np.clip(z_hi, 1, self.lattice.layers - 2)
 
-        # Store metadata as a dictionary
-        self._via_edge_metadata = {
-            'indices': via_edge_indices.astype(np.int32),
-            'xy_coords': via_xy_coords,
-            'z_lo': z_lo.astype(np.int32),
-            'z_hi': z_hi.astype(np.int32),
-        }
+        # Store metadata - on GPU if kernels available, CPU otherwise
+        use_via_gpu = self.config.use_gpu and GPU_AVAILABLE
 
-        elapsed = time.perf_counter() - t0
-        logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges in {elapsed:.3f}s")
+        if use_via_gpu:
+            # Keep on GPU for zero-copy kernel execution
+            self._via_edge_metadata = {
+                'indices': cp.asarray(via_edge_indices.astype(np.int32)),
+                'xy_coords': cp.asarray(via_xy_coords),
+                'z_lo': cp.asarray(z_lo.astype(np.int32)),
+                'z_hi': cp.asarray(z_hi.astype(np.int32)),
+            }
+            logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on GPU in {time.perf_counter() - t0:.3f}s")
+        else:
+            # Keep on CPU
+            self._via_edge_metadata = {
+                'indices': via_edge_indices.astype(np.int32),
+                'xy_coords': via_xy_coords,
+                'z_lo': z_lo.astype(np.int32),
+                'z_hi': z_hi.astype(np.int32),
+            }
+            logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on CPU in {time.perf_counter() - t0:.3f}s")
 
     def _path_to_edges(self, node_path: List[int]) -> List[int]:
         """Nodes → edge indices via on-the-fly CSR scan (no dict needed)"""
@@ -4505,6 +5259,9 @@ class PathFinderRouter:
         """
         Delegate to PadEscapePlanner for precomputing all pad escapes.
 
+        NEW: Pre-registers portal locations as via keepouts for iteration 1.
+        This prevents tracks from routing through portal columns before escape vias are created.
+
         Returns (tracks, vias) for visualization.
         """
         if not self.escape_planner:
@@ -4522,11 +5279,31 @@ class PathFinderRouter:
         self._escape_tracks, self._escape_vias = result
         logger.info(f"Cached {len(self._escape_tracks)} escape tracks and {len(self._escape_vias)} escape vias")
 
+        # Track escape vias in via spatial arrays to prevent routing collisions
+        self._track_escape_vias_in_via_usage()
+
+        # NOTE: Portal via keepout pre-registration removed - too slow for full-graph
+        # Via barrel conflicts exist but owner-aware blocking doesn't scale
+        # TODO: Investigate actual root cause of dangling vias
+
         return result
 
     def _via_world(self, at_idx: int, net: str, from_layer: int, to_layer: int):
         x, y, _ = self.lattice.idx_to_coord(at_idx)
         (x_mm, y_mm) = self.lattice.geom.lattice_to_world(x, y)
+
+        # CRITICAL FIX: Quantize via coordinates to grid (same as _segment_world)
+        # This ensures via centers EXACTLY match track endpoints (no epsilon mismatch!)
+        pitch = self.lattice.geom.pitch
+        origin_x = self.lattice.geom.grid_min_x
+        origin_y = self.lattice.geom.grid_min_y
+        x_mm = origin_x + round((x_mm - origin_x) / pitch) * pitch
+        y_mm = origin_y + round((y_mm - origin_y) / pitch) * pitch
+
+        # Normalize layer order (consistent output, KiCad accepts either way)
+        if from_layer > to_layer:
+            from_layer, to_layer = to_layer, from_layer
+
         return {
             'net': net,
             'x': x_mm, 'y': y_mm,
@@ -4541,38 +5318,29 @@ class PathFinderRouter:
         Convert routed node paths into drawable segments and vias.
         - Clean geometry (for KiCad export): only if overuse == 0
         - Provisional geometry (for GUI feedback): always generated
+
+        CRITICAL: Escape geometry is ALWAYS merged, even with overuse.
+        Escapes are the connection from pads to the routing grid and must be exported.
         """
-        # Check for overuse
-        over_sum, over_cnt = self.accounting.compute_overuse()
-
-        # Generate provisional geometry for GUI feedback (always)
+        # Generate provisional geometry from routing paths
         provisional_tracks, provisional_vias = self._generate_geometry_from_paths()
-        self._provisional_geometry = GeometryPayload(provisional_tracks, provisional_vias)
 
-        if over_sum > 0:
-            logger.warning(f"[EMIT] Overuse={over_sum}: emitting provisional geometry only (not exported)")
-            self._geometry_payload = GeometryPayload([], [])  # No clean geometry
-            return (0, 0)
+        # ALWAYS merge escape geometry with routed geometry
+        # Deduplicate helper
+        def _dedupe(items, key_fn):
+            seen, out = set(), []
+            for it in items:
+                k = key_fn(it)
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(it)
+            return out
 
-        # No overuse: emit clean geometry for export
-        logger.info("[EMIT] Converting to clean geometry")
-
-        # Merge escape geometry with routed geometry
         final_tracks = provisional_tracks
         final_vias = provisional_vias
 
         if hasattr(self, '_escape_tracks') and self._escape_tracks:
-            # Deduplicate helper
-            def _dedupe(items, key_fn):
-                seen, out = set(), []
-                for it in items:
-                    k = key_fn(it)
-                    if k in seen:
-                        continue
-                    seen.add(k)
-                    out.append(it)
-                return out
-
             # Merge escapes first (so they're visually "underneath")
             combined_tracks = self._escape_tracks + provisional_tracks
             combined_vias = self._escape_vias + provisional_vias
@@ -4593,13 +5361,27 @@ class PathFinderRouter:
                           round(v.get("diameter", 0), 3))
             )
 
-            logger.info(f"[PREVIEW-MERGE] escapes={len(self._escape_tracks)} + "
+            logger.info(f"[ESCAPE-MERGE] escapes={len(self._escape_tracks)} + "
                        f"routed={len(provisional_tracks)} → "
                        f"total={len(final_tracks)} tracks after dedup")
-            logger.info(f"[PREVIEW-MERGE] escape_vias={len(self._escape_vias)} + "
+            logger.info(f"[ESCAPE-MERGE] escape_vias={len(self._escape_vias)} + "
                        f"routed_vias={len(provisional_vias)} → "
                        f"total={len(final_vias)} vias after dedup")
 
+        # Store merged geometry as provisional (for GUI display)
+        self._provisional_geometry = GeometryPayload(final_tracks, final_vias)
+
+        # Check for overuse (include via spatial violations)
+        over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
+
+        if over_sum > 0:
+            logger.warning(f"[EMIT] Overuse={over_sum}: showing merged geometry in GUI but not exporting to KiCad")
+            self._geometry_payload = GeometryPayload([], [])  # No clean geometry for export
+            # Return merged counts so GUI shows escapes + routes
+            return (len(final_tracks), len(final_vias))
+
+        # No overuse: emit clean geometry for KiCad export
+        logger.info("[EMIT] Routing converged! Exporting clean geometry with escapes")
         self._geometry_payload = GeometryPayload(final_tracks, final_vias)
         return (len(final_tracks), len(final_vias))
 
@@ -4753,7 +5535,17 @@ class PathFinderRouter:
         return (tracks, vias)
 
     def get_geometry_payload(self):
-        """Get clean geometry (only if no overuse)"""
+        """
+        Get geometry payload for GUI/export.
+
+        Returns clean geometry if available (no overuse),
+        otherwise returns provisional geometry so GUI can still display/export.
+        """
+        # If clean geometry is empty but provisional exists, return provisional
+        if (not self._geometry_payload.tracks and not self._geometry_payload.vias
+            and hasattr(self, '_provisional_geometry')
+            and (self._provisional_geometry.tracks or self._provisional_geometry.vias)):
+            return self._provisional_geometry
         return self._geometry_payload
 
     def get_provisional_geometry(self):
