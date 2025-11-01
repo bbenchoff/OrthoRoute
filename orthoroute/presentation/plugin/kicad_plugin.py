@@ -39,21 +39,10 @@ class KiCadPlugin:
     
     def _setup_logging(self):
         """Setup logging configuration for plugin."""
-        # MAKE LOGS UN-MISSABLE: Set root level and handler levels to DEBUG
-        root = logging.getLogger()
-        root.setLevel(logging.DEBUG)
-        for h in root.handlers:
-            h.setLevel(logging.DEBUG)
-        
-        # Configure logging for plugin context
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.handlers.RotatingFileHandler('orthoroute_plugin.log', maxBytes=10_000_000, backupCount=3, encoding='utf-8', delay=True),
-                logging.StreamHandler()
-            ]
-        )
+        # NOTE: Logging already configured by init_logging() in main.py
+        # init_logging() sets up: DEBUG→file (logs/), WARNING→console
+        # DO NOT modify handler levels here to prevent console spam
+        pass
     
     def _setup_services(self):
         """Initialize plugin services."""

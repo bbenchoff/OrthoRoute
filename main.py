@@ -29,9 +29,10 @@ def setup_environment():
     # Initialize configuration
     config = initialize_config()
 
-    # Setup logging
-    setup_logging(config.get_settings().logging)
-    
+    # NOTE: setup_logging() disabled to prevent duplicate handlers
+    # init_logging() already configured DEBUG→file, WARNING→console
+    # setup_logging(config.get_settings().logging)
+
     return config
 
 

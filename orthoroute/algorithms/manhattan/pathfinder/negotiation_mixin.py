@@ -304,6 +304,19 @@ class NegotiationMixin:
         self.routed_nets.clear()
         total_nets = len(valid_nets)
 
+        # Build edge→src mapping once for barrel conflict detection (GPU-accelerated)
+        print("\n" + "="*80)
+        print("[NEGOTIATION-START] Building edge_src_map for barrel conflict detection")
+        print("="*80 + "\n")
+        logger.info("="*80)
+        logger.info("[NEGOTIATION-START] Building edge_src_map for barrel conflict detection")
+        logger.info("="*80)
+        if hasattr(self, '_ensure_edge_src_map'):
+            self._ensure_edge_src_map()
+        else:
+            logger.error("[NEGOTIATION-START] ERROR: _ensure_edge_src_map method NOT FOUND!")
+            print("[ERROR] _ensure_edge_src_map method NOT FOUND!")
+
         for it in range(1, cfg.max_iterations + 1):
             logger.info("[NEGOTIATE] iter=%d pres_fac=%.2f", it, pres_fac)
             self.current_iteration = it
@@ -332,6 +345,31 @@ class NegotiationMixin:
 
             # 2) Compute overuse on PRESENT and update costs
             over_sum, over_edges = self._compute_overuse_stats_present()  # must not raise
+
+            # 2b) CRITICAL: Detect via barrel conflicts (GPU-accelerated)
+            # This is THE fix for shorting_items! Detects when edges touch via barrels owned by other nets.
+            if hasattr(self, '_detect_barrel_conflicts'):
+                conflict_edge_indices, conflict_count = self._detect_barrel_conflicts()
+                if conflict_count > 0:
+                    logger.info(f"[BARREL-CONFLICT] Marking {conflict_count} conflicting edges as overused")
+                    # Mark conflicting edges as overused in present usage array (CRITICAL!)
+                    # This makes PathFinder see them and reroute them
+                    import numpy as np
+                    pres = self.edge_present_usage
+                    if hasattr(pres, 'get'):
+                        # GPU array - need to update on GPU
+                        import cupy as cp
+                        conflict_indices_gpu = cp.asarray(conflict_edge_indices)
+                        pres[conflict_indices_gpu] += 10.0  # Barrel conflict penalty
+                    else:
+                        # CPU array
+                        pres[conflict_edge_indices] += 10.0  # Barrel conflict penalty
+
+                    # Add to overuse stats
+                    over_sum += conflict_count
+                    over_edges += conflict_count
+                    logger.info(f"[BARREL-CONFLICT] Added {conflict_count} barrel conflicts to overuse (new total: {over_sum})")
+
             self._update_edge_total_costs(pres_fac)
 
             # 3) Route all nets against current costs (must not throw on single-net failure)

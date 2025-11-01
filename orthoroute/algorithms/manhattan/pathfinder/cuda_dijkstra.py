@@ -509,6 +509,7 @@ class CUDADijkstra:
             const unsigned int* roi_bitmap,     // (K, bitmap_words) per ROI - neighbor must be in bitmap!
             const int bitmap_words,             // Words per ROI bitmap
             const int use_bitmap,               // 1 = enforce bitmap, 0 = bbox-only (iteration 1 mode)
+            int* blocked_by_bitmap_counter,     // INSTRUMENTATION: count neighbors blocked by bitmap
             // Phase 4: ROI bounding boxes
             const int* roi_minx,                // (K,) Min X per ROI
             const int* roi_maxx,                // (K,) Max X per ROI
@@ -578,6 +579,8 @@ class CUDADijkstra:
                     if (nbr_word >= bitmap_words) continue;  // Neighbor index exceeds bitmap size
                     const unsigned int nbr_in_bitmap = (roi_bitmap[bitmap_off + nbr_word] >> nbr_bit) & 1;
                     if (nbr_in_bitmap == 0) {
+                        // INSTRUMENTATION: Count blocked neighbors
+                        atomicAdd(blocked_by_bitmap_counter, 1);
                         continue;  // Neighbor not in ROI - skip to prevent diagonal traces!
                     }
                 }
@@ -3239,6 +3242,9 @@ class CUDADijkstra:
         # Get use_bitmap flag from data dict
         use_bitmap_flag = 1 if data.get('use_bitmap', False) else 0  # Default FALSE for iter-1 compatibility
 
+        # INSTRUMENTATION: Allocate counter for blocked neighbors
+        blocked_counter = cp.zeros(1, dtype=cp.int32)
+
         args = (
             total_active,
             max_roi_size,
@@ -3268,6 +3274,7 @@ class CUDADijkstra:
             data['roi_bitmaps'].ravel(),    # (K, bitmap_words) flattened
             data['bitmap_words'],           # Words per bitmap
             use_bitmap_flag,                # 1 = enforce bitmap, 0 = bbox-only
+            blocked_counter,                # INSTRUMENTATION: bitmap block counter
             # Phase 4: ROI bounding boxes
             data['roi_minx'],
             data['roi_maxx'],
@@ -3288,6 +3295,13 @@ class CUDADijkstra:
         logger.info(f"[BATCH-SANITY] active_list_kernel: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape} node_ids.shape={node_ids.shape}")
         logger.info(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
         self.active_list_kernel((grid_size,), (block_size,), args)
+
+        # INSTRUMENTATION: Log bitmap blocking
+        blocked_count = int(blocked_counter[0])
+        if use_bitmap_flag and blocked_count > 0:
+            logger.info(f"[BITMAP-DEBUG] Blocked {blocked_count:,} neighbors by owner bitmap")
+        elif use_bitmap_flag:
+            logger.warning(f"[BITMAP-DEBUG] use_bitmap=1 but 0 neighbors blocked!")
         if rr_alpha > 0.0:
             logger.info(f"[KERNEL-RR-WAVEFRONT] Active: alpha={float(rr_alpha)}, window={int(window_cols)}")
         if jitter_eps > 0.0:

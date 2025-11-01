@@ -70,33 +70,19 @@ def setup_logging(settings: LoggingSettings) -> None:
         component_logger = logging.getLogger(component)
         component_logger.setLevel(getattr(logging, level.upper()))
 
-    # INFO LOGGING FOR CLEAN DEMO OUTPUT
-    root_logger.setLevel(logging.INFO)
+    # Configure handlers: DEBUG to file, WARNING to console
+    root_logger.setLevel(logging.DEBUG)  # Allow all levels through
     for h in root_logger.handlers:
-        h.setLevel(logging.INFO)
-
-    # Add dedicated debug file handler (DEBUG to file only)
-    try:
-        debug_fh = logging.handlers.RotatingFileHandler(
-            "orthoroute_debug.log",
-            maxBytes=10_000_000,  # 10 MB
-            backupCount=3,
-            encoding="utf-8",
-            delay=True  # Don't open file until first log - prevents Windows locking issues
-        )
-        debug_fh.setLevel(logging.DEBUG)
-        debug_fh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-        root_logger.addHandler(debug_fh)
-        root_logger.info("[LOG] Debug file handler added: orthoroute_debug.log")
-    except Exception as e:
-        root_logger.error(f"Failed to add debug file handler: {e}")
-
-    # Ensure console shows only INFO and above
-    root_logger.info("[LOG] Console logging set to INFO level for clean demo output")
+        if isinstance(h, logging.StreamHandler) and h.stream == sys.stdout:
+            # Console handler: WARNING only
+            h.setLevel(logging.WARNING)
+        else:
+            # File handlers: DEBUG level
+            h.setLevel(logging.DEBUG)
 
     # Log startup message
-    root_logger.debug("[LOG] Debug level enabled on all handlers")
-    root_logger.info("OrthoRoute logging initialized")
+    root_logger.warning("[LOG] Console: WARNING only (full logs in logs/ directory)")
+    root_logger.info("OrthoRoute logging initialized with file+console handlers")
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -153,32 +139,57 @@ class ContextLogger:
 
 
 def init_logging():
-    """Initialize logging with INFO+ to orthoroute_debug.log file."""
-    # Ensure file handler writes INFO+ and flushes
-    fh = logging.handlers.RotatingFileHandler(
-        "orthoroute_debug.log",
-        maxBytes=10_000_000,  # 10 MB
-        backupCount=3,
-        encoding="utf-8",
-        delay=True  # Don't open file until first log - prevents Windows locking issues
-    )
-    fh.setLevel(logging.INFO)
+    """Initialize logging with DEBUG to file, WARNING to console.
+
+    This prevents Claude Code memory overflow while preserving full logs for debugging.
+    - File (logs/latest.log): DEBUG level - everything
+    - Console (stdout): WARNING level - critical messages only
+    """
+    import os
+    from datetime import datetime
+
+    # Create logs directory
+    os.makedirs("logs", exist_ok=True)
+
+    # Delete old latest.log if it exists
+    latest_log = "logs/latest.log"
+    if os.path.exists(latest_log):
+        try:
+            os.remove(latest_log)
+        except:
+            pass  # If locked, just append
+
+    # Create timestamped log for history
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamped_log = f"logs/run_{timestamp}.log"
+
     fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    fh.setFormatter(fmt)
 
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(fh)
+    # FILE HANDLER 1: latest.log (DEBUG level - everything)
+    fh_latest = logging.FileHandler(latest_log, mode='w', encoding='utf-8')
+    fh_latest.setLevel(logging.DEBUG)
+    fh_latest.setFormatter(fmt)
 
-    # Keep console handler as-is (INFO)
+    # FILE HANDLER 2: timestamped log (DEBUG level - everything)
+    fh_timestamped = logging.FileHandler(timestamped_log, mode='w', encoding='utf-8')
+    fh_timestamped.setLevel(logging.DEBUG)
+    fh_timestamped.setFormatter(fmt)
+
+    # CONSOLE HANDLER: WARNING only (prevents memory overflow)
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.WARNING)
     console_handler.setFormatter(fmt)
+
+    # Configure root logger
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)  # Allow DEBUG through (handlers will filter)
+    root.addHandler(fh_latest)
+    root.addHandler(fh_timestamped)
     root.addHandler(console_handler)
 
-    # Ensure the UPF module logger is at INFO level for portal logs
-    upf_logger = logging.getLogger("orthoroute.algorithms.manhattan.unified_pathfinder")
-    upf_logger.setLevel(logging.INFO)
+    # Log startup message
+    root.info(f"[LOGGING] Full logs: {latest_log} and {timestamped_log}")
+    root.warning(f"[LOGGING] Console: WARNING only (full logs in logs/ directory)")
 
 
 def get_context_logger(name: str, **context) -> ContextLogger:

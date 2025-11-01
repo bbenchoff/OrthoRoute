@@ -154,6 +154,7 @@ class ViaKernelManager:
         self.use_gpu = use_gpu and CUDA_AVAILABLE
         self.hard_block_kernel = None
         self.via_penalty_kernel = None
+        self.barrel_conflict_kernel = None
 
         if self.use_gpu:
             self._compile_kernels()
@@ -168,6 +169,10 @@ class ViaKernelManager:
             self.via_penalty_kernel = cp.RawKernel(
                 VIA_PENALTY_KERNEL_CODE,
                 'apply_via_pooling_penalties'
+            )
+            self.barrel_conflict_kernel = cp.RawKernel(
+                BARREL_CONFLICT_KERNEL,
+                'detect_barrel_conflicts'
             )
             logger.info("[VIA-KERNELS] CUDA kernels compiled successfully")
         except Exception as e:
@@ -334,6 +339,68 @@ class ViaKernelManager:
 
         return penalties
 
+    def detect_barrel_conflicts_gpu(
+        self,
+        edge_indices_gpu: cp.ndarray,      # Edge indices to check
+        edge_net_ids_gpu: cp.ndarray,      # Net ID for each edge
+        edge_src_map_gpu: cp.ndarray,      # Precomputed src node mapping
+        graph_indices_gpu: cp.ndarray,     # CSR graph indices (destinations)
+        node_owner_gpu: cp.ndarray,        # Node ownership array
+    ) -> int:
+        """
+        GPU kernel: Detect via barrel conflicts in committed paths.
+
+        This kernel detects when committed edges touch via barrel nodes owned by other nets.
+        Runs in parallel across all edges for maximum performance.
+
+        Args:
+            edge_indices_gpu: Edge indices to check (CuPy array)
+            edge_net_ids_gpu: Net ID for each edge (CuPy array)
+            edge_src_map_gpu: Precomputed edge → src node mapping (CuPy array)
+            graph_indices_gpu: CSR graph indices array (CuPy array)
+            node_owner_gpu: Node ownership array, -1=free (CuPy array)
+
+        Returns:
+            Number of barrel conflicts detected
+        """
+        if not self.use_gpu or self.barrel_conflict_kernel is None:
+            raise RuntimeError("GPU barrel conflict kernel not available")
+
+        num_edges = len(edge_indices_gpu)
+        if num_edges == 0:
+            return 0
+
+        # Allocate output counter on GPU
+        conflict_count = cp.zeros(1, dtype=cp.int32)
+
+        # Configure kernel launch
+        threads_per_block = 256
+        num_blocks = (num_edges + threads_per_block - 1) // threads_per_block
+
+        # Launch kernel
+        t0 = time.perf_counter()
+        self.barrel_conflict_kernel(
+            (num_blocks,),
+            (threads_per_block,),
+            (
+                edge_indices_gpu,
+                edge_net_ids_gpu,
+                edge_src_map_gpu,
+                graph_indices_gpu,
+                node_owner_gpu,
+                num_edges,
+                conflict_count,
+                cp.int32(0)  # nullptr for conflict_edge_flags (we only need count)
+            )
+        )
+        cp.cuda.Stream.null.synchronize()
+        elapsed = time.perf_counter() - t0
+
+        conflicts = int(conflict_count[0])
+        logger.info(f"[BARREL-CONFLICT-GPU] Detected {conflicts} conflicts in {elapsed*1000:.2f}ms (checked {num_edges} edges)")
+
+        return conflicts
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CUDA KERNEL #3: OWNER-AWARE VIA KEEPOUT BLOCKING
@@ -381,6 +448,63 @@ void block_via_keepouts_owner_aware(
             // Planar edge - block it
             costs[eid] = block_cost;
             atomicAdd(blocked_count, 1);
+        }
+    }
+}
+'''
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CUDA KERNEL #4: VIA BARREL CONFLICT DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BARREL_CONFLICT_KERNEL = r'''
+extern "C" __global__
+void detect_barrel_conflicts(
+    const int* edge_indices,        // [num_edges] Edge indices to check
+    const int* edge_net_ids,        // [num_edges] Net ID for each edge
+    const int* edge_src_map,        // [total_edges] Precomputed src node for each edge idx
+    const int* graph_indices,       // [total_edges] CSR indices (destinations)
+    const int* node_owner,          // [num_nodes] Node ownership (-1 = free, else net_id)
+    const int num_edges_to_check,  // Number of edges to check
+    int* conflict_count,            // Output: total conflicts detected
+    int* conflict_edge_flags        // Optional: [num_edges_to_check] 1 if conflict, 0 otherwise
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_edges_to_check) return;
+
+    int edge_idx = edge_indices[idx];
+    int net_id = edge_net_ids[idx];
+
+    // Get source and destination nodes for this edge
+    int src_node = edge_src_map[edge_idx];
+    int dst_node = graph_indices[edge_idx];
+
+    // Check if either endpoint is owned by a different net (via barrel conflict!)
+    int src_owner = node_owner[src_node];
+    int dst_owner = node_owner[dst_node];
+
+    bool conflict = false;
+
+    // Conflict if src is owned by another net
+    if (src_owner != -1 && src_owner != net_id) {
+        conflict = true;
+    }
+
+    // Conflict if dst is owned by another net
+    if (dst_owner != -1 && dst_owner != net_id) {
+        conflict = true;
+    }
+
+    // Record conflict
+    if (conflict) {
+        atomicAdd(conflict_count, 1);
+        if (conflict_edge_flags != nullptr) {
+            conflict_edge_flags[idx] = 1;
+        }
+    } else {
+        if (conflict_edge_flags != nullptr) {
+            conflict_edge_flags[idx] = 0;
         }
     }
 }
@@ -524,3 +648,48 @@ def apply_via_penalties_cpu(
             penalty_count += 1
 
     return penalty_count
+
+
+def detect_barrel_conflicts_cpu(
+    edge_indices: np.ndarray,
+    edge_net_ids: np.ndarray,
+    edge_src_map: np.ndarray,
+    graph_indices: np.ndarray,
+    node_owner: np.ndarray
+) -> int:
+    """
+    CPU fallback: Detect via barrel conflicts.
+
+    Checks each committed edge to see if its endpoints touch via barrel nodes
+    owned by other nets.
+
+    Args:
+        edge_indices: Edge indices to check
+        edge_net_ids: Net ID for each edge
+        edge_src_map: Precomputed edge → src node mapping
+        graph_indices: CSR graph indices (destinations)
+        node_owner: Node ownership array (-1 = free)
+
+    Returns:
+        Number of conflicts detected
+    """
+    conflict_count = 0
+
+    for i in range(len(edge_indices)):
+        edge_idx = int(edge_indices[i])
+        net_id = int(edge_net_ids[i])
+
+        # Get source and destination nodes
+        src_node = int(edge_src_map[edge_idx])
+        dst_node = int(graph_indices[edge_idx])
+
+        # Check ownership
+        src_owner = int(node_owner[src_node])
+        dst_owner = int(node_owner[dst_node])
+
+        # Conflict if either endpoint is owned by a different net
+        if (src_owner != -1 and src_owner != net_id) or \
+           (dst_owner != -1 and dst_owner != net_id):
+            conflict_count += 1
+
+    return conflict_count

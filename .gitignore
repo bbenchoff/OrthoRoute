@@ -52,6 +52,10 @@ gpu_parallelization.py
 orthoroute.log
 *.tmp
 *.temp
+tests/
+tests/*
+logs/
+logs/*
 
 # Status and summary documents (keep in docs/)
 *_SUMMARY.md

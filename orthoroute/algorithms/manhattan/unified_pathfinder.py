@@ -909,10 +909,7 @@ class EdgeAccountant:
         # DIAGNOSTIC: Log what's actually happening
         if not hasattr(self, '_hist_update_count'):
             self._hist_update_count = 0
-            print(f"### UPDATE_HISTORY: Initializing counter", file=sys.stderr, flush=True)
         self._hist_update_count += 1
-
-        print(f"### UPDATE_HISTORY: Call #{self._hist_update_count} gain={gain:.3f} decay={decay_factor:.3f} cap_mult={history_cap_multiplier:.1f}", file=sys.stderr, flush=True)
 
         # Always log first 5 calls
         if self._hist_update_count <= 5:
@@ -2757,6 +2754,25 @@ class PathFinderRouter:
                         self.node_owner[node_idx] = net_id
                         owned_count += 1
 
+        # 3. ESCAPE VIA COLUMNS: Mark internal-layer nodes from via keepouts (escape vias!)
+        # This is THE missing piece - escape vias in _via_keepouts_map weren't in node_owner!
+        if hasattr(self, '_via_keepouts_map') and self._via_keepouts_map:
+            escape_owned = 0
+            for (z, xu, yu), owner_net in self._via_keepouts_map.items():
+                # Skip F.Cu (z=0) so source seeds aren't blocked
+                if z <= 0:
+                    continue
+                node_idx = self.lattice.node_idx(xu, yu, z)
+                net_id_int = self._get_net_id(owner_net)
+                # First owner wins (don't thrash ownership)
+                if self.node_owner[node_idx] == -1:
+                    self.node_owner[node_idx] = net_id_int
+                    owned_count += 1
+                    escape_owned += 1
+
+            if escape_owned > 0:
+                logger.info(f"[NODE-OWNER] Escape via columns marked: {escape_owned:,} internal layer nodes")
+
         logger.info(f"[NODE-OWNER] Marked {owned_count:,} nodes as owned ({owned_count*100//self.lattice.num_nodes}% of graph)")
         # NOTE: Node ownership enforced via bitmap filtering in GPU kernels, not cost penalties!
 
@@ -2766,6 +2782,40 @@ class PathFinderRouter:
             self.net_id_map[net_name] = self.next_net_id
             self.next_net_id += 1
         return self.net_id_map[net_name]
+
+    def _ensure_edge_src_map(self):
+        """
+        Build mapping from edge index to source node (once per routing).
+
+        This is critical for barrel conflict detection - we need to know both
+        endpoints of each edge. The CSR graph gives us destinations (indices),
+        but we need to reconstruct sources from indptr.
+
+        Performance: O(num_edges), done once at start of routing.
+        """
+        if hasattr(self, "_edge_src"):
+            return
+
+        import numpy as np
+
+        # Get indptr from graph (handle both CPU and GPU)
+        indptr = self.graph.indptr
+        if hasattr(indptr, 'get'):
+            indptr = indptr.get()
+
+        # Total number of edges
+        num_edges = len(self.graph.indices)
+
+        # Build reverse mapping: edge_idx → source_node
+        edge_src = np.empty(num_edges, dtype=np.int32)
+
+        for u in range(len(indptr) - 1):
+            edge_start = int(indptr[u])
+            edge_end = int(indptr[u + 1])
+            edge_src[edge_start:edge_end] = u
+
+        self._edge_src = edge_src
+        logger.info(f"[EDGE-SRC-MAP] Built mapping for {num_edges:,} edges")
 
     def _mark_via_barrel_ownership_for_path(self, net_name: str, path: List[int]) -> None:
         """
@@ -3483,6 +3533,10 @@ class PathFinderRouter:
         logger.info(f"[NEGOTIATE] {len(tasks)} nets, {cfg.max_iterations} iters")
         logger.info(f"[PARAMS] layers={n_sig_layers} pres_fac_init={pres_fac:.2f} pres_fac_mult={pres_fac_mult:.2f} pres_fac_max={pres_fac_max:.0f} hist_gain={hist_gain:.2f} hist_weight={cfg.hist_cost_weight * hist_cost_weight_mult:.1f}")
 
+        # Build edge→src mapping for barrel conflict detection
+        logger.warning("[BARREL-CONFLICT-INIT] Building edge_src_map once before routing")
+        self._ensure_edge_src_map()
+
         for it in range(1, cfg.max_iterations + 1):
             self.iteration = it
             logger.info(f"[ITER {it}] pres_fac={pres_fac:.2f}")
@@ -3669,6 +3723,25 @@ class PathFinderRouter:
             # STEP 4: Overuse (include via spatial violations)
             over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
 
+            # STEP 4.5: CRITICAL - Detect via barrel conflicts (GPU-accelerated)
+            conflict_edge_indices, conflict_count = self._detect_barrel_conflicts()
+            if conflict_count > 0:
+                logger.warning(f"[BARREL-CONFLICT] Detected {conflict_count} barrel conflicts in iteration {it}")
+                # Mark conflicting edges as overused
+                pres = self.accounting.present
+                if hasattr(pres, 'get'):
+                    # GPU array
+                    import cupy as cp
+                    conflict_indices_gpu = cp.asarray(conflict_edge_indices)
+                    pres[conflict_indices_gpu] += 10.0
+                else:
+                    # CPU array
+                    pres[conflict_edge_indices] += 10.0
+                # Add to overuse stats
+                over_sum += conflict_count
+                over_cnt += conflict_count
+                logger.info(f"[BARREL-CONFLICT] Updated overuse: sum={over_sum}, edges={over_cnt}")
+
             # Instrumentation: via overuse ratio
             # OPTIMIZATION: Use cached GPU transfers
             present = present_cpu_cache
@@ -3851,9 +3924,6 @@ class PathFinderRouter:
             # Early iterations (1-10): No decay (1.0) to build up history
             # Later iterations (11+): Gentle decay (0.98) allows route redistribution
             history_decay = 0.98 if it >= 10 else 1.0
-
-            import sys
-            print(f"### BEFORE update_history: it={it} gain={hist_gain_eff:.3f} cap_mult={hist_cap_mult:.1f} decay={history_decay:.3f}", file=sys.stderr, flush=True)
 
             self.accounting.update_history(
                 hist_gain_eff,
@@ -5206,6 +5276,102 @@ class PathFinderRouter:
                     out.append(ei)
                     break
         return out
+
+    def _detect_barrel_conflicts(self) -> Tuple[np.ndarray, int]:
+        """
+        Detect via barrel conflicts across all committed paths (GPU-accelerated).
+
+        This is THE critical fix for shorting_items violations!
+        Detects when committed edges touch via barrel nodes owned by other nets.
+
+        Returns:
+            (conflict_edge_indices, conflict_count)
+        """
+        import numpy as np
+
+        logger.warning("[BARREL-CONFLICT] Checking for via barrel conflicts...")
+
+        # Bail out if node_owner not initialized
+        if not hasattr(self, 'node_owner') or self.node_owner is None:
+            logger.info("[BARREL-CONFLICT] Skipping: node_owner not initialized")
+            return np.array([], dtype=np.int32), 0
+
+        # Ensure edge_src mapping exists
+        self._ensure_edge_src_map()
+
+        # Use _net_paths (with underscore) - this is what the negotiation loop uses!
+        paths_dict = getattr(self, '_net_paths', {})
+        if not paths_dict:
+            # Fallback to net_paths if _net_paths doesn't exist
+            paths_dict = getattr(self, 'net_paths', {})
+
+        if not paths_dict:
+            logger.info("[BARREL-CONFLICT] Skipping: no committed paths found")
+            return np.array([], dtype=np.int32), 0
+
+        logger.info(f"[BARREL-CONFLICT] Found {len(paths_dict)} committed paths")
+
+        # Collect all committed edges with their net IDs
+        all_edge_indices = []
+        all_net_ids = []
+
+        for net_name, path in paths_dict.items():
+            if not path or len(path) < 2:
+                continue
+
+            net_id = self._get_net_id(net_name)
+            edge_indices = self._path_to_edges(path)
+
+            all_edge_indices.extend(edge_indices)
+            all_net_ids.extend([net_id] * len(edge_indices))
+
+        if len(all_edge_indices) == 0:
+            logger.info("[BARREL-CONFLICT] No edges found in paths")
+            return np.array([], dtype=np.int32), 0
+
+        logger.info(f"[BARREL-CONFLICT] Checking {len(all_edge_indices)} edges across {len(paths_dict)} nets")
+
+        # Convert to arrays
+        edge_indices = np.array(all_edge_indices, dtype=np.int32)
+        edge_net_ids = np.array(all_net_ids, dtype=np.int32)
+
+        # Get graph data (handle CPU/GPU)
+        graph_indices = self.graph.indices
+        if hasattr(graph_indices, 'get'):
+            graph_indices_cpu = graph_indices.get()
+        else:
+            graph_indices_cpu = graph_indices
+
+        # Detect conflicts - we need to know WHICH edges have conflicts
+        conflict_mask = np.zeros(len(edge_indices), dtype=bool)
+
+        for i in range(len(edge_indices)):
+            edge_idx = int(edge_indices[i])
+            net_id = int(edge_net_ids[i])
+
+            # Get source and destination nodes
+            src_node = int(self._edge_src[edge_idx])
+            dst_node = int(graph_indices_cpu[edge_idx])
+
+            # Check ownership
+            src_owner = int(self.node_owner[src_node])
+            dst_owner = int(self.node_owner[dst_node])
+
+            # Conflict if either endpoint is owned by a different net
+            if (src_owner != -1 and src_owner != net_id) or \
+               (dst_owner != -1 and dst_owner != net_id):
+                conflict_mask[i] = True
+
+        # Get the actual edge indices that have conflicts
+        conflict_edge_indices = edge_indices[conflict_mask]
+        conflict_count = len(conflict_edge_indices)
+
+        if conflict_count > 0:
+            logger.info(f"[BARREL-CONFLICT] Detected {conflict_count} conflicts (checked {len(edge_indices)} edges)")
+        else:
+            logger.info(f"[BARREL-CONFLICT] No conflicts found (checked {len(edge_indices)} edges)")
+
+        return conflict_edge_indices, conflict_count
 
     def _path_is_manhattan(self, path: List[int]) -> bool:
         """Validate that path obeys Manhattan routing discipline"""
