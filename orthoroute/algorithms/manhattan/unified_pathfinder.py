@@ -3720,27 +3720,40 @@ class PathFinderRouter:
             if not self.accounting.verify_present_matches_canonical():
                 logger.warning(f"[ITER {it}] Accounting mismatch detected - potential bug")
 
-            # STEP 4: Overuse (include via spatial violations)
-            over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
-
-            # STEP 4.5: CRITICAL - Detect via barrel conflicts (GPU-accelerated)
+            # STEP 3.5: CRITICAL - Detect via barrel conflicts BEFORE computing overuse
+            # TWO-PHASE APPROACH:
+            #   Phase 1 (iters 1-50): Aggressively penalize barrel conflicts
+            #   Phase 2 (iters 51+): Disable penalties, let PathFinder optimize freely
             conflict_edge_indices, conflict_count = self._detect_barrel_conflicts()
+
+            BARREL_PHASE_1_ITERS = 50  # Aggressive barrel conflict reduction
+
             if conflict_count > 0:
                 logger.warning(f"[BARREL-CONFLICT] Detected {conflict_count} barrel conflicts in iteration {it}")
-                # Mark conflicting edges as overused
-                pres = self.accounting.present
-                if hasattr(pres, 'get'):
-                    # GPU array
-                    import cupy as cp
-                    conflict_indices_gpu = cp.asarray(conflict_edge_indices)
-                    pres[conflict_indices_gpu] += 10.0
+
+                if it <= BARREL_PHASE_1_ITERS:
+                    # PHASE 1: Apply penalty to reduce barrel conflicts
+                    pres = self.accounting.present
+                    conflict_penalty = min(10.0 * pres_fac, 100.0)  # Cap at 100
+
+                    if hasattr(pres, 'get'):
+                        # GPU array
+                        import cupy as cp
+                        conflict_indices_gpu = cp.asarray(conflict_edge_indices)
+                        pres[conflict_indices_gpu] += conflict_penalty
+                    else:
+                        # CPU array
+                        pres[conflict_edge_indices] += conflict_penalty
+
+                    logger.info(f"[BARREL-CONFLICT] PHASE 1: Applied penalty {conflict_penalty:.1f} to {conflict_count} edges")
                 else:
-                    # CPU array
-                    pres[conflict_edge_indices] += 10.0
-                # Add to overuse stats
-                over_sum += conflict_count
-                over_cnt += conflict_count
-                logger.info(f"[BARREL-CONFLICT] Updated overuse: sum={over_sum}, edges={over_cnt}")
+                    # PHASE 2: Detection only, no penalty - let PathFinder optimize
+                    logger.info(f"[BARREL-CONFLICT] PHASE 2: No penalty applied (iteration {it} > {BARREL_PHASE_1_ITERS})")
+                    if it == BARREL_PHASE_1_ITERS + 1:
+                        logger.warning(f"[BARREL-CONFLICT] *** PHASE 2 START: Barrel penalties disabled for remaining iterations ***")
+
+            # STEP 4: Overuse (now includes barrel conflicts as usage)
+            over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
 
             # Instrumentation: via overuse ratio
             # OPTIMIZATION: Use cached GPU transfers
