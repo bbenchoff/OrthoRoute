@@ -73,15 +73,15 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
     pres_fac_init = 1.0
 
     if ρ < 0.6:
-        # SPARSE: Fast convergence
-        pres_fac_mult = 1.15
-        pres_fac_max = 6.0
-        strategy = "SPARSE (fast convergence)"
+        # SPARSE: Fast convergence - AGGRESSIVE growth to break plateau early
+        pres_fac_mult = 1.30  # Increased from 1.15 to reach critical threshold ~3x faster
+        pres_fac_max = 12.0   # Increased ceiling to allow full escalation
+        strategy = "SPARSE (aggressive convergence)"
     elif ρ < 0.9:
-        # NORMAL: Balanced
-        pres_fac_mult = 1.12
-        pres_fac_max = 7.0
-        strategy = "NORMAL (balanced)"
+        # NORMAL: Balanced - moderate acceleration
+        pres_fac_mult = 1.20  # Increased from 1.12
+        pres_fac_max = 10.0   # Increased ceiling
+        strategy = "NORMAL (accelerated)"
     elif ρ < 1.2:
         # TIGHT: Gentle escalation
         pres_fac_mult = 1.10
