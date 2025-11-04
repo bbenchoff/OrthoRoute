@@ -22,14 +22,14 @@ A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository 
       <a href="https://www.youtube.com/watch?v=KXxxNQPTagA">
         <img src="https://img.youtube.com/vi/KXxxNQPTagA/maxresdefault.jpg" alt="OrthoRoute Overview" width="100%"/>
         <br/>
-        <b>🎥 OrthoRoute Overview</b>
+        <b>OrthoRoute Overview</b>
       </a>
     </td>
     <td align="center" width="50%">
       <a href="https://www.youtube.com/watch?v=P8Wsej71XAQ">
         <img src="https://img.youtube.com/vi/P8Wsej71XAQ/maxresdefault.jpg" alt="Algorithm Demonstration" width="100%"/>
         <br/>
-        <b>🎥 Algorithm Demonstration</b>
+        <b>Algorithm Demonstration</b>
       </a>
     </td>
   </tr>
