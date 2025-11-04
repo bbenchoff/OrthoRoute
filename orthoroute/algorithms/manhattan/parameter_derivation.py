@@ -83,10 +83,10 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
         pres_fac_max = 10.0   # Increased ceiling
         strategy = "NORMAL (accelerated)"
     elif ρ < 1.2:
-        # TIGHT: Gentle escalation
-        pres_fac_mult = 1.10
-        pres_fac_max = 8.0
-        strategy = "TIGHT (gentle escalation)"
+        # TIGHT: AGGRESSIVE escalation for large boards
+        pres_fac_mult = 1.35  # Much more aggressive (was 1.10)
+        pres_fac_max = 16.0   # Higher ceiling (was 8.0)
+        strategy = "TIGHT (aggressive for convergence)"
     else:
         # DENSE: Very gentle
         pres_fac_mult = 1.08
@@ -125,9 +125,9 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
 
     hist_cost_weight = base_hist_weight + layer_bonus + congestion_bonus
 
-    # History gain (accumulation rate)
-    # Higher congestion needs faster accumulation
-    hist_gain = 0.20 + 0.15 * max(0.0, min(1.0, ρ - 0.8))
+    # History gain: Balanced for tight boards
+    # Not too high (fights present) or too low (gets drowned out)
+    hist_gain = 0.15  # Moderate value for ρ ~ 0.9
 
     # No decay (full memory)
     history_decay = 1.0

@@ -14,8 +14,26 @@
 
 A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository is available on the [build log for this project](https://bbenchoff.github.io/pages/OrthoRoute.html).
 
-[Watch the video](https://www.youtube.com/watch?v=KXxxNQPTagA)
-[Watch the algorithm demonstration](https://www.youtube.com/watch?v=P8Wsej71XAQ)
+## Videos
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://www.youtube.com/watch?v=KXxxNQPTagA">
+        <img src="https://img.youtube.com/vi/KXxxNQPTagA/maxresdefault.jpg" alt="OrthoRoute Overview" width="100%"/>
+        <br/>
+        <b>🎥 OrthoRoute Overview</b>
+      </a>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://www.youtube.com/watch?v=P8Wsej71XAQ">
+        <img src="https://img.youtube.com/vi/P8Wsej71XAQ/maxresdefault.jpg" alt="Algorithm Demonstration" width="100%"/>
+        <br/>
+        <b>🎥 Algorithm Demonstration</b>
+      </a>
+    </td>
+  </tr>
+</table>
 
 ## Key Features
 
