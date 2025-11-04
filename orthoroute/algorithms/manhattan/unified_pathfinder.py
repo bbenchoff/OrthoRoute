@@ -494,7 +494,7 @@ import time
 import random
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
 from collections import defaultdict
 
 # Third-party
@@ -577,8 +577,8 @@ class PathFinderConfig:
     20%+ convergence regression. Prefer infrastructure improvements over tuning.
     """
     max_iterations: int = 40  # Extended to give convergence more time
-    # CONVERGENCE SCHEDULE (BALANCED BASED ON DIAGNOSTICS):
-    pres_fac_init: float = 1.0   # Start gentle (iteration 1)
+    # CONVERGENCE SCHEDULE (AGGRESSIVE FOR FAST CONVERGENCE):
+    pres_fac_init: float = 3.0   # Start with pressure immediately (skip iteration 1 warmup)
     pres_fac_mult: float = 1.10  # Gentler exponential to keep history competitive (was 1.15)
     pres_fac_max: float = 64.0    # Allow higher pressure to resolve late-stage congestion (was 8.0)
     hist_gain: float = 0.2       # Lowered for raw present (was 0.8 with present_ema)
@@ -2022,6 +2022,11 @@ class PathFinderRouter:
         self._negotiation_ran = False
         self._geometry_payload = GeometryPayload([], [])
         self._provisional_geometry = GeometryPayload([], [])  # For GUI feedback during routing
+
+        # Checkpoint management
+        from .checkpoint import CheckpointManager
+        self.checkpoint_manager = CheckpointManager()
+        self.auto_checkpoint = True  # Enable auto-save by default
 
         # Hotset management: locked nets and clean streak tracking
         self.locked_nets: Set[str] = set()
@@ -3558,14 +3563,33 @@ class PathFinderRouter:
 
         self._negotiation_ran = True
 
-        logger.info(f"[NEGOTIATE] {len(tasks)} nets, {cfg.max_iterations} iters")
+        # Check if resuming from checkpoint
+        start_iteration = 1
+        if self.iteration > 0:
+            # Checkpoint loaded - resume from next iteration
+            start_iteration = self.iteration + 1
+
+            # Always use NEW parameters (ignore old checkpoint pres_fac)
+            # This allows testing new aggressive settings on old checkpoints
+            old_pres_fac = getattr(self, '_checkpoint_pres_fac', None)
+            pres_fac = pres_fac * (pres_fac_mult ** (self.iteration - 1))
+            pres_fac = min(pres_fac, pres_fac_max)
+
+            if old_pres_fac:
+                logger.warning(f"[CHECKPOINT-RESUME] Old pres_fac={old_pres_fac:.2f} -> NEW pres_fac={pres_fac:.2f} (using current params)")
+            else:
+                logger.warning(f"[CHECKPOINT-RESUME] Calculated pres_fac={pres_fac:.2f} for iteration {self.iteration}")
+
+            logger.warning(f"[CHECKPOINT-RESUME] Resuming from iteration {self.iteration} -> starting at {start_iteration}")
+
+        logger.info(f"[NEGOTIATE] {len(tasks)} nets, {cfg.max_iterations} iters (starting from {start_iteration})")
         logger.info(f"[PARAMS] layers={n_sig_layers} pres_fac_init={pres_fac:.2f} pres_fac_mult={pres_fac_mult:.2f} pres_fac_max={pres_fac_max:.0f} hist_gain={hist_gain:.2f} hist_weight={cfg.hist_cost_weight * hist_cost_weight_mult:.1f}")
 
         # Build edge→src mapping for barrel conflict detection
         logger.warning("[BARREL-CONFLICT-INIT] Building edge_src_map once before routing")
         self._ensure_edge_src_map()
 
-        for it in range(1, cfg.max_iterations + 1):
+        for it in range(start_iteration, cfg.max_iterations + 1):
             self.iteration = it
             logger.info(f"[ITER {it}] pres_fac={pres_fac:.2f}")
 
@@ -4035,6 +4059,22 @@ class PathFinderRouter:
                     iteration_cb(it, provisional_tracks, provisional_vias, over_sum, over_cnt)
                 except Exception as e:
                     logger.warning(f"[ITER {it}] Iteration callback failed: {e}")
+
+            # Auto-checkpoint after each iteration
+            if self.auto_checkpoint:
+                try:
+                    metadata = {
+                        'overuse': over_sum,
+                        'overused_edges': over_cnt,
+                        'routed_nets': routed,
+                        'failed_nets': failed,
+                        'via_overuse_pct': via_ratio,
+                    }
+                    self.checkpoint_manager.save_checkpoint(self, it, pres_fac, metadata)
+                    # Keep only last 10 checkpoints to save disk space
+                    self.checkpoint_manager.cleanup_old_checkpoints(keep_last_n=10)
+                except Exception as e:
+                    logger.warning(f"[CHECKPOINT] Failed to save checkpoint: {e}")
 
             # STEP 6: Terminate?
             if failed == 0 and over_sum == 0:
@@ -5304,10 +5344,17 @@ class PathFinderRouter:
             use_async = num_via_edges < 100_000_000
 
             try:
+                xu_gpu = cp.array(xu, copy=False) if not use_async else cp.asarray(xu)
+                yu_gpu = cp.array(yu, copy=False) if not use_async else cp.asarray(yu)
+
+                # Create xy_coords for GPU kernel (expects [N, 2] array)
+                xy_coords_gpu = cp.stack([xu_gpu, yu_gpu], axis=1)
+
                 self._via_edge_metadata = {
                     'indices': cp.array(via_edge_indices, copy=False) if not use_async else cp.asarray(via_edge_indices),
-                    'xu': cp.array(xu, copy=False) if not use_async else cp.asarray(xu),
-                    'yu': cp.array(yu, copy=False) if not use_async else cp.asarray(yu),
+                    'xu': xu_gpu,
+                    'yu': yu_gpu,
+                    'xy_coords': xy_coords_gpu,
                     'z_lo': cp.array(z_lo, copy=False) if not use_async else cp.asarray(z_lo),
                     'z_hi': cp.array(z_hi, copy=False) if not use_async else cp.asarray(z_hi),
                 }
@@ -5319,10 +5366,13 @@ class PathFinderRouter:
 
         if not use_via_gpu:
             # Keep on CPU - store x,y separately
+            xy_coords_cpu = np.stack([xu, yu], axis=1)
+
             self._via_edge_metadata = {
                 'indices': via_edge_indices,
                 'xu': xu,
                 'yu': yu,
+                'xy_coords': xy_coords_cpu,
                 'z_lo': z_lo,
                 'z_hi': z_hi,
             }
@@ -5801,6 +5851,43 @@ class PathFinderRouter:
     def get_provisional_geometry(self):
         """Get provisional geometry for GUI feedback (always available)"""
         return self._provisional_geometry
+
+    def load_checkpoint(self, filepath: str) -> Dict[str, Any]:
+        """
+        Load checkpoint from file.
+
+        Args:
+            filepath: Path to checkpoint file
+
+        Returns:
+            Checkpoint metadata
+        """
+        checkpoint = self.checkpoint_manager.load_checkpoint(filepath)
+        self.checkpoint_manager.restore_checkpoint(self, checkpoint)
+
+        metadata = checkpoint.get('metadata', {})
+        logger.info(f"[CHECKPOINT] Loaded iteration {self.iteration}: "
+                   f"overuse={metadata.get('overuse', 'N/A')}, "
+                   f"routed={metadata.get('routed_nets', 'N/A')}")
+
+        return checkpoint
+
+    def resume_from_checkpoint(self, filepath: str = None):
+        """
+        Resume routing from a checkpoint.
+
+        Args:
+            filepath: Path to checkpoint file (uses latest if None)
+        """
+        if filepath is None:
+            filepath = self.checkpoint_manager.get_latest_checkpoint()
+            if filepath is None:
+                raise ValueError("No checkpoints found")
+
+        checkpoint = self.load_checkpoint(filepath)
+        logger.info(f"[CHECKPOINT] Ready to resume from iteration {self.iteration}")
+
+        return checkpoint
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

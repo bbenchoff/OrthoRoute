@@ -43,6 +43,7 @@ A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository 
   - Lee's Wavefront: Traditional routing (experimental)
 - KiCad Integration: Built as a native KiCad plugin using the IPC API
 - Real-time Visualization: Interactive 2D board view with zoom, pan, and layer controls
+- Checkpoint system for instant resume after crashes
 
 ## Why GPU Acceleration?
 

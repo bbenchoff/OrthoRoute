@@ -1406,9 +1406,37 @@ class OrthoRouteMainWindow(QMainWindow):
         refresh_action = QAction("Refresh Board", self)
         refresh_action.triggered.connect(self.refresh_board)
         file_menu.addAction(refresh_action)
-        
+
         file_menu.addSeparator()
-        
+
+        # Checkpoint submenu
+        checkpoint_menu = file_menu.addMenu("Checkpoints")
+
+        save_checkpoint_action = QAction("Save Checkpoint Now", self)
+        save_checkpoint_action.setShortcut("Ctrl+S")
+        save_checkpoint_action.triggered.connect(self.save_checkpoint_manual)
+        checkpoint_menu.addAction(save_checkpoint_action)
+
+        load_checkpoint_action = QAction("Load Checkpoint...", self)
+        load_checkpoint_action.setShortcut("Ctrl+L")
+        load_checkpoint_action.triggered.connect(self.load_checkpoint_dialog)
+        checkpoint_menu.addAction(load_checkpoint_action)
+
+        resume_checkpoint_action = QAction("Resume from Latest", self)
+        resume_checkpoint_action.setShortcut("Ctrl+R")
+        resume_checkpoint_action.triggered.connect(self.resume_from_latest)
+        checkpoint_menu.addAction(resume_checkpoint_action)
+
+        checkpoint_menu.addSeparator()
+
+        self.auto_checkpoint_action = QAction("Auto-save Checkpoints", self)
+        self.auto_checkpoint_action.setCheckable(True)
+        self.auto_checkpoint_action.setChecked(True)
+        self.auto_checkpoint_action.triggered.connect(self.toggle_auto_checkpoint)
+        checkpoint_menu.addAction(self.auto_checkpoint_action)
+
+        file_menu.addSeparator()
+
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -2705,7 +2733,181 @@ class OrthoRouteMainWindow(QMainWindow):
     def auto_route_all(self):
         """Auto route all nets (menu action)"""
         self.begin_autorouting()
-    
+
+    def _ensure_router_exists(self):
+        """Create router instance if it doesn't exist (for checkpoint loading)"""
+        if hasattr(self, 'router') and self.router is not None:
+            return  # Router already exists
+
+        # Create router instance
+        from ...algorithms.manhattan.unified_pathfinder import UnifiedPathFinder, PathFinderConfig, GPUConfig
+
+        pf_config = PathFinderConfig()
+        pf_config.strict_drc = True
+
+        self.router = UnifiedPathFinder(config=pf_config, use_gpu=GPUConfig.GPU_MODE)
+        logger.info(f"[CHECKPOINT] Created new router instance for checkpoint loading")
+
+    def save_checkpoint_manual(self):
+        """Manually save a checkpoint (Ctrl+S)"""
+        try:
+            if not hasattr(self, 'router') or self.router is None:
+                QMessageBox.warning(self, "No Router", "No active router to save. Start routing first.")
+                return
+
+            # Get current iteration and pres_fac (if available)
+            iteration = getattr(self.router, 'iteration', 0)
+            pres_fac = 1.0  # Default, would need to track actual value
+
+            metadata = {'manual_save': True}
+            filepath = self.router.checkpoint_manager.save_checkpoint(
+                self.router, iteration, pres_fac, metadata
+            )
+
+            QMessageBox.information(self, "Checkpoint Saved",
+                                   f"Saved checkpoint to:\n{filepath}")
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            QMessageBox.critical(self, "Save Failed", f"Failed to save checkpoint:\n{str(e)}")
+
+    def load_checkpoint_dialog(self):
+        """Show dialog to select and load a checkpoint (Ctrl+L)"""
+        from PyQt6.QtWidgets import QFileDialog
+
+        try:
+            # Create router if it doesn't exist
+            self._ensure_router_exists()
+
+            # Get checkpoint directory
+            checkpoint_dir = str(self.router.checkpoint_manager.checkpoint_dir)
+
+            # Show file dialog
+            filepath, _ = QFileDialog.getOpenFileName(
+                self,
+                "Load Checkpoint",
+                checkpoint_dir,
+                "Checkpoint Files (*.pkl);;All Files (*)"
+            )
+
+            if filepath:
+                checkpoint = self.router.load_checkpoint(filepath)
+                metadata = checkpoint.get('metadata', {})
+
+                msg = (f"Loaded checkpoint from iteration {checkpoint['iteration']}\n"
+                      f"Overuse: {metadata.get('overuse', 'N/A')}\n"
+                      f"Routed nets: {metadata.get('routed_nets', 'N/A')}")
+
+                QMessageBox.information(self, "Checkpoint Loaded", msg)
+
+                # Refresh visualization with loaded routing
+                if hasattr(self, 'pcb_viewer'):
+                    # Get geometry from router
+                    geometry = self.router.get_provisional_geometry()
+                    if geometry and (geometry.tracks or geometry.vias):
+                        logger.info(f"[CHECKPOINT-VIS] Updating visualization: {len(geometry.tracks)} tracks, {len(geometry.vias)} vias")
+                        self.pcb_viewer.update_routing(geometry.tracks, geometry.vias)
+                    self.pcb_viewer.update()
+
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            QMessageBox.critical(self, "Load Failed", f"Failed to load checkpoint:\n{str(e)}")
+
+    def resume_from_latest(self):
+        """Resume routing from the most recent checkpoint (Ctrl+R)"""
+        try:
+            # Check if we have an existing router with board already initialized
+            has_initialized_router = (hasattr(self, 'router') and
+                                     self.router is not None and
+                                     hasattr(self.router, 'lattice') and
+                                     self.router.lattice is not None)
+
+            if not has_initialized_router:
+                # Check if checkpoint has geometry (new format = instant resume)
+                latest = self.router.checkpoint_manager.get_latest_checkpoint() if hasattr(self, 'router') and self.router else None
+                if not latest:
+                    from ...algorithms.manhattan.checkpoint import CheckpointManager
+                    cm = CheckpointManager()
+                    latest = cm.get_latest_checkpoint()
+
+                has_geometry = False
+                if latest:
+                    try:
+                        import pickle
+                        with open(latest, 'rb') as f:
+                            checkpoint = pickle.load(f)
+                        has_geometry = 'geometry' in checkpoint
+                    except:
+                        pass
+
+                if has_geometry:
+                    # New checkpoint format - instant resume!
+                    reply = QMessageBox.information(
+                        self,
+                        "Instant Resume Ready",
+                        "This checkpoint contains full board geometry.\n\n"
+                        "✓ Resume will be INSTANT (no 1-hour wait)\n"
+                        "✓ All routing state preserved\n\n"
+                        "Click OK to load checkpoint.",
+                        QMessageBox.StandardButton.Ok
+                    )
+                else:
+                    # Old checkpoint format - needs board init
+                    reply = QMessageBox.question(
+                        self,
+                        "Board Initialization Required",
+                        "This is an OLD checkpoint without board geometry.\n\n"
+                        "⏳ Requires board initialization (~1 hour)\n"
+                        "✓ New checkpoints will have instant resume\n\n"
+                        "Do you want to continue?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.No:
+                        return
+
+            # Create router if it doesn't exist
+            self._ensure_router_exists()
+
+            latest = self.router.checkpoint_manager.get_latest_checkpoint()
+
+            if latest is None:
+                QMessageBox.information(self, "No Checkpoints",
+                                       "No checkpoints found. Run routing first to create checkpoints.")
+                return
+
+            checkpoint = self.router.load_checkpoint(latest)
+            metadata = checkpoint.get('metadata', {})
+
+            msg = (f"✓ Loaded checkpoint from iteration {checkpoint['iteration']}\n\n"
+                  f"Overuse: {metadata.get('overuse', 'N/A'):,}\n"
+                  f"Routed nets: {metadata.get('routed_nets', 'N/A')}\n"
+                  f"Failed nets: {metadata.get('failed_nets', 'N/A')}\n\n"
+                  f"Router is now initialized with checkpoint state.\n"
+                  f"You can modify parameters and start routing to continue.")
+
+            # Mark that we need to resume (board init required first)
+            self._pending_checkpoint_resume = True
+
+            msg_updated = (f"✓ Loaded checkpoint from iteration {checkpoint['iteration']}\n\n"
+                  f"Overuse: {metadata.get('overuse', 'N/A'):,}\n"
+                  f"Routed nets: {metadata.get('routed_nets', 'N/A')}\n"
+                  f"Failed nets: {metadata.get('failed_nets', 'N/A')}\n\n"
+                  f"⚠️ Board initialization still needed (~1 hour)\n"
+                  f"Click 'Auto Route All' to initialize board and resume routing.\n"
+                  f"Routing will continue from iteration {checkpoint['iteration'] + 1}.")
+
+            QMessageBox.information(self, "Checkpoint Loaded - Resume Pending", msg_updated)
+
+        except Exception as e:
+            logger.error(f"Failed to resume from checkpoint: {e}")
+            QMessageBox.critical(self, "Resume Failed", f"Failed to resume from checkpoint:\n{str(e)}")
+
+    def toggle_auto_checkpoint(self, checked):
+        """Toggle auto-checkpoint saving"""
+        if hasattr(self, 'router') and self.router is not None:
+            self.router.auto_checkpoint = checked
+            status = "enabled" if checked else "disabled"
+            logger.info(f"Auto-checkpoint {status}")
+
     def _route_manhattan_rrg(self):
         """Perform Manhattan RRG routing with live GUI updates"""
         try:

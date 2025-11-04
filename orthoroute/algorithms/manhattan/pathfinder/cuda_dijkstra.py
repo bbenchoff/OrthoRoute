@@ -3190,8 +3190,6 @@ class CUDADijkstra:
             [], data, current_iteration
         )
 
-        logger.info(f"[RR-WAVEFRONT] iteration={current_iteration}, rr_alpha={float(rr_alpha)}, jitter={float(jitter_eps)}")
-
         # P0-5: CUDA Event instrumentation
         start_event = cp.cuda.Event()
         end_event = cp.cuda.Event()
@@ -3291,21 +3289,7 @@ class CUDADijkstra:
 
         # P0-5: Time kernel execution
         start_event.record()
-        # BATCH SANITY CHECK
-        logger.info(f"[BATCH-SANITY] active_list_kernel: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape} node_ids.shape={node_ids.shape}")
-        logger.info(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
         self.active_list_kernel((grid_size,), (block_size,), args)
-
-        # INSTRUMENTATION: Log bitmap blocking
-        blocked_count = int(blocked_counter[0])
-        if use_bitmap_flag and blocked_count > 0:
-            logger.info(f"[BITMAP-DEBUG] Blocked {blocked_count:,} neighbors by owner bitmap")
-        elif use_bitmap_flag:
-            logger.warning(f"[BITMAP-DEBUG] use_bitmap=1 but 0 neighbors blocked!")
-        if rr_alpha > 0.0:
-            logger.info(f"[KERNEL-RR-WAVEFRONT] Active: alpha={float(rr_alpha)}, window={int(window_cols)}")
-        if jitter_eps > 0.0:
-            logger.info(f"[KERNEL-JITTER-WAVEFRONT] Active: eps={float(jitter_eps)}")
         end_event.record()
         end_event.synchronize()
         kernel_ms = cp.cuda.get_elapsed_time(start_event, end_event)
@@ -3695,19 +3679,9 @@ class CUDADijkstra:
         if current_iteration <= 3:
             rr_alpha = 0.12
             jitter_eps = 0.001
-            logger.info(f"[RR-ENABLE] YES - iteration {current_iteration} <= 3")
-            logger.info(f"[ROUNDROBIN-PARAMS] iteration={current_iteration}, rr_alpha={rr_alpha}, window_cols={window_cols}")
-            logger.info(f"[ROUNDROBIN-KERNEL] Active for iteration {current_iteration}: alpha={rr_alpha}, window={window_cols} cols")
-            logger.debug(f"[RR-SAMPLE] First 5 ROIs: pref_layers={pref_layers[:min(5,K)]}, src_x={src_x_coords[:min(5,K)]}")
         else:
             rr_alpha = 0.0
             jitter_eps = 0.001  # Jitter always on
-            logger.debug(f"[RR-ENABLE] NO - iteration {current_iteration} > 3")
-            #             logger.debug(f"[ROUNDROBIN-KERNEL] RR disabled for iteration {current_iteration}, jitter still active")
-
-        logger.info(f"[JITTER-ENABLE] YES - jitter_eps={jitter_eps}")
-        logger.info(f"[JITTER-PARAMS] jitter_eps={jitter_eps}")
-        logger.info(f"[JITTER-KERNEL] jitter_eps={jitter_eps} (breaks ties, prevents elevator shafts)")
 
         return pref_layers_gpu, src_x_coords_gpu, rr_alpha, window_cols, jitter_eps
 
@@ -4629,10 +4603,6 @@ class CUDADijkstra:
             data['roi_minz'],
             data['roi_maxz'],
         )
-
-        # BATCH SANITY CHECK
-        logger.info(f"[BATCH-SANITY] delta_stepping active_list: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape}")
-        logger.info(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
         self.active_list_kernel((grid_size,), (block_size,), args)
         cp.cuda.Stream.null.synchronize()
 
@@ -5697,12 +5667,10 @@ class CUDADijkstra:
                         best_idx = int(cp.argmin(target_dists))
                         best_dst = int(dst_targets_gpu[best_idx])
                         best_dist = min_dist
-                        logger.info(f"[GPU-SEEDS] Path found at iteration {iteration+1}: best_dst={best_dst}, dist={best_dist:.2f}")
                         break
 
                     # Check upper bound hint
                     if ub_hint is not None and min_dist > ub_hint:
-                        logger.info(f"[GPU-SEEDS] Exceeding upper bound hint {ub_hint} at iteration {iteration}")
                         break
 
                 # OPTIMIZATION: Only check for empty frontier periodically (every 50 iters) or near end
@@ -5710,15 +5678,11 @@ class CUDADijkstra:
                 if iteration % 50 == 0 or iteration > max_iterations - 10:
                     active_count = int(cp.count_nonzero(frontier))
                     if active_count == 0:
-                        logger.info(f"[GPU-SEEDS] Frontier empty at iteration {iteration}")
                         break
 
         # Check final state
         if best_dst is None:
-            logger.warning(f"[GPU-SEEDS] No path found after {iteration+1} iterations")
             return None
-
-        logger.info(f"[GPU-SEEDS] Path found in {iteration+1} iterations ({best_dist:.2f}ms)")
 
         # Reconstruct path from best_dst back to source
         path = []

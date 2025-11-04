@@ -47,11 +47,6 @@ Iter 15: pres_fac = 107.9  (hits max)
 - **Oscillating?** Decrease (try 1.10-1.15)
 - **Slow convergence?** Increase slightly
 
-**Example from today:**
-- 8,192-net board with ρ=0.915 was diverging (overuse 2.4M → 4.4M)
-- **Fix:** Changed from 1.10 → 1.35
-- **Result:** Should converge in ~50 iterations instead of diverging
-
 ---
 
 ### 2. Present Factor Maximum (`pres_fac_max`)

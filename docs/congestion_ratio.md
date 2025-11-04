@@ -192,7 +192,7 @@ The congestion ratio concept comes from FPGA routing research:
 - Betz & Rose, "VPR: A New Packing, Placement and Routing Tool for FPGA Research" (1997)
 - Used in commercial PCB routers (Allegro, Altium) but rarely documented publicly
 
-OrthoRoute makes this metric explicit and uses it for board-adaptive parameter tuning - a novel approach for PCB routing.
+OrthoRoute makes this metric explicit and uses it for board-adaptive parameter tuning
 
 ---
 

@@ -83,10 +83,10 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
         pres_fac_max = 10.0   # Increased ceiling
         strategy = "NORMAL (accelerated)"
     elif ρ < 1.2:
-        # TIGHT: AGGRESSIVE escalation for large boards
-        pres_fac_mult = 1.35  # Much more aggressive (was 1.10)
-        pres_fac_max = 16.0   # Higher ceiling (was 8.0)
-        strategy = "TIGHT (aggressive for convergence)"
+        # TIGHT: EXTREMELY AGGRESSIVE escalation for large boards
+        pres_fac_mult = 2.5  # Extreme - hits max pressure by iteration 8
+        pres_fac_max = 256.0   # Very high ceiling for difficult boards
+        strategy = "TIGHT (extreme aggression for fast convergence)"
     else:
         # DENSE: Very gentle
         pres_fac_mult = 1.08
