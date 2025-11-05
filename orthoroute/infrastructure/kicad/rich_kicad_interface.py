@@ -420,18 +420,34 @@ class RichKiCadInterface:
             
             for track in board_tracks:
                 try:
+                    # Track objects have attributes, not dict keys
+                    start = getattr(track, 'start', None)
+                    end = getattr(track, 'end', None)
+
+                    start_x = float(getattr(start, 'x', 0)) / 1000000.0 if start else 0.0  # nm to mm
+                    start_y = float(getattr(start, 'y', 0)) / 1000000.0 if start else 0.0
+                    end_x = float(getattr(end, 'x', 0)) / 1000000.0 if end else 0.0
+                    end_y = float(getattr(end, 'y', 0)) / 1000000.0 if end else 0.0
+
+                    width = float(getattr(track, 'width', 200000)) / 1000000.0  # nm to mm
+                    layer = getattr(track, 'layer', 'F.Cu')
+
+                    # Get net info
+                    net_obj = getattr(track, 'net', None)
+                    net_name = getattr(net_obj, 'name', '') if net_obj else ''
+
                     track_data = {
-                        'start_x': track.get('start_x', 0),
-                        'start_y': track.get('start_y', 0),
-                        'end_x': track.get('end_x', 0),
-                        'end_y': track.get('end_y', 0),
-                        'width': track.get('width', 0.2),
-                        'layer': track.get('layer', 'F.Cu'),
-                        'net_name': track.get('net_name', '')
+                        'start_x': start_x,
+                        'start_y': start_y,
+                        'end_x': end_x,
+                        'end_y': end_y,
+                        'width': width,
+                        'layer': layer,
+                        'net_name': net_name
                     }
-                    
+
                     tracks.append(track_data)
-                    
+
                 except Exception as e:
                     logger.warning(f"Error extracting track: {e}")
                     continue

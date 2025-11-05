@@ -123,13 +123,15 @@ class CheckpointManager:
                     'pitch': lattice.pitch,
                     'layers': lattice.layers,
                     'bounds': lattice.bounds,
-                    'Nx': lattice.Nx,
-                    'Ny': lattice.Ny,
-                    'Nz': lattice.Nz,
+                    'x_steps': lattice.x_steps,
+                    'y_steps': lattice.y_steps,
+                    'num_nodes': lattice.num_nodes,
                 }
                 # Save coordinate mapping if available
                 if hasattr(lattice, 'idx_to_coord'):
                     checkpoint['geometry']['lattice']['idx_to_coord'] = lattice.idx_to_coord.copy()
+
+                logger.info(f"[CHECKPOINT] Saved lattice: {lattice.x_steps}×{lattice.y_steps}×{lattice.layers}")
 
             # Save pad mappings
             if hasattr(router, 'pad_to_node'):
@@ -253,13 +255,20 @@ class CheckpointManager:
                     import numpy as np
 
                     graph_data = geom['graph']
-                    router.graph = CSRGraph(
-                        indptr=graph_data['indptr'],
-                        indices=graph_data['indices'],
-                        base_costs=graph_data['base_costs'],
-                        N=graph_data['N'],
-                        use_gpu=router.config.use_gpu
-                    )
+                    # Create empty graph
+                    router.graph = CSRGraph(use_gpu=router.config.use_gpu)
+
+                    # Restore arrays directly
+                    if router.config.use_gpu:
+                        import cupy as cp
+                        router.graph.indptr = cp.asarray(graph_data['indptr'])
+                        router.graph.indices = cp.asarray(graph_data['indices'])
+                        router.graph.base_costs = cp.asarray(graph_data['base_costs'])
+                    else:
+                        router.graph.indptr = graph_data['indptr']
+                        router.graph.indices = graph_data['indices']
+                        router.graph.base_costs = graph_data['base_costs']
+
                     # Restore optional attributes
                     if 'edge_layer' in graph_data:
                         if router.config.use_gpu:
@@ -274,7 +283,9 @@ class CheckpointManager:
                         else:
                             router.graph.edge_kind = graph_data['edge_kind']
 
-                    logger.info(f"[CHECKPOINT] Restored graph: {router.graph.N} nodes, {router.graph.E} edges")
+                    N = graph_data['N']
+                    E = graph_data['E']
+                    logger.info(f"[CHECKPOINT] Restored graph: {N:,} nodes, {E:,} edges")
 
                 # Restore lattice
                 if 'lattice' in geom:
@@ -286,15 +297,16 @@ class CheckpointManager:
                         pitch=lat_data['pitch'],
                         layers=lat_data['layers']
                     )
-                    # Restore dimensions
-                    router.lattice.Nx = lat_data['Nx']
-                    router.lattice.Ny = lat_data['Ny']
-                    router.lattice.Nz = lat_data['Nz']
+                    # Lattice constructor already sets x_steps, y_steps, num_nodes
+                    # Just verify they match
+                    assert router.lattice.x_steps == lat_data['x_steps'], "Lattice x_steps mismatch"
+                    assert router.lattice.y_steps == lat_data['y_steps'], "Lattice y_steps mismatch"
+
                     # Restore coordinate mapping
                     if 'idx_to_coord' in lat_data:
                         router.lattice.idx_to_coord = lat_data['idx_to_coord']
 
-                    logger.info(f"[CHECKPOINT] Restored lattice: {router.lattice.Nx}×{router.lattice.Ny}×{router.lattice.Nz}")
+                    logger.info(f"[CHECKPOINT] Restored lattice: {router.lattice.x_steps}×{router.lattice.y_steps}×{router.lattice.layers}")
 
                 # Restore pad mappings
                 if 'pad_to_node' in geom:

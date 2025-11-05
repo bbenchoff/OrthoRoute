@@ -3543,13 +3543,13 @@ class PathFinderRouter:
 
         # Scale by layer count (fewer layers = stronger penalties needed)
         if n_sig_layers <= 12:
-            pres_fac_max = 128.0  # Very high ceiling for difficult boards
+            pres_fac_max = 512.0  # Extreme ceiling for difficult boards
             hist_cost_weight_mult = 1.2  # 12.0 for few layers
         elif n_sig_layers <= 20:
-            pres_fac_max = 256.0  # Very high ceiling for difficult boards
+            pres_fac_max = 1024.0  # Nuclear option - force convergence
             hist_cost_weight_mult = 1.0  # 10.0
         else:
-            pres_fac_max = 512.0  # Extreme ceiling for many-layer boards
+            pres_fac_max = 2048.0  # Extreme ceiling for many-layer boards
             hist_cost_weight_mult = 0.8  # 8.0 for many layers
 
         # Allow env overrides for testing

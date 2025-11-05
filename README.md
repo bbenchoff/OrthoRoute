@@ -18,18 +18,25 @@ A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository 
 
 <table>
   <tr>
-    <td align="center" width="50%">
+    <td align="center" width="33%">
       <a href="https://www.youtube.com/watch?v=KXxxNQPTagA">
         <img src="https://img.youtube.com/vi/KXxxNQPTagA/maxresdefault.jpg" alt="OrthoRoute Overview" width="100%"/>
         <br/>
         <b>OrthoRoute Overview</b>
       </a>
     </td>
-    <td align="center" width="50%">
+    <td align="center" width="33%">
       <a href="https://www.youtube.com/watch?v=P8Wsej71XAQ">
         <img src="https://img.youtube.com/vi/P8Wsej71XAQ/maxresdefault.jpg" alt="Algorithm Demonstration" width="100%"/>
         <br/>
         <b>Algorithm Demonstration</b>
+      </a>
+    </td>
+    <td align="center" width="33%">
+      <a href="https://www.youtube.com/watch?v=j_XJNxEXXkQ">
+        <img src="https://img.youtube.com/vi/j_XJNxEXXkQ/maxresdefault.jpg" alt="PathFinder Net Tour" width="100%"/>
+        <br/>
+        <b>PathFinder Net Tour</b>
       </a>
     </td>
   </tr>

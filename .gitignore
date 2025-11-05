@@ -58,6 +58,8 @@ logs/
 logs/*
 checkpoints/
 checkpoints/*
+viz/
+viz/*
 
 # Status and summary documents (keep in docs/)
 *_SUMMARY.md
