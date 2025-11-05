@@ -58,8 +58,7 @@ logs/
 logs/*
 checkpoints/
 checkpoints/*
-viz/
-viz/*
+
 
 # Status and summary documents (keep in docs/)
 *_SUMMARY.md
@@ -131,6 +130,11 @@ quick_*.py
 
 # Debug output directory
 debug_output/
+
+# Video generation outputs
+viz/frames/
+viz/iteration_frames/
+viz/*.mp4
 
 # GPU profiling outputs
 *.nvvp
