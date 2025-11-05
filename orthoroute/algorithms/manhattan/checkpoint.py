@@ -97,18 +97,24 @@ class CheckpointManager:
             # Save graph (CSRGraph)
             if hasattr(router, 'graph') and router.graph is not None:
                 graph = router.graph
+                # CSRGraph doesn't store N/E - calculate from arrays
+                N = len(graph.indptr) - 1 if graph.indptr is not None else 0
+                E = len(graph.indices) if graph.indices is not None else 0
+
                 checkpoint['geometry']['graph'] = {
                     'indptr': graph.indptr.copy(),
                     'indices': graph.indices.copy(),
                     'base_costs': graph.base_costs.get() if hasattr(graph.base_costs, 'get') else graph.base_costs.copy(),
-                    'N': graph.N,
-                    'E': graph.E,
+                    'N': N,
+                    'E': E,
                 }
                 # Optional graph attributes
                 if hasattr(graph, 'edge_layer'):
                     checkpoint['geometry']['graph']['edge_layer'] = graph.edge_layer.get() if hasattr(graph.edge_layer, 'get') else graph.edge_layer.copy()
                 if hasattr(graph, 'edge_kind'):
                     checkpoint['geometry']['graph']['edge_kind'] = graph.edge_kind.get() if hasattr(graph.edge_kind, 'get') else graph.edge_kind.copy()
+
+                logger.info(f"[CHECKPOINT] Saved graph: {N:,} nodes, {E:,} edges")
 
             # Save lattice (Lattice3D)
             if hasattr(router, 'lattice') and router.lattice is not None:
