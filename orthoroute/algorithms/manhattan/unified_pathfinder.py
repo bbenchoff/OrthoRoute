@@ -3818,6 +3818,43 @@ class PathFinderRouter:
 
             logger.info(f"[ITER {it}] routed={routed} failed={failed} overuse={over_sum} edges={over_cnt} via_overuse={via_ratio:.1f}%")
 
+            # Log metrics to CSV/MD files if logger is attached
+            if hasattr(self, '_metrics_logger') and self._metrics_logger:
+                from datetime import datetime
+                try:
+                    # Count barrel conflicts from last detection
+                    barrel_conflict_count = len(barrel_conflicts) if 'barrel_conflicts' in locals() else 0
+
+                    # Track whether plateau kick was applied this iteration
+                    plateau_kick_applied = (stagnant == 2)
+
+                    # Calculate total edges in use
+                    total_edges = sum(len(path) for path in self.net_paths.values() if path)
+
+                    metrics = {
+                        'iteration': it,
+                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'duration_s': time.time() - iter_start,
+                        'overuse': int(over_sum),
+                        'overuse_delta': 0,  # Will be calculated by logger
+                        'barrel_conflicts': barrel_conflict_count,
+                        'routed_nets': routed,
+                        'failed_nets': failed,
+                        'total_edges': total_edges,
+                        'pres_fac': float(pres_fac),
+                        'pres_fac_mult': float(pres_fac_mult),
+                        'hist_gain': float(hist_gain),
+                        'hist_cost_weight': float(cfg.hist_cost_weight * hist_cost_weight_mult),
+                        'via_penalty': float(cfg.via_cost),
+                        'hotset_size': len(hotset),
+                        'stagnant_iters': stagnant,
+                        'stagnation_events': self.stagnation_counter,
+                        'plateau_kick_applied': 1 if plateau_kick_applied else 0,
+                    }
+                    self._metrics_logger.log_iteration(metrics)
+                except Exception as e:
+                    logger.warning(f"[METRICS] Failed to log iteration {it}: {e}")
+
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0)
             if it <= 10:
                 hist_sum = float(self.accounting.history.sum())

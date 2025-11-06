@@ -1833,6 +1833,20 @@ class OrthoRouteMainWindow(QMainWindow):
             pf = self.plugin.get_pathfinder()
             board = self._create_board_from_data()
 
+            # Initialize iteration metrics logger
+            from ...algorithms.manhattan.iteration_metrics import IterationMetricsLogger
+            board_info = {
+                'Board Name': board.name if hasattr(board, 'name') else 'Unknown',
+                'Total Nets': len(board.nets) if hasattr(board, 'nets') else 0,
+                'Layers': board.layer_count if hasattr(board, 'layer_count') else 0,
+                'Grid Pitch': f"{pf.config.grid_pitch}mm" if hasattr(pf.config, 'grid_pitch') else 'N/A',
+            }
+            metrics_logger = IterationMetricsLogger(self._current_run_folder, board_info)
+            self.log_to_gui(f"[METRICS] Logging enabled: {self._current_run_folder}", "DEBUG")
+
+            # Attach metrics logger to pathfinder for iteration tracking
+            pf._metrics_logger = metrics_logger
+
             self.log_to_gui(f"[GUI] Starting unified pipeline with pf={pf._instance_tag}", "INFO")
 
             # 1) Build lattice + CSR + preflight

@@ -70,34 +70,31 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
     # ========================================================================
     # Principle: Sparse boards can escalate fast, dense boards need gentle ramp
 
-    pres_fac_init = 1.0
+    pres_fac_init = 2.0  # Start higher for faster convergence (was 1.0)
 
     if ρ < 0.6:
         # SPARSE: Fast convergence - AGGRESSIVE growth to break plateau early
-        pres_fac_mult = 1.30  # Increased from 1.15 to reach critical threshold ~3x faster
-        pres_fac_max = 12.0   # Increased ceiling to allow full escalation
+        pres_fac_mult = 1.40  # Aggressive escalation (was 1.30)
+        pres_fac_max = 16384.0  # Very high ceiling for extended escalation (was 12.0)
         strategy = "SPARSE (aggressive convergence)"
     elif ρ < 0.9:
         # NORMAL: Balanced - moderate acceleration
-        pres_fac_mult = 1.20  # Increased from 1.12
-        pres_fac_max = 10.0   # Increased ceiling
+        pres_fac_mult = 1.40  # Aggressive escalation (was 1.20)
+        pres_fac_max = 16384.0  # Very high ceiling (was 10.0)
         strategy = "NORMAL (accelerated)"
     elif ρ < 1.2:
         # TIGHT: NUCLEAR escalation for plateau-breaking
-        pres_fac_mult = 2.5  # Extreme - hits max pressure by iteration 8
-        pres_fac_max = 1024.0   # Nuclear option - break through 200K plateau
+        pres_fac_mult = 1.40  # Aggressive escalation (was 2.5)
+        pres_fac_max = 16384.0  # Very high ceiling (was 1024.0)
         strategy = "TIGHT (nuclear pressure for convergence)"
     else:
-        # DENSE: Very gentle
-        pres_fac_mult = 1.08
-        pres_fac_max = 10.0
-        strategy = "DENSE (conservative)"
+        # DENSE: More aggressive than before
+        pres_fac_mult = 1.40  # Aggressive escalation (was 1.08)
+        pres_fac_max = 16384.0  # Very high ceiling (was 10.0)
+        strategy = "DENSE (aggressive)"
 
-    # Adjust max by layer count
-    if L <= 12:
-        pres_fac_max *= 0.75  # Lower ceiling for few layers
-    elif L >= 25:
-        pres_fac_max *= 1.25  # Higher ceiling for many layers
+    # Don't scale max by layer count - use consistent high ceiling
+    # (removed layer-based scaling to allow full escalation range)
 
     logger.info(f"Present schedule: mult={pres_fac_mult:.3f}, max={pres_fac_max:.1f}")
 
@@ -127,10 +124,11 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
 
     # History gain: Increased to strengthen memory of congested edges
     # Higher value makes repeated congestion more painful
-    hist_gain = 0.25  # Increased from 0.15 to push through plateau
+    hist_gain = 0.5  # Increased from 0.25 for better historical memory
 
-    # No decay (full memory)
-    history_decay = 1.0
+    # Moderate decay to allow re-exploration of previously congested paths
+    # 0.95 = history halves every ~14 iterations, preventing "locked in" routes
+    history_decay = 0.95
 
     logger.info(f"History: weight={hist_cost_weight:.1f}, gain={hist_gain:.3f}, decay={history_decay:.3f}")
 

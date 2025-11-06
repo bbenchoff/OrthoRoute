@@ -25,9 +25,9 @@ PER_NET_BUDGET_S = 0.5             # Time budget per net in seconds
 MAX_ROI_NODES = 20000              # Maximum nodes in Region of Interest
 
 # PathFinder Cost Parameters (CONVERGENCE FIXES)
-PRES_FAC_INIT = 1.0  # Initial present factor for congestion
-PRES_FAC_MULT = 1.10  # Gentler exponential growth to keep history competitive (was 1.15)
-PRES_FAC_MAX = 8.0                 # Cap pres_fac (will be scaled by layer count)
+PRES_FAC_INIT = 2.0  # Initial present factor for congestion (was 1.0)
+PRES_FAC_MULT = 1.40  # Aggressive exponential growth for faster convergence (was 1.10)
+PRES_FAC_MAX = 16384.0             # Higher cap for extended escalation (was 8.0)
 HIST_ACCUM_GAIN = 1.2  # Stronger history (was 1.1)
 OVERUSE_EPS = 1e-6                 # Epsilon for overuse calculations
 
@@ -98,10 +98,10 @@ class PathFinderConfig:
     max_iterations: int = MAX_ITERATIONS  # Alias for compatibility
     max_search_nodes: int = MAX_SEARCH_NODES
     pres_fac_init: float = PRES_FAC_INIT
-    pres_fac_mult: float = PRES_FAC_MULT  # Now 1.35 from module constant
-    pres_fac_max: float = PRES_FAC_MAX    # Now 512.0 from module constant
+    pres_fac_mult: float = PRES_FAC_MULT  # Now 1.40 from module constant
+    pres_fac_max: float = PRES_FAC_MAX    # Now 16384.0 from module constant
     hist_accum_gain: float = HIST_ACCUM_GAIN
-    hist_gain: float = 0.2  # Historical cost gain (lowered for raw present - was 0.8 with present_ema)
+    hist_gain: float = 0.5  # Historical cost gain - increased for better memory (was 0.2)
     overuse_eps: float = OVERUSE_EPS
     mode: str = "near_far"  # Use fast GPU ROI pathfinding with actual CUDA kernels
     roi_parallel: bool = False
