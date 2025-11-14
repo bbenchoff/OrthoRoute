@@ -141,7 +141,7 @@ While general autorouting remains a complex constraint-satisfaction problem, Ort
 1. **Navigate to the OrthoRoute Folder** Wherever it's installed via KiCad
 2. **Run from CLI**: `python main.py --test-manhattan`
 
-#### Headless (KiCad-less) Mode
+#### Cloud (Headless, Kicad-less) Mode
 Headless mode is designed for instances when you would like to route a board, but it won't fit in your GPU. This mode is actually several functions that allow for running a routing algorithm _without KiCad_.
 
 The workflow is three steps. First, export the PCB from the OrthoRoute plugin
