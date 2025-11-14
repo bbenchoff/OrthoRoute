@@ -33,7 +33,7 @@ debug_*.py
 validate_*.py
 demo_*.py
 comprehensive_*.py
-performance_*.py
+
 routing_quality_*.py
 enhanced_*.py
 final_*.py
