@@ -915,7 +915,7 @@ class EdgeAccountant:
         if self._hist_update_count <= 5:
             # Before update
             hist_before_max = float(self.history.max()) if self.history.size > 0 else 0.0
-            logger.error(f"[UPDATE-HISTORY CALLED] Call #{self._hist_update_count} START gain={gain:.3f}")
+            logger.debug(f"[UPDATE-HISTORY CALLED] Call #{self._hist_update_count} START gain={gain:.3f}")
 
         # Apply gentle decay before adding new history
         self.history *= decay_factor
@@ -936,7 +936,7 @@ class EdgeAccountant:
                 capped_mask = increment_before_cap > history_cap
                 capped_count = int(self.xp.sum(capped_mask))
                 if capped_count > 0:
-                    logger.error(f"  [HIST-CAP] {capped_count} edges capped! avg_cap={float(history_cap.mean()):.3f}")
+                    logger.debug(f"  [HIST-CAP] {capped_count} edges capped! avg_cap={float(history_cap.mean()):.3f}")
 
         self.history += increment
 
@@ -950,15 +950,15 @@ class EdgeAccountant:
             pres_ema_max = float(self.present_ema.max())
             pres_raw_max = float(self.present.max())
 
-            logger.error(f"[UPDATE-HISTORY #{self._hist_update_count}]")
-            logger.error(f"  gain={gain:.3f} decay={decay_factor:.3f} cap_mult={history_cap_multiplier:.1f}")
-            logger.error(f"  use_raw_present={use_raw_present}")
-            logger.error(f"  present_raw_max={pres_raw_max:.1f} present_ema_max={pres_ema_max:.1f}")
-            logger.error(f"  overuse: max={over_max:.2f} mean={over_mean:.3f}")
-            logger.error(f"  increment: max={incr_max:.3f}")
-            logger.error(f"  history: before={hist_before_max:.3f} → after={hist_after_max:.3f}")
+            logger.debug(f"[UPDATE-HISTORY #{self._hist_update_count}]")
+            logger.debug(f"  gain={gain:.3f} decay={decay_factor:.3f} cap_mult={history_cap_multiplier:.1f}")
+            logger.debug(f"  use_raw_present={use_raw_present}")
+            logger.debug(f"  present_raw_max={pres_raw_max:.1f} present_ema_max={pres_ema_max:.1f}")
+            logger.debug(f"  overuse: max={over_max:.2f} mean={over_mean:.3f}")
+            logger.debug(f"  increment: max={incr_max:.3f}")
+            logger.debug(f"  history: before={hist_before_max:.3f} → after={hist_after_max:.3f}")
             if base_costs is not None:
-                logger.error(f"  base_cost: mean={float(base_costs.mean()):.4f} max={float(base_costs.max()):.4f}")
+                logger.debug(f"  base_cost: mean={float(base_costs.mean()):.4f} max={float(base_costs.max()):.4f}")
 
     def update_present_ema(self, beta: float = 0.60):
         """
@@ -3702,7 +3702,7 @@ class PathFinderRouter:
                 sub_tasks = {nid: sub_tasks[nid] for nid in net_ids}
                 logger.debug(f"[SHUFFLE] Randomized net order for iteration {it}")
 
-            routed, failed = self._route_all(sub_tasks, all_tasks=tasks, pres_fac=pres_fac)
+            routed, failed = self._route_all(sub_tasks, all_tasks=tasks, pres_fac=pres_fac, iteration=it)
 
             # Track changed edges for next iteration's incremental cost update
             # Collect all edges used by nets routed in this iteration
@@ -3769,10 +3769,10 @@ class PathFinderRouter:
             # Check barrel conflicts
             barrel_conflicts = getattr(self, '_last_barrel_conflict_count', 0)
 
-            # Clean consolidated iteration summary
+            # Clean consolidated iteration summary (WARNING level so it shows in console)
             status = "✓ CONVERGED" if over_sum == 0 else f"overuse={over_sum}"
-            barrel_info = f" barrel={barrel_conflicts}" if barrel_conflicts > 0 else ""
-            logger.info(f"[ITER {it:3d}] nets={routed}/{routed+failed}  {status}  edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}")
+            barrel_info = f"  barrel={barrel_conflicts}" if barrel_conflicts > 0 else ""
+            logger.warning(f"[ITER {it:3d}] nets={routed}/{routed+failed}  {status}  edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}")
 
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0) - only first 3 iterations
             if it <= 3:
@@ -3996,7 +3996,11 @@ class PathFinderRouter:
 
             # STEP 6: Terminate?
             if failed == 0 and over_sum == 0:
-                logger.info("[SUCCESS] Zero overuse and zero failed nets")
+                barrel_conflicts = getattr(self, '_last_barrel_conflict_count', 0)
+                if barrel_conflicts == 0:
+                    logger.info("[SUCCESS] Zero overuse, zero failed nets, AND zero barrel conflicts!")
+                else:
+                    logger.info(f"[SUCCESS] Zero overuse and zero failed nets ({barrel_conflicts} barrel conflicts remain)")
 
                 # Final collision detection validation
                 edges_over_capacity = [(e, usage) for e, usage in self.accounting.edge_usage.items() if usage > 1]
@@ -4007,13 +4011,22 @@ class PathFinderRouter:
                 else:
                     logger.info("[COLLISION] 0 edges over capacity ✓ PERFECT!")
 
-                # Log GPU vs CPU pathfinding statistics
-                total_paths = self._gpu_path_count + self._cpu_path_count
-                if total_paths > 0:
-                    gpu_pct = (self._gpu_path_count / total_paths) * 100
-                    logger.info(f"[GPU-STATS] GPU: {self._gpu_path_count} paths ({gpu_pct:.1f}%), CPU: {self._cpu_path_count} paths ({100-gpu_pct:.1f}%)")
+                # Check barrel conflicts before declaring full convergence
+                if barrel_conflicts > 0:
+                    logger.warning(f"[CONVERGENCE] Edge overuse=0 but {barrel_conflicts} barrel conflicts remain")
+                    logger.warning(f"[CONVERGENCE] Continuing to iteration {it+1} to resolve barrel conflicts...")
+                    # Don't return yet - continue iterating to resolve barrel conflicts
+                else:
+                    # TRUE convergence: zero edge overuse AND zero barrel conflicts
+                    logger.info("[COLLISION] 0 edges over capacity ✓ PERFECT!")
 
-                return {'success': True, 'paths': self.net_paths}
+                    # Log GPU vs CPU pathfinding statistics
+                    total_paths = self._gpu_path_count + self._cpu_path_count
+                    if total_paths > 0:
+                        gpu_pct = (self._gpu_path_count / total_paths) * 100
+                        logger.info(f"[GPU-STATS] GPU: {self._gpu_path_count} paths ({gpu_pct:.1f}%), CPU: {self._cpu_path_count} paths ({100-gpu_pct:.1f}%)")
+
+                    return {'success': True, 'paths': self.net_paths, 'converged': True}
 
             if over_sum < best_overuse:
                 best_overuse = over_sum
@@ -4094,11 +4107,18 @@ class PathFinderRouter:
             logger.info(f"ROUTING COMPLETE: All {len(tasks)} nets routed successfully with zero overuse!")
             logger.info("="*80)
 
-        # Determine success based on actual convergence
+        # Determine success based on edge convergence
+        # Note: Barrel conflicts are reported but don't affect success/convergence
+        final_barrel_conflicts = getattr(self, '_last_barrel_conflict_count', 0)
         success = (failed == 0 and over_sum == 0)
+
+        if success and final_barrel_conflicts > 0:
+            logger.info(f"[FINAL] Edge routing converged ({final_barrel_conflicts} barrel conflicts remain - acceptable)")
 
         return {
             'success': success,
+            'converged': success,  # Edge convergence = success
+            'barrel_conflicts': final_barrel_conflicts,
             'error_code': None if success else 'ROUTING-FAILED',
             'message': 'Complete' if success else f'{failed} unrouted, {over_cnt} overused',
             'overuse_sum': over_sum,
@@ -4287,7 +4307,7 @@ class PathFinderRouter:
 
         return ordered
 
-    def _route_all(self, tasks: Dict[str, Tuple[int, int]], all_tasks: Dict[str, Tuple[int, int]] = None, pres_fac: float = 1.0) -> Tuple[int, int]:
+    def _route_all(self, tasks: Dict[str, Tuple[int, int]], all_tasks: Dict[str, Tuple[int, int]] = None, pres_fac: float = 1.0, iteration: int = 0) -> Tuple[int, int]:
         """Route nets with adaptive ROI extraction and intra-iteration cost updates"""
         if all_tasks is None:
             all_tasks = tasks
@@ -4324,8 +4344,14 @@ class PathFinderRouter:
         for idx, net_id in enumerate(ordered_nets):
             net_start_time = time.time()
             src, dst = tasks[net_id]
-            if idx % 50 == 0 and total > 50:
-                logger.info(f"  Routing net {idx+1}/{total}")
+
+            # Show progress more frequently in iteration 1 (greedy routing)
+            if iteration == 1:
+                # Show every 25 nets in iteration 1
+                if (idx + 1) % 25 == 0 or idx == 0:
+                    logger.warning(f"[ITER 1 - GREEDY] Routing {idx+1}/{total} nets...")
+            elif idx % 50 == 0 and total > 50:
+                logger.debug(f"  Routing net {idx+1}/{total}")
 
             # Only clear if we're actually re-routing this net
             if net_id in self.net_paths and self.net_paths[net_id]:

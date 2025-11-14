@@ -548,10 +548,15 @@ def run_headless(
         end_time = time.time()
         total_time = end_time - start_time
 
+        # Extract convergence info (includes barrel conflicts now)
+        barrel_conflicts = result.get('barrel_conflicts', 0) if isinstance(result, dict) else 0
+        fully_converged = result.get('converged', False) if isinstance(result, dict) else False
+
         routing_metadata = {
             'total_time': total_time,
             'iterations': len(iteration_metrics),
-            'converged': result.get('converged', False) if isinstance(result, dict) else False,
+            'converged': fully_converged,
+            'barrel_conflicts': barrel_conflicts,
             'nets_routed': result.get('nets_routed', 0) if isinstance(result, dict) else 0,
             'wirelength': result.get('wirelength', 0.0) if isinstance(result, dict) else 0.0,
             'via_count': vias,
@@ -570,15 +575,30 @@ def run_headless(
 
         # If we got here, export succeeded (would have raised exception otherwise)
         if True:
-            logging.info(f"[HEADLESS] Successfully exported solution to: {output_file}")
-            logging.info("=" * 80)
-            logging.info("HEADLESS ROUTING COMPLETED SUCCESSFULLY")
-            logging.info("=" * 80)
-            logging.info(f"Total runtime: {total_time/60:.1f} minutes")
-            logging.info(f"Iterations: {len(iteration_metrics)}")
-            logging.info(f"Converged: {routing_metadata['converged']}")
-            logging.info(f"Tracks: {tracks}, Vias: {vias}")
-            logging.info("=" * 80)
+            logging.warning("=" * 80)
+            logging.warning("ROUTING COMPLETE!")
+            logging.warning("=" * 80)
+            logging.warning(f"Solution file: {output_file}")
+            logging.warning(f"Total runtime: {total_time/60:.1f} minutes")
+            logging.warning(f"Iterations: {len(iteration_metrics)}")
+
+            # Report convergence status
+            if fully_converged:
+                logging.warning(f"Converged: YES ✓")
+            else:
+                logging.warning(f"Converged: NO")
+
+            logging.warning(f"Geometry: {tracks} tracks, {vias} vias")
+
+            # Report barrel conflicts if present (known limitation)
+            if barrel_conflicts > 0:
+                logging.warning(f"Barrel conflicts: {barrel_conflicts} (via overlaps - see docs/barrel_conflicts_explained.md)")
+            else:
+                logging.warning(f"Barrel conflicts: 0 ✓")
+
+            logging.warning("=" * 80)
+            logging.warning(f"Next step: Import {output_file} into KiCad (Ctrl+I)")
+            logging.warning("=" * 80)
             sys.exit(0)
         else:
             logging.error("[HEADLESS] Failed to export solution")
