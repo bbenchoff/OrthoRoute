@@ -70,31 +70,34 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
     # ========================================================================
     # Principle: Sparse boards can escalate fast, dense boards need gentle ramp
 
-    pres_fac_init = 2.0  # Start higher for faster convergence (was 1.0)
+    pres_fac_init = 1.0
 
     if ρ < 0.6:
-        # SPARSE: Fast convergence - AGGRESSIVE growth to break plateau early
-        pres_fac_mult = 1.40  # Aggressive escalation (was 1.30)
-        pres_fac_max = 16384.0  # Very high ceiling for extended escalation (was 12.0)
-        strategy = "SPARSE (aggressive convergence)"
+        # SPARSE: Fast convergence
+        pres_fac_mult = 1.15
+        pres_fac_max = 6.0
+        strategy = "SPARSE (fast convergence)"
     elif ρ < 0.9:
-        # NORMAL: Balanced - moderate acceleration
-        pres_fac_mult = 1.40  # Aggressive escalation (was 1.20)
-        pres_fac_max = 16384.0  # Very high ceiling (was 10.0)
-        strategy = "NORMAL (accelerated)"
+        # NORMAL: Balanced
+        pres_fac_mult = 1.12
+        pres_fac_max = 7.0
+        strategy = "NORMAL (balanced)"
     elif ρ < 1.2:
-        # TIGHT: NUCLEAR escalation for plateau-breaking
-        pres_fac_mult = 1.40  # Aggressive escalation (was 2.5)
-        pres_fac_max = 16384.0  # Very high ceiling (was 1024.0)
-        strategy = "TIGHT (nuclear pressure for convergence)"
+        # TIGHT: Gentle escalation
+        pres_fac_mult = 1.10
+        pres_fac_max = 8.0
+        strategy = "TIGHT (gentle escalation)"
     else:
-        # DENSE: More aggressive than before
-        pres_fac_mult = 1.40  # Aggressive escalation (was 1.08)
-        pres_fac_max = 16384.0  # Very high ceiling (was 10.0)
-        strategy = "DENSE (aggressive)"
+        # DENSE: Very gentle
+        pres_fac_mult = 1.08
+        pres_fac_max = 10.0
+        strategy = "DENSE (conservative)"
 
-    # Don't scale max by layer count - use consistent high ceiling
-    # (removed layer-based scaling to allow full escalation range)
+    # Adjust max by layer count
+    if L <= 12:
+        pres_fac_max *= 0.75  # Lower ceiling for few layers
+    elif L >= 25:
+        pres_fac_max *= 1.25  # Higher ceiling for many layers
 
     logger.info(f"Present schedule: mult={pres_fac_mult:.3f}, max={pres_fac_max:.1f}")
 
@@ -122,13 +125,12 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
 
     hist_cost_weight = base_hist_weight + layer_bonus + congestion_bonus
 
-    # History gain: Increased to strengthen memory of congested edges
-    # Higher value makes repeated congestion more painful
-    hist_gain = 0.5  # Increased from 0.25 for better historical memory
+    # History gain (accumulation rate)
+    # Higher congestion needs faster accumulation
+    hist_gain = 0.20 + 0.15 * max(0.0, min(1.0, ρ - 0.8))
 
-    # Moderate decay to allow re-exploration of previously congested paths
-    # 0.95 = history halves every ~14 iterations, preventing "locked in" routes
-    history_decay = 0.95
+    # No decay (full memory)
+    history_decay = 1.0
 
     logger.info(f"History: weight={hist_cost_weight:.1f}, gain={hist_gain:.3f}, decay={history_decay:.3f}")
 
@@ -199,17 +201,17 @@ def derive_routing_parameters(board: BoardCharacteristics) -> DerivedRoutingPara
 
     if ρ < 0.8:
         stagnation_patience = 5
-        max_iterations = 200  # Extended for full convergence
+        max_iterations = 100  # Increased for better convergence
     elif ρ < 1.1:
         stagnation_patience = 6
-        max_iterations = 200  # Extended for full convergence
+        max_iterations = 100  # Increased for better convergence
     else:
         stagnation_patience = 8
-        max_iterations = 200  # Extended for full convergence
+        max_iterations = 100  # Increased for better convergence
 
     # Fewer layers also need more iterations (less flexibility)
     if L <= 12:
-        max_iterations = max(max_iterations, 200)  # Extended
+        max_iterations = max(max_iterations, 100)  # Increased
         stagnation_patience = max(stagnation_patience, 7)
 
     logger.info(f"Convergence: max_iters={max_iterations}, patience={stagnation_patience}")

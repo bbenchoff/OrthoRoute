@@ -25,34 +25,14 @@ class OrthoRouteBuildSystem:
         self.build_dir = self.project_root / "build"
         self.version = "1.0.0"
         
-        # Package configurations
+        # Single package configuration
         self.packages = {
-            'production': {
-                'name': 'orthoroute-production',
-                'description': 'OrthoRoute Professional PCB Autorouting Plugin',
-                'main_file': 'src/orthoroute.py',
-                'include_gpu': True,
-                'include_docs': True,
-                'include_tests': False,
-                'include_debug': False
-            },
-            'lite': {
+            'default': {
                 'name': 'orthoroute',
-                'description': 'OrthoRoute - Professional PCB autorouting functionality',
-                'main_file': 'src/orthoroute.py',
-                'include_gpu': False,
-                'include_docs': False,
-                'include_tests': False,
-                'include_debug': False
-            },
-            'development': {
-                'name': 'orthoroute-dev',
-                'description': 'OrthoRoute Development Build with debugging tools',
-                'main_file': 'src/orthoroute.py',
+                'description': 'OrthoRoute - GPU-accelerated PCB autorouting plugin',
                 'include_gpu': True,
-                'include_docs': True,
-                'include_tests': True,
-                'include_debug': True
+                'include_docs': False,
+                'include_tests': False
             }
         }
     
@@ -67,6 +47,7 @@ class OrthoRouteBuildSystem:
     def create_plugin_metadata(self, package_config: Dict) -> Dict:
         """Create plugin metadata for KiCad"""
         return {
+            "$schema": "https://go.kicad.org/pcm/schemas/v1",
             "name": package_config['name'],
             "description": package_config['description'],
             "description_full": f"{package_config['description']} - GPU-accelerated PCB autorouting with real-time visualization",
@@ -86,12 +67,13 @@ class OrthoRouteBuildSystem:
             },
             "license": "MIT",
             "resources": {
-                "homepage": "https://github.com/bbenchoff/OrthoRoute"
+                "homepage": "https://github.com/bbenchoff/OrthoRoute",
+                "icon": "resources/icon64.png"
             },
             "tags": [
                 "pcb",
                 "routing",
-                "autorouting", 
+                "autorouting",
                 "gpu",
                 "automation",
                 "visualization"
@@ -102,67 +84,67 @@ class OrthoRouteBuildSystem:
                     "version": self.version,
                     "status": "stable",
                     "kicad_version": "9.0",
-                    "kicad_version_max": "9.99",
-                    "platforms": ["windows", "macos", "linux"],
-                    "python_requires": ">=3.8",
-                    "install_size": 0,  # Will be calculated
-                    "download_sha256": "",  # Will be calculated
-                    "download_size": 0,  # Will be calculated
-                    "download_url": "",
-                    "dependencies": [
-                        {
-                            "plugin": "kipy",
-                            "version": ">=0.1.0"
-                        }
-                    ]
+                    "platforms": ["windows", "macos", "linux"]
                 }
-            ]
+            ],
+            "runtime": "ipc"
         }
     
     def copy_core_files(self, package_dir: Path, package_config: Dict):
         """Copy core plugin files"""
         logger.info(f"📂 Copying core files for {package_config['name']}...")
-        
-        # Source directory first
-        src_dir = self.project_root / "src"
-        if src_dir.exists():
-            package_src = package_dir / "src"
-            shutil.copytree(src_dir, package_src)
-            logger.info(f"✓ Copied source directory: {len(list(src_dir.glob('*.py')))} files")
-        
-        # Main plugin file (create entry point)
-        main_file = self.project_root / package_config['main_file']
+
+        # For PCM IPC plugins, everything goes in the "plugins" subdirectory
+        # which will be extracted to 3rdparty/plugins/orthoroute/
+        plugins_dir = package_dir / "plugins"
+        plugins_dir.mkdir(exist_ok=True)
+
+        # Copy the orthoroute package directory directly into plugins/
+        orthoroute_dir = self.project_root / "orthoroute"
+        if orthoroute_dir.exists():
+            package_orthoroute = plugins_dir / "orthoroute"
+            shutil.copytree(orthoroute_dir, package_orthoroute)
+            py_files = len(list(orthoroute_dir.rglob('*.py')))
+            logger.info(f"✓ Copied orthoroute package: {py_files} Python files")
+
+        # Copy main.py entry point directly to plugins/ (not nested)
+        main_file = self.project_root / "main.py"
         if main_file.exists():
-            # Create a simple entry point that imports from src
-            entry_point = f"""#!/usr/bin/env python3
-'''
-{package_config['name']} - PCB Autorouting Plugin
-Entry point for the OrthoRoute application
-'''
+            shutil.copy2(main_file, plugins_dir / "main.py")
+            logger.info(f"✓ Copied main.py entry point")
 
-import sys
-from pathlib import Path
+        # Create plugin.json directly in plugins/ (not nested)
+        # Icon path is relative from here
+        plugin_json = {
+            "identifier": "com.orthoroute.autorouter",
+            "name": "OrthoRoute",
+            "version": self.version,
+            "description": "GPU-accelerated PCB autorouter with Manhattan routing",
+            "runtime": "python",
+            "actions": [
+                {
+                    "id": "orthoroute.route",
+                    "label": "OrthoRoute",
+                    "icon": "resources/icon24.png",  # Changed: relative from plugins/
+                    "entry_point": "main.py"
+                }
+            ]
+        }
 
-# Add src directory to path
-src_path = Path(__file__).parent / "src"
-sys.path.insert(0, str(src_path))
+        with open(plugins_dir / "plugin.json", 'w', encoding='utf-8') as f:
+            json.dump(plugin_json, f, indent=2)
+        logger.info(f"✓ Created plugin.json for IPC registration")
 
-# Import and run the main application
-import orthoroute
-
-if __name__ == "__main__":
-    sys.exit(orthoroute.main())
-"""
-            with open(package_dir / "__init__.py", 'w', encoding='utf-8') as f:
-                f.write(entry_point)
-            logger.info(f"✓ Created entry point from {main_file.name}")
-        
-        # Graphics
-        graphics_dir = self.project_root / "graphics"
-        if graphics_dir.exists():
-            package_graphics = package_dir / "graphics"
-            shutil.copytree(graphics_dir, package_graphics)
-            logger.info(f"✓ Copied graphics: {len(list(graphics_dir.glob('*')))} files")
+        # Copy resources directly to plugins/resources/ (sibling to plugin.json)
+        resources_src = self.project_root / "graphics"
+        if resources_src.exists():
+            resources_dir = plugins_dir / "resources"
+            resources_dir.mkdir(exist_ok=True)
+            for icon_file in ["icon24.png", "icon64.png", "icon200.png"]:
+                src = resources_src / icon_file
+                if src.exists():
+                    shutil.copy2(src, resources_dir / icon_file)
+            logger.info(f"✓ Copied icons to plugins/resources/")
         
         # Requirements
         requirements_file = self.project_root / "requirements.txt"
@@ -207,23 +189,24 @@ if __name__ == "__main__":
                 logger.info("✓ Removed GPU files for lite version")
     
     def create_package_zip(self, package_dir: Path, package_config: Dict) -> Path:
-        """Create ZIP package"""
+        """Create ZIP package for PCM installation"""
         zip_name = f"{package_config['name']}-{self.version}.zip"
         zip_path = self.build_dir / zip_name
-        
-        logger.info(f"📦 Creating ZIP package: {zip_name}")
-        
+
+        logger.info(f"📦 Creating PCM plugin ZIP package: {zip_name}")
+
+        # For PCM packages, files must be at the root of the ZIP (no subdirectory)
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for file_path in package_dir.rglob('*'):
                 if file_path.is_file():
-                    # Create archive path relative to package directory
-                    arcname = package_config['name'] + '/' + str(file_path.relative_to(package_dir))
+                    # Create archive path relative to package_dir (files at root)
+                    arcname = str(file_path.relative_to(package_dir))
                     zipf.write(file_path, arcname)
-        
+
         # Calculate size
         size_mb = zip_path.stat().st_size / (1024 * 1024)
-        logger.info(f"✓ Package created: {zip_name} ({size_mb:.2f} MB)")
-        
+        logger.info(f"✓ PCM plugin package created: {zip_name} ({size_mb:.2f} MB)")
+
         return zip_path
     
     def build_package(self, package_type: str) -> Optional[Path]:
@@ -242,14 +225,44 @@ if __name__ == "__main__":
         # Copy files
         self.copy_core_files(package_dir, package_config)
         self.copy_optional_files(package_dir, package_config)
-        
-        # Create metadata
+
+        # Create metadata.json for PCM installation
         metadata = self.create_plugin_metadata(package_config)
         metadata_file = package_dir / "metadata.json"
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
-        logger.info("✓ Created metadata.json")
-        
+        logger.info("✓ Created metadata.json for PCM")
+
+        # Create README for installation instructions
+        readme_content = f"""# OrthoRoute {self.version} - IPC Plugin
+
+## Installation via Plugin Manager (Recommended)
+
+1. Open KiCad
+2. Go to Plugin and Content Manager
+3. Click "Install from File..."
+4. Select orthoroute-{self.version}.zip
+5. Restart KiCad
+6. The OrthoRoute button should appear in the PCB Editor toolbar
+
+## Manual Installation
+
+1. Extract this ZIP file
+2. Copy the extracted folder to your KiCad plugins directory
+3. Restart KiCad
+
+## Requirements
+
+- KiCad 9.0 or later with IPC API enabled
+- Python 3.8 or later
+- See requirements.txt for Python dependencies
+
+For more information, visit: https://github.com/bbenchoff/OrthoRoute
+"""
+        with open(package_dir / "README.txt", 'w', encoding='utf-8') as f:
+            f.write(readme_content)
+        logger.info("✓ Created README.txt")
+
         # Create ZIP package
         zip_path = self.create_package_zip(package_dir, package_config)
         
@@ -257,63 +270,49 @@ if __name__ == "__main__":
         return zip_path
     
     def build_all_packages(self) -> List[Path]:
-        """Build all package types"""
+        """Build the default package"""
         logger.info("🚀 Starting OrthoRoute build process...")
         logger.info(f"Project root: {self.project_root}")
         logger.info(f"Version: {self.version}")
-        
+
         self.clean_build_directory()
-        
-        built_packages = []
-        for package_type in self.packages:
-            try:
-                zip_path = self.build_package(package_type)
-                if zip_path:
-                    built_packages.append(zip_path)
-            except Exception as e:
-                logger.error(f"Failed to build {package_type} package: {e}")
-        
-        # Summary
-        logger.info("="*60)
-        logger.info("🎉 BUILD COMPLETE!")
-        logger.info(f"Built {len(built_packages)} packages:")
-        
-        total_size = 0
-        for package_path in built_packages:
-            size_mb = package_path.stat().st_size / (1024 * 1024)
-            total_size += size_mb
-            logger.info(f"  📦 {package_path.name} ({size_mb:.2f} MB)")
-        
-        logger.info(f"Total size: {total_size:.2f} MB")
-        logger.info(f"Build directory: {self.build_dir}")
-        logger.info("="*60)
-        
-        return built_packages
+
+        # Build only the default package
+        try:
+            zip_path = self.build_package('default')
+            if zip_path:
+                size_mb = zip_path.stat().st_size / (1024 * 1024)
+                logger.info("="*60)
+                logger.info("🎉 BUILD COMPLETE!")
+                logger.info(f"  📦 {zip_path.name} ({size_mb:.2f} MB)")
+                logger.info(f"Build directory: {self.build_dir}")
+                logger.info("="*60)
+                return [zip_path]
+        except Exception as e:
+            logger.error(f"Failed to build package: {e}")
+            return []
+
+        return []
 
 def main():
     """Main build script entry point"""
     import argparse
     
     parser = argparse.ArgumentParser(description='OrthoRoute Build System')
-    parser.add_argument('--package', choices=['production', 'lite', 'development', 'all'], 
-                       default='all', help='Package type to build')
     parser.add_argument('--version', default='1.0.0', help='Version number')
     parser.add_argument('--clean', action='store_true', help='Clean build directory only')
-    
+
     args = parser.parse_args()
-    
+
     builder = OrthoRouteBuildSystem()
     builder.version = args.version
-    
+
     if args.clean:
         builder.clean_build_directory()
         return 0
-    
-    if args.package == 'all':
-        builder.build_all_packages()
-    else:
-        builder.build_package(args.package)
-    
+
+    builder.build_all_packages()
+
     return 0
 
 if __name__ == "__main__":

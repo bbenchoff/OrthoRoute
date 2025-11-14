@@ -284,6 +284,309 @@ def run_tiny_via_test():
         sys.exit(1)
 
 
+def run_headless(
+    orp_file: str,
+    output_file: Optional[str] = None,
+    max_iterations: int = 200,
+    checkpoint_interval: int = 30,
+    resume_checkpoint: Optional[str] = None,
+    use_gpu: bool = None,
+    cpu_only: bool = False
+):
+    """
+    Run headless cloud routing mode.
+
+    This is the main entry point for cloud-based routing:
+    1. Import board from .ORP file
+    2. Run routing algorithm (identical to GUI mode)
+    3. Export solution to .ORS file
+
+    Args:
+        orp_file: Path to input .ORP file (board export)
+        output_file: Path to output .ORS file (default: derive from input)
+        max_iterations: Maximum routing iterations (default: 200)
+        checkpoint_interval: Checkpoint save interval in minutes (default: 30)
+        resume_checkpoint: Path to checkpoint file to resume from
+        use_gpu: Force GPU mode if True, auto-detect if None
+        cpu_only: Force CPU-only mode if True
+    """
+    try:
+        import time
+        from pathlib import Path
+        from orthoroute.infrastructure.serialization import (
+            import_board_from_orp,
+            export_solution_to_ors,
+            derive_ors_filename
+        )
+        from orthoroute.algorithms.manhattan.unified_pathfinder import UnifiedPathFinder, PathFinderConfig
+        from orthoroute.algorithms.manhattan.iteration_metrics import IterationMetricsLogger
+
+        config = setup_environment()
+        start_time = time.time()
+
+        logging.info("=" * 80)
+        logging.info("HEADLESS CLOUD ROUTING MODE")
+        logging.info("=" * 80)
+        logging.info(f"[HEADLESS] Input: {orp_file}")
+
+        # Determine output path
+        if not output_file:
+            output_file = derive_ors_filename(orp_file)
+        logging.info(f"[HEADLESS] Output: {output_file}")
+        logging.info(f"[HEADLESS] Max iterations: {max_iterations}")
+        logging.info(f"[HEADLESS] Checkpoint interval: {checkpoint_interval} minutes")
+
+        # Step 1: Import board from .ORP file
+        logging.info("[HEADLESS] Step 1: Loading board from .ORP file...")
+        orp_data = import_board_from_orp(orp_file)
+        if not orp_data:
+            logging.error("[HEADLESS] Failed to load board from .ORP file")
+            sys.exit(1)
+
+        # Convert ORP dictionary to board_data format (same as GUI uses)
+        from orthoroute.infrastructure.serialization import convert_orp_to_board_data
+        board_data = convert_orp_to_board_data(orp_data)
+        if not board_data:
+            logging.error("[HEADLESS] Failed to convert ORP data to board_data format")
+            sys.exit(1)
+
+        # Convert board_data to Board object (using same logic as GUI's _create_board_from_data)
+        from orthoroute.domain.models.board import Board, Net, Pad, Component, Coordinate
+
+        layer_count = board_data.get('layers', 2)
+        board = Board(id="headless-board", name=board_data.get('filename', 'board'), layer_count=layer_count)
+        board.nets = []
+        board.components = []
+
+        # Track components and their pads
+        components_dict = {}
+        all_pads = []
+
+        # Create components from board_data (if any)
+        components_data = board_data.get('components', [])
+        for comp_data in components_data:
+            comp_id = comp_data.get('reference', comp_data.get('id', ''))
+            if comp_id:
+                component = Component(
+                    id=comp_id,
+                    reference=comp_id,
+                    value=comp_data.get('value', ''),
+                    footprint=comp_data.get('footprint', ''),
+                    position=Coordinate(
+                        x=comp_data.get('x', 0.0),
+                        y=comp_data.get('y', 0.0)
+                    ),
+                    angle=comp_data.get('rotation', 0.0)
+                )
+                components_dict[comp_id] = component
+
+        # Convert nets from board_data (nets contain pads)
+        nets_data = board_data.get('nets', {})
+        logging.info(f"[HEADLESS] Converting {len(nets_data)} nets from board_data...")
+        for net_id, net_info in nets_data.items():
+            net = Net(id=net_id, name=net_info.get('name', net_id))
+            net.pads = []
+
+            # Create pads from net data
+            for pad_ref in net_info.get('pads', []):
+                if isinstance(pad_ref, dict):
+                    pad_name = pad_ref.get('name', pad_ref.get('id', ''))
+                    component_id = pad_ref.get('component', '')
+
+                    pad = Pad(
+                        id=pad_name or pad_ref.get('id', f"pad_{len(all_pads)}"),
+                        component_id=component_id,
+                        net_id=net_id,
+                        position=Coordinate(x=pad_ref.get('x', 0.0), y=pad_ref.get('y', 0.0)),
+                        size=(pad_ref.get('width', 0.2), pad_ref.get('height', 0.2)),
+                        drill_size=pad_ref.get('drill'),
+                        layer=pad_ref.get('layers', ['F.Cu'])[0] if pad_ref.get('layers') else 'F.Cu'
+                    )
+                    net.pads.append(pad)
+                    all_pads.append(pad)
+
+                    # Add pad to component (treat empty component_id as default component)
+                    if not component_id:
+                        component_id = "GENERIC_COMPONENT"
+                        pad.component_id = component_id  # Update pad's component_id
+
+                    if component_id not in components_dict:
+                        components_dict[component_id] = Component(
+                            id=component_id,
+                            reference=component_id,
+                            value="",
+                            footprint="",
+                            position=Coordinate(x=pad.position.x, y=pad.position.y),
+                            pads=[]
+                        )
+                    components_dict[component_id].pads.append(pad)
+
+            board.nets.append(net)
+
+        # Add all components to board
+        board.components = list(components_dict.values())
+
+        # Store KiCad-calculated bounds for accurate routing area
+        board._kicad_bounds = board_data.get('bounds', None)
+        board.layer_names = board_data.get('layer_names', [])
+
+        logging.info(f"[HEADLESS] Loaded board: {board.name}")
+        logging.info(f"[HEADLESS]   - Nets: {len(board.nets)}")
+        logging.info(f"[HEADLESS]   - Components: {len(board.components)}")
+        logging.info(f"[HEADLESS]   - Component IDs: {list(components_dict.keys())[:5]}")
+        if board.components:
+            logging.info(f"[HEADLESS]   - Component[0] has {len(board.components[0].pads)} pads")
+        logging.info(f"[HEADLESS]   - Pads: {len(all_pads)}")
+        logging.info(f"[HEADLESS]   - Layers: {board.layer_count}")
+
+        # Step 2: Create UnifiedPathFinder with same config as GUI
+        logging.info("[HEADLESS] Step 2: Creating UnifiedPathFinder...")
+
+        # Determine GPU mode
+        if cpu_only:
+            use_gpu_mode = False
+            logging.info("[HEADLESS] GPU mode: DISABLED (--cpu-only)")
+        elif use_gpu:
+            use_gpu_mode = True
+            logging.info("[HEADLESS] GPU mode: FORCED (--use-gpu)")
+        else:
+            # Auto-detect
+            use_gpu_mode = os.environ.get('USE_GPU', '1') == '1' and not os.environ.get('ORTHO_CPU_ONLY', '0') == '1'
+            logging.info(f"[HEADLESS] GPU mode: AUTO-DETECT ({'ENABLED' if use_gpu_mode else 'DISABLED'})")
+
+        # Create PathFinder config with custom max iterations
+        pf_config = PathFinderConfig()
+        pf_config.max_routing_iterations = max_iterations
+
+        pf = UnifiedPathFinder(config=pf_config, use_gpu=use_gpu_mode)
+        logging.info(f"[HEADLESS] Created UnifiedPathFinder (instance_tag={pf._instance_tag})")
+
+        # Setup iteration metrics logger
+        debug_dir = pf.debug_dir if hasattr(pf, 'debug_dir') else 'debug_output'
+        board_info = {
+            'board_name': board.name,
+            'nets': len(board.nets),
+            'pads': len(all_pads),
+            'layers': board.layer_count,
+            'max_iterations': max_iterations,
+            'mode': 'headless',
+        }
+        metrics_logger = IterationMetricsLogger(debug_dir, board_info)
+        pf._metrics_logger = metrics_logger
+        logging.info(f"[HEADLESS] Metrics logging to: {debug_dir}")
+
+        # Step 3: Initialize graph (build lattice, CSR)
+        logging.info("[HEADLESS] Step 3: Building routing graph...")
+        pf.initialize_graph(board)
+
+        # Step 4: Map pads to lattice
+        logging.info("[HEADLESS] Step 4: Mapping pads to lattice...")
+        pf.map_all_pads(board)
+
+        # Step 4.5: Precompute pad escapes and portals (CRITICAL for routing!)
+        logging.info("[HEADLESS] Step 4.5: Computing pad escape portals...")
+
+        # CRITICAL: Attach GUI pads to board (required by pad escape planner)
+        board._gui_pads = board_data.get('pads', [])
+        logging.info(f"[HEADLESS] Attached {len(board._gui_pads)} GUI pads for escape planning")
+
+        escape_tracks, escape_vias = pf.precompute_all_pad_escapes(board)
+        logging.info(f"[HEADLESS] Generated {len(escape_tracks)} escape tracks, {len(escape_vias)} escape vias")
+        logging.info(f"[HEADLESS] Created {len(pf.portals)} portals for pad escapes")
+
+        # Step 5: Prepare routing runtime
+        logging.info("[HEADLESS] Step 5: Preparing routing runtime...")
+        pf.prepare_routing_runtime()
+
+        # Step 6: Route all nets (main routing loop)
+        logging.info("[HEADLESS] Step 6: Starting routing algorithm...")
+        logging.info("[HEADLESS] This may take hours for large boards - logs will show progress")
+
+        # Custom iteration callback to track metrics
+        iteration_metrics = []
+
+        def iteration_callback(iter_num, provisional_tracks, provisional_vias, overflow_sum, overflow_cnt):
+            """Called after each routing iteration."""
+            nonlocal iteration_metrics
+            iteration_metrics.append({
+                'iteration': iter_num,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'duration_s': 0.0,  # Will be calculated from timestamps
+                'overuse': overflow_cnt,
+                'barrel_conflicts': 0,  # Not available in callback
+                'routed_nets': len(provisional_tracks),  # Approximate
+                'failed_nets': 0,  # Not available in callback
+                'total_edges': len(provisional_tracks) + len(provisional_vias),
+                'pres_fac': 1.0,  # Not available in callback
+                'pres_fac_mult': 1.0,  # Not available in callback
+                'hist_gain': 0.0,  # Not available in callback
+                'hist_cost_weight': 0.0,  # Not available in callback
+                'via_penalty': 3.0,  # Not available in callback
+                'hotset_size': 0,  # Not available in callback
+                'stagnant_iters': 0,  # Not available in callback
+                'stagnation_events': 0,  # Not available in callback
+                'plateau_kick_applied': False,  # Not available in callback
+            })
+            logging.info(f"[HEADLESS] Iteration {iter_num}: overuse={overflow_cnt}, tracks={len(provisional_tracks)}, vias={len(provisional_vias)}")
+
+        result = pf.route_multiple_nets(board.nets, iteration_cb=iteration_callback)
+
+        # Step 7: Emit geometry
+        logging.info("[HEADLESS] Step 7: Emitting geometry...")
+        tracks, vias = pf.emit_geometry(board)
+        logging.info(f"[HEADLESS] Generated {tracks} tracks, {vias} vias")
+
+        # Step 8: Export solution to .ORS file
+        logging.info("[HEADLESS] Step 8: Exporting solution to .ORS file...")
+
+        # Get geometry payload
+        geom = pf.get_geometry_payload()
+
+        # Build routing metadata
+        end_time = time.time()
+        total_time = end_time - start_time
+
+        routing_metadata = {
+            'total_time': total_time,
+            'iterations': len(iteration_metrics),
+            'converged': result.get('converged', False) if isinstance(result, dict) else False,
+            'nets_routed': result.get('nets_routed', 0) if isinstance(result, dict) else 0,
+            'wirelength': result.get('wirelength', 0.0) if isinstance(result, dict) else 0.0,
+            'via_count': vias,
+            'track_count': tracks,
+            'overflow': result.get('overflow', 0) if isinstance(result, dict) else 0,
+        }
+
+        # Export to .ORS
+        export_solution_to_ors(
+            geom,
+            iteration_metrics,
+            routing_metadata,
+            output_file,
+            compress=True
+        )
+
+        # If we got here, export succeeded (would have raised exception otherwise)
+        if True:
+            logging.info(f"[HEADLESS] Successfully exported solution to: {output_file}")
+            logging.info("=" * 80)
+            logging.info("HEADLESS ROUTING COMPLETED SUCCESSFULLY")
+            logging.info("=" * 80)
+            logging.info(f"Total runtime: {total_time/60:.1f} minutes")
+            logging.info(f"Iterations: {len(iteration_metrics)}")
+            logging.info(f"Converged: {routing_metadata['converged']}")
+            logging.info(f"Tracks: {tracks}, Vias: {vias}")
+            logging.info("=" * 80)
+            sys.exit(0)
+        else:
+            logging.error("[HEADLESS] Failed to export solution")
+            sys.exit(1)
+
+    except Exception as e:
+        logging.error(f"[HEADLESS] Fatal error: {e}", exc_info=True)
+        sys.exit(1)
+
+
 def run_cli(board_file: str, output_dir: str = ".", config_path: Optional[str] = None):
     """Run command line interface using unified pipeline (same as GUI)."""
     try:
@@ -359,6 +662,8 @@ Examples:
   %(prog)s --test-manhattan             # Run automated Manhattan routing test
   %(prog)s cli board.kicad_pcb          # Route board via CLI
   %(prog)s cli board.kicad_pcb -o out/  # Route and save to directory
+  %(prog)s headless input.ORP           # Headless cloud routing mode
+  %(prog)s headless input.ORP -o out.ORS --max-iterations 200
         """
     )
     
@@ -392,6 +697,43 @@ Examples:
         help='Configuration file path'
     )
     
+    # Headless mode
+    headless_parser = subparsers.add_parser('headless', help='Headless cloud routing mode')
+    headless_parser.add_argument(
+        'orp_file',
+        help='Input .ORP file (board export)'
+    )
+    headless_parser.add_argument(
+        '-o', '--output',
+        help='Output .ORS filepath (default: derive from input, e.g., input.ORP → input.ORS)'
+    )
+    headless_parser.add_argument(
+        '--max-iterations',
+        type=int,
+        default=200,
+        help='Override default iteration limit (default: 200)'
+    )
+    headless_parser.add_argument(
+        '--checkpoint-interval',
+        type=int,
+        default=30,
+        help='Checkpoint save interval in minutes (default: 30)'
+    )
+    headless_parser.add_argument(
+        '--resume-checkpoint',
+        help='Resume from checkpoint file'
+    )
+    headless_parser.add_argument(
+        '--use-gpu',
+        action='store_true',
+        help='Enable GPU acceleration if available (default: auto-detect)'
+    )
+    headless_parser.add_argument(
+        '--cpu-only',
+        action='store_true',
+        help='Force CPU-only mode (no GPU)'
+    )
+
     # Global options
     parser.add_argument(
         '--version',
@@ -445,6 +787,16 @@ Examples:
                     args.board_file,
                     args.output,
                     getattr(args, 'config', None)
+                )
+            elif args.mode == 'headless':
+                run_headless(
+                    args.orp_file,
+                    output_file=getattr(args, 'output', None),
+                    max_iterations=getattr(args, 'max_iterations', 200),
+                    checkpoint_interval=getattr(args, 'checkpoint_interval', 30),
+                    resume_checkpoint=getattr(args, 'resume_checkpoint', None),
+                    use_gpu=getattr(args, 'use_gpu', None),
+                    cpu_only=getattr(args, 'cpu_only', False)
                 )
             else:
                 parser.error(f"Unknown mode: {args.mode}")

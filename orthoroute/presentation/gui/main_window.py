@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QGroupBox, QScrollArea, QTabWidget, QProgressBar,
     QStatusBar, QMenuBar, QToolBar, QApplication, QMessageBox,
     QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QSlider,
-    QFrame, QSizePolicy, QLineEdit
+    QFrame, QSizePolicy, QLineEdit, QFileDialog
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPoint, QPointF,
@@ -43,6 +43,10 @@ from ...algorithms.manhattan.manhattan_router_rrg import ManhattanRRGRoutingEngi
 from ...algorithms.manhattan.rrg import RoutingConfig
 from ...infrastructure.gpu.cuda_provider import CUDAProvider
 from ...infrastructure.gpu.cpu_fallback import CPUProvider
+from ...infrastructure.serialization import (
+    export_pcb_to_orp, import_solution_from_ors,
+    derive_orp_filename, derive_ors_filename, get_solution_summary
+)
 from kipy.board_types import Track, Via, PadStack, BoardLayer, ViaType
 from kipy.common_types import Vector2
 
@@ -1437,6 +1441,21 @@ class OrthoRouteMainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        # Cloud routing workflow menu items
+        self.export_pcb_action = QAction("Export PCB...", self)
+        self.export_pcb_action.setShortcut("Ctrl+E")
+        self.export_pcb_action.triggered.connect(self.export_pcb)
+        self.export_pcb_action.setEnabled(True)  # Enabled when board is loaded
+        file_menu.addAction(self.export_pcb_action)
+
+        self.import_solution_action = QAction("Import Solution...", self)
+        self.import_solution_action.setShortcut("Ctrl+I")
+        self.import_solution_action.triggered.connect(self.import_solution)
+        self.import_solution_action.setEnabled(True)
+        file_menu.addAction(self.import_solution_action)
+
+        file_menu.addSeparator()
+
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -1833,19 +1852,9 @@ class OrthoRouteMainWindow(QMainWindow):
             pf = self.plugin.get_pathfinder()
             board = self._create_board_from_data()
 
-            # Initialize iteration metrics logger
-            from ...algorithms.manhattan.iteration_metrics import IterationMetricsLogger
-            board_info = {
-                'Board Name': board.name if hasattr(board, 'name') else 'Unknown',
-                'Total Nets': len(board.nets) if hasattr(board, 'nets') else 0,
-                'Layers': board.layer_count if hasattr(board, 'layer_count') else 0,
-                'Grid Pitch': f"{pf.config.grid_pitch}mm" if hasattr(pf.config, 'grid_pitch') else 'N/A',
-            }
-            metrics_logger = IterationMetricsLogger(self._current_run_folder, board_info)
-            self.log_to_gui(f"[METRICS] Logging enabled: {self._current_run_folder}", "DEBUG")
-
-            # Attach metrics logger to pathfinder for iteration tracking
-            pf._metrics_logger = metrics_logger
+            # NOTE: IterationMetricsLogger not available in 22eb7db baseline
+            # Metrics logging functionality removed during rollback to 22eb7db
+            # PathFinder will run without metrics logger (basic logging still works)
 
             self.log_to_gui(f"[GUI] Starting unified pipeline with pf={pf._instance_tag}", "INFO")
 
@@ -2921,6 +2930,178 @@ class OrthoRouteMainWindow(QMainWindow):
             self.router.auto_checkpoint = checked
             status = "enabled" if checked else "disabled"
             logger.info(f"Auto-checkpoint {status}")
+
+    def export_pcb(self):
+        """Export board to .ORP file for cloud routing (Ctrl+E)"""
+        try:
+            if not self.board_data:
+                QMessageBox.warning(self, "No Board", "No board loaded. Please load a board first.")
+                return
+
+            # Derive default filename from board filename
+            board_filename = self.board_data.get('filename', 'board.kicad_pcb')
+            default_filename = derive_orp_filename(board_filename)
+
+            # Show save dialog
+            filepath, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export PCB to ORP",
+                default_filename,
+                "OrthoRoute PCB Files (*.ORP);;All Files (*)"
+            )
+
+            if not filepath:
+                return  # User cancelled
+
+            # Ensure .ORP extension
+            if not filepath.upper().endswith('.ORP'):
+                filepath += '.ORP'
+
+            # Export board data
+            self.status_label.setText("Exporting board to ORP...")
+            logger.info(f"Exporting board to {filepath}")
+
+            export_pcb_to_orp(self.board_data, filepath, compress=True)
+
+            # If we got here, export succeeded (would have raised exception otherwise)
+            self.status_label.setText("Board exported successfully")
+
+            # Show success message with details
+            nets_count = len(self.board_data.get('nets', {}))
+            pads_count = len(self.board_data.get('pads', []))
+            layers = self.board_data.get('layers', 0)
+
+            msg = (f"Board exported successfully!\n\n"
+                   f"File: {filepath}\n"
+                   f"Nets: {nets_count}\n"
+                   f"Pads: {pads_count}\n"
+                   f"Layers: {layers}\n\n"
+                   f"You can now upload this file to a cloud GPU instance for routing.")
+
+            QMessageBox.information(self, "Export Successful", msg)
+            logger.info(f"Successfully exported board: {nets_count} nets, {pads_count} pads, {layers} layers")
+
+        except Exception as e:
+            logger.error(f"Error exporting PCB: {e}", exc_info=True)
+            self.status_label.setText("Export failed")
+            QMessageBox.critical(self, "Export Error", f"Error exporting board:\n{str(e)}")
+
+    def import_solution(self):
+        """Import routing solution from .ORS file (Ctrl+I)"""
+        try:
+            # Show open dialog
+            filepath, _ = QFileDialog.getOpenFileName(
+                self,
+                "Import Solution from ORS",
+                "",
+                "OrthoRoute Solution Files (*.ORS);;All Files (*)"
+            )
+
+            if not filepath:
+                return  # User cancelled
+
+            # Import solution
+            self.status_label.setText("Importing routing solution...")
+            logger.info(f"Importing solution from {filepath}")
+
+            ors_data = import_solution_from_ors(filepath)
+
+            if not ors_data:
+                self.status_label.setText("Import failed")
+                QMessageBox.critical(self, "Import Failed",
+                                   "Failed to import routing solution from ORS file.\n"
+                                   "Check that the file is valid and not corrupted.")
+                return
+
+            # Store the imported solution
+            self.routing_result = ors_data
+            self.status_label.setText("Solution imported successfully")
+
+            # Generate summary for display
+            summary = get_solution_summary(ors_data)
+
+            # Display solution in the preview
+            self._display_imported_solution(ors_data)
+
+            # Show success message with routing metrics
+            QMessageBox.information(self, "Import Successful",
+                                  f"Routing solution imported successfully!\n\n{summary}")
+
+            logger.info(f"Successfully imported solution from {filepath}")
+
+        except Exception as e:
+            logger.error(f"Error importing solution: {e}", exc_info=True)
+            self.status_label.setText("Import failed")
+            QMessageBox.critical(self, "Import Error", f"Error importing solution:\n{str(e)}")
+
+    def _display_imported_solution(self, ors_data: Dict[str, Any]):
+        """Display imported routing solution in the PCB viewer"""
+        try:
+            if not self.pcb_viewer:
+                logger.warning("No PCB viewer available to display solution")
+                return
+
+            # Extract geometry from ORS data
+            nets = ors_data.get('nets', {})
+
+            # Convert ORS format to display format
+            # The PCB viewer expects Track and Via objects
+            tracks = []
+            vias = []
+
+            for net_name, net_data in nets.items():
+                # Process traces
+                for trace in net_data.get('traces', []):
+                    # trace format: [layer, x1, y1, x2, y2, width]
+                    if len(trace) >= 6:
+                        layer, x1, y1, x2, y2, width = trace[:6]
+                        track = Track(
+                            start=Vector2(x1, y1),
+                            end=Vector2(x2, y2),
+                            width=width,
+                            layer=BoardLayer(layer),
+                            net=net_name
+                        )
+                        tracks.append(track)
+
+                # Process vias
+                for via in net_data.get('vias', []):
+                    # via format: [x, y, layer_from, layer_to, diameter, drill]
+                    if len(via) >= 6:
+                        x, y, layer_from, layer_to, diameter, drill = via[:6]
+                        via_obj = Via(
+                            position=Vector2(x, y),
+                            via_type=ViaType.THROUGH,
+                            size=diameter,
+                            drill=drill,
+                            layers=(BoardLayer(layer_from), BoardLayer(layer_to)),
+                            net=net_name
+                        )
+                        vias.append(via_obj)
+
+            # Update PCB viewer with imported geometry
+            logger.info(f"Displaying {len(tracks)} tracks and {len(vias)} vias in viewer")
+
+            # Store the geometry for later commit
+            if not hasattr(self, 'imported_tracks'):
+                self.imported_tracks = []
+                self.imported_vias = []
+
+            self.imported_tracks = tracks
+            self.imported_vias = vias
+
+            # Update viewer display
+            if hasattr(self.pcb_viewer, 'set_routing_preview'):
+                self.pcb_viewer.set_routing_preview(tracks, vias)
+            elif hasattr(self.pcb_viewer, 'display_tracks'):
+                self.pcb_viewer.display_tracks(tracks)
+                self.pcb_viewer.display_vias(vias)
+
+            self.pcb_viewer.update()
+            logger.info("Solution displayed in viewer")
+
+        except Exception as e:
+            logger.error(f"Error displaying imported solution: {e}", exc_info=True)
 
     def _route_manhattan_rrg(self):
         """Perform Manhattan RRG routing with live GUI updates"""

@@ -494,7 +494,7 @@ import time
 import random
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set, Any
+from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
 
 # Third-party
@@ -577,8 +577,8 @@ class PathFinderConfig:
     20%+ convergence regression. Prefer infrastructure improvements over tuning.
     """
     max_iterations: int = 40  # Extended to give convergence more time
-    # CONVERGENCE SCHEDULE (AGGRESSIVE FOR FAST CONVERGENCE):
-    pres_fac_init: float = 3.0   # Start with pressure immediately (skip iteration 1 warmup)
+    # CONVERGENCE SCHEDULE (BALANCED BASED ON DIAGNOSTICS):
+    pres_fac_init: float = 1.0   # Start gentle (iteration 1)
     pres_fac_mult: float = 1.10  # Gentler exponential to keep history competitive (was 1.15)
     pres_fac_max: float = 64.0    # Allow higher pressure to resolve late-stage congestion (was 8.0)
     hist_gain: float = 0.2       # Lowered for raw present (was 0.8 with present_ema)
@@ -2023,11 +2023,6 @@ class PathFinderRouter:
         self._geometry_payload = GeometryPayload([], [])
         self._provisional_geometry = GeometryPayload([], [])  # For GUI feedback during routing
 
-        # Checkpoint management
-        from .checkpoint import CheckpointManager
-        self.checkpoint_manager = CheckpointManager()
-        self.auto_checkpoint = True  # Enable auto-save by default
-
         # Hotset management: locked nets and clean streak tracking
         self.locked_nets: Set[str] = set()
         self.net_clean_streak: Dict[str, int] = defaultdict(int)  # iterations since last overuse
@@ -2828,40 +2823,25 @@ class PathFinderRouter:
 
         CRITICAL: This must be called AFTER each net commits, not just at iteration start!
         Without this, later nets in the same iteration don't see earlier nets' via barrels.
-
-        NOTE: This is optimized for sequential routing. True parallelization would require
-        speculative routing + conflict detection + retry, which is a larger architecture change.
         """
         if not path or len(path) < 2:
             return
 
         net_id = self._get_net_id(net_name)
 
-        # Vectorized via detection - find all layer transitions
-        path_arr = np.array(path, dtype=np.int32)
-        u_nodes = path_arr[:-1]
-        v_nodes = path_arr[1:]
+        # Walk path and find via transitions
+        for i in range(len(path) - 1):
+            u, v = path[i], path[i+1]
+            xu, yu, zu = self.lattice.idx_to_coord(u)
+            xv, yv, zv = self.lattice.idx_to_coord(v)
 
-        # Bulk coordinate conversion (vectorized)
-        coords_u = np.array([self.lattice.idx_to_coord(n) for n in u_nodes])
-        coords_v = np.array([self.lattice.idx_to_coord(n) for n in v_nodes])
-
-        # Find vias: same x,y but different z
-        via_mask = (coords_u[:, 0] == coords_v[:, 0]) & \
-                   (coords_u[:, 1] == coords_v[:, 1]) & \
-                   (coords_u[:, 2] != coords_v[:, 2])
-
-        # For each via, mark all barrel nodes
-        via_indices = np.where(via_mask)[0]
-        for i in via_indices:
-            xu, yu, zu = coords_u[i]
-            zv = coords_v[i, 2]
-            z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
-
-            # Mark all layers in barrel
-            for z in range(z_lo, z_hi + 1):
-                node_idx = self.lattice.node_idx(xu, yu, z)
-                self.node_owner[node_idx] = net_id
+            # Via: same (x,y), different z
+            if xu == xv and yu == yv and zu != zv:
+                # Mark ALL nodes in via barrel span
+                z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                for z in range(z_lo, z_hi + 1):
+                    node_idx = self.lattice.node_idx(xu, yu, z)
+                    self.node_owner[node_idx] = net_id
 
     def _build_owner_bitmap_for_fullgraph(self, current_net: str, force_allow_nodes=None) -> np.ndarray:
         """
@@ -3256,9 +3236,7 @@ class PathFinderRouter:
 
         # Get precomputed metadata
         via_edge_indices = self._via_edge_metadata['indices']
-        # x,y stored separately to save memory (no stacking)
-        xu = self._via_edge_metadata['xu']
-        yu = self._via_edge_metadata['yu']
+        via_xy_coords = self._via_edge_metadata['xy_coords']
         z_lo = self._via_edge_metadata['z_lo']
         z_hi = self._via_edge_metadata['z_hi']
 
@@ -3266,18 +3244,12 @@ class PathFinderRouter:
         if num_via_edges == 0:
             return
 
-        # Initialize penalties array (match GPU/CPU based on metadata)
-        use_gpu_penalties = hasattr(xu, 'get')  # Check if xu is GPU array
+        # Initialize penalties array
+        penalties = np.zeros(num_via_edges, dtype=np.float32)
 
-        if use_gpu_penalties:
-            import cupy as cp
-            penalties = cp.zeros(num_via_edges, dtype=cp.float32)
-        else:
-            penalties = np.zeros(num_via_edges, dtype=np.float32)
-
-        # Vectorized column penalty computation (use separate x,y arrays)
+        # Vectorized column penalty computation
         if hasattr(self, 'via_col_pres'):
-            col_penalties = self.via_col_pres[xu, yu]
+            col_penalties = self.via_col_pres[via_xy_coords[:, 0], via_xy_coords[:, 1]]
             penalties += col_weight * col_penalties
 
         # Vectorized segment penalty computation (using prefix sums)
@@ -3287,31 +3259,29 @@ class PathFinderRouter:
             hi_idx = z_hi - 2  # Index for upper bound
             lo_idx = z_lo - 2  # Index for lower bound
 
-            # Create masks for valid indices (match GPU/CPU type of z_hi/z_lo)
-            xp = cp if use_gpu_penalties else np
+            # Create masks for valid indices
             valid_mask = z_hi > z_lo  # Only process edges spanning multiple layers
             hi_valid = (hi_idx >= 0) & (hi_idx < self._segZ)
             lo_valid = (lo_idx >= 0) & (lo_idx < self._segZ)
 
-            # Fetch prefix values with bounds checking (match array type)
-            pref_hi = xp.zeros(num_via_edges, dtype=xp.float32)
-            pref_lo = xp.zeros(num_via_edges, dtype=xp.float32)
+            # Fetch prefix values with bounds checking
+            pref_hi = np.zeros(num_via_edges, dtype=np.float32)
+            pref_lo = np.zeros(num_via_edges, dtype=np.float32)
 
-            # Use advanced indexing for valid entries (use separate xu, yu)
-            # Convert masks to same backend for indexing
-            if xp.any(hi_valid):
+            # Use advanced indexing for valid entries
+            if np.any(hi_valid):
                 valid_hi_edges = hi_valid
                 pref_hi[valid_hi_edges] = self.via_seg_prefix[
-                    xu[valid_hi_edges],
-                    yu[valid_hi_edges],
+                    via_xy_coords[valid_hi_edges, 0],
+                    via_xy_coords[valid_hi_edges, 1],
                     hi_idx[valid_hi_edges]
                 ]
 
-            if xp.any(lo_valid):
+            if np.any(lo_valid):
                 valid_lo_edges = lo_valid
                 pref_lo[valid_lo_edges] = self.via_seg_prefix[
-                    xu[valid_lo_edges],
-                    yu[valid_lo_edges],
+                    via_xy_coords[valid_lo_edges, 0],
+                    via_xy_coords[valid_lo_edges, 1],
                     lo_idx[valid_lo_edges]
                 ]
 
@@ -3448,18 +3418,15 @@ class PathFinderRouter:
         # CPU fallback
         via_edges = self._via_edge_metadata
         edge_indices = via_edges['indices']
-        xu_arr = via_edges['xu']
-        yu_arr = via_edges['yu']
+        xy_coords = via_edges['xy_coords']
         z_lo = via_edges['z_lo']
         z_hi = via_edges['z_hi']
 
         # Convert from GPU to CPU if needed
         if hasattr(edge_indices, 'get'):
             edge_indices = edge_indices.get()
-        if hasattr(xu_arr, 'get'):
-            xu_arr = xu_arr.get()
-        if hasattr(yu_arr, 'get'):
-            yu_arr = yu_arr.get()
+        if hasattr(xy_coords, 'get'):
+            xy_coords = xy_coords.get()
         if hasattr(z_lo, 'get'):
             z_lo = z_lo.get()
         if hasattr(z_hi, 'get'):
@@ -3481,7 +3448,7 @@ class PathFinderRouter:
         blocked_count = 0
 
         for i in range(len(edge_indices)):
-            xu, yu = int(xu_arr[i]), int(yu_arr[i])
+            xu, yu = int(xy_coords[i, 0]), int(xy_coords[i, 1])
             z_start, z_end = int(z_lo[i]), int(z_hi[i])
             edge_idx = edge_indices[i]
 
@@ -3543,13 +3510,13 @@ class PathFinderRouter:
 
         # Scale by layer count (fewer layers = stronger penalties needed)
         if n_sig_layers <= 12:
-            pres_fac_max = 512.0  # Extreme ceiling for difficult boards
+            pres_fac_max = 32.0  # Increased from 6.0 to allow convergence
             hist_cost_weight_mult = 1.2  # 12.0 for few layers
         elif n_sig_layers <= 20:
-            pres_fac_max = 1024.0  # Nuclear option - force convergence
+            pres_fac_max = 64.0  # Increased from 8.0 to allow convergence
             hist_cost_weight_mult = 1.0  # 10.0
         else:
-            pres_fac_max = 2048.0  # Extreme ceiling for many-layer boards
+            pres_fac_max = 128.0  # Increased from 10.0 to allow convergence
             hist_cost_weight_mult = 0.8  # 8.0 for many layers
 
         # Allow env overrides for testing
@@ -3563,33 +3530,14 @@ class PathFinderRouter:
 
         self._negotiation_ran = True
 
-        # Check if resuming from checkpoint
-        start_iteration = 1
-        if self.iteration > 0:
-            # Checkpoint loaded - resume from next iteration
-            start_iteration = self.iteration + 1
-
-            # Always use NEW parameters (ignore old checkpoint pres_fac)
-            # This allows testing new aggressive settings on old checkpoints
-            old_pres_fac = getattr(self, '_checkpoint_pres_fac', None)
-            pres_fac = pres_fac * (pres_fac_mult ** (self.iteration - 1))
-            pres_fac = min(pres_fac, pres_fac_max)
-
-            if old_pres_fac:
-                logger.warning(f"[CHECKPOINT-RESUME] Old pres_fac={old_pres_fac:.2f} -> NEW pres_fac={pres_fac:.2f} (using current params)")
-            else:
-                logger.warning(f"[CHECKPOINT-RESUME] Calculated pres_fac={pres_fac:.2f} for iteration {self.iteration}")
-
-            logger.warning(f"[CHECKPOINT-RESUME] Resuming from iteration {self.iteration} -> starting at {start_iteration}")
-
-        logger.info(f"[NEGOTIATE] {len(tasks)} nets, {cfg.max_iterations} iters (starting from {start_iteration})")
+        logger.info(f"[NEGOTIATE] {len(tasks)} nets, {cfg.max_iterations} iters")
         logger.info(f"[PARAMS] layers={n_sig_layers} pres_fac_init={pres_fac:.2f} pres_fac_mult={pres_fac_mult:.2f} pres_fac_max={pres_fac_max:.0f} hist_gain={hist_gain:.2f} hist_weight={cfg.hist_cost_weight * hist_cost_weight_mult:.1f}")
 
         # Build edge→src mapping for barrel conflict detection
         logger.warning("[BARREL-CONFLICT-INIT] Building edge_src_map once before routing")
         self._ensure_edge_src_map()
 
-        for it in range(start_iteration, cfg.max_iterations + 1):
+        for it in range(1, cfg.max_iterations + 1):
             self.iteration = it
             logger.info(f"[ITER {it}] pres_fac={pres_fac:.2f}")
 
@@ -3718,9 +3666,9 @@ class PathFinderRouter:
                     edge_kind=edge_kind_arr
                 )
 
-            # STEP 2.5: Via pooling DISABLED for 22-layer boards (GPU/CPU type mixing issues)
-            # NOTE: Not critical - routing works without this optimization
-            # self._apply_via_pooling_penalties(pres_fac)
+            # STEP 2.5: Apply via column/segment pooling penalties
+            # NOTE: Layer balancing now enabled (vectorized, applied in update_costs)
+            self._apply_via_pooling_penalties(pres_fac)
 
             # STEP 2.6: Hard-block via edges with spatial collisions (iteration 2+)
             # This prevents PathFinder from using edges that would cause via collisions
@@ -3774,19 +3722,19 @@ class PathFinderRouter:
 
             # STEP 3.5: CRITICAL - Detect via barrel conflicts BEFORE computing overuse
             # TWO-PHASE APPROACH:
-            #   Phase 1 (iters 1-10): Light barrel penalties (don't force divergence)
-            #   Phase 2 (iters 11+): Disable penalties, let PathFinder optimize freely
+            #   Phase 1 (iters 1-50): Aggressively penalize barrel conflicts
+            #   Phase 2 (iters 51+): Disable penalties, let PathFinder optimize freely
             conflict_edge_indices, conflict_count = self._detect_barrel_conflicts()
 
-            BARREL_PHASE_1_ITERS = 10  # Short Phase 1 for large boards - get to Phase 2 fast!
+            BARREL_PHASE_1_ITERS = 50  # Aggressive barrel conflict reduction
 
             if conflict_count > 0:
                 logger.warning(f"[BARREL-CONFLICT] Detected {conflict_count} barrel conflicts in iteration {it}")
 
                 if it <= BARREL_PHASE_1_ITERS:
-                    # PHASE 1: Apply LIGHT penalty (don't force divergence on large boards)
+                    # PHASE 1: Apply penalty to reduce barrel conflicts
                     pres = self.accounting.present
-                    conflict_penalty = min(5.0 * pres_fac, 50.0)  # Lighter penalty, lower cap
+                    conflict_penalty = min(10.0 * pres_fac, 100.0)  # Cap at 100
 
                     if hasattr(pres, 'get'):
                         # GPU array
@@ -3817,43 +3765,6 @@ class PathFinderRouter:
             via_ratio = (via_overuse / over_sum * 100) if over_sum > 0 else 0.0
 
             logger.info(f"[ITER {it}] routed={routed} failed={failed} overuse={over_sum} edges={over_cnt} via_overuse={via_ratio:.1f}%")
-
-            # Log metrics to CSV/MD files if logger is attached
-            if hasattr(self, '_metrics_logger') and self._metrics_logger:
-                from datetime import datetime
-                try:
-                    # Count barrel conflicts from last detection
-                    barrel_conflict_count = len(barrel_conflicts) if 'barrel_conflicts' in locals() else 0
-
-                    # Track whether plateau kick was applied this iteration
-                    plateau_kick_applied = (stagnant == 2)
-
-                    # Calculate total edges in use
-                    total_edges = sum(len(path) for path in self.net_paths.values() if path)
-
-                    metrics = {
-                        'iteration': it,
-                        'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        'duration_s': time.time() - iter_start,
-                        'overuse': int(over_sum),
-                        'overuse_delta': 0,  # Will be calculated by logger
-                        'barrel_conflicts': barrel_conflict_count,
-                        'routed_nets': routed,
-                        'failed_nets': failed,
-                        'total_edges': total_edges,
-                        'pres_fac': float(pres_fac),
-                        'pres_fac_mult': float(pres_fac_mult),
-                        'hist_gain': float(hist_gain),
-                        'hist_cost_weight': float(cfg.hist_cost_weight * hist_cost_weight_mult),
-                        'via_penalty': float(cfg.via_cost),
-                        'hotset_size': len(hotset),
-                        'stagnant_iters': stagnant,
-                        'stagnation_events': self.stagnation_counter,
-                        'plateau_kick_applied': 1 if plateau_kick_applied else 0,
-                    }
-                    self._metrics_logger.log_iteration(metrics)
-                except Exception as e:
-                    logger.warning(f"[METRICS] Failed to log iteration {it}: {e}")
 
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0)
             if it <= 10:
@@ -4096,22 +4007,6 @@ class PathFinderRouter:
                     iteration_cb(it, provisional_tracks, provisional_vias, over_sum, over_cnt)
                 except Exception as e:
                     logger.warning(f"[ITER {it}] Iteration callback failed: {e}")
-
-            # Auto-checkpoint after each iteration
-            if self.auto_checkpoint:
-                try:
-                    metadata = {
-                        'overuse': over_sum,
-                        'overused_edges': over_cnt,
-                        'routed_nets': routed,
-                        'failed_nets': failed,
-                        'via_overuse_pct': via_ratio,
-                    }
-                    self.checkpoint_manager.save_checkpoint(self, it, pres_fac, metadata)
-                    # Keep only last 10 checkpoints to save disk space
-                    self.checkpoint_manager.cleanup_old_checkpoints(keep_last_n=10)
-                except Exception as e:
-                    logger.warning(f"[CHECKPOINT] Failed to save checkpoint: {e}")
 
             # STEP 6: Terminate?
             if failed == 0 and over_sum == 0:
@@ -5066,36 +4961,22 @@ class PathFinderRouter:
         return hotset
 
     def _log_top_overused_channels(self, over: np.ndarray, top_k: int = 10):
-        """Log top-K overused channels with spatial info (GPU-accelerated)"""
-        # GPU-accelerated: Use argsort to find top-K on GPU, then transfer only those
-        use_gpu = hasattr(over, 'get')
-
-        if use_gpu:
-            import cupy as cp
-            # Find top-K indices on GPU (fast!)
-            top_k_indices = cp.argsort(over)[-top_k:][::-1]  # Descending
-            top_k_indices_cpu = top_k_indices.get()
-            top_k_values_cpu = over[top_k_indices].get()
-        else:
-            top_k_indices_cpu = np.argsort(over)[-top_k:][::-1]
-            top_k_values_cpu = over[top_k_indices_cpu]
-
-        # Filter out zero overuse
-        nonzero_mask = top_k_values_cpu > 0
-        top_k_indices_cpu = top_k_indices_cpu[nonzero_mask]
-        top_k_values_cpu = top_k_values_cpu[nonzero_mask]
-
-        if len(top_k_indices_cpu) == 0:
+        """Log top-K overused channels with spatial info"""
+        # Find top-K overused edges
+        overused_edges = [(ei, float(over[ei])) for ei in range(len(over)) if over[ei] > 0]
+        if not overused_edges:
             return
 
-        logger.info(f"[INSTRUMENTATION] Top-{len(top_k_indices_cpu)} overused channels:")
+        overused_edges.sort(key=lambda x: x[1], reverse=True)
+        top_edges = overused_edges[:top_k]
+
+        logger.info(f"[INSTRUMENTATION] Top-{len(top_edges)} overused channels:")
 
         indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
         indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
 
-        # Only loop through top-K (typically 10), not millions
-        for rank, (ei, overuse_val) in enumerate(zip(top_k_indices_cpu, top_k_values_cpu), 1):
-            ei = int(ei)
+        for rank, (ei, overuse_val) in enumerate(top_edges, 1):
+            # Find source node for this edge using binary search: O(log N) instead of O(N)
             u = int(np.searchsorted(indptr, ei, side='right') - 1)
 
             if 0 <= u < len(indptr) - 1 and indptr[u] <= ei < indptr[u + 1]:
@@ -5103,12 +4984,14 @@ class PathFinderRouter:
                 ux, uy, uz = self.lattice.idx_to_coord(u)
                 vx, vy, vz = self.lattice.idx_to_coord(v)
 
+                # Convert to mm for spatial context
                 ux_mm, uy_mm = self.lattice.geom.lattice_to_world(ux, uy)
                 vx_mm, vy_mm = self.lattice.geom.lattice_to_world(vx, vy)
 
                 edge_type = "VIA" if uz != vz else "TRACK"
                 layer_info = f"L{uz}" if uz == vz else f"L{uz}→L{vz}"
 
+                # Count nets using this edge (use cached reverse lookup)
                 nets_on_edge = len(self._edge_to_nets.get(ei, set()))
 
                 logger.info(f"  {rank:2d}. {edge_type:5s} {layer_info:6s} "
@@ -5116,40 +4999,61 @@ class PathFinderRouter:
                            f"overuse={overuse_val:.1f} nets={nets_on_edge}")
 
     def _log_per_layer_congestion(self, over: np.ndarray):
-        """Log overuse breakdown by layer (GPU-accelerated using edge_layer if available)"""
-        # FAST PATH: Use edge_layer array if available (GPU-accelerated)
-        if hasattr(self.graph, 'edge_layer'):
-            use_gpu = hasattr(over, 'get')
-            layer_count = self.config.layer_count
+        """Log overuse breakdown by layer (horizontal) and via pairs (vertical)"""
+        indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
+        indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
 
-            if use_gpu:
-                import cupy as cp
-                # Use GPU version for massive speedup (29 min → milliseconds!)
-                edge_layer = self.graph.edge_layer_gpu if hasattr(self.graph, 'edge_layer_gpu') else cp.asarray(self.graph.edge_layer)
-                # GPU bincount - MUCH faster than looping!
-                per_layer_overuse = cp.bincount(edge_layer, weights=over, minlength=layer_count)
-                per_layer_overuse_cpu = per_layer_overuse.get()
-            else:
-                edge_layer = self.graph.edge_layer
-                per_layer_overuse_cpu = np.bincount(edge_layer, weights=over, minlength=layer_count)
+        # Initialize per-layer accumulators
+        layer_count = self.config.layer_count
+        overuse_horiz = {z: 0.0 for z in range(1, layer_count + 1)}
+        overuse_vert = {}  # Key: (z1, z2) for via pairs
 
-            # Convert to dict for compatibility
-            overuse_horiz = {z: float(per_layer_overuse_cpu[z]) for z in range(layer_count) if per_layer_overuse_cpu[z] > 0}
+        # Accumulate overuse by edge type using actual edge orientation
+        for ei in range(len(over)):
+            if over[ei] <= 0:
+                continue
 
-            # Log results
-            total = sum(overuse_horiz.values())
-            if total > 0:
-                logger.info(f"[LAYER-CONGESTION] Overuse by layer (total={total:.0f}):")
-                for z in sorted(overuse_horiz.keys()):
-                    if overuse_horiz[z] > 0:
-                        pct = (overuse_horiz[z] / total) * 100
-                        logger.info(f"  Layer {z:2d}: {overuse_horiz[z]:7.1f} ({pct:5.1f}%)")
+            # Find source and dest nodes
+            u = int(np.searchsorted(indptr, ei, side='right') - 1)
+            if 0 <= u < len(indptr) - 1 and indptr[u] <= ei < indptr[u + 1]:
+                v = int(indices[ei])
+                ux, uy, uz = self.lattice.idx_to_coord(u)
+                vx, vy, vz = self.lattice.idx_to_coord(v)
 
-            return overuse_horiz
+                if uz == vz:
+                    # Same-layer edge - check actual orientation (H or V)
+                    dx = abs(vx - ux)
+                    dy = abs(vy - uy)
+                    # Only count as horizontal/vertical if it's actually a track (not a via)
+                    if dx > 0 and dy == 0:
+                        # Horizontal track (x changes, y constant)
+                        overuse_horiz[uz] = overuse_horiz.get(uz, 0.0) + float(over[ei])
+                    elif dy > 0 and dx == 0:
+                        # Vertical track (y changes, x constant) - DON'T count as horizontal!
+                        pass  # Skip vertical tracks in horizontal report
+                else:
+                    # Via edge (changes layer)
+                    pair = (min(uz, vz), max(uz, vz))
+                    overuse_vert[pair] = overuse_vert.get(pair, 0.0) + float(over[ei])
 
-        # FALLBACK: No edge_layer array - skip detailed analysis for speed
-        logger.info(f"[LAYER-CONGESTION] Skipped (no edge_layer array, would be too slow)")
-        return {}
+        # Log horizontal overuse by layer
+        total_horiz = sum(overuse_horiz.values())
+        if total_horiz > 0:
+            logger.info(f"[LAYER-CONGESTION] Horizontal overuse by layer:")
+            for z in sorted(overuse_horiz.keys()):
+                if overuse_horiz[z] > 0:
+                    pct = (overuse_horiz[z] / total_horiz) * 100
+                    logger.info(f"  Layer {z:2d}: {overuse_horiz[z]:7.1f} ({pct:5.1f}%)")
+
+        # Log vertical overuse by via pair
+        total_vert = sum(overuse_vert.values())
+        if total_vert > 0:
+            logger.info(f"[VIA-CONGESTION] Vertical overuse by layer pair:")
+            for (z1, z2), val in sorted(overuse_vert.items(), key=lambda x: x[1], reverse=True):
+                pct = (val / total_vert) * 100
+                logger.info(f"  L{z1}→L{z2}: {val:7.1f} ({pct:5.1f}%)")
+
+        return overuse_horiz  # Return for layer balancing
 
     def _update_layer_bias(self, overuse_by_layer: dict, layer_bias: dict) -> dict:
         """
@@ -5302,26 +5206,9 @@ class PathFinderRouter:
         Precompute via edge metadata for vectorized penalty application.
 
         Keeps metadata on GPU if available for zero-copy kernel execution.
-
-        NOTE: Disabled for very large boards (>100M via edges) to avoid GPU pinned memory issues.
         """
         import time
         t0 = time.perf_counter()
-
-        # Free old GPU/CPU memory if exists
-        if hasattr(self, '_via_edge_metadata') and self._via_edge_metadata:
-            if self.config.use_gpu and GPU_AVAILABLE:
-                import cupy as cp
-                # Clear GPU memory pools
-                try:
-                    mempool = cp.get_default_memory_pool()
-                    pinned_mempool = cp.get_default_pinned_memory_pool()
-                    mempool.free_all_blocks()
-                    pinned_mempool.free_all_blocks()
-                    logger.info("[VIA-METADATA] GPU memory pools cleared")
-                except:
-                    pass
-            self._via_edge_metadata = None
 
         # Get via edge indices
         via_edge_indices = np.where(self._via_edges)[0]
@@ -5330,8 +5217,6 @@ class PathFinderRouter:
         if num_via_edges == 0:
             self._via_edge_metadata = None
             return
-
-        logger.info(f"[VIA-METADATA] Building metadata for {num_via_edges:,} via edges...")
 
         # Get graph data
         indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
@@ -5346,72 +5231,47 @@ class PathFinderRouter:
         # Convert to coordinates (vectorized)
         plane_size = self.lattice.x_steps * self.lattice.y_steps
 
-        # u coordinates - use int32 immediately to reduce memory
-        xu = ((u_indices % plane_size) % self.lattice.x_steps).astype(np.int32)
-        yu = ((u_indices % plane_size) // self.lattice.x_steps).astype(np.int32)
-        zu = (u_indices // plane_size).astype(np.int32)
+        # u coordinates
+        xu = (u_indices % plane_size) % self.lattice.x_steps
+        yu = (u_indices % plane_size) // self.lattice.x_steps
+        zu = u_indices // plane_size
 
-        # v coordinates - use int32 immediately to reduce memory
-        xv = ((v_indices % plane_size) % self.lattice.x_steps).astype(np.int32)
-        yv = ((v_indices % plane_size) // self.lattice.x_steps).astype(np.int32)
-        zv = (v_indices // plane_size).astype(np.int32)
+        # v coordinates
+        xv = (v_indices % plane_size) % self.lattice.x_steps
+        yv = (v_indices % plane_size) // self.lattice.x_steps
+        zv = v_indices // plane_size
 
         # For via edges, x,y should be same (sanity check in debug mode)
         # Store just one (x,y) coordinate per via edge
-        # MEMORY: Avoid stacking xy coords - just keep xu, yu separate to save 661 MB
-        # via_xy_coords = np.stack([xu, yu], axis=1)  # Would need 661 MB × 2 = 1.3 GB
-        # Instead: Store xu, yu separately (no stacking needed)
+        via_xy_coords = np.stack([xu, yu], axis=1).astype(np.int32)
 
-        # Store z ranges (lo, hi) for each via edge (already int32)
+        # Store z ranges (lo, hi) for each via edge
         z_lo = np.minimum(zu, zv)
         z_hi = np.maximum(zu, zv)
 
-        # Clamp z values IN-PLACE to avoid allocating new arrays
-        np.clip(z_lo, 1, self.lattice.layers - 2, out=z_lo)
-        np.clip(z_hi, 1, self.lattice.layers - 2, out=z_hi)
+        # Clamp z values to valid routing layers (1..Nz-2)
+        z_lo = np.clip(z_lo, 1, self.lattice.layers - 2)
+        z_hi = np.clip(z_hi, 1, self.lattice.layers - 2)
 
         # Store metadata - on GPU if kernels available, CPU otherwise
         use_via_gpu = self.config.use_gpu and GPU_AVAILABLE
 
         if use_via_gpu:
-            import cupy as cp
             # Keep on GPU for zero-copy kernel execution
-            # Store x,y separately to save memory (no stacking)
-            # For very large arrays (>100M), disable async transfer to avoid pinned memory issues
-            use_async = num_via_edges < 100_000_000
-
-            try:
-                xu_gpu = cp.array(xu, copy=False) if not use_async else cp.asarray(xu)
-                yu_gpu = cp.array(yu, copy=False) if not use_async else cp.asarray(yu)
-
-                # Create xy_coords for GPU kernel (expects [N, 2] array)
-                xy_coords_gpu = cp.stack([xu_gpu, yu_gpu], axis=1)
-
-                self._via_edge_metadata = {
-                    'indices': cp.array(via_edge_indices, copy=False) if not use_async else cp.asarray(via_edge_indices),
-                    'xu': xu_gpu,
-                    'yu': yu_gpu,
-                    'xy_coords': xy_coords_gpu,
-                    'z_lo': cp.array(z_lo, copy=False) if not use_async else cp.asarray(z_lo),
-                    'z_hi': cp.array(z_hi, copy=False) if not use_async else cp.asarray(z_hi),
-                }
-                logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on GPU in {time.perf_counter() - t0:.3f}s")
-            except Exception as e:
-                logger.error(f"[VIA-METADATA] GPU allocation failed: {e}")
-                logger.warning(f"[VIA-METADATA] Falling back to CPU metadata")
-                use_via_gpu = False  # Fall through to CPU path
-
-        if not use_via_gpu:
-            # Keep on CPU - store x,y separately
-            xy_coords_cpu = np.stack([xu, yu], axis=1)
-
             self._via_edge_metadata = {
-                'indices': via_edge_indices,
-                'xu': xu,
-                'yu': yu,
-                'xy_coords': xy_coords_cpu,
-                'z_lo': z_lo,
-                'z_hi': z_hi,
+                'indices': cp.asarray(via_edge_indices.astype(np.int32)),
+                'xy_coords': cp.asarray(via_xy_coords),
+                'z_lo': cp.asarray(z_lo.astype(np.int32)),
+                'z_hi': cp.asarray(z_hi.astype(np.int32)),
+            }
+            logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on GPU in {time.perf_counter() - t0:.3f}s")
+        else:
+            # Keep on CPU
+            self._via_edge_metadata = {
+                'indices': via_edge_indices.astype(np.int32),
+                'xy_coords': via_xy_coords,
+                'z_lo': z_lo.astype(np.int32),
+                'z_hi': z_hi.astype(np.int32),
             }
             logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on CPU in {time.perf_counter() - t0:.3f}s")
 
@@ -5465,7 +5325,6 @@ class PathFinderRouter:
         logger.info(f"[BARREL-CONFLICT] Found {len(paths_dict)} committed paths")
 
         # Collect all committed edges with their net IDs
-        # FAST PATH: Use cached edge indices if available (avoids 8,192 CSR scans!)
         all_edge_indices = []
         all_net_ids = []
 
@@ -5474,13 +5333,7 @@ class PathFinderRouter:
                 continue
 
             net_id = self._get_net_id(net_name)
-
-            # Use cached edges if available (MUCH faster!)
-            if hasattr(self, '_net_to_edges') and net_name in self._net_to_edges:
-                edge_indices = self._net_to_edges[net_name]
-            else:
-                # Fallback: compute edges from path
-                edge_indices = self._path_to_edges(path)
+            edge_indices = self._path_to_edges(path)
 
             all_edge_indices.extend(edge_indices)
             all_net_ids.extend([net_id] * len(edge_indices))
@@ -5491,51 +5344,40 @@ class PathFinderRouter:
 
         logger.info(f"[BARREL-CONFLICT] Checking {len(all_edge_indices)} edges across {len(paths_dict)} nets")
 
-        # Convert to arrays - use GPU if available for massive speedup!
-        use_gpu = self.accounting.use_gpu and GPU_AVAILABLE
+        # Convert to arrays
+        edge_indices = np.array(all_edge_indices, dtype=np.int32)
+        edge_net_ids = np.array(all_net_ids, dtype=np.int32)
 
-        if use_gpu:
-            import cupy as cp
-            # GPU-ACCELERATED BARREL CONFLICT DETECTION (1 sec → milliseconds!)
-            edge_indices = cp.array(all_edge_indices, dtype=cp.int32)
-            edge_net_ids = cp.array(all_net_ids, dtype=cp.int32)
-
-            # Move node_owner to GPU if not already there
-            if not hasattr(self, 'node_owner_gpu'):
-                self.node_owner_gpu = cp.asarray(self.node_owner)
-
-            # Get source and destination nodes (all on GPU)
-            edge_src_gpu = cp.asarray(self._edge_src) if not hasattr(self, '_edge_src_gpu') else self._edge_src_gpu
-            src_nodes = edge_src_gpu[edge_indices]
-            dst_nodes = self.graph.indices[edge_indices]  # Already on GPU
-
-            # Get ownership (GPU arrays)
-            src_owners = self.node_owner_gpu[src_nodes]
-            dst_owners = self.node_owner_gpu[dst_nodes]
-
-            # Vectorized conflict detection on GPU (milliseconds!)
-            conflict_mask = ((src_owners != -1) & (src_owners != edge_net_ids)) | \
-                            ((dst_owners != -1) & (dst_owners != edge_net_ids))
-
-            # Get conflict indices and transfer only the result to CPU
-            conflict_edge_indices = edge_indices[conflict_mask].get()
-            conflict_count = int(cp.sum(conflict_mask).get())
+        # Get graph data (handle CPU/GPU)
+        graph_indices = self.graph.indices
+        if hasattr(graph_indices, 'get'):
+            graph_indices_cpu = graph_indices.get()
         else:
-            # CPU fallback
-            edge_indices = np.array(all_edge_indices, dtype=np.int32)
-            edge_net_ids = np.array(all_net_ids, dtype=np.int32)
+            graph_indices_cpu = graph_indices
 
-            src_nodes = self._edge_src[edge_indices]
-            dst_nodes = self.graph.indices[edge_indices]
+        # Detect conflicts - we need to know WHICH edges have conflicts
+        conflict_mask = np.zeros(len(edge_indices), dtype=bool)
 
-            src_owners = self.node_owner[src_nodes]
-            dst_owners = self.node_owner[dst_nodes]
+        for i in range(len(edge_indices)):
+            edge_idx = int(edge_indices[i])
+            net_id = int(edge_net_ids[i])
 
-            conflict_mask = ((src_owners != -1) & (src_owners != edge_net_ids)) | \
-                            ((dst_owners != -1) & (dst_owners != edge_net_ids))
+            # Get source and destination nodes
+            src_node = int(self._edge_src[edge_idx])
+            dst_node = int(graph_indices_cpu[edge_idx])
 
-            conflict_edge_indices = edge_indices[conflict_mask]
-            conflict_count = int(np.sum(conflict_mask))
+            # Check ownership
+            src_owner = int(self.node_owner[src_node])
+            dst_owner = int(self.node_owner[dst_node])
+
+            # Conflict if either endpoint is owned by a different net
+            if (src_owner != -1 and src_owner != net_id) or \
+               (dst_owner != -1 and dst_owner != net_id):
+                conflict_mask[i] = True
+
+        # Get the actual edge indices that have conflicts
+        conflict_edge_indices = edge_indices[conflict_mask]
+        conflict_count = len(conflict_edge_indices)
 
         if conflict_count > 0:
             logger.info(f"[BARREL-CONFLICT] Detected {conflict_count} conflicts (checked {len(edge_indices)} edges)")
@@ -5888,43 +5730,6 @@ class PathFinderRouter:
     def get_provisional_geometry(self):
         """Get provisional geometry for GUI feedback (always available)"""
         return self._provisional_geometry
-
-    def load_checkpoint(self, filepath: str) -> Dict[str, Any]:
-        """
-        Load checkpoint from file.
-
-        Args:
-            filepath: Path to checkpoint file
-
-        Returns:
-            Checkpoint metadata
-        """
-        checkpoint = self.checkpoint_manager.load_checkpoint(filepath)
-        self.checkpoint_manager.restore_checkpoint(self, checkpoint)
-
-        metadata = checkpoint.get('metadata', {})
-        logger.info(f"[CHECKPOINT] Loaded iteration {self.iteration}: "
-                   f"overuse={metadata.get('overuse', 'N/A')}, "
-                   f"routed={metadata.get('routed_nets', 'N/A')}")
-
-        return checkpoint
-
-    def resume_from_checkpoint(self, filepath: str = None):
-        """
-        Resume routing from a checkpoint.
-
-        Args:
-            filepath: Path to checkpoint file (uses latest if None)
-        """
-        if filepath is None:
-            filepath = self.checkpoint_manager.get_latest_checkpoint()
-            if filepath is None:
-                raise ValueError("No checkpoints found")
-
-        checkpoint = self.load_checkpoint(filepath)
-        logger.info(f"[CHECKPOINT] Ready to resume from iteration {self.iteration}")
-
-        return checkpoint
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
