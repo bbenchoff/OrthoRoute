@@ -3728,8 +3728,11 @@ class PathFinderRouter:
 
             BARREL_PHASE_1_ITERS = 50  # Aggressive barrel conflict reduction
 
+            # Store barrel conflict count for iteration summary
+            self._last_barrel_conflict_count = conflict_count
+
             if conflict_count > 0:
-                logger.warning(f"[BARREL-CONFLICT] Detected {conflict_count} barrel conflicts in iteration {it}")
+                logger.debug(f"[BARREL-CONFLICT] Detected {conflict_count} barrel conflicts in iteration {it}")
 
                 if it <= BARREL_PHASE_1_ITERS:
                     # PHASE 1: Apply penalty to reduce barrel conflicts
@@ -3745,12 +3748,11 @@ class PathFinderRouter:
                         # CPU array
                         pres[conflict_edge_indices] += conflict_penalty
 
-                    logger.info(f"[BARREL-CONFLICT] PHASE 1: Applied penalty {conflict_penalty:.1f} to {conflict_count} edges")
+                    logger.debug(f"[BARREL-CONFLICT] PHASE 1: Applied penalty {conflict_penalty:.1f} to {conflict_count} edges")
                 else:
                     # PHASE 2: Detection only, no penalty - let PathFinder optimize
-                    logger.info(f"[BARREL-CONFLICT] PHASE 2: No penalty applied (iteration {it} > {BARREL_PHASE_1_ITERS})")
                     if it == BARREL_PHASE_1_ITERS + 1:
-                        logger.warning(f"[BARREL-CONFLICT] *** PHASE 2 START: Barrel penalties disabled for remaining iterations ***")
+                        logger.info(f"[BARREL-CONFLICT] PHASE 2: Barrel penalties disabled (iter > {BARREL_PHASE_1_ITERS})")
 
             # STEP 4: Overuse (now includes barrel conflicts as usage)
             over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
@@ -3764,48 +3766,32 @@ class PathFinderRouter:
             via_overuse = float(over[self._via_edges[:len(over)]].sum())
             via_ratio = (via_overuse / over_sum * 100) if over_sum > 0 else 0.0
 
-            logger.info(f"[ITER {it}] routed={routed} failed={failed} overuse={over_sum} edges={over_cnt} via_overuse={via_ratio:.1f}%")
+            # Check barrel conflicts
+            barrel_conflicts = getattr(self, '_last_barrel_conflict_count', 0)
 
-            # DIAGNOSTIC: Verify history is growing (not capped at 1.0)
-            if it <= 10:
-                hist_sum = float(self.accounting.history.sum())
+            # Clean consolidated iteration summary
+            status = "✓ CONVERGED" if over_sum == 0 else f"overuse={over_sum}"
+            barrel_info = f" barrel={barrel_conflicts}" if barrel_conflicts > 0 else ""
+            logger.info(f"[ITER {it:3d}] nets={routed}/{routed+failed}  {status}  edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}")
+
+            # DIAGNOSTIC: Verify history is growing (not capped at 1.0) - only first 3 iterations
+            if it <= 3:
                 hist_max = float(self.accounting.history.max())
-                hist_nonzero = self.accounting.history[self.accounting.history > 0]
-                hist_mean = float(hist_nonzero.mean()) if len(hist_nonzero) > 0 else 0.0
-                pres_sum = float(self.accounting.present.sum())
-                pres_ema_sum = float(self.accounting.present_ema.sum())
-
-                logger.error(f"[HISTORY-DEBUG] Iter {it}:")
-                logger.error(f"  hist_sum={hist_sum:.0f} hist_max={hist_max:.1f} hist_mean={hist_mean:.3f}")
-                logger.error(f"  pres_sum={pres_sum:.0f} pres_ema_sum={pres_ema_sum:.0f}")
-                logger.error(f"  overuse={over_sum} edges={over_cnt}")
-                logger.error(f"  hist/pres ratio: {hist_sum / (pres_fac * pres_ema_sum + 1e-9):.3f}")
-
                 if hist_max <= 1.1:
-                    logger.error(f"  ⚠️ HISTORY STILL CAPPED AT ~1.0! Cap multiplier fix didn't work!")
-                elif hist_max > 10.0:
-                    logger.error(f"  ✓ History growing properly (max={hist_max:.1f})")
+                    logger.warning(f"[HISTORY] Iter {it}: hist_max={hist_max:.1f} (still capped?)")
+                else:
+                    logger.debug(f"[HISTORY] Iter {it}: hist_max={hist_max:.1f} (growing)")
 
-            # Convergence diagnostics (every 5 iterations)
-            if it % 5 == 0:
+            # Convergence diagnostics (every 10 iterations, reduced from every 5)
+            if it % 10 == 0:
                 hist_sum = float(self.accounting.history.sum())
-                hist_max = float(self.accounting.history.max())
-                hist_mean = float(self.accounting.history.mean())
                 pres_ema_sum = float(self.accounting.present_ema.sum())
-                pres_ema_max = float(self.accounting.present_ema.max())
-
-                # Cost balance ratio (should be 0.5-2.0 for good convergence)
                 cost_ratio = hist_sum / (pres_fac * pres_ema_sum + 1e-9)
 
-                logger.info(f"[CONVERGENCE] pres_fac={pres_fac:.2f} hist_gain={hist_gain:.2f}")
-                logger.info(f"[CONVERGENCE] hist_sum={hist_sum:.0f} hist_max={hist_max:.1f} hist_mean={hist_mean:.3f}")
-                logger.info(f"[CONVERGENCE] pres_ema_sum={pres_ema_sum:.0f} pres_ema_max={pres_ema_max:.1f}")
-                logger.info(f"[CONVERGENCE] balance_ratio={cost_ratio:.3f} (target: 0.5-2.0)")
+                logger.debug(f"[CONVERGENCE] pres_fac={pres_fac:.2f} hist_gain={hist_gain:.2f} balance={cost_ratio:.2f}")
 
-                if cost_ratio < 0.1:
-                    logger.warning(f"[CONVERGENCE] ⚠️ Present costs dominating history! (ratio={cost_ratio:.3f})")
-                elif cost_ratio > 10.0:
-                    logger.warning(f"[CONVERGENCE] ⚠️ History costs dominating present! (ratio={cost_ratio:.3f})")
+                if cost_ratio < 0.1 or cost_ratio > 10.0:
+                    logger.warning(f"[CONVERGENCE] Cost imbalance: ratio={cost_ratio:.3f} (target: 0.5-2.0)")
 
             # INSTRUMENTATION: Report hard wall count for iter-1 (must be 0)
             if it == 1 and hasattr(self, '_iter1_inf_writes'):
@@ -5302,7 +5288,7 @@ class PathFinderRouter:
         """
         import numpy as np
 
-        logger.warning("[BARREL-CONFLICT] Checking for via barrel conflicts...")
+        logger.debug("[BARREL-CONFLICT] Checking for via barrel conflicts...")
 
         # Bail out if node_owner not initialized
         if not hasattr(self, 'node_owner') or self.node_owner is None:

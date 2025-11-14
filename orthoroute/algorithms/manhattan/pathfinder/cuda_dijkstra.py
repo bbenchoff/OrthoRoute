@@ -3300,8 +3300,7 @@ class CUDADijkstra:
         blocked_count = int(blocked_counter[0])
         if use_bitmap_flag and blocked_count > 0:
             logger.info(f"[BITMAP-DEBUG] Blocked {blocked_count:,} neighbors by owner bitmap")
-        elif use_bitmap_flag:
-            logger.warning(f"[BITMAP-DEBUG] use_bitmap=1 but 0 neighbors blocked!")
+        # Removed spammy warning about 0 neighbors blocked - this is normal
         if rr_alpha > 0.0:
             logger.info(f"[KERNEL-RR-WAVEFRONT] Active: alpha={float(rr_alpha)}, window={int(window_cols)}")
         if jitter_eps > 0.0:

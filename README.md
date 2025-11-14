@@ -141,6 +141,36 @@ While general autorouting remains a complex constraint-satisfaction problem, Ort
 1. **Navigate to the OrthoRoute Folder** Wherever it's installed via KiCad
 2. **Run from CLI**: `python main.py --test-manhattan`
 
+#### Headless (KiCad-less) Mode
+Headless mode is designed for instances when you would like to route a board, but it won't fit in your GPU. This mode is actually several functions that allow for running a routing algorithm _without KiCad_.
+
+The workflow is three steps. First, export the PCB from the OrthoRoute plugin
+1. Load a PCB in KiCad
+2. Run the OrthoRoute plugin
+3. Select `File -> Export PCB...` from the top menu
+4. Save this file (with `.ORP` extension) to disk
+
+Second, run OrthoRoute using the saved `.ORP` file:
+  ```bash
+  python main.py headless <your-board>.ORP
+
+    Optional parameters:
+  python main.py headless <board>.ORP --max-iterations 200    # Set max iterations (default: 200)
+  python main.py headless <board>.ORP -o custom.ORS           # Specify output filename
+  python main.py headless <board>.ORP --use-gpu               # Force GPU mode
+  python main.py headless <board>.ORP --cpu-only              # Force CPU-only mode
+  ```
+
+Third, import the routing solution back into KiCad:
+1. In the OrthoRoute plugin, select `File -> Import Solution...` (or press Ctrl+I)
+2. Select the generated `.ORS` file
+3. Review the routing in the preview window
+4. Click "Apply to KiCad" to commit the traces and vias to your PCB
+
+Typical use case: Cloud GPU routing
+
+Upload your .ORP file to a cloud GPU instance (Vast.ai, RunPod, etc.), run the routing there, then download the .ORS file back to your local machine for import. This allows routing large boards on powerful GPUs with more memory. Details on the file format are available [in the docs](docs/ORP_ORS_file_formats.md)
+
 #### There's something wrong with the KiCad IPC API
 
 For reasons I don't comprehend, the KiCad IPC API only works when the "Select Items" (the arrow pointer) is active and nothing is selected. The API doesn't work if you're trying to route tracks or drawing text. If you do, something like this message will pop up:
