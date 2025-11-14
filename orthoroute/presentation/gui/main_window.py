@@ -3004,24 +3004,28 @@ class OrthoRouteMainWindow(QMainWindow):
             self.status_label.setText("Importing routing solution...")
             logger.info(f"Importing solution from {filepath}")
 
-            ors_data = import_solution_from_ors(filepath)
+            # import_solution_from_ors returns a tuple: (geometry_data, metadata)
+            geometry_data, metadata = import_solution_from_ors(filepath)
 
-            if not ors_data:
+            if not geometry_data or not metadata:
                 self.status_label.setText("Import failed")
                 QMessageBox.critical(self, "Import Failed",
                                    "Failed to import routing solution from ORS file.\n"
                                    "Check that the file is valid and not corrupted.")
                 return
 
-            # Store the imported solution
-            self.routing_result = ors_data
+            # Store the imported solution (combine for compatibility)
+            self.routing_result = {
+                'geometry': geometry_data,
+                'metadata': metadata
+            }
             self.status_label.setText("Solution imported successfully")
 
-            # Generate summary for display
-            summary = get_solution_summary(ors_data)
+            # Generate summary for display (pass the metadata dict which contains 'metadata' and 'statistics' keys)
+            summary = get_solution_summary(metadata)
 
             # Display solution in the preview
-            self._display_imported_solution(ors_data)
+            self._display_imported_solution(geometry_data)
 
             # Show success message with routing metrics
             QMessageBox.information(self, "Import Successful",
@@ -3034,71 +3038,157 @@ class OrthoRouteMainWindow(QMainWindow):
             self.status_label.setText("Import failed")
             QMessageBox.critical(self, "Import Error", f"Error importing solution:\n{str(e)}")
 
-    def _display_imported_solution(self, ors_data: Dict[str, Any]):
+    def _display_imported_solution(self, geometry_data: Dict[str, Any]):
         """Display imported routing solution in the PCB viewer"""
         try:
             if not self.pcb_viewer:
                 logger.warning("No PCB viewer available to display solution")
                 return
 
-            # Extract geometry from ORS data
-            nets = ors_data.get('nets', {})
+            # Build net lookup from board (needed for Track/Via net assignment)
+            board = self.kicad_interface.board
+            board_nets = board.get_nets()
+            net_lookup = {net.name: net for net in board_nets}
+
+            # Layer conversion functions
+            def layer_to_name(layer):
+                """Convert layer (int or string) to layer name string"""
+                # If already a string, return it
+                if isinstance(layer, str):
+                    return layer
+
+                # Convert integer to layer name
+                layer_int = int(layer)
+                if layer_int == 0:
+                    return "F.Cu"
+                elif layer_int == 31:
+                    return "B.Cu"
+                elif 1 <= layer_int <= 30:
+                    return f"In{layer_int}.Cu"
+                else:
+                    logger.warning(f"Unknown layer int {layer_int}, defaulting to F.Cu")
+                    return "F.Cu"
+
+            def layer_to_enum(layer_str):
+                """Convert layer name string to BoardLayer enum"""
+                layer_map = {'F.Cu': BoardLayer.BL_F_Cu, 'B.Cu': BoardLayer.BL_B_Cu}
+                for i in range(1, 31):
+                    layer_map[f'In{i}.Cu'] = getattr(BoardLayer, f'BL_In{i}_Cu')
+                return layer_map.get(layer_str, BoardLayer.BL_F_Cu)
+
+            # Extract geometry from ORS data (geometry_data has 'by_net', not 'nets')
+            nets = geometry_data.get('by_net', {})
 
             # Convert ORS format to display format
-            # The PCB viewer expects Track and Via objects
+            # The PCB viewer expects tracks and vias as dictionaries
             tracks = []
             vias = []
 
             for net_name, net_data in nets.items():
-                # Process traces
-                for trace in net_data.get('traces', []):
-                    # trace format: [layer, x1, y1, x2, y2, width]
-                    if len(trace) >= 6:
-                        layer, x1, y1, x2, y2, width = trace[:6]
-                        track = Track(
-                            start=Vector2(x1, y1),
-                            end=Vector2(x2, y2),
-                            width=width,
-                            layer=BoardLayer(layer),
-                            net=net_name
-                        )
+                # Process tracks (ORS format uses 'tracks' not 'traces')
+                for track_data in net_data.get('tracks', []):
+                    # DEBUG: Log first track to see actual format
+                    if len(tracks) == 0:
+                        logger.info(f"DEBUG: First track_data from ORS: {track_data}")
+                        logger.info(f"DEBUG: track_data keys: {track_data.keys() if isinstance(track_data, dict) else 'not a dict'}")
+
+                    # ORS track format: {"layer": int, "start": {"x": float, "y": float}, "end": {...}, "width": float}
+                    if isinstance(track_data, dict):
+                        layer = track_data.get('layer', 0)
+                        start = track_data.get('start', {})
+                        end = track_data.get('end', {})
+                        width = track_data.get('width', 0.15)
+
+                        if len(tracks) == 0:
+                            logger.info(f"DEBUG: start = {start}, end = {end}")
+
+                        x1 = start.get('x', 0.0)
+                        y1 = start.get('y', 0.0)
+                        x2 = end.get('x', 0.0)
+                        y2 = end.get('y', 0.0)
+
+                        # Convert layer to name string for viewer
+                        layer_name = layer_to_name(layer)
+
+                        # Create track dictionary for viewer (not Track object)
+                        track = {
+                            'x1': x1,
+                            'y1': y1,
+                            'x2': x2,
+                            'y2': y2,
+                            'layer': layer_name,
+                            'width': width,
+                            'net': net_name
+                        }
                         tracks.append(track)
 
                 # Process vias
-                for via in net_data.get('vias', []):
-                    # via format: [x, y, layer_from, layer_to, diameter, drill]
-                    if len(via) >= 6:
-                        x, y, layer_from, layer_to, diameter, drill = via[:6]
-                        via_obj = Via(
-                            position=Vector2(x, y),
-                            via_type=ViaType.THROUGH,
-                            size=diameter,
-                            drill=drill,
-                            layers=(BoardLayer(layer_from), BoardLayer(layer_to)),
-                            net=net_name
-                        )
-                        vias.append(via_obj)
+                for via_data in net_data.get('vias', []):
+                    # ORS via format: {"position": {"x": float, "y": float}, "from_layer": int, "to_layer": int, "diameter": float, "drill": float}
+                    if isinstance(via_data, dict):
+                        position = via_data.get('position', {})
+                        x = position.get('x', 0.0)
+                        y = position.get('y', 0.0)
+                        layer_from = via_data.get('from_layer', 0)
+                        layer_to = via_data.get('to_layer', 1)
+                        diameter = via_data.get('diameter', 0.4)
+                        drill = via_data.get('drill', 0.2)
 
-            # Update PCB viewer with imported geometry
-            logger.info(f"Displaying {len(tracks)} tracks and {len(vias)} vias in viewer")
+                        # Convert layers to name strings for viewer
+                        from_layer_name = layer_to_name(layer_from)
+                        to_layer_name = layer_to_name(layer_to)
 
-            # Store the geometry for later commit
-            if not hasattr(self, 'imported_tracks'):
-                self.imported_tracks = []
-                self.imported_vias = []
+                        # Create via dictionary for viewer (not Via object)
+                        via = {
+                            'x': x,
+                            'y': y,
+                            'from_layer': from_layer_name,
+                            'to_layer': to_layer_name,
+                            'diameter': diameter,
+                            'drill': drill,
+                            'net': net_name
+                        }
+                        vias.append(via)
 
-            self.imported_tracks = tracks
-            self.imported_vias = vias
+            # CRITICAL: Clear any existing tracks/vias first (they might be Track objects from KiCad load)
+            logger.info(f"Before import: board_data has {len(self.board_data.get('tracks', []))} existing tracks")
 
-            # Update viewer display
-            if hasattr(self.pcb_viewer, 'set_routing_preview'):
-                self.pcb_viewer.set_routing_preview(tracks, vias)
-            elif hasattr(self.pcb_viewer, 'display_tracks'):
-                self.pcb_viewer.display_tracks(tracks)
-                self.pcb_viewer.display_vias(vias)
+            # Store tracks/vias directly in board_data (same as routing does)
+            logger.info(f"Storing {len(tracks)} tracks and {len(vias)} vias in board_data")
+            if tracks:
+                logger.info(f"Sample track: {tracks[0]}")
+                logger.info(f"Sample track type: {type(tracks[0])}")
+            if vias:
+                logger.info(f"Sample via: {vias[0]}")
 
-            self.pcb_viewer.update()
-            logger.info("Solution displayed in viewer")
+            self.board_data['tracks'] = tracks
+            self.board_data['vias'] = vias
+
+            logger.info(f"After import: board_data now has {len(self.board_data.get('tracks', []))} tracks")
+            logger.info(f"After import track type: {type(self.board_data['tracks'][0]) if self.board_data.get('tracks') else 'none'}")
+
+            # CRITICAL: Also set on viewer's board_data (they should be the same object, but be explicit)
+            if hasattr(self, 'pcb_viewer') and self.pcb_viewer:
+                if self.pcb_viewer.board_data is not None:
+                    self.pcb_viewer.board_data['tracks'] = tracks
+                    self.pcb_viewer.board_data['vias'] = vias
+                    logger.info(f"Set {len(tracks)} tracks on viewer.board_data")
+                else:
+                    logger.warning("Viewer board_data is None, setting it now")
+                    self.pcb_viewer.board_data = self.board_data
+
+                # Trigger viewer repaint
+                self.pcb_viewer.update()
+                logger.info("Viewer updated - solution should now be visible")
+            else:
+                logger.warning("No pcb_viewer available to display routing")
+
+            # Enable commit button so user can apply the imported solution
+            if hasattr(self, 'commit_btn'):
+                self.commit_btn.setEnabled(True)
+                logger.info("Commit button enabled")
+            if hasattr(self, 'rollback_btn'):
+                self.rollback_btn.setEnabled(True)
 
         except Exception as e:
             logger.error(f"Error displaying imported solution: {e}", exc_info=True)

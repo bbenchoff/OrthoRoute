@@ -128,8 +128,17 @@ def _build_geometry_data(geometry) -> Dict[str, Any]:
     layer_usage = {}
 
     # Process tracks
-    for track in geometry.tracks:
-        net_id = str(track.get('net_id', 'unknown'))
+    import logging
+    logger = logging.getLogger(__name__)
+
+    for idx, track in enumerate(geometry.tracks):
+        # DEBUG: Log first track to see actual format
+        if idx == 0:
+            logger.info(f"[ORS-EXPORT] First track from geometry: {track}")
+            logger.info(f"[ORS-EXPORT] Track keys: {track.keys() if isinstance(track, dict) else 'not a dict'}")
+
+        # Extract net_id - handle both 'net' and 'net_id' keys
+        net_id = str(track.get('net_id') or track.get('net', 'unknown'))
 
         if net_id not in geometry_by_net:
             geometry_by_net[net_id] = {
@@ -138,15 +147,29 @@ def _build_geometry_data(geometry) -> Dict[str, Any]:
                 "vias": [],
             }
 
-        # Extract track data - handle both tuple and dict formats
+        # Extract track data - handle multiple coordinate formats
         if 'start' in track and 'end' in track:
+            # Format 1: tuple coordinates
             start_x, start_y = track['start']
             end_x, end_y = track['end']
+            if idx == 0:
+                logger.info(f"[ORS-EXPORT] Format: tuples - start=({start_x}, {start_y}), end=({end_x}, {end_y})")
+        elif 'x1' in track and 'y1' in track:
+            # Format 2: x1, y1, x2, y2 keys (actual format from pathfinder!)
+            start_x = track.get('x1', 0.0)
+            start_y = track.get('y1', 0.0)
+            end_x = track.get('x2', 0.0)
+            end_y = track.get('y2', 0.0)
+            if idx == 0:
+                logger.info(f"[ORS-EXPORT] Format: x1/y1/x2/y2 - start=({start_x}, {start_y}), end=({end_x}, {end_y})")
         else:
+            # Format 3: start_x, start_y, end_x, end_y keys
             start_x = track.get('start_x', 0.0)
             start_y = track.get('start_y', 0.0)
             end_x = track.get('end_x', 0.0)
             end_y = track.get('end_y', 0.0)
+            if idx == 0:
+                logger.info(f"[ORS-EXPORT] Format: start_x/start_y - start=({start_x}, {start_y}), end=({end_x}, {end_y})")
 
         layer = track.get('layer', 0)
         width = track.get('width', 0.15)
@@ -171,7 +194,8 @@ def _build_geometry_data(geometry) -> Dict[str, Any]:
 
     # Process vias
     for via in geometry.vias:
-        net_id = str(via.get('net_id', 'unknown'))
+        # Extract net_id - handle both 'net' and 'net_id' keys
+        net_id = str(via.get('net_id') or via.get('net', 'unknown'))
 
         if net_id not in geometry_by_net:
             geometry_by_net[net_id] = {
@@ -180,13 +204,20 @@ def _build_geometry_data(geometry) -> Dict[str, Any]:
                 "vias": [],
             }
 
-        # Extract via data
-        position = via.get('position', (0.0, 0.0))
-        if isinstance(position, (list, tuple)):
-            pos_x, pos_y = position
+        # Extract via data - handle multiple position formats
+        if 'position' in via:
+            position = via['position']
+            if isinstance(position, (list, tuple)):
+                pos_x, pos_y = position
+            else:
+                pos_x = position.get('x', 0.0)
+                pos_y = position.get('y', 0.0)
+        elif 'x' in via and 'y' in via:
+            # Direct x, y keys on via
+            pos_x = via.get('x', 0.0)
+            pos_y = via.get('y', 0.0)
         else:
-            pos_x = position.get('x', 0.0)
-            pos_y = position.get('y', 0.0)
+            pos_x, pos_y = 0.0, 0.0
 
         via_dict = {
             "position": {

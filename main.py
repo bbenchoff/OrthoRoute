@@ -319,7 +319,8 @@ def run_headless(
             derive_ors_filename
         )
         from orthoroute.algorithms.manhattan.unified_pathfinder import UnifiedPathFinder, PathFinderConfig
-        from orthoroute.algorithms.manhattan.iteration_metrics import IterationMetricsLogger
+        # NOTE: IterationMetricsLogger not available in baseline - PathFinder runs without it
+        # from orthoroute.algorithms.manhattan.iteration_metrics import IterationMetricsLogger
 
         config = setup_environment()
         start_time = time.time()
@@ -471,9 +472,10 @@ def run_headless(
             'max_iterations': max_iterations,
             'mode': 'headless',
         }
-        metrics_logger = IterationMetricsLogger(debug_dir, board_info)
-        pf._metrics_logger = metrics_logger
-        logging.info(f"[HEADLESS] Metrics logging to: {debug_dir}")
+        # NOTE: IterationMetricsLogger not available in baseline - basic logging still works
+        # metrics_logger = IterationMetricsLogger(debug_dir, board_info)
+        # pf._metrics_logger = metrics_logger
+        logging.info(f"[HEADLESS] Debug directory: {debug_dir}")
 
         # Step 3: Initialize graph (build lattice, CSR)
         logging.info("[HEADLESS] Step 3: Building routing graph...")
