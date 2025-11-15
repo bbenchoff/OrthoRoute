@@ -52,7 +52,7 @@ PathFinder is iterative. In the first iteration, all nets (airwires) are routed 
 
 With this architecture -- the PathFinder algorithm on a very large graph, within the same order of magnitude of the largest FPGAs -- it makes sense to run the algorithm with GPU acceleration. There are a few factors that went into this decision:
 
-1. Everyone who's routing giant backplanes probably has a gaming PC. 
+1. Everyone who's routing giant backplanes probably has a gaming PC. Or you can rent a GPU from whatever company is advertising on MUNI bus stops this month.
 2. The PathFinder algorithm requires hundreds of billions of calculations for every iteration, making single-core CPU computation glacially slow. 
 3. With CUDA, I can implement a SSSP (parallel Dijkstra) to find a path through a weighted graph very fast. 
 
@@ -115,7 +115,7 @@ _Testing / examples are the following_:
 
 ## Will it work with <X> GPU?
 
-On larger boards with many layers, the memory requirements for OrthoRoute become excessive. As an example, I'll show what is needed for the reason I built this: a 200x200mm board with 32 layers.
+On larger boards with many layers, the memory requirements for OrthoRoute become excessive. As an example, I'll show what is needed for the reason I built this: a 200x200mm board with 32 layers. This is a _very_ large graph, within an order of magnitude of the largest FPGAs available. 
 
 | Board Specs | → | Lattice Size |
 |-------------|---|--------------|
@@ -126,8 +126,6 @@ On larger boards with many layers, the memory requirements for OrthoRoute become
 
 Total nodes: 500 × 500 × 32 = **8,000,000 nodes**
 Edges: ~8M nodes × 6 neighbors = **~48 million edges**
-
-This is a _very_ large graph, within an order of magnitude of the largest FPGAs available. 
 
 #### Memory requirements:
 
