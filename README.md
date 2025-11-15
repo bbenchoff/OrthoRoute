@@ -115,22 +115,19 @@ _Testing / examples are the following_:
 
 ## Will it work with <X> GPU?
 
-#### Calculating Graph Size
-
 On larger boards with many layers, the memory requirements start to be crazy. As an example, I'll show what is needed for the reason I built this: a 200x200mm board with 32 layers.
 
-Board specs:
-  - Dimensions: 200mm × 200mm
-  - Grid pitch: 0.4mm
-  - Layers: 32
+| Board Specs | → | Lattice Size |
+|-------------|---|--------------|
+| 200mm × 200mm | → | 500 × 500 nodes |
+| Grid pitch: 0.4mm | → | (200 ÷ 0.4 = 500) |
+| Layers: 32 | → | Z dimension: 32 |
+| **Result** | → | **8,000,000 nodes** |
 
-  Lattice size:
-  X nodes: 200mm ÷ 0.4mm = 500
-  Y nodes: 200mm ÷ 0.4mm = 500
-  Z nodes: 32 layers
+Total nodes: 500 × 500 × 32 = **8,000,000 nodes**
+Edges: ~8M nodes × 6 neighbors = **~48 million edges**
 
-Total nodes: 500 × 500 × 32 = 8,000,000 nodes
-Edges: ~8M nodes × 6 neighbors = ~48 million edges
+This is a _very_ large graph, within an order of magnitude of the largest FPGAs available. 
 
 #### Memory requirements:
 
@@ -164,7 +161,7 @@ Plus graph structure, node ownership, buffers: +20-25 GB
 
 **If you get "Out of Memory" errors:** Rent a GPU with more VRAM or use `--cpu-only` mode (slower but no memory limit).
 
-### Usage
+## Usage
 
 #### GUI Mode (Recommended)
 1. **Open your PCB** in KiCad 9.0+ with IPC API enabled
