@@ -44,7 +44,7 @@ A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository 
 
 ## What Is Orthoroute?
 
-OrthoRoute is a KiCad autorouter for _exceptionally large_ or _very complex_ backplane designs or BGA escape patterns. The simplified idea behind this algorithm is, "put all your parts on the top layer, and on layers below that, create a grid of traces. Only horizontal traces on layer 1, only vertical traces on layer 2, and continue like that for all the other layers. Route through this 'Manhattan grid' of traces".
+OrthoRoute is a KiCad autorouter for _exceptionally large_ or _very complex_ backplane designs or BGA escape patterns. The simplified idea behind this algorithm is, "put all your parts on the top layer, and on layers below that, create a grid of traces. Only horizontal traces on layer 1, only vertical traces on layer 2, and continue like that for all the other layers. Route through this 'Manhattan grid' of traces with blind and buried vias".
 
 The algorithm used for this autorouter is [PathFinder: a negotiation-based performance-driven router for FPGAs](https://dl.acm.org/doi/10.1145/201310.201328). My implementation of PathFinder treats the PCB as a graph: nodes are intersections on an x–y grid where vias can go, and edges are the segments between intersections where copper traces can run. Each edge and node is treated as a shared resource.
 
@@ -110,8 +110,59 @@ _Testing / examples are the following_:
 3. **Run**: Start OrthoRoute with your KiCad project open
    ```bash
    cd src
-   python orthoroute_plugin.py
+   python main.py
    ```
+
+## Will it work with <X> GPU?
+
+#### Calculating Graph Size
+
+On larger boards with many layers, the memory requirements start to be crazy. As an example, I'll show what is needed for the reason I built this: a 200x200mm board with 32 layers.
+
+Board specs:
+  - Dimensions: 200mm × 200mm
+  - Grid pitch: 0.4mm
+  - Layers: 32
+
+  Lattice size:
+  X nodes: 200mm ÷ 0.4mm = 500
+  Y nodes: 200mm ÷ 0.4mm = 500
+  Z nodes: 32 layers
+
+Total nodes: 500 × 500 × 32 = 8,000,000 nodes
+Edges: ~8M nodes × 6 neighbors = ~48 million edges
+
+#### Memory requirements:
+
+PathFinder stores multiple arrays per edge (distance, parent, cost, history, present usage, etc.):
+ - ~48M edges × 32 bytes per edge = 1.5 GB per array
+ - × 8 arrays (distance, parent, cost, history, present, capacity, etc.)
+ - = ~12 GB base
+
+Plus graph structure, node ownership, buffers: +20-25 GB
+
+**GPU Recommendations:**
+
+| Board Size | Layers | Grid Pitch | Nodes | VRAM Needed | GPU Required |
+|------------|--------|------------|-------|-------------|--------------|
+| 100×100mm | 6 | 0.4mm | 1.9M | 8-12 GB | RTX 3080, RTX 4070 |
+| 150×150mm | 18 | 0.4mm | 5M | 18-24 GB | RTX 4090 |
+| 200×200mm | 18 | 0.4mm | 7.2M | 24-30 GB | RTX 6000 Ada (48GB) |
+| 200×200mm | 32 | 0.4mm | 8M | 35-40 GB| A100 80GB, H100 |
+| 300×300mm | 32 | 0.4mm | 18M | 60-80 GB | H100 80GB |
+
+**Rule of thumb:**
+ - VRAM needed ≈ (board_area_mm² ÷ grid_pitch² ÷ 10,000) × num_layers × 5
+ - Always round up - running out of VRAM mid-job loses all progress
+ - For consumer GPUs: 24GB max (RTX 4090/5090) limits you to ~150×150mm at 18 layers
+ - This list of recommendations is either going to be hilarious or sad in a decade
+
+**Important distinction:**
+- **VRAM usage** is determined by board dimensions, layers, and grid pitch (not net count)
+- **Routing time** is determined by number of nets
+- Example: 500 nets vs 8,000 nets on the same 200×200mm board uses the **same VRAM** but takes **16x longer** to route
+
+**If you get "Out of Memory" errors:** Rent a GPU with more VRAM or use `--cpu-only` mode (slower but no memory limit).
 
 ### Usage
 

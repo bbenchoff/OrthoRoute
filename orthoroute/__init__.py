@@ -17,8 +17,12 @@ from .application.services.routing_orchestrator import RoutingOrchestrator
 from .shared.configuration.config_manager import ConfigManager, get_config, initialize_config
 from .shared.configuration.settings import ApplicationSettings
 
-# Main application classes
-from .presentation.plugin.kicad_plugin import KiCadPlugin
+# Main application classes (GUI - optional for headless mode)
+try:
+    from .presentation.plugin.kicad_plugin import KiCadPlugin
+except ImportError:
+    # GUI dependencies not available - headless mode only
+    KiCadPlugin = None
 
 # Algorithm exports
 from .algorithms.manhattan.manhattan_router_rrg import ManhattanRRGRoutingEngine
