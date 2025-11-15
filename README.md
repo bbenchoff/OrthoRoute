@@ -133,7 +133,11 @@ _Testing / examples are the following_:
 #### Cloud (Headless, Kicad-less) Mode
 Headless mode is designed for instances when you would like to route a board, but it won't fit in your GPU. This mode is actually several functions that allow for running a routing algorithm _without KiCad_.
 
-![Diagram of Cloud Routing Workflow](graphics/CloudRoutingWorkflow.png)
+<div align="center">
+  <img src="graphics/CloudRoutingWorkflow.png" alt="Cloud Routing Workflow" width="600">
+  <br>
+  <em>Cloud routing workflow for running OrthoRoute on remote GPU instances</em>
+</div>
 
 The workflow is three steps. First, export the PCB from the OrthoRoute plugin
 1. Load a PCB in KiCad
