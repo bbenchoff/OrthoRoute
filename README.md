@@ -42,39 +42,32 @@ A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository 
   </tr>
 </table>
 
-## Key Features
+## What Is Orthoroute?
 
+OrthoRoute is a KiCad autorouter for _exceptionally large_ or _very complex_ backplane designs or BGA escape patterns. The simplified idea behind this algorithm is, "put all your parts on the top layer, and on layers below that, create a grid of traces. Only horizontal traces on layer 1, only vertical traces on layer 2, and continue like that for all the other layers. Route through this 'Manhattan grid' of traces".
+
+The algorithm used for this autorouter is [PathFinder: a negotiation-based performance-driven router for FPGAs](https://dl.acm.org/doi/10.1145/201310.201328). My implementation of PathFinder treats the PCB as a graph: nodes are intersections on an x–y grid where vias can go, and edges are the segments between intersections where copper traces can run. Each edge and node is treated as a shared resource.
+
+PathFinder is iterative. In the first iteration, all nets (airwires) are routed _greedily_, without accounting for overuse of nodes or edges. Subsequent iterations account for congestion, increasing the “cost” of overused edges and ripping up the worst offenders to re-route them. Over time, the algorithm _converges_ to a PCB layout where no edge or node is over-subscribed by multiple nets.
+
+With this architecture -- the PathFinder algorithm on a very large graph, within the same order of magnitude of the largest FPGAs -- it makes sense to run the algorithm with GPU acceleration. There are a few factors that went into this decision:
+
+1. Everyone who's routing giant backplanes probably has a gaming PC. 
+2. The PathFinder algorithm requires hundreds of billions of calculations for every iteration, making single-core CPU computation glacially slow. 
+3. With CUDA, I can implement a SSSP (parallel Dijkstra) to find a path through a weighted graph very fast. 
+
+Note this is _not_ a fully parallel autorouter; in OrthoRoute, nets are still routed in sequence on a shared congestion map. The parallelism lives inside the shortest-path search: a CUDA SSSP (“parallel Dijkstra”) kernel makes each individual net’s pathfinding fast, but it doesn’t route many nets simultaneously.
+
+## Features
+
+- KiCad Integration: Built as a native KiCad plugin using the IPC API
 - GPU-Accelerated Routing: Uses CUDA/CuPy
 - Multiple Routing Algorithms
   - Manhattan Routing: Specialized for orthogonal routing patterns (horizontal/vertical layer pairs)
   - Lee's Wavefront: Traditional routing (experimental)
-- KiCad Integration: Built as a native KiCad plugin using the IPC API
 - Real-time Visualization: Interactive 2D board view with zoom, pan, and layer controls
-- Checkpoint system for instant resume after crashes
-
-## Why GPU Acceleration?
-
-Traditional autorouters like FreeRouting can take hours or even days on large boards. OrthoRoute uses GPUs for the embarrassingly parallel parts of routing - specifically the pathfinding and sparse matrix accounting - while handling constraints and decision-making on the CPU.
-
-For Manhattan routing patterns (the plugin's specialty), this approach is particularly effective because geometric constraints make the problem highly parallelizable
-
-## Technical Achievements
-
-### Unified PathFinder Engine
-- **GPU-First Architecture**: CUDA kernels for wavefront/Dijkstra with intelligent CPU fallback
-- **CSR Matrix Optimization**: Uses Compressed Sparse Row matrices for efficient graph representation
-- **Memory Efficient**: Optimized data structures reduce memory usage by 60% vs. dense matrices
-
-### Routing Performance
-- **Large Board Capability**: Successfully routes 16000+ pad backplanes with 8000+ nets
-- **Fast Routing**: Complex boards route in 10 minutes or less
-- **Validation Pipeline**: Comprehensive preflight checks and integrity validation
-
-### Architecture Consolidation
-- **Unified Pipeline**: Single routing path shared between CLI and GUI (eliminates code duplication)
-- **Graph Validation**: Automated checks for lattice integrity and CSR matrix correctness
-- **Deterministic Results**: CLI and GUI produce identical routing outcomes
-
+- Checkpoint system for instant resume after crashes (experimental)
+- Headless (Cloud) Routing: Rent an A100 GPU in some datacenter
 
 ## Screenshots
 
@@ -98,10 +91,6 @@ _Testing / examples are the following_:
   <br>
   <em>OrthoRoute plugin showing real-time PCB visualization with airwires and routing analysis</em>
 </div>
-
-## Performance
-
-While general autorouting remains a complex constraint-satisfaction problem, OrthoRoute excels at large backplanes, manhattan-style routing requirements, and boards where traditional autorouters would take prohibitively long
 
 ## Quick Start
 
@@ -202,6 +191,7 @@ Install via Plugin Manager
 - **KiCad Integration**: Full IPC API support for real-time board data extraction
 - **Interactive Visualization**: Real-time PCB viewer with routing progress updates
 - **Graph Validation**: Preflight checks and lattice integrity validation
+- **Headless/Cloud Routing**: Route on a GPU in a datacenter somewhere
 
 
 ### 🔄 In Development
