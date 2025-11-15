@@ -3677,33 +3677,36 @@ class PathFinderRouter:
 
             # STEP 2.9: Exclude persistently failing nets (CRITICAL for large boards)
             # Track nets that fail repeatedly and exclude them to prevent thrashing
+            # ONLY ACTIVATE AFTER ITERATION 4 to allow greedy routing to complete
             if not hasattr(self, '_net_failure_count'):
                 self._net_failure_count = {}  # net_id -> consecutive failures
                 self._excluded_nets = set()   # nets we've given up on
 
-            # Update failure counts based on which nets have paths
-            for net_id in tasks.keys():
-                has_path = bool(self.net_paths.get(net_id))
-                if not has_path:
-                    # Net failed to route
-                    self._net_failure_count[net_id] = self._net_failure_count.get(net_id, 0) + 1
-                else:
-                    # Net successfully routed - reset failure count
-                    self._net_failure_count[net_id] = 0
+            # Only start tracking failures after iteration 4
+            if it > 4:
+                # Update failure counts based on which nets have paths
+                for net_id in tasks.keys():
+                    has_path = bool(self.net_paths.get(net_id))
+                    if not has_path:
+                        # Net failed to route
+                        self._net_failure_count[net_id] = self._net_failure_count.get(net_id, 0) + 1
+                    else:
+                        # Net successfully routed - reset failure count
+                        self._net_failure_count[net_id] = 0
 
-            # Exclude nets that have failed 1+ consecutive times
-            FAILURE_THRESHOLD = 1
-            newly_excluded = set()
-            for net_id, failures in self._net_failure_count.items():
-                if failures >= FAILURE_THRESHOLD and net_id not in self._excluded_nets:
-                    self._excluded_nets.add(net_id)
-                    newly_excluded.add(net_id)
+                # Exclude nets that have failed 5+ consecutive times
+                FAILURE_THRESHOLD = 5
+                newly_excluded = set()
+                for net_id, failures in self._net_failure_count.items():
+                    if failures >= FAILURE_THRESHOLD and net_id not in self._excluded_nets:
+                        self._excluded_nets.add(net_id)
+                        newly_excluded.add(net_id)
 
-            if newly_excluded:
-                logger.warning(f"[EXCLUDE] Giving up on {len(newly_excluded)} nets after {FAILURE_THRESHOLD} failed attempts: {list(newly_excluded)[:5]}...")
+                if newly_excluded:
+                    logger.warning(f"[EXCLUDE] Giving up on {len(newly_excluded)} nets after {FAILURE_THRESHOLD} failed attempts: {list(newly_excluded)[:5]}...")
 
-            if self._excluded_nets:
-                logger.info(f"[EXCLUDE] {len(self._excluded_nets)} nets permanently excluded from routing")
+                if self._excluded_nets:
+                    logger.info(f"[EXCLUDE] {len(self._excluded_nets)} nets permanently excluded from routing")
 
             # STEP 3: Route (hotset incremental after iter 1)
             # DIAGNOSTIC OVERRIDE: Test with hotset disabled

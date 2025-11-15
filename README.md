@@ -113,7 +113,7 @@ _Testing / examples are the following_:
    python main.py
    ```
 
-## Will it work with <X> GPU?
+## Will it work with _my_ GPU?
 
 On larger boards with many layers, the memory requirements for OrthoRoute become excessive. As an example, I'll show what is needed for the reason I built this: a 200x200mm board with 32 layers. This is a _very_ large graph, within an order of magnitude of the largest FPGAs available. 
 
