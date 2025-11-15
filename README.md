@@ -115,7 +115,7 @@ _Testing / examples are the following_:
 
 ## Will it work with <X> GPU?
 
-On larger boards with many layers, the memory requirements start to be crazy. As an example, I'll show what is needed for the reason I built this: a 200x200mm board with 32 layers.
+On larger boards with many layers, the memory requirements for OrthoRoute become excessive. As an example, I'll show what is needed for the reason I built this: a 200x200mm board with 32 layers.
 
 | Board Specs | → | Lattice Size |
 |-------------|---|--------------|
