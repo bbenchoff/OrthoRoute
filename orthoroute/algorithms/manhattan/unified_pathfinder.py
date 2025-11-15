@@ -3675,22 +3675,54 @@ class PathFinderRouter:
             if it > 1:  # Allow greedy first pass without hard blocking
                 self._block_via_edges_with_collisions()
 
+            # STEP 2.9: Exclude persistently failing nets (CRITICAL for large boards)
+            # Track nets that fail repeatedly and exclude them to prevent thrashing
+            if not hasattr(self, '_net_failure_count'):
+                self._net_failure_count = {}  # net_id -> consecutive failures
+                self._excluded_nets = set()   # nets we've given up on
+
+            # Update failure counts based on which nets have paths
+            for net_id in tasks.keys():
+                has_path = bool(self.net_paths.get(net_id))
+                if not has_path:
+                    # Net failed to route
+                    self._net_failure_count[net_id] = self._net_failure_count.get(net_id, 0) + 1
+                else:
+                    # Net successfully routed - reset failure count
+                    self._net_failure_count[net_id] = 0
+
+            # Exclude nets that have failed 1+ consecutive times
+            FAILURE_THRESHOLD = 1
+            newly_excluded = set()
+            for net_id, failures in self._net_failure_count.items():
+                if failures >= FAILURE_THRESHOLD and net_id not in self._excluded_nets:
+                    self._excluded_nets.add(net_id)
+                    newly_excluded.add(net_id)
+
+            if newly_excluded:
+                logger.warning(f"[EXCLUDE] Giving up on {len(newly_excluded)} nets after {FAILURE_THRESHOLD} failed attempts: {list(newly_excluded)[:5]}...")
+
+            if self._excluded_nets:
+                logger.info(f"[EXCLUDE] {len(self._excluded_nets)} nets permanently excluded from routing")
+
             # STEP 3: Route (hotset incremental after iter 1)
             # DIAGNOSTIC OVERRIDE: Test with hotset disabled
             FORCE_ROUTE_ALL = False  # Set to False to restore hotset behavior (TESTING: hotset ENABLED)
 
             if FORCE_ROUTE_ALL:
-                sub_tasks = tasks
-                logger.info(f"  [DIAGNOSTIC] Routing ALL {len(tasks)} nets every iteration (hotset DISABLED for testing)")
+                sub_tasks = {k: v for k, v in tasks.items() if k not in self._excluded_nets}
+                logger.info(f"  [DIAGNOSTIC] Routing ALL {len(sub_tasks)} nets every iteration (hotset DISABLED for testing)")
             elif cfg.reroute_only_offenders and it > 1:
                 # Pass ripped set to _build_hotset (Fix 2)
                 offenders = self._build_hotset(tasks, ripped=getattr(self, "_last_ripped", set()))
-                sub_tasks = {k: v for k, v in tasks.items() if k in offenders}
+                # Exclude permanently failed nets from offenders
+                offenders = offenders - self._excluded_nets
+                sub_tasks = {k: v for k, v in tasks.items() if k in offenders and k not in self._excluded_nets}
                 logger.info(f"  Hotset: {len(offenders)}/{len(tasks)} nets")
                 # Clear _last_ripped after use
                 self._last_ripped = set()
             else:
-                sub_tasks = tasks
+                sub_tasks = {k: v for k, v in tasks.items() if k not in self._excluded_nets}
 
             # ANTI-OSCILLATION: Shuffle net order each iteration to break deterministic patterns
             # This prevents the same nets from always winning/losing in the same order
@@ -4110,15 +4142,21 @@ class PathFinderRouter:
         # Determine success based on edge convergence
         # Note: Barrel conflicts are reported but don't affect success/convergence
         final_barrel_conflicts = getattr(self, '_last_barrel_conflict_count', 0)
+        excluded_nets = getattr(self, '_excluded_nets', set())
         success = (failed == 0 and over_sum == 0)
 
         if success and final_barrel_conflicts > 0:
             logger.info(f"[FINAL] Edge routing converged ({final_barrel_conflicts} barrel conflicts remain - acceptable)")
 
+        if excluded_nets:
+            logger.warning(f"[FINAL] {len(excluded_nets)} nets excluded as unroutable: {list(excluded_nets)[:10]}...")
+
         return {
             'success': success,
             'converged': success,  # Edge convergence = success
             'barrel_conflicts': final_barrel_conflicts,
+            'excluded_nets': len(excluded_nets),
+            'excluded_net_ids': list(excluded_nets),
             'error_code': None if success else 'ROUTING-FAILED',
             'message': 'Complete' if success else f'{failed} unrouted, {over_cnt} overused',
             'overuse_sum': over_sum,

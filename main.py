@@ -548,8 +548,9 @@ def run_headless(
         end_time = time.time()
         total_time = end_time - start_time
 
-        # Extract convergence info (includes barrel conflicts now)
+        # Extract convergence info (includes barrel conflicts and excluded nets)
         barrel_conflicts = result.get('barrel_conflicts', 0) if isinstance(result, dict) else 0
+        excluded_nets = result.get('excluded_nets', 0) if isinstance(result, dict) else 0
         fully_converged = result.get('converged', False) if isinstance(result, dict) else False
 
         routing_metadata = {
@@ -595,6 +596,12 @@ def run_headless(
                 logging.warning(f"Barrel conflicts: {barrel_conflicts} (via overlaps - see docs/barrel_conflicts_explained.md)")
             else:
                 logging.warning(f"Barrel conflicts: 0 ✓")
+
+            # Report excluded nets if any
+            if excluded_nets > 0:
+                logging.warning(f"Excluded nets: {excluded_nets} (unroutable - gave up after 10 attempts)")
+            else:
+                logging.warning(f"Excluded nets: 0 ✓")
 
             logging.warning("=" * 80)
             logging.warning(f"Next step: Import {output_file} into KiCad (Ctrl+I)")

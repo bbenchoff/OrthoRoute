@@ -52,7 +52,7 @@ PathFinder is iterative. In the first iteration, all nets (airwires) are routed 
 
 With this architecture -- the PathFinder algorithm on a very large graph, within the same order of magnitude of the largest FPGAs -- it makes sense to run the algorithm with GPU acceleration. There are a few factors that went into this decision:
 
-1. Everyone who's routing giant backplanes probably has a gaming PC. Or you can rent a GPU from whatever company is advertising on MUNI bus stops this month.
+1. Everyone who's routing giant backplanes probably has a gaming PC. Or you can rent a GPU from whatever company is advertising on MUNI bus stopsal this month.
 2. The PathFinder algorithm requires hundreds of billions of calculations for every iteration, making single-core CPU computation glacially slow. 
 3. With CUDA, I can implement a SSSP (parallel Dijkstra) to find a path through a weighted graph very fast. 
 
