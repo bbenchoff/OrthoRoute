@@ -44,7 +44,7 @@ A much more comprehensive explanation of the _WHY_ and _HOW_ of this repository 
 
 ## What Is Orthoroute?
 
-OrthoRoute is a KiCad autorouter for _exceptionally large_ or _very complex_ backplane designs or BGA escape patterns. The simplified idea behind this algorithm is, "put all your parts on the top layer, and on layers below that, create a grid of traces. Only horizontal traces on layer 1, only vertical traces on layer 2, and continue like that for all the other layers. Route through this 'Manhattan grid' of traces with blind and buried vias".
+OrthoRoute is a KiCad autorouter for _exceptionally large_ or _very complex_ backplane designs and BGA escape patterns. The simplified idea behind this algorithm is, "put all your parts on the top layer, and on layers below that, create a grid of traces. Only horizontal traces on layer 1, only vertical traces on layer 2, and continue like that for all the other layers. Route through this 'Manhattan grid' of traces with blind and buried vias".
 
 The algorithm used for this autorouter is [PathFinder: a negotiation-based performance-driven router for FPGAs](https://dl.acm.org/doi/10.1145/201310.201328). My implementation of PathFinder treats the PCB as a graph: nodes are intersections on an x–y grid where vias can go, and edges are the segments between intersections where copper traces can run. Each edge and node is treated as a shared resource.
 
@@ -52,7 +52,7 @@ PathFinder is iterative. In the first iteration, all nets (airwires) are routed 
 
 With this architecture -- the PathFinder algorithm on a very large graph, within the same order of magnitude of the largest FPGAs -- it makes sense to run the algorithm with GPU acceleration. There are a few factors that went into this decision:
 
-1. Everyone who's routing giant backplanes probably has a gaming PC. Or you can rent a GPU from whatever company is advertising on MUNI bus stopsal this month.
+1. Everyone who's routing giant backplanes probably has a gaming PC. Or you can rent a GPU from whatever company is advertising on MUNI bus stops this month.
 2. The PathFinder algorithm requires hundreds of billions of calculations for every iteration, making single-core CPU computation glacially slow. 
 3. With CUDA, I can implement a SSSP (parallel Dijkstra) to find a path through a weighted graph very fast. 
 
@@ -96,7 +96,7 @@ _Testing / examples are the following_:
 
 ### Prerequisites
 - **KiCad 9.0+** with IPC API support
-- **Python 3.8+**
+- **Python 3.12+**
 - **PyQt6**
 - **kipy** (KiCad IPC client)
 
@@ -150,7 +150,7 @@ Plus graph structure, node ownership, buffers: +20-25 GB
  - VRAM needed ≈ (board_area_mm² ÷ grid_pitch² ÷ 10,000) × num_layers × 5
  - Always round up - running out of VRAM mid-job loses all progress
  - For consumer GPUs: 24GB max (RTX 4090/5090) limits you to ~150×150mm at 18 layers
- - This list of recommendations is either going to be hilarious or sad in a decade
+ - This list of recommended GPUs is either going to be hilarious or sad in a decade
 
 **Important distinction:**
 - **VRAM usage** is determined by board dimensions, layers, and grid pitch (not net count)
@@ -161,7 +161,7 @@ Plus graph structure, node ownership, buffers: +20-25 GB
 
 ## Usage
 
-#### GUI Mode (Recommended)
+### GUI Mode (Recommended)
 1. **Open your PCB** in KiCad 9.0+ with IPC API enabled
 2. **Launch OrthoRoute Plugin** via the Plugin Manager
 3. **Route your nets** - OrthoRoute will automatically:
@@ -172,11 +172,11 @@ Plus graph structure, node ownership, buffers: +20-25 GB
 4. **Monitor progress** in the interactive PCB viewer
 5. **Import back to KiCad**
 
-#### CLI Mode (For Development)
+### CLI Mode (For Development)
 1. **Navigate to the OrthoRoute Folder** Wherever it's installed via KiCad
 2. **Run from CLI**: `python main.py --test-manhattan`
 
-#### Cloud (Headless, Kicad-less) Mode
+### Cloud (Headless, Kicad-less) Mode
 Headless mode is designed for instances when you would like to route a board, but it won't fit in your GPU. This mode is actually several functions that allow for running a routing algorithm _without KiCad_.
 
 <div align="center">
@@ -213,7 +213,7 @@ Typical use case: Cloud GPU routing
 
 Upload your .ORP file to a cloud GPU instance (Vast.ai, RunPod, etc.), run the routing there, then download the .ORS file back to your local machine for import. This allows routing large boards on powerful GPUs with more memory. Details on the file format are available [in the docs](docs/ORP_ORS_file_formats.md)
 
-#### There's something wrong with the KiCad IPC API
+### There's something wrong with the KiCad IPC API
 
 For reasons I don't comprehend, the KiCad IPC API only works when the "Select Items" (the arrow pointer) is active and nothing is selected. The API doesn't work if you're trying to route tracks or drawing text. If you do, something like this message will pop up:
 
