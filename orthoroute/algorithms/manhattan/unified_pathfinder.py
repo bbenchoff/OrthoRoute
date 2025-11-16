@@ -3757,11 +3757,17 @@ class PathFinderRouter:
 
             # STEP 3.5: CRITICAL - Detect via barrel conflicts BEFORE computing overuse
             # TWO-PHASE APPROACH:
-            #   Phase 1 (iters 1-50): Aggressively penalize barrel conflicts
-            #   Phase 2 (iters 51+): Disable penalties, let PathFinder optimize freely
-            conflict_edge_indices, conflict_count = self._detect_barrel_conflicts()
+            #   Phase 1 (iters 1-50): Aggressively penalize barrel conflicts - check every iteration
+            #   Phase 2 (iters 51+): Disable penalties - only check every 10 iterations (for reporting)
+            BARREL_PHASE_1_ITERS = 50
 
-            BARREL_PHASE_1_ITERS = 50  # Aggressive barrel conflict reduction
+            # Detect barrel conflicts (expensive on large boards - skip in Phase 2 except every 10 iters)
+            if it <= BARREL_PHASE_1_ITERS or it % 10 == 0:
+                conflict_edge_indices, conflict_count = self._detect_barrel_conflicts()
+            else:
+                # Skip detection, use last known count
+                conflict_edge_indices = np.array([], dtype=np.int32)
+                conflict_count = getattr(self, '_last_barrel_conflict_count', 0)  # Aggressive barrel conflict reduction
 
             # Store barrel conflict count for iteration summary
             self._last_barrel_conflict_count = conflict_count
