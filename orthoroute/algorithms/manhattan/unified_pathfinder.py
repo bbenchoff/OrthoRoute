@@ -4383,7 +4383,7 @@ class PathFinderRouter:
         if force_sequential:
             logger.info(f"[SEQUENTIAL_ALL] Sequential mode ENABLED via environment variable")
         logger.info(f"[ROUTING MODE] Using sequential routing for {total} nets (PathFinder algorithm)")
-        
+
         for idx, net_id in enumerate(ordered_nets):
             net_start_time = time.time()
             src, dst = tasks[net_id]
