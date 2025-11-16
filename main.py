@@ -325,9 +325,14 @@ def run_headless(
         config = setup_environment()
         start_time = time.time()
 
-        logging.info("=" * 80)
-        logging.info("HEADLESS CLOUD ROUTING MODE")
-        logging.info("=" * 80)
+        # Import version
+        from orthoroute import __version__
+
+        # Startup banner (WARNING level so it shows in console)
+        logging.warning("=" * 80)
+        logging.warning(f"  OrthoRoute v{__version__} - GPU-Accelerated PCB Autorouter")
+        logging.warning(f"  Headless Cloud Routing Mode")
+        logging.warning("=" * 80)
         logging.info(f"[HEADLESS] Input: {orp_file}")
 
         # Determine output path
@@ -554,6 +559,7 @@ def run_headless(
         fully_converged = result.get('converged', False) if isinstance(result, dict) else False
 
         routing_metadata = {
+            'orthoroute_version': __version__,
             'total_time': total_time,
             'iterations': len(iteration_metrics),
             'converged': fully_converged,

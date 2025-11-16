@@ -210,7 +210,7 @@ __all__ = [
     'DiagnosticsMixin',
 ]
 
-__version__ = "1.0.0-refactored"
+__version__ = "0.2.0"
 __author__ = "OrthoRoute Development Team"
 __doc__ = """
 PathFinder PCB Routing Engine - Modular Architecture

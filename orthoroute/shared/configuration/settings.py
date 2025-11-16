@@ -222,7 +222,7 @@ class ApplicationSettings:
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     
     # Application metadata
-    version: str = "1.0.0"
+    version: str = "0.2.0"
     config_version: int = 1
     
     def validate(self) -> Dict[str, List[str]]:
