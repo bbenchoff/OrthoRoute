@@ -3856,16 +3856,18 @@ class PathFinderRouter:
                     max_seg_prefix = float(np.max(self.via_seg_prefix))
                     logger.info(f"[VIA-POOL] Segments: used={segs_used}, over_cap={segs_over}, max_use={max_seg_use}, max_pres={max_seg_pres:.2f}, max_prefix={max_seg_prefix:.2f}")
 
-            # Instrumentation: Per-layer congestion breakdown (EXPENSIVE - only every 10 iters)
+            # Instrumentation: Per-layer congestion breakdown (GPU-vectorized - fast!)
             overuse_by_layer = None
-            if over_sum > 0 and it % 10 == 0:
+            if over_sum > 0:
                 overuse_by_layer = self._log_per_layer_congestion(over)
+
+            # Top-10 channels only every 10 iters (still expensive due to coordinate conversion)
+            if over_sum > 0 and it % 10 == 0:
                 self._log_top_overused_channels(over, top_k=10)
 
             # Update layer bias from horizontal overuse (EWMA for stability)
-            # Only update every 10 iterations to avoid expensive computation
-            if hasattr(self, 'layer_bias') and hasattr(self.graph, 'edge_layer') and it % 10 == 0:
-                if overuse_by_layer is None:
+            if hasattr(self, 'layer_bias') and hasattr(self.graph, 'edge_layer'):
+                if overuse_by_layer is None and over_sum > 0:
                     overuse_by_layer = self._log_per_layer_congestion(over)
 
                 if overuse_by_layer and sum(overuse_by_layer.values()) > 0:
@@ -5056,42 +5058,56 @@ class PathFinderRouter:
                            f"overuse={overuse_val:.1f} nets={nets_on_edge}")
 
     def _log_per_layer_congestion(self, over: np.ndarray):
-        """Log overuse breakdown by layer (horizontal) and via pairs (vertical)"""
-        indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
-        indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
+        """Log overuse breakdown by layer (GPU-accelerated version)"""
+        import time
+        start_time = time.time()
 
-        # Initialize per-layer accumulators
+        # Use edge_layer array if available (pre-computed), otherwise compute from graph
+        if hasattr(self.graph, 'edge_layer'):
+            edge_layer = self.graph.edge_layer.get() if hasattr(self.graph.edge_layer, 'get') else self.graph.edge_layer
+            logger.debug(f"[LAYER-DIAG] Using pre-computed edge_layer array ({len(edge_layer)} edges)")
+        else:
+            # Fallback: compute layers from nodes (slower but works)
+            logger.debug(f"[LAYER-DIAG] Computing edge layers from graph (fallback mode)")
+            indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
+            indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
+            plane_size = self.lattice.Nx * self.lattice.Ny
+
+            # Vectorized: find source nodes for all edges
+            edge_indices = np.arange(len(over), dtype=np.int32)
+            src_nodes = np.searchsorted(indptr, edge_indices, side='right') - 1
+            dst_nodes = indices[edge_indices]
+
+            src_layers = src_nodes // plane_size
+            dst_layers = dst_nodes // plane_size
+            edge_layer = src_layers  # Use source layer for classification
+            logger.debug(f"[LAYER-DIAG] Computed layers for {len(edge_layer)} edges in {time.time()-start_time:.2f}s")
+
+        # GPU-accelerated aggregation
         layer_count = self.config.layer_count
-        overuse_horiz = {z: 0.0 for z in range(1, layer_count + 1)}
-        overuse_vert = {}  # Key: (z1, z2) for via pairs
+        overuse_horiz = {}
 
-        # Accumulate overuse by edge type using actual edge orientation
-        for ei in range(len(over)):
-            if over[ei] <= 0:
-                continue
+        # Filter to overused edges only
+        overused_mask = over > 0
+        num_overused = int(np.sum(overused_mask))
 
-            # Find source and dest nodes
-            u = int(np.searchsorted(indptr, ei, side='right') - 1)
-            if 0 <= u < len(indptr) - 1 and indptr[u] <= ei < indptr[u + 1]:
-                v = int(indices[ei])
-                ux, uy, uz = self.lattice.idx_to_coord(u)
-                vx, vy, vz = self.lattice.idx_to_coord(v)
+        if num_overused == 0:
+            logger.debug(f"[LAYER-DIAG] No overused edges, skipping")
+            return {}
 
-                if uz == vz:
-                    # Same-layer edge - check actual orientation (H or V)
-                    dx = abs(vx - ux)
-                    dy = abs(vy - uy)
-                    # Only count as horizontal/vertical if it's actually a track (not a via)
-                    if dx > 0 and dy == 0:
-                        # Horizontal track (x changes, y constant)
-                        overuse_horiz[uz] = overuse_horiz.get(uz, 0.0) + float(over[ei])
-                    elif dy > 0 and dx == 0:
-                        # Vertical track (y changes, x constant) - DON'T count as horizontal!
-                        pass  # Skip vertical tracks in horizontal report
-                else:
-                    # Via edge (changes layer)
-                    pair = (min(uz, vz), max(uz, vz))
-                    overuse_vert[pair] = overuse_vert.get(pair, 0.0) + float(over[ei])
+        logger.debug(f"[LAYER-DIAG] Processing {num_overused}/{len(over)} overused edges")
+
+        overused_values = over[overused_mask]
+        overused_layers = edge_layer[overused_mask]
+
+        # Sum by layer (vectorized)
+        for z in range(1, layer_count + 1):
+            layer_mask = overused_layers == z
+            if np.any(layer_mask):
+                overuse_horiz[z] = float(np.sum(overused_values[layer_mask]))
+
+        elapsed = time.time() - start_time
+        logger.debug(f"[LAYER-DIAG] Completed in {elapsed:.3f}s (vectorized)")
 
         # Log horizontal overuse by layer
         total_horiz = sum(overuse_horiz.values())
@@ -5101,14 +5117,6 @@ class PathFinderRouter:
                 if overuse_horiz[z] > 0:
                     pct = (overuse_horiz[z] / total_horiz) * 100
                     logger.info(f"  Layer {z:2d}: {overuse_horiz[z]:7.1f} ({pct:5.1f}%)")
-
-        # Log vertical overuse by via pair
-        total_vert = sum(overuse_vert.values())
-        if total_vert > 0:
-            logger.info(f"[VIA-CONGESTION] Vertical overuse by layer pair:")
-            for (z1, z2), val in sorted(overuse_vert.items(), key=lambda x: x[1], reverse=True):
-                pct = (val / total_vert) * 100
-                logger.info(f"  L{z1}→L{z2}: {val:7.1f} ({pct:5.1f}%)")
 
         return overuse_horiz  # Return for layer balancing
 
