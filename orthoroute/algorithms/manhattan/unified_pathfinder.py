@@ -5420,25 +5420,22 @@ class PathFinderRouter:
         else:
             graph_indices_cpu = graph_indices
 
-        # Detect conflicts - we need to know WHICH edges have conflicts
-        conflict_mask = np.zeros(len(edge_indices), dtype=bool)
+        # VECTORIZED CONFLICT DETECTION (GPU-accelerated!)
+        # Get source and destination nodes for all edges at once
+        src_nodes = self._edge_src[edge_indices]  # Vectorized lookup
+        dst_nodes = graph_indices_cpu[edge_indices]  # Vectorized lookup
 
-        for i in range(len(edge_indices)):
-            edge_idx = int(edge_indices[i])
-            net_id = int(edge_net_ids[i])
+        # Get ownership for all nodes at once
+        src_owners = self.node_owner[src_nodes]  # Vectorized lookup
+        dst_owners = self.node_owner[dst_nodes]  # Vectorized lookup
 
-            # Get source and destination nodes
-            src_node = int(self._edge_src[edge_idx])
-            dst_node = int(graph_indices_cpu[edge_idx])
+        # Vectorized conflict check:
+        # Conflict if src owned by different net OR dst owned by different net
+        src_conflict = (src_owners != -1) & (src_owners != edge_net_ids)
+        dst_conflict = (dst_owners != -1) & (dst_owners != edge_net_ids)
+        conflict_mask = src_conflict | dst_conflict  # Element-wise OR
 
-            # Check ownership
-            src_owner = int(self.node_owner[src_node])
-            dst_owner = int(self.node_owner[dst_node])
-
-            # Conflict if either endpoint is owned by a different net
-            if (src_owner != -1 and src_owner != net_id) or \
-               (dst_owner != -1 and dst_owner != net_id):
-                conflict_mask[i] = True
+        logger.info(f"[BARREL-CONFLICT] Vectorized check of {len(edge_indices)} edges completed")
 
         # Get the actual edge indices that have conflicts
         conflict_edge_indices = edge_indices[conflict_mask]
