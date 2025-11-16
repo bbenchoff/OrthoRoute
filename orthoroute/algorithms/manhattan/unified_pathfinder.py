@@ -3856,17 +3856,17 @@ class PathFinderRouter:
                     max_seg_prefix = float(np.max(self.via_seg_prefix))
                     logger.info(f"[VIA-POOL] Segments: used={segs_used}, over_cap={segs_over}, max_use={max_seg_use}, max_pres={max_seg_pres:.2f}, max_prefix={max_seg_prefix:.2f}")
 
-            # Instrumentation: Per-layer congestion breakdown
-            if over_sum > 0:  # Every iteration for detailed monitoring
-                self._log_per_layer_congestion(over)
-
-            # Instrumentation: Top-10 overused channels
-            if over_sum > 0:  # Every iteration for detailed monitoring
+            # Instrumentation: Per-layer congestion breakdown (EXPENSIVE - only every 10 iters)
+            overuse_by_layer = None
+            if over_sum > 0 and it % 10 == 0:
+                overuse_by_layer = self._log_per_layer_congestion(over)
                 self._log_top_overused_channels(over, top_k=10)
 
             # Update layer bias from horizontal overuse (EWMA for stability)
-            if hasattr(self, 'layer_bias') and hasattr(self.graph, 'edge_layer'):
-                overuse_by_layer = self._log_per_layer_congestion(over)  # Already returns dict
+            # Only update every 10 iterations to avoid expensive computation
+            if hasattr(self, 'layer_bias') and hasattr(self.graph, 'edge_layer') and it % 10 == 0:
+                if overuse_by_layer is None:
+                    overuse_by_layer = self._log_per_layer_congestion(over)
 
                 if overuse_by_layer and sum(overuse_by_layer.values()) > 0:
                     # Compute pressure per layer (normalized to mean)
@@ -4502,11 +4502,15 @@ class PathFinderRouter:
                                 routed_this_pass += 1
                                 continue  # Skip ROI extraction and CPU routing
                             else:
-                                logger.info(f"[GPU-SEEDS] No path found, falling back to ROI routing")
+                                logger.info(f"[GPU-SEEDS] No path found, skipping net (will be marked as failed)")
+                                failed_this_pass += 1
+                                continue  # Skip CPU fallback, let exclusion handle it
                         else:
                             logger.warning(f"[GPU-SEEDS] Empty seed arrays, skipping GPU fast path")
                 except Exception as e:
-                    logger.warning(f"[GPU-SEEDS] GPU fast path failed: {e}, falling back to ROI routing")
+                    logger.warning(f"[GPU-SEEDS] GPU fast path failed: {e}, skipping net (will be marked as failed)")
+                    failed_this_pass += 1
+                    continue  # Skip CPU fallback, let exclusion handle it
             
             # If GPU fast path succeeded, we already continued to next net above
             # Otherwise, proceed with standard ROI routing below

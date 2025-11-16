@@ -2077,8 +2077,9 @@ class CUDADijkstra:
             return paths
 
         except Exception as e:
-            logger.warning(f"[CUDA-ROI] GPU pathfinding failed: {e}, falling back to CPU")
-            return self._fallback_cpu_dijkstra(roi_batch)
+            logger.warning(f"[CUDA-ROI] GPU pathfinding failed: {e}, skipping (fail fast mode)")
+            # Return None for all paths instead of slow CPU fallback
+            return [None] * len(roi_batch)
 
     def find_path_batch(self,
                        adjacency_csr,  # cupyx.scipy.sparse.csr_matrix

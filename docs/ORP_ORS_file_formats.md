@@ -375,16 +375,6 @@ Both import and export functions are thread-safe and can be called concurrently 
 
 ---
 
-## Examples
-
-See the complete cloud routing workflow in action:
-
-- [Cloud Routing Workflow Guide](cloud_routing_workflow.md) - End-to-end tutorial
-- [Quick Start Guide](../CLOUD_ROUTING_QUICK_START.md) - Fast reference
-- [Implementation Guide](../CLOUD_ROUTING_IMPLEMENTATION_GUIDE.md) - Technical details
-
----
-
 **Last Updated:** November 13, 2025
 **Format Version:** 1.0
 **OrthoRoute Version:** 0.1.0
