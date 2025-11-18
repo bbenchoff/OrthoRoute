@@ -87,7 +87,7 @@ _Testing / examples are the following_:
 </div>
 
 <div align="center">
-  <img src="graphics/screenshots/OrthoRouteRouted.png" alt="Trace Pattern" width="800">
+  <img src="graphics/screenshots/OrthorouteRouted.png" alt="Trace Pattern" width="800">
   <br>
   <em>A view of what the 'Manhattan Lattice' looks like in KiCad</em>
 </div>
