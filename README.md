@@ -140,22 +140,22 @@ Plus graph structure, node ownership, buffers: +20-25 GB
 
 | Board Size | Layers | Grid Pitch | Nodes | VRAM Needed | GPU Required |
 |------------|--------|------------|-------|-------------|--------------|
-| 100×100mm | 6 | 0.4mm | 1.9M | 8-12 GB | RTX 3080, RTX 4070 |
-| 150×150mm | 18 | 0.4mm | 5M | 18-24 GB | RTX 4090 |
-| 200×200mm | 18 | 0.4mm | 7.2M | 24-30 GB | RTX 6000 Ada (48GB) |
+| 100×100mm | 6 | 0.4mm | 375k | 8-12 GB | RTX 3080, RTX 4070 |
+| 150×150mm | 18 | 0.4mm | 2.53M | 18-24 GB | RTX 4090 |
+| 200×200mm | 18 | 0.4mm | 4.5MM | 24-30 GB | RTX 6000 Ada (48GB) |
 | 200×200mm | 32 | 0.4mm | 8M | 35-40 GB| A100 80GB, H100 |
 | 300×300mm | 32 | 0.4mm | 18M | 60-80 GB | H100 80GB |
 
 **Rule of thumb:**
- - VRAM needed ≈ (board_area_mm² ÷ grid_pitch² ÷ 10,000) × num_layers × 5
- - Always round up - running out of VRAM mid-job loses all progress
- - For consumer GPUs: 24GB max (RTX 4090/5090) limits you to ~150×150mm at 18 layers
+ - Calculate nodes: (board_width_mm ÷ grid_pitch_mm) × (board_height_mm ÷ grid_pitch_mm) × num_layers
+ - Estimate VRAM: nodes ÷ 200,000 = GB needed (conservative estimate)
+ - Example: 8M nodes ÷ 200,000 = 40 GB minimum
  - This list of recommended GPUs is either going to be hilarious or sad in a decade
 
 **Important distinction:**
 - **VRAM usage** is determined by board dimensions, layers, and grid pitch (not net count)
 - **Routing time** is determined by number of nets
-- Example: 500 nets vs 8,000 nets on the same 200×200mm board uses the **same VRAM** but takes **16x longer** to route
+- Example: 500 nets vs 8,000 nets on the same 200×200mm 20-layer board uses the **same VRAM** but takes **16x longer** to route
 
 **If you get "Out of Memory" errors:** Rent a GPU with more VRAM or use `--cpu-only` mode (slower but no memory limit).
 

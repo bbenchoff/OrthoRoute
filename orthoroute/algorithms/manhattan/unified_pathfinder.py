@@ -3682,6 +3682,14 @@ class PathFinderRouter:
                 self._net_failure_count = {}  # net_id -> consecutive failures
                 self._excluded_nets = set()   # nets we've given up on
 
+            # Every 10 iterations, give excluded nets another chance (conditions may have improved)
+            # This prevents permanent exclusion of temporarily unroutable nets
+            if it > 10 and it % 10 == 0 and self._excluded_nets:
+                num_to_retry = len(self._excluded_nets)
+                logger.warning(f"[EXCLUDE-RETRY] Iteration {it}: Giving {num_to_retry} excluded nets another chance")
+                self._excluded_nets.clear()
+                self._net_failure_count.clear()
+
             # Only start tracking failures after iteration 4
             if it > 4:
                 # Update failure counts based on which nets have paths
