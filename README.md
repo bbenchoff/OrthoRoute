@@ -81,6 +81,18 @@ _Testing / examples are the following_:
 ### Main Interface
 
 <div align="center">
+  <img src="graphics/screenshots/OrthoRouteLarge.png" alt="OrthoRoute Interface" width="800">
+  <br>
+  <em>OrthoRoute plugin showing a successful Manhattan route</em>
+</div>
+
+<div align="center">
+  <img src="graphics/screenshots/OrthoRouteRouted.png" alt="Trace Pattern" width="800">
+  <br>
+  <em>A view of what the 'Manhattan Lattice' looks like in KiCad</em>
+</div>
+
+<div align="center">
   <img src="graphics/screenshots/TestBackplane.png" alt="OrthoRoute Interface" width="800">
   <br>
   <em>OrthoRoute plugin showing a successful Manhattan route</em>
