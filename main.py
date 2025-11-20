@@ -304,7 +304,7 @@ def run_headless(
     Args:
         orp_file: Path to input .ORP file (board export)
         output_file: Path to output .ORS file (default: derive from input)
-        max_iterations: Maximum routing iterations (default: 200)
+        max_iterations: Maximum routing iterations (default: 250)
         checkpoint_interval: Checkpoint save interval in minutes (default: 30)
         resume_checkpoint: Path to checkpoint file to resume from
         use_gpu: Force GPU mode if True, auto-detect if None
@@ -698,7 +698,7 @@ Examples:
   %(prog)s cli board.kicad_pcb          # Route board via CLI
   %(prog)s cli board.kicad_pcb -o out/  # Route and save to directory
   %(prog)s headless input.ORP           # Headless cloud routing mode
-  %(prog)s headless input.ORP -o out.ORS --max-iterations 200
+  %(prog)s headless input.ORP -o out.ORS --max-iterations 250
         """
     )
     
@@ -745,8 +745,8 @@ Examples:
     headless_parser.add_argument(
         '--max-iterations',
         type=int,
-        default=200,
-        help='Override default iteration limit (default: 200)'
+        default=250,
+        help='Override default iteration limit (default: 250)'
     )
     headless_parser.add_argument(
         '--checkpoint-interval',
