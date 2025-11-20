@@ -7,7 +7,7 @@ Part of the PathFinder routing algorithm refactoring.
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 import numpy as np
 
 try:
@@ -16,6 +16,11 @@ try:
 except ImportError:
     cp = None
     CUPY_AVAILABLE = False
+
+if TYPE_CHECKING:
+    # For type hints only - avoid runtime AttributeError when CuPy not installed
+    if cp is not None:
+        import cupy
 
 from types import SimpleNamespace
 from ....domain.models.board import Board, Pad
@@ -850,7 +855,7 @@ class PathfindingMixin:
         return results
     
 
-    def _compute_manhattan_heuristic(self, roi_size: int, roi_sink: int, node_coords_map: dict = None) -> cp.ndarray:
+    def _compute_manhattan_heuristic(self, roi_size: int, roi_sink: int, node_coords_map: dict = None) -> Any:
         """Compute Manhattan distance heuristic for A* pathfinding
         
         FIXED: Use zero heuristic to ensure routing works (pure Dijkstra)
