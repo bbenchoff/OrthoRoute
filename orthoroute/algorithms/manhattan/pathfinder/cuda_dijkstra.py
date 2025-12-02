@@ -13,7 +13,11 @@ try:
     import cupyx.scipy.sparse
     CUDA_AVAILABLE = True
 except ImportError:
-    cp = None
+    # Create dummy module for type hints when CuPy not available
+    import numpy as np
+    class _DummyCuPy:
+        ndarray = np.ndarray  # Use numpy's ndarray as fallback type for type hints
+    cp = _DummyCuPy()
     CUDA_AVAILABLE = False
 
 logger = logging.getLogger(__name__)

@@ -14,7 +14,10 @@ try:
     import cupy as cp
     CUPY_AVAILABLE = True
 except ImportError:
-    cp = None
+    # Create dummy module for type hints when CuPy not available
+    class _DummyCuPy:
+        ndarray = np.ndarray
+    cp = _DummyCuPy()
     CUPY_AVAILABLE = False
 
 from types import SimpleNamespace

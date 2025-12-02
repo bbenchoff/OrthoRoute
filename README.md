@@ -106,6 +106,19 @@ _Testing / examples are the following_:
 
 ## Quick Start
 
+**KiCAD IS CURRENTLY BROKEN** with regards to support of IPC API plugins installed via the Content and Plugin manager. The workaround is to run this outside the Content and Plugin manager. This is documented here:
+
+- https://gitlab.com/kicad/code/kicad/-/issues/19465
+- https://forum.kicad.info/t/kicad-9-0-python-api-ipc-api/57236
+
+The fix is upcoming, but has not been released yet. **To run this, do the following:**
+
+- Clone the OrthoRoute repo
+- in the OrthoRoute/ folder, run `pip install -r requirements.txt`
+- Once that's done, run `python main.py`, with a board open in KiCad, and 'Enable KiCad API' selected in Preferences -> Plugins
+
+
+
 ### Prerequisites
 - **KiCad 9.0+** with IPC API support
 - **Python 3.12+**
