@@ -4543,6 +4543,7 @@ class PathFinderRouter:
             ROI_THRESHOLD_STEPS = 125
             use_roi_extraction = manhattan_dist < ROI_THRESHOLD_STEPS
 
+            import numpy as np
             if use_roi_extraction:
                 # SHORT NET: Use focused ROI for fast routing
                 # Determine src/dst for ROI center
