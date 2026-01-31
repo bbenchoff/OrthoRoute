@@ -44,7 +44,10 @@ setup(
             "PyQt6>=6.0.0",
         ],
         "gpu": [
-            "cupy>=10.0.0",  # For CUDA support
+            "cupy>=10.0.0",  # For NVIDIA CUDA support
+        ],
+        "mlx": [
+            "mlx>=0.0.5",  # For Apple Silicon GPU support
         ],
         "kicad": [
             # KiCad Python API dependencies would go here

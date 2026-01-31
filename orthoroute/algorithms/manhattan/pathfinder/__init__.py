@@ -150,6 +150,9 @@ from .roi_extractor_mixin import RoiExtractorMixin
 from .geometry_mixin import GeometryMixin
 from .diagnostics_mixin import DiagnosticsMixin
 
+# Cross-platform Dijkstra solver (works with CUDA, MLX, or NumPy)
+from .dijkstra_solver import DijkstraSolver, NumpyDijkstraSolver, get_solver
+
 # Note: UnifiedPathFinder is imported from parent module to avoid circular imports
 # Use: from orthoroute.algorithms.manhattan import UnifiedPathFinder
 
@@ -208,6 +211,11 @@ __all__ = [
     'RoiExtractorMixin',
     'GeometryMixin',
     'DiagnosticsMixin',
+
+    # Cross-platform Dijkstra solver
+    'DijkstraSolver',
+    'NumpyDijkstraSolver',
+    'get_solver',
 ]
 
 __version__ = "0.2.0"
