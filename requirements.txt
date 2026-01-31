@@ -9,8 +9,8 @@ PyQt6>=6.0.0
 # GPU acceleration (optional)
 # For NVIDIA GPUs:
 cupy>=10.0.0
-# For Apple Silicon (install with: pip install mlx):
-# mlx>=0.0.5
+# For Apple Silicon:
+mlx>=0.0.5
 
 # Development dependencies (optional)
 pytest>=6.0.0
