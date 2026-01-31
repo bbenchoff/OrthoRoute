@@ -880,8 +880,7 @@ class LatticeBuilderMixin:
         if gs is not None:
             gs.edge_count = edge_count
 
-        if self.use_gpu:
-            import cupy as cp
+        # cp already imported from cupy_compat at module level
 
         def ensure(name, dtype, fill=0):
             arr = getattr(self, name, None)

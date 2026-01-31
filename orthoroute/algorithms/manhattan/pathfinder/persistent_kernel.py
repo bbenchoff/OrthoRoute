@@ -270,7 +270,7 @@ def launch_persistent_kernel(
         best_dist: Distance to best destination (inf if no path)
         iterations: Number of iterations performed
     """
-    import cupy as cp
+    # cp already imported from cupy_compat at module level
 
     # Allocate frontier buffers
     frontier_curr = cp.zeros(frontier_words, dtype=cp.uint32)

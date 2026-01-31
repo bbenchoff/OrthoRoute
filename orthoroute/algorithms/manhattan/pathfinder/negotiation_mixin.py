@@ -350,11 +350,9 @@ class NegotiationMixin:
                     logger.info(f"[BARREL-CONFLICT] Marking {conflict_count} conflicting edges as overused")
                     # Mark conflicting edges as overused in present usage array (CRITICAL!)
                     # This makes PathFinder see them and reroute them
-                    import numpy as np
                     pres = self.edge_present_usage
                     if hasattr(pres, 'get'):
-                        # GPU array - need to update on GPU
-                        import cupy as cp
+                        # GPU array - need to update on GPU (cp from cupy_compat)
                         conflict_indices_gpu = cp.asarray(conflict_edge_indices)
                         pres[conflict_indices_gpu] += 10.0  # Barrel conflict penalty
                     else:
@@ -1323,13 +1321,12 @@ class NegotiationMixin:
     def _apply_column_multipliers_gpu(self, col_mult: np.ndarray, plane_size: int,
                                       x_steps: int, y_steps: int, layer_count: int) -> None:
         """Apply column multipliers to vertical edges on GPU in vectorized fashion."""
-        try:
-            import cupy as cp
-        except ImportError:
+        if not CUPY_AVAILABLE:
             # Fallback to CPU if no GPU
             self._apply_column_multipliers_cpu(col_mult, plane_size, x_steps, y_steps, layer_count)
             return
 
+        # cp already imported from cupy_compat at module level
         # Get edge costs (should be on GPU)
         if not hasattr(self.edge_total_cost, 'get'):
             # Already CPU array, use CPU path
@@ -1450,12 +1447,9 @@ class NegotiationMixin:
                         modified_count += 1
 
         # Write back if needed
-        if hasattr(self.edge_total_cost, 'get'):
-            try:
-                import cupy as cp
-                self.edge_total_cost = cp.asarray(edge_costs)
-            except ImportError:
-                self.edge_total_cost = edge_costs
+        if hasattr(self.edge_total_cost, 'get') and CUPY_AVAILABLE:
+            # cp already imported from cupy_compat at module level
+            self.edge_total_cost = cp.asarray(edge_costs)
         else:
             self.edge_total_cost = edge_costs
 
@@ -1566,11 +1560,10 @@ class NegotiationMixin:
 
         # Write back modified costs
         if hasattr(self.edge_total_cost, 'get'):
-            # GPU array - need to convert back
-            try:
-                import cupy as cp
+            # GPU array - need to convert back (cp from cupy_compat)
+            if CUPY_AVAILABLE:
                 self.edge_total_cost = cp.asarray(edge_costs)
-            except ImportError:
+            else:
                 self.edge_total_cost = edge_costs
         else:
             self.edge_total_cost = edge_costs

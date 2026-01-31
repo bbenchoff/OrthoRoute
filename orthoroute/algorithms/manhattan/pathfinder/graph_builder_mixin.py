@@ -41,7 +41,7 @@ class GraphBuilderMixin:
         """One-time GPU buffer allocation - no per-net allocs"""
         if getattr(self, "_gpu_bufs_inited", False) and getattr(self, 'dist_gpu', None) is not None and self.dist_gpu.size >= N:
             return
-        import cupy as cp
+        # cp already imported from cupy_compat at module level
         self.dist_gpu = cp.empty((N,), dtype=cp.float32)
         self.parent_gpu = cp.empty((N,), dtype=cp.int32)
         self.in_bucket = cp.empty((N,), dtype=cp.uint8)
@@ -51,7 +51,7 @@ class GraphBuilderMixin:
 
     def _reset_gpu_buffers(self, n):
         """Reset GPU buffers for ROI of size n using .fill() - much faster than allocation"""
-        import cupy as cp
+        # cp already imported from cupy_compat at module level
         self.dist_gpu[:n].fill(cp.inf)
         self.parent_gpu[:n].fill(-1)
         self.in_bucket[:n].fill(0)
@@ -62,7 +62,7 @@ class GraphBuilderMixin:
         if not self.use_gpu:
             return
 
-        import cupy as cp
+        # cp already imported from cupy_compat at module level
         # This is called after CPU arrays are built, so just create GPU mirrors
         gpu_attrs = [
             'edge_total_penalty', 'edge_dir_mask', 'edge_bottleneck_penalty',
@@ -427,19 +427,15 @@ class GraphBuilderMixin:
             self.edge_base_cost = (w[:E_live] + pen[:E_live]).astype(np.float32, copy=False)
 
         # Mirror to GPU if needed
-        if getattr(self, "use_gpu", False):
-            try:
-                import cupy as cp
-                for name in (
-                    "edge_total_penalty", "edge_bottleneck_penalty", "edge_present_usage",
-                    "edge_history", "edge_capacity", "edge_dir_mask", "edge_total_cost", "edge_base_cost"
-                ):
-                    cpu_arr = getattr(self, name)
-                    if not hasattr(cpu_arr, "get"):  # not a CuPy array
-                        setattr(self, name, cp.asarray(cpu_arr))
-            except Exception:
-                # If CuPy unavailable, stay CPU
-                pass
+        if getattr(self, "use_gpu", False) and CUPY_AVAILABLE:
+            # cp already imported from cupy_compat at module level
+            for name in (
+                "edge_total_penalty", "edge_bottleneck_penalty", "edge_present_usage",
+                "edge_history", "edge_capacity", "edge_dir_mask", "edge_total_cost", "edge_base_cost"
+            ):
+                cpu_arr = getattr(self, name)
+                if not hasattr(cpu_arr, "get"):  # not a CuPy array
+                    setattr(self, name, cp.asarray(cpu_arr))
 
         logger.info(f"[LIVE-SIZE] Edge arrays synced to E_live={E_live} (no truncation/mismatch)")
 
