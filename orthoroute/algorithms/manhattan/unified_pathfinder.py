@@ -499,12 +499,10 @@ from collections import defaultdict
 
 # Third-party
 import numpy as np
-try:
-    import cupy as cp
-    CUPY_AVAILABLE = True
-except ImportError:
-    cp = np  # Fallback to numpy if cupy not available
-    CUPY_AVAILABLE = False
+
+# Use compatibility layer for cross-platform support (CUDA, MLX, NumPy)
+from ...infrastructure.gpu.cupy_compat import cp, CUDA_AVAILABLE as CUPY_AVAILABLE
+GPU_AVAILABLE = CUPY_AVAILABLE
 
 # Local config
 from .pathfinder.config import PAD_CLEARANCE_MM
@@ -512,14 +510,6 @@ from .pad_escape_planner import PadEscapePlanner, Portal
 from .board_analyzer import analyze_board_characteristics, BoardCharacteristics
 from .parameter_derivation import derive_routing_parameters, apply_derived_parameters, DerivedRoutingParameters
 from .pathfinder.via_kernels import ViaKernelManager, convert_via_metadata_to_gpu, ensure_gpu_array
-
-# Optional GPU
-try:
-    import cupy as cp
-    GPU_AVAILABLE = True
-except ImportError:
-    cp = None
-    GPU_AVAILABLE = False
 
 # Local imports
 from ...domain.models.board import Board
@@ -3073,11 +3063,7 @@ class PathFinderRouter:
 
         # Update the base cost array (copy back to GPU if needed)
         if is_gpu:
-            try:
-                import cupy as cp
-                self.graph.base_costs = cp.asarray(base_cost_cpu)
-            except ImportError:
-                self.graph.base_costs = base_cost_cpu
+            self.graph.base_costs = cp.asarray(base_cost_cpu)
         else:
             self.graph.base_costs = base_cost_cpu
 
@@ -3789,8 +3775,7 @@ class PathFinderRouter:
                     conflict_penalty = min(10.0 * pres_fac, 100.0)  # Cap at 100
 
                     if hasattr(pres, 'get'):
-                        # GPU array
-                        import cupy as cp
+                        # GPU array - use cp from compatibility layer
                         conflict_indices_gpu = cp.asarray(conflict_edge_indices)
                         pres[conflict_indices_gpu] += conflict_penalty
                     else:
@@ -4461,9 +4446,7 @@ class PathFinderRouter:
             # Full-graph routing with owner-aware bitmap filtering
             if use_portals and hasattr(self.solver, 'gpu_solver') and self.solver.gpu_solver:
                 try:
-                    import numpy as np
-                    import cupy as cp
-
+                    # cp and np already imported at module level from compatibility layer
                     # Check if costs are on GPU
                     costs_on_gpu = hasattr(costs, 'device')
 

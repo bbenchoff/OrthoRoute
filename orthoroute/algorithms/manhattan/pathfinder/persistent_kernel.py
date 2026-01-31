@@ -4,12 +4,8 @@ Single-launch kernel that runs until convergence or destination found.
 Eliminates kernel launch overhead by running persistently on device.
 """
 
-try:
-    import cupy as cp
-    CUDA_AVAILABLE = True
-except ImportError:
-    cp = None
-    CUDA_AVAILABLE = False
+# Use compatibility layer for cross-platform support (CUDA, MLX, NumPy)
+from ....infrastructure.gpu.cupy_compat import cp, CUDA_AVAILABLE
 
 # PERSISTENT SSSP KERNEL
 # This kernel launches ONCE per net and runs until:

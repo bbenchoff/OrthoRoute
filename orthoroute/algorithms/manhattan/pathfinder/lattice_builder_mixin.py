@@ -10,12 +10,8 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
-try:
-    import cupy as cp
-    CUPY_AVAILABLE = True
-except ImportError:
-    cp = None
-    CUPY_AVAILABLE = False
+# Use compatibility layer for cross-platform support (CUDA, MLX, NumPy)
+from ....infrastructure.gpu.cupy_compat import cp, CUDA_AVAILABLE as CUPY_AVAILABLE
 
 from types import SimpleNamespace
 

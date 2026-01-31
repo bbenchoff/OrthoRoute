@@ -10,17 +10,8 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 import numpy as np
 
-try:
-    import cupy as cp
-    CUPY_AVAILABLE = True
-except ImportError:
-    cp = None
-    CUPY_AVAILABLE = False
-
-if TYPE_CHECKING:
-    # For type hints only - avoid runtime AttributeError when CuPy not installed
-    if cp is not None:
-        import cupy
+# Use compatibility layer for cross-platform support (CUDA, MLX, NumPy)
+from ....infrastructure.gpu.cupy_compat import cp, CUDA_AVAILABLE as CUPY_AVAILABLE
 
 from types import SimpleNamespace
 from ....domain.models.board import Board, Pad

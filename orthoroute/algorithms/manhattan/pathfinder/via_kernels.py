@@ -13,16 +13,8 @@ import time
 from typing import Optional, Dict, Tuple
 import numpy as np
 
-try:
-    import cupy as cp
-    CUDA_AVAILABLE = True
-except ImportError:
-    # Create dummy module for type hints when CuPy not available
-    import numpy as np
-    class _DummyCuPy:
-        ndarray = np.ndarray
-    cp = _DummyCuPy()
-    CUDA_AVAILABLE = False
+# Use compatibility layer for cross-platform support (CUDA, MLX, NumPy)
+from ....infrastructure.gpu.cupy_compat import cp, CUDA_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
