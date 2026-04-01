@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QGroupBox, QScrollArea, QTabWidget, QProgressBar,
     QStatusBar, QMenuBar, QToolBar, QApplication, QMessageBox,
     QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QSlider,
-    QFrame, QSizePolicy, QLineEdit, QFileDialog
+    QFrame, QSizePolicy, QLineEdit, QFileDialog, QMenu
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QSize, QRect, QPoint, QPointF,
@@ -1071,7 +1071,74 @@ class PCBViewer(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.is_panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
-    
+
+    def _screen_to_world(self, screen_pos) -> tuple:
+        """Convert a screen QPoint to world (mm) coordinates."""
+        cx = self.width()  / 2.0
+        cy = self.height() / 2.0
+        wx = screen_pos.x() / self.zoom_factor - cx / self.zoom_factor + self.pan_x
+        wy = screen_pos.y() / self.zoom_factor - cy / self.zoom_factor + self.pan_y
+        return wx, wy
+
+    @staticmethod
+    def _point_in_polygon(px: float, py: float, polygon) -> bool:
+        """Ray-casting PIP test."""
+        n = len(polygon)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = polygon[i][0], polygon[i][1]
+            xj, yj = polygon[j][0], polygon[j][1]
+            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi + 1e-15) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def contextMenuEvent(self, event):
+        """Right-click: show keepout constraints when clicking inside a keepout area."""
+        keepouts = self.board_data.get('keepouts', []) if hasattr(self, 'board_data') else []
+        if not keepouts:
+            return
+
+        wx, wy = self._screen_to_world(event.pos())
+
+        hit = None
+        for ko in keepouts:
+            outline = ko.get('outline', [])
+            if len(outline) >= 3 and self._point_in_polygon(wx, wy, outline):
+                hit = ko
+                break
+
+        if hit is None:
+            return
+
+        menu = QMenu(self)
+        name = hit.get('name') or '(unnamed)'
+        title_action = menu.addAction(f"Keepout: {name}")
+        title_action.setEnabled(False)
+        menu.addSeparator()
+
+        CONSTRAINTS = [
+            ('keepout_tracks',      'No Tracks'),
+            ('keepout_vias',        'No Vias'),
+            ('keepout_copper',      'No Copper Fills'),
+            ('keepout_pads',        'No Pads'),
+            ('keepout_footprints',  'No Footprints'),
+        ]
+
+        layers = hit.get('layers', [])
+        layers_action = menu.addAction(f"Layers: {', '.join(layers) if layers else 'all'}")
+        layers_action.setEnabled(False)
+        menu.addSeparator()
+
+        for key, label in CONSTRAINTS:
+            val = hit.get(key, False)
+            mark = '\u2718  ' if val else '\u2713  '   # ✘ blocked, ✓ allowed
+            a = menu.addAction(f"{mark}{label}")
+            a.setEnabled(False)
+
+        menu.exec(event.globalPos())
+
     def debug_screenshot(self, filename_prefix: str = "debug_routing", scale_factor: int = 1, output_dir: str = None):
         """Capture screenshot of the PCB viewer for debugging with optional high-res rendering"""
         try:
