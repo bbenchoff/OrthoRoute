@@ -53,18 +53,38 @@ def show_usage():
 def run_plugin(show_gui: bool = False):
     """Run as KiCad plugin with the same GUI as orthoroute_plugin.py."""
     try:
+        print(f"[OrthoRoute] run_plugin(show_gui={show_gui})")
+        print(f"[OrthoRoute] Python: {sys.executable}")
+        print(f"[OrthoRoute] CWD: {os.getcwd()}")
+        print(f"[OrthoRoute] KICAD_API_SOCKET: {os.environ.get('KICAD_API_SOCKET', '<not set>')}")
+        print(f"[OrthoRoute] PYTHONPATH: {os.environ.get('PYTHONPATH', '<not set>')}")
+        sys.stdout.flush()
+
         config = setup_environment()
-        
+        print("[OrthoRoute] Environment setup complete")
+        sys.stdout.flush()
+
         # Use new architecture for both GUI and non-GUI modes
         from orthoroute.presentation.plugin.kicad_plugin import KiCadPlugin
-        
+        print("[OrthoRoute] KiCadPlugin imported")
+        sys.stdout.flush()
+
         plugin = KiCadPlugin()
-        
+        print("[OrthoRoute] KiCadPlugin() created")
+        sys.stdout.flush()
+
         if show_gui:
+            print("[OrthoRoute] Calling plugin.run_with_gui()...")
+            sys.stdout.flush()
             success = plugin.run_with_gui()
         else:
+            print("[OrthoRoute] Calling plugin.run()...")
+            sys.stdout.flush()
             success = plugin.run()
-        
+
+        print(f"[OrthoRoute] Result: success={success}")
+        sys.stdout.flush()
+
         if success:
             logging.info("Plugin execution completed successfully")
             sys.exit(0)
@@ -73,7 +93,12 @@ def run_plugin(show_gui: bool = False):
             sys.exit(1)
             
     except Exception as e:
+        print(f"[OrthoRoute] EXCEPTION: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
         logging.error(f"Plugin execution failed: {e}")
+        input("[OrthoRoute] Press Enter to close...")
         sys.exit(1)
 
 
