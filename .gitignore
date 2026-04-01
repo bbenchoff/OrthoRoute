@@ -145,7 +145,6 @@ viz/*.mp4
 # Generated documentation
 docs/_build/
 docs/api/
-.github/
 
 # Log files
 *.log
