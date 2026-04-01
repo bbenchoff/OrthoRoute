@@ -514,12 +514,12 @@ class PCBViewer(QWidget):
         """Draw existing tracks/traces with performance optimization"""
         tracks = self.board_data.get('tracks', [])
         
-        logger.info(f"_draw_tracks called: board_data has {len(tracks)} tracks")
+        logger.debug(f"_draw_tracks called: board_data has {len(tracks)} tracks")
         if tracks:
-            logger.info(f"First track: {tracks[0]}")
+            logger.debug(f"First track: {tracks[0]}")
 
         if not tracks:
-            logger.info("No tracks to draw - returning early")
+            logger.debug("No tracks to draw - returning early")
             return
             
         # CRITICAL PERFORMANCE FIX: Viewport culling and LOD
@@ -535,8 +535,8 @@ class PCBViewer(QWidget):
             margin = max(visible_rect.width(), visible_rect.height()) * 0.1
             visible_rect = visible_rect.adjusted(-margin, -margin, margin, margin)
 
-            logger.info(f"VIEWPORT DEBUG: visible_rect = ({visible_rect.left():.1f}, {visible_rect.top():.1f}) -> ({visible_rect.right():.1f}, {visible_rect.bottom():.1f})")
-            logger.info(f"VIEWPORT DEBUG: zoom_level = {zoom_level:.3f}")
+            logger.debug(f"VIEWPORT DEBUG: visible_rect = ({visible_rect.left():.1f}, {visible_rect.top():.1f}) -> ({visible_rect.right():.1f}, {visible_rect.bottom():.1f})")
+            logger.debug(f"VIEWPORT DEBUG: zoom_level = {zoom_level:.3f}")
         except Exception as e:
             # Fallback: render everything if transform fails
             logger.warning(f"VIEWPORT DEBUG: Transform failed ({e}), using fallback viewport")
@@ -607,8 +607,8 @@ class PCBViewer(QWidget):
                         board_min_y, board_max_y = bounds[1], bounds[3]
                         in_bounds_x = board_min_x <= x1 <= board_max_x and board_min_x <= x2 <= board_max_x
                         in_bounds_y = board_min_y <= y1 <= board_max_y and board_min_y <= y2 <= board_max_y
-                        logger.info(f"COORD VERIFY: Track ({x1:.1f},{y1:.1f})->({x2:.1f},{y2:.1f}) in_bounds=({in_bounds_x},{in_bounds_y})")
-                        logger.info(f"COORD VERIFY: Board bounds ({board_min_x:.1f},{board_min_y:.1f})->({board_max_x:.1f},{board_max_y:.1f})")
+                        logger.debug(f"COORD VERIFY: Track ({x1:.1f},{y1:.1f})->({x2:.1f},{y2:.1f}) in_bounds=({in_bounds_x},{in_bounds_y})")
+                        logger.debug(f"COORD VERIFY: Board bounds ({board_min_x:.1f},{board_min_y:.1f})->({board_max_x:.1f},{board_max_y:.1f})")
 
                 # Handle both layer formats: integer and string
                 layer_raw = track.get('layer', 0)
@@ -634,7 +634,7 @@ class PCBViewer(QWidget):
 
                 # DEBUG: Log first few tracks to see coordinate ranges
                 if drawn_tracks < 5:
-                    logger.info(f"TRACK COORDS #{drawn_tracks+1}: ({x1:.1f},{y1:.1f})->({x2:.1f},{y2:.1f}) layer={layer}")
+                    logger.debug(f"TRACK COORDS #{drawn_tracks+1}: ({x1:.1f},{y1:.1f})->({x2:.1f},{y2:.1f}) layer={layer}")
 
                 # DISABLED: Skip viewport culling for now
                 # if (visible_rect.contains(line_start) or
@@ -655,7 +655,7 @@ class PCBViewer(QWidget):
                 if layer not in self.visible_layers:
                     # Log layer visibility issue for first few tracks
                     if drawn_tracks < 3:
-                        logger.info(f"TRACK LAYER FILTERED #{drawn_tracks+1}: track layer '{layer}' not in visible_layers {list(self.visible_layers)}")
+                        logger.debug(f"TRACK LAYER FILTERED #{drawn_tracks+1}: track layer '{layer}' not in visible_layers {list(self.visible_layers)}")
                     continue
                 
                 # Set color based on layer
@@ -688,12 +688,12 @@ class PCBViewer(QWidget):
                 
                 # Log first few tracks drawn
                 if drawn_tracks <= 3:
-                    logger.info(f"TRACK DRAWN #{drawn_tracks}: ({x1:.3f},{y1:.3f}) -> ({x2:.3f},{y2:.3f}) width={line_width} layer={layer}")
+                    logger.debug(f"TRACK DRAWN #{drawn_tracks}: ({x1:.3f},{y1:.3f}) -> ({x2:.3f},{y2:.3f}) width={line_width} layer={layer}")
                 
             except (KeyError, TypeError):
                 continue
         
-        logger.info(f"_draw_tracks completed: drew {drawn_tracks} tracks, culled {culled_tracks} (viewport + limit), total {len(tracks)} available")
+        logger.debug(f"_draw_tracks completed: drew {drawn_tracks} tracks, culled {culled_tracks} (viewport + limit), total {len(tracks)} available")
                 
     def _line_intersects_rect(self, x1, y1, x2, y2, rect):
         """Check if a line intersects with a rectangle (simple bounding box check)"""
@@ -846,10 +846,10 @@ class PCBViewer(QWidget):
         vias = self.board_data.get('vias', [])
 
         if not vias:
-            logger.info("_draw_vias: No vias to draw")
+            logger.debug("_draw_vias: No vias to draw")
             return  # No vias to draw
 
-        logger.info(f"_draw_vias called: board_data has {len(vias)} vias")
+        logger.debug(f"_draw_vias called: board_data has {len(vias)} vias")
             
         # Get zoom level for LOD optimization
         zoom_level = painter.transform().m11()
@@ -959,7 +959,7 @@ class PCBViewer(QWidget):
                 logger.warning(f"Invalid via data: {via}, error: {e}")
                 continue
 
-        logger.info(f"_draw_vias completed: drew {drawn_vias} vias out of {len(vias)} available")
+        logger.debug(f"_draw_vias completed: drew {drawn_vias} vias out of {len(vias)} available")
 
     def _draw_zones(self, painter: QPainter):
         """Draw copper fill zones (pours)"""
@@ -967,7 +967,7 @@ class PCBViewer(QWidget):
         if not zones:
             return
 
-        logger.info(f"_draw_zones called: {len(zones)} zones")
+        logger.debug(f"_draw_zones called: {len(zones)} zones")
         drawn_zones = 0
 
         for zone in zones:
@@ -1011,7 +1011,7 @@ class PCBViewer(QWidget):
                 logger.warning(f"Error drawing zone: {e}")
                 continue
 
-        logger.info(f"_draw_zones completed: drew {drawn_zones} fill polygons")
+        logger.debug(f"_draw_zones completed: drew {drawn_zones} fill polygons")
 
     def _draw_keepouts(self, painter: QPainter):
         """Draw keepout rule areas as hatched / dashed outlines."""
