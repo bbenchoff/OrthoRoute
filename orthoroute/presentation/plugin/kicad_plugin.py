@@ -154,6 +154,11 @@ class KiCadPlugin:
         logger.info(f"[BOARD DEBUG] About to create Board with layer_count={layer_count}")
         board = Board(id="gui-board", name="GUI Board", layer_count=layer_count)
         board.nets = nets
+        # Attach keepout rule areas so the router can block constrained lattice nodes
+        if hasattr(self, 'board_data') and self.board_data:
+            board.keepouts = self.board_data.get('keepouts', [])
+            if board.keepouts:
+                logger.info(f"[BOARD DEBUG] Attached {len(board.keepouts)} keepout areas to Board")
         logger.info(f"[BOARD DEBUG] Created Board domain object: board.layer_count={board.layer_count}")
         
         # SAME THREE CALLS AS CLI
@@ -503,6 +508,7 @@ class KiCadPlugin:
                     layer_count = 6  # fallback
                 logger.info(f"Board layer stack: {layer_count} copper layers detected")
                 self.layer_count = layer_count
+                self.board_data = board_data  # Store for keepout access in route_all()
 
                 # STEP 4: Initialize UnifiedPathFinder with the REAL board data (GUI PATH FIX)
                 

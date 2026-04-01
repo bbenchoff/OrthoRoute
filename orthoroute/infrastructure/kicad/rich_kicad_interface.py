@@ -223,9 +223,9 @@ class RichKiCadInterface:
             logger.info("Extracting existing vias...")
             vias = self._extract_vias(board)
 
-            # Extract zones (copper pours)
+            # Extract zones (copper pours) and keepout rule areas
             logger.info("Extracting zones...")
-            zones = self._extract_zones(board)
+            zones, keepouts = self._extract_zones(board)
             logger.info(f"Found {len(zones)} zones")
             
             # Extract nets with pad connectivity
@@ -266,6 +266,7 @@ class RichKiCadInterface:
                 'tracks': tracks,
                 'vias': vias,
                 'zones': zones,
+                'keepouts': keepouts,
                 'nets': nets_data,
                 'airwires': airwires,
                 'bounds': bounds,
@@ -277,7 +278,7 @@ class RichKiCadInterface:
             }
             
             logger.info(f"Extracted board data: {filename} ({width:.1f}x{height:.1f}mm, {layer_count} copper layers)")
-            logger.info(f"  {len(routable_nets)} routable nets, {len(components)} components, {len(tracks)} tracks, {len(vias)} vias, {len(zones)} zones")
+            logger.info(f"  {len(routable_nets)} routable nets, {len(components)} components, {len(tracks)} tracks, {len(vias)} vias, {len(zones)} zones, {len(keepouts)} keepouts")
             logger.info(f"  Generated {len(airwires)} airwires for visualization")
             logger.info(f"  Extracted {len(drc_rules.get('netclasses', {}))} netclasses with design rules")
             
@@ -553,9 +554,11 @@ class RichKiCadInterface:
         logger.info(f"Loaded {len(vias)} existing vias from KiCad")
         return vias
 
-    def _extract_zones(self, board) -> List[Dict]:
-        """Extract copper zones/pours using KiCad IPC API"""
+    def _extract_zones(self, board) -> tuple:
+        """Extract copper zones/pours and rule area keepouts using KiCad IPC API.
+        Returns (zones, keepouts) tuple."""
         zones = []
+        keepouts = []
         try:
             from kipy.board_types import BoardLayer, ZoneType
 
@@ -585,9 +588,27 @@ class RichKiCadInterface:
 
             for zone in board_zones:
                 try:
-                    # Skip rule areas — not copper fills
+                    type_name = ZoneType.Name(zone.type)
+                    net_name = zone.net.name if zone.net is not None else ""
+                    logger.info(f"Zone: name='{zone.name}' type={type_name} net='{net_name}' layers={[_layer_id_to_name(l) for l in zone.layers]}")
+
                     if zone.type == ZoneType.ZT_RULE_AREA:
-                        logger.info(f"Skipping rule area zone: '{zone.name}'")
+                        # Extract keepout constraints from rule area
+                        ra = zone._proto.rule_area_settings
+                        outline_pts = _poly_to_points(zone.outline)
+                        layer_names = [_layer_id_to_name(l) for l in zone.layers]
+                        keepout = {
+                            'name':              zone.name,
+                            'layers':            layer_names,
+                            'outline':           outline_pts,
+                            'keepout_tracks':    ra.keepout_tracks,
+                            'keepout_vias':      ra.keepout_vias,
+                            'keepout_copper':    ra.keepout_copper,
+                            'keepout_pads':      ra.keepout_pads,
+                            'keepout_footprints':ra.keepout_footprints,
+                        }
+                        keepouts.append(keepout)
+                        logger.info(f"Keepout '{zone.name}': tracks={ra.keepout_tracks} vias={ra.keepout_vias} copper={ra.keepout_copper} pads={ra.keepout_pads} layers={layer_names}")
                         continue
 
                     net_name = zone.net.name if zone.net is not None else ""
@@ -618,8 +639,8 @@ class RichKiCadInterface:
         except Exception as e:
             logger.error(f"Error extracting zones: {e}")
 
-        logger.info(f"Loaded {len(zones)} copper zones from KiCad")
-        return zones
+        logger.info(f"Loaded {len(zones)} copper zones and {len(keepouts)} keepout areas from KiCad")
+        return zones, keepouts
 
     def _extract_nets(self, board, pads: List[Dict]) -> Dict[str, Dict]:
         """Extract nets with pad connectivity"""

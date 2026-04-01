@@ -1972,6 +1972,34 @@ class SimpleDijkstra:
         return (path, entry_layer, exit_layer)
 
 
+def _points_in_polygon(px: np.ndarray, py: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Ray-casting point-in-polygon test, vectorised over N points.
+
+    Args:
+        px, py: 1-D float arrays of query point coordinates (mm), shape (N,)
+        poly:   polygon vertices, shape (M, 2) in (x, y) order
+
+    Returns:
+        Boolean array of shape (N,), True if the point is inside the polygon.
+    """
+    n = len(poly)
+    inside = np.zeros(len(px), dtype=bool)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i, 0], poly[i, 1]
+        xj, yj = poly[j, 0], poly[j, 1]
+        cond1 = (yi > py) != (yj > py)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            x_intersect = np.where(
+                cond1,
+                (xj - xi) * (py - yi) / (yj - yi + 1e-15) + xi,
+                np.inf
+            )
+        inside ^= cond1 & (px < x_intersect)
+        j = i
+    return inside
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PATHFINDER ROUTER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2226,6 +2254,9 @@ class PathFinderRouter:
 
         # Note: Portal discounts are applied at seed level in _get_portal_seeds()
         # No need for graph-level discount modification
+
+        # Block lattice edges inside keepout rule areas
+        self._apply_keepout_obstacles(board)
 
         logger.info("=== Init complete ===")
         return True
@@ -3082,6 +3113,116 @@ class PathFinderRouter:
             self.graph.base_costs = base_cost_cpu
 
         logger.info(f"[VIA-KEEPOUT] Applied {len(self._via_keepouts_map)} via keepouts, blocked {blocked_planar_edges} planar edges in full graph")
+
+    def _apply_keepout_obstacles(self, board) -> None:
+        """Block lattice edges inside keepout rule area polygons.
+
+        Respects per-keepout constraint flags:
+            keepout_tracks → block planar (same-layer) edges
+            keepout_vias   → block via (inter-layer) edges
+
+        Called from initialize_graph() after the graph is built.
+        """
+        keepouts = getattr(board, 'keepouts', [])
+        if not keepouts:
+            logger.debug("[KEEPOUT] No keepout areas on board")
+            return
+
+        if not hasattr(self, 'graph') or self.graph is None:
+            logger.warning("[KEEPOUT] Graph not initialized, skipping keepout obstacles")
+            return
+
+        if not hasattr(self.graph, 'base_costs') or self.graph.base_costs is None:
+            logger.warning("[KEEPOUT] Base cost array not available, skipping keepout obstacles")
+            return
+
+        base_cost = self.graph.base_costs
+        is_gpu = hasattr(base_cost, 'get')
+        base_cost_cpu = base_cost.get() if is_gpu else base_cost
+
+        indptr = self.graph.indptr
+        indices = self.graph.indices
+        if hasattr(indptr, 'get'):
+            indptr = indptr.get()
+        if hasattr(indices, 'get'):
+            indices = indices.get()
+
+        BLOCK_COST = 1e9
+        Nx, Ny, Nz = self._Nx, self._Ny, self._Nz
+        bounds = self.lattice.bounds  # (min_x, min_y, max_x, max_y)
+        pitch = self.lattice.pitch
+
+        # Pre-build vectorised mm grids for PIP tests (shape Nx*Ny)
+        xs = bounds[0] + np.arange(Nx, dtype=np.float64) * pitch
+        ys = bounds[1] + np.arange(Ny, dtype=np.float64) * pitch
+        grid_x, grid_y = np.meshgrid(xs, ys, indexing='ij')  # (Nx, Ny)
+        grid_x_flat = grid_x.ravel()
+        grid_y_flat = grid_y.ravel()
+
+        layer_names = list(getattr(self.config, 'layer_names', []))
+        total_blocked_tracks = 0
+        total_blocked_vias = 0
+
+        for keepout in keepouts:
+            outline = keepout.get('outline', [])  # [[x_mm, y_mm], ...]
+            if len(outline) < 3:
+                continue
+
+            block_tracks = keepout.get('keepout_tracks', False)
+            block_vias   = keepout.get('keepout_vias',   False)
+            if not block_tracks and not block_vias:
+                continue
+
+            # Determine affected z-indices
+            ko_layers = keepout.get('layers', [])
+            if ko_layers and layer_names:
+                z_indices = [layer_names.index(ln) for ln in ko_layers if ln in layer_names]
+            else:
+                z_indices = list(range(Nz))
+
+            if not z_indices:
+                continue
+
+            # Vectorised point-in-polygon over the whole (Nx, Ny) plane
+            poly = np.array(outline, dtype=np.float64)
+            inside_flat = _points_in_polygon(grid_x_flat, grid_y_flat, poly)
+            inside_2d = inside_flat.reshape(Nx, Ny)  # bool (Nx, Ny)
+
+            xis, yis = np.nonzero(inside_2d)  # lattice indices inside polygon
+            if len(xis) == 0:
+                continue
+
+            for zi in z_indices:
+                for xi, yi in zip(xis.tolist(), yis.tolist()):
+                    node_idx = self.lattice.node_idx(xi, yi, zi)
+                    src_z = zi  # same as the loop variable
+                    start = int(indptr[node_idx])
+                    end   = int(indptr[node_idx + 1])
+                    for edge_idx in range(start, end):
+                        dst_node = int(indices[edge_idx])
+                        _, _, dst_z = self.lattice.idx_to_coord(dst_node)
+                        is_via_edge = (src_z != dst_z)
+                        if not is_via_edge and block_tracks:
+                            base_cost_cpu[edge_idx] = BLOCK_COST
+                            total_blocked_tracks += 1
+                        elif is_via_edge and block_vias:
+                            base_cost_cpu[edge_idx] = BLOCK_COST
+                            total_blocked_vias += 1
+
+        # Sync back to GPU if needed
+        if is_gpu:
+            try:
+                import cupy as cp
+                self.graph.base_costs = cp.asarray(base_cost_cpu)
+            except ImportError:
+                self.graph.base_costs = base_cost_cpu
+        else:
+            self.graph.base_costs = base_cost_cpu
+
+        logger.info(
+            f"[KEEPOUT] Applied {len(keepouts)} keepout area(s): "
+            f"blocked {total_blocked_tracks} track edges, {total_blocked_vias} via edges"
+        )
 
     def _apply_owner_aware_via_keepouts(self, current_net_id: str, costs) -> int:
         """

@@ -165,6 +165,10 @@ class Board:
     # Board properties
     thickness: float = 1.6  # mm, standard PCB thickness
     layer_count: int = 2
+
+    # Keepout rule areas from KiCad (each is a dict with 'outline', 'layers',
+    # 'keepout_tracks', 'keepout_vias', 'keepout_copper', etc.)
+    keepouts: List[Dict] = field(default_factory=list)
     
     # Mappings for efficient lookup
     _components_by_id: Dict[str, Component] = field(default_factory=dict, init=False)
