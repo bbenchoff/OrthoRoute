@@ -436,6 +436,10 @@ class PCBViewer(QWidget):
         # Draw copper zones
         if self.show_zones:
             self._draw_zones(painter)
+
+        # Draw keepout rule areas
+        if self.show_keepouts:
+            self._draw_keepouts(painter)
         
     def _draw_board_outline(self, painter: QPainter):
         """Draw the board outline"""
@@ -1008,6 +1012,36 @@ class PCBViewer(QWidget):
                 continue
 
         logger.info(f"_draw_zones completed: drew {drawn_zones} fill polygons")
+
+    def _draw_keepouts(self, painter: QPainter):
+        """Draw keepout rule areas as hatched / dashed outlines."""
+        keepouts = self.board_data.get('keepouts', [])
+        if not keepouts:
+            return
+
+        HATCH_COLOR = QColor(255, 80, 80, 120)   # red-ish, semi-transparent
+        FILL_COLOR  = QColor(255, 80, 80, 25)    # very faint red fill
+
+        pen = QPen(HATCH_COLOR, 0.08)
+        pen.setStyle(Qt.PenStyle.DashLine)
+
+        for keepout in keepouts:
+            outline = keepout.get('outline', [])
+            if len(outline) < 3:
+                continue
+
+            layers = keepout.get('layers', [])
+            # Skip if none of the keepout's layers are visible
+            if layers and not any(ln in self.visible_layers for ln in layers):
+                continue
+
+            try:
+                painter.setPen(pen)
+                painter.setBrush(QBrush(FILL_COLOR))
+                polygon = QPolygonF([QPointF(p[0], p[1]) for p in outline])
+                painter.drawPolygon(polygon)
+            except Exception as e:
+                logger.warning(f"Error drawing keepout: {e}")
 
     def wheelEvent(self, event: QWheelEvent):
         """Handle mouse wheel for zooming"""
