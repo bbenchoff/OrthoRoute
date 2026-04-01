@@ -215,8 +215,11 @@ class RichKiCadInterface:
             # Extract tracks
             logger.info("Extracting existing tracks...")
             tracks = self._extract_tracks(board)
-            logger.info(f"Loaded {len(tracks)} existing tracks from KiCad")
-            
+
+            # Extract vias
+            logger.info("Extracting existing vias...")
+            vias = self._extract_vias(board)
+
             # Extract zones (copper pours)
             logger.info("Extracting zones...")
             zones = self._extract_zones(board)
@@ -258,6 +261,7 @@ class RichKiCadInterface:
                 'pads': pads,
                 'components': components,
                 'tracks': tracks,
+                'vias': vias,
                 'zones': zones,
                 'nets': nets_data,
                 'airwires': airwires,
@@ -270,7 +274,7 @@ class RichKiCadInterface:
             }
             
             logger.info(f"Extracted board data: {filename} ({width:.1f}x{height:.1f}mm, {layer_count} copper layers)")
-            logger.info(f"  {len(routable_nets)} routable nets, {len(components)} components, {len(tracks)} tracks, {len(zones)} zones")
+            logger.info(f"  {len(routable_nets)} routable nets, {len(components)} components, {len(tracks)} tracks, {len(vias)} vias, {len(zones)} zones")
             logger.info(f"  Generated {len(airwires)} airwires for visualization")
             logger.info(f"  Extracted {len(drc_rules.get('netclasses', {}))} netclasses with design rules")
             
@@ -417,29 +421,134 @@ class RichKiCadInterface:
             # Use the correct KiCad API method
             board_tracks = _ipc_retry(board.get_tracks, "get_tracks", max_retries=3, sleep_s=0.5)
             logger.info(f"Found {len(board_tracks)} tracks using KiCad API")
-            
+
+            # BoardLayer enum for converting integer layer IDs to KiCad layer names.
+            # BoardLayer.Name() returns proto enum names like "BL_F_Cu", "BL_B_Cu",
+            # "BL_In1_Cu" etc.  Strip the 3-char "BL_" prefix and replace "_" with
+            # "." to get the KiCad canonical name: "F.Cu", "B.Cu", "In1.Cu" etc.
+            try:
+                from kipy.board_types import BoardLayer
+            except ImportError:
+                BoardLayer = None
+
+            def _layer_id_to_name(layer_id) -> str:
+                if BoardLayer is not None:
+                    try:
+                        proto_name = BoardLayer.Name(layer_id)  # e.g. "BL_F_Cu"
+                        if proto_name.startswith("BL_"):
+                            return proto_name[3:].replace("_", ".")
+                        return proto_name
+                    except Exception:
+                        pass
+                return f"layer_{layer_id}"
+
             for track in board_tracks:
                 try:
+                    # track.start / track.end are Vector2 objects; .x and .y are in nanometers
+                    start = track.start
+                    end = track.end
+                    start_x = float(start.x) / 1e6
+                    start_y = float(start.y) / 1e6
+                    end_x   = float(end.x)   / 1e6
+                    end_y   = float(end.y)   / 1e6
+                    # track.width is in nanometers
+                    width = float(track.width) / 1e6
+                    # track.layer is a BoardLayer enum integer
+                    layer = _layer_id_to_name(track.layer)
+                    # track.net.name is the net name string
+                    net_name = track.net.name if track.net is not None else ''
+
                     track_data = {
-                        'start_x': track.get('start_x', 0),
-                        'start_y': track.get('start_y', 0),
-                        'end_x': track.get('end_x', 0),
-                        'end_y': track.get('end_y', 0),
-                        'width': track.get('width', 0.2),
-                        'layer': track.get('layer', 'F.Cu'),
-                        'net_name': track.get('net_name', '')
+                        'start_x': start_x,
+                        'start_y': start_y,
+                        'end_x':   end_x,
+                        'end_y':   end_y,
+                        'width':   width,
+                        'layer':   layer,
+                        'net_name': net_name,
                     }
-                    
                     tracks.append(track_data)
-                    
+
                 except Exception as e:
                     logger.warning(f"Error extracting track: {e}")
                     continue
-                    
+
         except Exception as e:
             logger.error(f"Error extracting tracks: {e}")
-            
+
+        logger.info(f"Loaded {len(tracks)} existing tracks from KiCad")
         return tracks
+
+    def _extract_vias(self, board) -> List[Dict]:
+        """Extract existing vias using KiCad IPC API"""
+        vias = []
+        try:
+            from kipy.board_types import BoardLayer, ViaType
+        except ImportError:
+            logger.warning("kipy not available — skipping via extraction")
+            return vias
+
+        def _layer_id_to_name(layer_id) -> str:
+            try:
+                proto_name = BoardLayer.Name(layer_id)
+                if proto_name.startswith("BL_"):
+                    return proto_name[3:].replace("_", ".")
+                return proto_name
+            except Exception:
+                return f"layer_{layer_id}"
+
+        # ViaType proto enum names → GUI via type strings
+        _via_type_map = {
+            "VT_THROUGH":      "through",
+            "VT_BLIND_BURIED": "blind_buried",
+            "VT_MICRO":        "micro",
+        }
+
+        try:
+            board_vias = _ipc_retry(board.get_vias, "get_vias", max_retries=3, sleep_s=0.5)
+            logger.info(f"Found {len(board_vias)} vias using KiCad API")
+
+            for via in board_vias:
+                try:
+                    pos = via.position
+                    x = float(pos.x) / 1e6
+                    y = float(pos.y) / 1e6
+                    diameter = float(via.diameter) / 1e6
+                    drill    = float(via.drill_diameter) / 1e6
+                    net_name = via.net.name if via.net is not None else ''
+                    type_proto = ViaType.Name(via.type)
+                    via_type = _via_type_map.get(type_proto, "through")
+
+                    # For through vias the layers are always F.Cu→B.Cu.
+                    # For blind/buried vias read from the padstack drill span.
+                    try:
+                        drill_obj = via.padstack.drill
+                        start_layer = _layer_id_to_name(drill_obj.start_layer)
+                        end_layer   = _layer_id_to_name(drill_obj.end_layer)
+                    except Exception:
+                        start_layer = "F.Cu"
+                        end_layer   = "B.Cu"
+
+                    vias.append({
+                        'x':           x,
+                        'y':           y,
+                        'diameter':    diameter,
+                        'drill':       drill,
+                        'type':        via_type,
+                        'start_layer': start_layer,
+                        'end_layer':   end_layer,
+                        'net_name':    net_name,
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Error extracting via: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error extracting vias: {e}")
+
+        logger.info(f"Loaded {len(vias)} existing vias from KiCad")
+        return vias
 
     def _extract_zones(self, board) -> List[Dict]:
         """Extract copper zones/pours"""

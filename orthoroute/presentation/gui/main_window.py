@@ -614,6 +614,9 @@ class PCBViewer(QWidget):
                         layer = f'In{layer_raw-1}.Cu'  # Internal layers In1.Cu, In2.Cu, etc.
                 else:
                     layer = layer_raw
+                    # Normalize kipy proto enum names: "BL_F_Cu" -> "F.Cu"
+                    if isinstance(layer, str) and layer.startswith('BL_'):
+                        layer = layer[3:].replace('_', '.')
                 
                 # TEMPORARY: Disable viewport culling to debug coordinate system
                 # PERFORMANCE: Skip tracks outside visible viewport
@@ -668,7 +671,10 @@ class PCBViewer(QWidget):
                 # Use actual track dimensions (just like footprints are drawn)
                 # Convert mm to scene coordinates - same as footprints use
                 line_width = width  # Use actual track width in mm
-                painter.setPen(QPen(color, line_width))
+                pen = QPen(color, line_width)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
                 painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
                 drawn_tracks += 1
                 
