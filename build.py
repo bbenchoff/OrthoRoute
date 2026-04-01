@@ -249,8 +249,8 @@ class OrthoRouteBuildSystem:
                 shutil.copy2(icon_src, pkg / dst_name)
                 logger.info(f"  [OK] {dst_name}")
 
-        # requirements.txt, LICENSE
-        for fname in ("requirements.txt", "LICENSE"):
+        # requirements.txt, LICENSE, orthoroute.json (runtime config)
+        for fname in ("requirements.txt", "LICENSE", "orthoroute.json"):
             f = self.project_root / fname
             if f.exists():
                 shutil.copy2(f, pkg / fname)
@@ -265,6 +265,7 @@ class OrthoRouteBuildSystem:
             "plugin.json",
             "metadata.json",
             "icon-24.png",
+            "orthoroute.json",
             "orthoroute/__init__.py",
         ]
         missing = [f for f in required if not (self.package_dir / f).exists()]
