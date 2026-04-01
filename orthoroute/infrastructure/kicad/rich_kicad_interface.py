@@ -42,7 +42,10 @@ class BoardData:
 
 def fetch_board_and_drc():
     """Fetch board and DRC data using IPC API (proper method)"""
-    from kicad import KiCad
+    try:
+        from kicad import KiCad
+    except ImportError:
+        raise ImportError("kicad Python module not available in this environment")
 
     try:
         kc = KiCad()                                   # IPC session (nng under the hood)
@@ -551,15 +554,71 @@ class RichKiCadInterface:
         return vias
 
     def _extract_zones(self, board) -> List[Dict]:
-        """Extract copper zones/pours"""
+        """Extract copper zones/pours using KiCad IPC API"""
         zones = []
         try:
-            # KiCad zone extraction would go here
-            # For now, return empty list as zones are complex
-            pass
+            from kipy.board_types import BoardLayer, ZoneType
+
+            def _layer_id_to_name(layer_id) -> str:
+                try:
+                    proto_name = BoardLayer.Name(layer_id)
+                    if proto_name.startswith("BL_"):
+                        return proto_name[3:].replace("_", ".")
+                    return proto_name
+                except Exception:
+                    return f"layer_{layer_id}"
+
+            def _poly_to_points(poly_with_holes) -> List[List[float]]:
+                """Convert a PolygonWithHoles outline to a list of [x, y] mm points."""
+                pts = []
+                try:
+                    for node in poly_with_holes.outline.nodes:
+                        if node.has_point:
+                            pts.append([float(node.point.x) / 1e6,
+                                        float(node.point.y) / 1e6])
+                except Exception:
+                    pass
+                return pts
+
+            board_zones = _ipc_retry(board.get_zones, "get_zones", max_retries=3, sleep_s=0.5)
+            logger.info(f"Found {len(board_zones)} zones using KiCad API")
+
+            for zone in board_zones:
+                try:
+                    # Skip rule areas — not copper fills
+                    if zone.type == ZoneType.ZT_RULE_AREA:
+                        logger.info(f"Skipping rule area zone: '{zone.name}'")
+                        continue
+
+                    net_name = zone.net.name if zone.net is not None else ""
+                    layer_names = [_layer_id_to_name(l) for l in zone.layers]
+                    outline_pts = _poly_to_points(zone.outline)
+
+                    # Collect filled polygon outlines per layer
+                    filled = {}
+                    for layer_id, poly_list in zone.filled_polygons.items():
+                        layer_name = _layer_id_to_name(layer_id)
+                        filled[layer_name] = [_poly_to_points(p) for p in poly_list]
+
+                    zones.append({
+                        'net_name':  net_name,
+                        'layers':    layer_names,
+                        'outline':   outline_pts,
+                        'filled':    filled,
+                        'priority':  zone.priority,
+                        'name':      zone.name,
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Error extracting zone: {e}")
+                    continue
+
+        except ImportError:
+            logger.info("kipy not available — skipping zone extraction")
         except Exception as e:
             logger.error(f"Error extracting zones: {e}")
-            
+
+        logger.info(f"Loaded {len(zones)} copper zones from KiCad")
         return zones
 
     def _extract_nets(self, board, pads: List[Dict]) -> Dict[str, Dict]:
@@ -783,7 +842,7 @@ class RichKiCadInterface:
             if ipc_data and ipc_data.get('all_netclasses'):
                 return self._process_ipc_drc_data(ipc_data)
         except Exception as e:
-            logger.warning(f"IPC-based DRC extraction failed: {e}")
+            logger.info(f"IPC-based DRC extraction not available ({e}), using defaults")
 
         # Fallback to safe defaults
         logger.info("Using fallback DRC defaults")

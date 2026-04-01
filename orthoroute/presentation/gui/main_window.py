@@ -432,6 +432,10 @@ class PCBViewer(QWidget):
         # Draw vias
         if self.show_vias:
             self._draw_vias(painter)
+
+        # Draw copper zones
+        if self.show_zones:
+            self._draw_zones(painter)
         
     def _draw_board_outline(self, painter: QPainter):
         """Draw the board outline"""
@@ -952,7 +956,59 @@ class PCBViewer(QWidget):
                 continue
 
         logger.info(f"_draw_vias completed: drew {drawn_vias} vias out of {len(vias)} available")
-                
+
+    def _draw_zones(self, painter: QPainter):
+        """Draw copper fill zones (pours)"""
+        zones = self.board_data.get('zones', [])
+        if not zones:
+            return
+
+        logger.info(f"_draw_zones called: {len(zones)} zones")
+        drawn_zones = 0
+
+        for zone in zones:
+            try:
+                layer_names = zone.get('layers', [])
+                filled = zone.get('filled', {})
+
+                # Prefer filled polygons (post-pour); fall back to outline
+                if filled:
+                    polys_to_draw = [(layer, pts)
+                                     for layer, poly_list in filled.items()
+                                     for pts in poly_list]
+                elif zone.get('outline'):
+                    layer = layer_names[0] if layer_names else 'F.Cu'
+                    polys_to_draw = [(layer, zone['outline'])]
+                else:
+                    continue
+
+                for layer_name, pts in polys_to_draw:
+                    if not pts or len(pts) < 3:
+                        continue
+
+                    # Skip if layer is not visible
+                    if layer_name not in self.visible_layers:
+                        continue
+
+                    color = self.color_scheme.get_layer_color(layer_name)
+                    fill_color = QColor(color)
+                    fill_color.setAlpha(60)  # Semi-transparent fill
+                    outline_color = QColor(color)
+                    outline_color.setAlpha(120)
+
+                    painter.setPen(QPen(outline_color, 0.05))
+                    painter.setBrush(QBrush(fill_color))
+
+                    polygon = QPolygonF([QPointF(p[0], p[1]) for p in pts])
+                    painter.drawPolygon(polygon)
+                    drawn_zones += 1
+
+            except Exception as e:
+                logger.warning(f"Error drawing zone: {e}")
+                continue
+
+        logger.info(f"_draw_zones completed: drew {drawn_zones} fill polygons")
+
     def wheelEvent(self, event: QWheelEvent):
         """Handle mouse wheel for zooming"""
         zoom_factor = 1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2
@@ -2253,11 +2309,11 @@ class OrthoRouteMainWindow(QMainWindow):
             else:
                 pads_orphaned += 1
                 if pads_orphaned <= 5:  # Log first few orphaned pads
-                    logger.warning(f"DEBUG: Orphaned pad '{pad.id}' with component_id '{pad.component_id}' - not found in components_dict")
+                    logger.debug(f"Orphaned pad '{pad.id}' with component_id '{pad.component_id}' - assigning to generic component")
 
-        # FALLBACK: Create a generic component for orphaned pads
+        # FALLBACK: Create a generic component for orphaned pads (e.g. mounting holes, fiducials)
         if pads_orphaned > 0:
-            logger.info(f"DEBUG: Creating generic component for {pads_orphaned} orphaned pads")
+            logger.info(f"Assigning {pads_orphaned} unmatched pads (mounting holes/fiducials) to generic component")
             generic_component = Component(
                 id="GENERIC_COMPONENT",
                 reference="GENERIC_COMPONENT",
