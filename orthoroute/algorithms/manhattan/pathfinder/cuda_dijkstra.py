@@ -142,10 +142,26 @@ class CUDADijkstra:
 
         # PERFORMANCE: Persistent kernel (compiled on-demand)
         self._persistent_kernel = None
-        self._enable_persistent_kernel = False  # Disabled - persistent kernel doesn't support owner-aware bitmap
+        self._enable_persistent_kernel = False  # Disabled — see TODO below
         self._persistent_kernel_version = 2  # Increment to recompile after bug fixes
+        # WHY DISABLED: The persistent kernel (single-launch, device-side queues) does not
+        # accept the `allowed_bitmap` argument used for owner-aware node filtering.
+        # The bitmap prevents a net from routing through nodes that belong to other nets'
+        # pads — omitting it causes routing short-circuits and incorrect results.
+        #
+        # The MULTI-LAUNCH path (Python for-loop, ~150 iterations × ~2ms PCIe round-trip)
+        # passes `allowed_bitmap` through `_expand_wavefront_parallel` → `data['roi_bitmaps']`
+        # on every kernel call. The persistent kernel has no corresponding parameter.
+        #
+        # FIX REQUIRED to enable: Add `allowed_bitmap` (uint32* device pointer) and
+        # `bitmap_words` (int) parameters to the persistent CUDA kernel PTX, then pass
+        # `data['roi_bitmaps']` and `data['bitmap_words']` in launch_persistent_kernel().
+        # The inner loop in the kernel must test `(bitmap[node/32] >> (node%32)) & 1`
+        # before relaxing each neighbor, matching the IN_BITMAP check in the multi-launch
+        # wavefront_expand_all kernel.
+        #
+        # EXPECTED SPEEDUP: ~20× per net (306ms → ~15ms), cutting 48-min run to ~3 min.
         # NOTE: Multi-launch wavefront_expand_all kernel HAS IN_BITMAP check, persistent doesn't
-        # TODO: Add bitmap support to persistent kernel for maximum performance
 
         # Compile CUDA kernel for parallel edge relaxation
         self.relax_kernel = cp.RawKernel(r'''
@@ -1770,7 +1786,7 @@ class CUDADijkstra:
         # PARENT-CSR CONSISTENCY VALIDATOR KERNEL: Diagnose parent pointer corruption
         # Checks if every parent[node] is actually a CSR neighbor of that node
         # This helps identify if corruption happens during search or during backtrace/mapping
-        logger.info("[CUDA-COMPILE] Compiling validate_parents kernel for debugging")
+        logger.debug("[CUDA-COMPILE] Compiling validate_parents kernel for debugging")
         self.validate_parents_kernel = cp.RawKernel(r'''
         extern "C" __global__
         void validate_parents(
@@ -1812,7 +1828,7 @@ class CUDADijkstra:
         # Each thread reconstructs one path by following parent pointers on GPU
         # Outputs: compact path arrays + path lengths (sparse transfer)
         # BACKTRACE KERNEL COMPILATION (should see this log EXACTLY ONCE)
-        logger.info("[CUDA-COMPILE] Compiling backtrace_paths kernel with use_bitmap parameter")
+        logger.debug("[CUDA-COMPILE] Compiling backtrace_paths kernel with use_bitmap parameter")
         self.backtrace_kernel = cp.RawKernel(r'''
         extern "C" __global__
         void backtrace_paths(
@@ -1920,15 +1936,15 @@ class CUDADijkstra:
         }
         ''', 'backtrace_paths')
 
-        logger.info("[CUDA] Compiled parallel edge relaxation kernel")
-        logger.info("[CUDA] Compiled FULLY PARALLEL wavefront expansion kernel")
-        logger.info("[CUDA] Compiled ACTIVE-LIST kernel (2-3× faster than one-block-per-ROI!)")
-        logger.info("[CUDA] Compiled PROCEDURAL NEIGHBOR kernel (P1-8: ditches CSR, pure arithmetic!)")
-        logger.info("[CUDA] Compiled DELTA-STEPPING bucket assignment kernel (P1-7: replaces Python loop!)")
-        logger.info("[CUDA] Compiled PERSISTENT KERNEL (P1-6: device-side queues, eliminates launch overhead!)")
-        logger.info("[CUDA] Compiled COMPACTION KERNEL (P3: GPU-side frontier compaction, no host sync!)")
-        logger.info("[CUDA] Compiled ACCOUNTANT KERNEL (Phase 5: GPU-side history/present/cost updates!)")
-        logger.info("[CUDA] Compiled GPU BACKTRACE KERNEL (eliminates 256 MB parent/dist CPU transfers!)")
+        logger.debug("[CUDA] Compiled parallel edge relaxation kernel")
+        logger.debug("[CUDA] Compiled FULLY PARALLEL wavefront expansion kernel")
+        logger.debug("[CUDA] Compiled ACTIVE-LIST kernel (2-3× faster than one-block-per-ROI!)")
+        logger.debug("[CUDA] Compiled PROCEDURAL NEIGHBOR kernel (P1-8: ditches CSR, pure arithmetic!)")
+        logger.debug("[CUDA] Compiled DELTA-STEPPING bucket assignment kernel (P1-7: replaces Python loop!)")
+        logger.debug("[CUDA] Compiled PERSISTENT KERNEL (P1-6: device-side queues, eliminates launch overhead!)")
+        logger.debug("[CUDA] Compiled COMPACTION KERNEL (P3: GPU-side frontier compaction, no host sync!)")
+        logger.debug("[CUDA] Compiled ACCOUNTANT KERNEL (Phase 5: GPU-side history/present/cost updates!)")
+        logger.debug("[CUDA] Compiled GPU BACKTRACE KERNEL (eliminates 256 MB parent/dist CPU transfers!)")
 
     def _normalize_batch(self, roi_batch):
         """
@@ -2031,17 +2047,17 @@ class CUDADijkstra:
 
         K = len(roi_batch)
         mode_desc = "BBOX-ONLY (no bitmap fence)" if not use_bitmap else "BITMAP-FILTERED (L-corridor)"
-        logger.info(f"[CUDA-ROI] Processing {K} ROI subgraphs using GPU Near-Far algorithm ({mode_desc})")
+        logger.debug(f"[CUDA-ROI] Processing {K} ROI subgraphs using GPU Near-Far algorithm ({mode_desc})")
 
         try:
             # Prepare batched GPU arrays
-            logger.info(f"[DEBUG-GPU] Preparing batch data for {K} ROIs (use_bitmap={use_bitmap})")
+            logger.debug(f"[DEBUG-GPU] Preparing batch data for {K} ROIs (use_bitmap={use_bitmap})")
             batch_data = self._prepare_batch(roi_batch, use_bitmap=use_bitmap)
-            logger.info(f"[DEBUG-GPU] Batch data prepared, starting Near-Far algorithm")
+            logger.debug(f"[DEBUG-GPU] Batch data prepared, starting Near-Far algorithm")
 
             # CRITICAL: Use the K that _prepare_batch actually built arrays for
             K_actual = int(batch_data.get('K', len(roi_batch)))
-            logger.info(f"[K-RESYNC-CALLER] K adjusted from {K} -> {K_actual} after _prepare_batch")
+            logger.debug(f"[K-RESYNC-CALLER] K adjusted from {K} -> {K_actual} after _prepare_batch")
             K = K_actual
 
             # INVARIANT CHECKS: Shared-CSR indexing (user-requested debugging)
@@ -2052,7 +2068,7 @@ class CUDADijkstra:
                                 batch_data['batch_indptr'].strides[0] == 0)
 
                 if is_shared_csr:
-                    logger.info("[INVARIANT-CHECK] Shared CSR detected (stride=0)")
+                    logger.debug("[INVARIANT-CHECK] Shared CSR detected (stride=0)")
                     # In shared CSR mode, max_roi_size must equal total graph size
                     N_global = len(batch_data['batch_indptr'][0]) - 1  # indptr shape is (N+1,)
                     max_roi = batch_data['max_roi_size']
@@ -2061,15 +2077,15 @@ class CUDADijkstra:
                         logger.error(f"[INVARIANT-FAIL] Shared CSR but max_roi_size={max_roi} != N_global={N_global}")
                         raise AssertionError(f"Shared CSR invariant violated: max_roi_size={max_roi} != N_global={N_global}")
                     else:
-                        logger.info(f"[INVARIANT-OK] Shared CSR: max_roi_size={max_roi} == N_global={N_global}")
+                        logger.debug(f"[INVARIANT-OK] Shared CSR: max_roi_size={max_roi} == N_global={N_global}")
                 else:
-                    logger.info("[INVARIANT-CHECK] Per-ROI CSR mode (no shared CSR)")
+                    logger.debug("[INVARIANT-CHECK] Per-ROI CSR mode (no shared CSR)")
 
             # Run Near-Far algorithm on GPU
             # CRITICAL: Slice roi_batch to match K so indices align with arrays
             try:
                 paths = self._run_near_far(batch_data, K, roi_batch[:K])
-                logger.info(f"[DEBUG-GPU] Near-Far algorithm completed")
+                logger.debug(f"[DEBUG-GPU] Near-Far algorithm completed")
             except Exception as near_far_error:
                 logger.error(f"[DEBUG-GPU] Error in _run_near_far: {near_far_error}")
                 import traceback
@@ -2077,7 +2093,7 @@ class CUDADijkstra:
                 raise
 
             found = sum(1 for p in paths if p)
-            logger.info(f"[CUDA-ROI] Complete: {found}/{K} paths found using GPU")
+            logger.debug(f"[CUDA-ROI] Complete: {found}/{K} paths found using GPU")
             return paths
 
         except Exception as e:
@@ -2107,7 +2123,7 @@ class CUDADijkstra:
         num_pairs = len(sources)
         num_nodes = adjacency_csr.shape[0]
 
-        logger.info(f"[CUDA] Batch Dijkstra: {num_pairs} paths on {num_nodes} nodes")
+        logger.debug(f"[CUDA] Batch Dijkstra: {num_pairs} paths on {num_nodes} nodes")
 
         # Convert to GPU arrays
         sources_gpu = cp.asarray(sources, dtype=cp.int32)
@@ -2193,7 +2209,7 @@ class CUDADijkstra:
                 # No path found
                 paths.append(None)
 
-        logger.info(f"[CUDA] Batch complete: {sum(1 for p in paths if p)} / {num_pairs} paths found")
+        logger.debug(f"[CUDA] Batch complete: {sum(1 for p in paths if p)} / {num_pairs} paths found")
         return paths
 
     def find_path_single(self,
@@ -2228,7 +2244,7 @@ class CUDADijkstra:
 
         # CRITICAL: Normalize batch BEFORE any allocations or as_strided views
         K, roi_batch = self._normalize_batch(roi_batch)
-        logger.info(f"[PREPARE] preparing batch for {K} ROIs (after normalization)")
+        logger.debug(f"[PREPARE] preparing batch for {K} ROIs (after normalization)")
 
         # Check if all nets share the same CSR (full graph routing)
         # Use array length instead of id() - if all have same huge size, it's shared full graph
@@ -2237,13 +2253,13 @@ class CUDADijkstra:
         all_share_csr = all(roi[5] == first_roi_size and len(roi[3]) == first_indices_len for roi in roi_batch)
         # Additional check: if roi_size > 1M and all same size, definitely shared full graph
         if all_share_csr and first_roi_size > 1_000_000:
-            logger.info(f"[SHARED-CSR-DETECT] All {K} nets have roi_size={first_roi_size:,} - using shared CSR mode")
+            logger.debug(f"[SHARED-CSR-DETECT] All {K} nets have roi_size={first_roi_size:,} - using shared CSR mode")
         else:
-            logger.info(f"[INDIVIDUAL-CSR-DETECT] Nets have varying sizes - using individual CSR mode")
+            logger.debug(f"[INDIVIDUAL-CSR-DETECT] Nets have varying sizes - using individual CSR mode")
 
         if all_share_csr:
             # SHARED CSR MODE: All nets use same graph - allocate CSR once!
-            logger.info(f"[SHARED-CSR] All {K} nets share same CSR - no duplication!")
+            logger.debug(f"[SHARED-CSR] All {K} nets share same CSR - no duplication!")
             shared_indptr = roi_batch[0][2]
             shared_indices = roi_batch[0][3]
             shared_weights = roi_batch[0][4]
@@ -2268,11 +2284,11 @@ class CUDADijkstra:
                     padding_size = (max_roi_size + 1) - len(shared_indptr_cpu)
                     shared_indptr_cpu = np.concatenate([shared_indptr_cpu, np.full(padding_size, final_val, dtype=shared_indptr_cpu.dtype)])
                     shared_indptr = cp.asarray(shared_indptr_cpu)
-                    logger.info(f"[SHARED-CSR-FIX] Padded indptr from {len(shared_indptr) - padding_size} to {len(shared_indptr)}")
+                    logger.debug(f"[SHARED-CSR-FIX] Padded indptr from {len(shared_indptr) - padding_size} to {len(shared_indptr)}")
                 else:
                     # Truncate to correct size
                     shared_indptr = shared_indptr[:max_roi_size + 1]
-                    logger.info(f"[SHARED-CSR-FIX] Truncated indptr to {len(shared_indptr)}")
+                    logger.debug(f"[SHARED-CSR-FIX] Truncated indptr to {len(shared_indptr)}")
 
             # Transfer CSR to GPU once (not K times!)
             if not isinstance(shared_indptr, cp.ndarray):
@@ -2292,7 +2308,7 @@ class CUDADijkstra:
                         gpu_val = float(shared_weights[edge_idx])
                         if cpu_val > 1e8:  # If CPU had infinity
                             if gpu_val > 1e8:
-                                logger.info(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} -> GPU={gpu_val:.2e} ✅")
+                                logger.debug(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} -> GPU={gpu_val:.2e} ✅")
                             else:
                                 logger.error(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} -> GPU={gpu_val:.2e} ❌ LOST INFINITY!")
 
@@ -2324,10 +2340,10 @@ class CUDADijkstra:
                     self.K_pool = K_pool_calculated
                     self._k_pool_calculated = True
 
-                    logger.info(f"[MEMORY-AWARE] GPU memory: {free_bytes / 1e9:.2f} GB free, {total_bytes / 1e9:.2f} GB total")
-                    logger.info(f"[MEMORY-AWARE] Calculated K_pool: {self.K_pool} (allows {self.K_pool} nets in parallel)")
-                    logger.info(f"[MEMORY-AWARE] Per-net memory: {bytes_per_net / 1e6:.1f} MB")
-                    logger.info(f"[MEMORY-AWARE] Total pool memory: {self.K_pool * bytes_per_net / 1e9:.2f} GB")
+                    logger.debug(f"[MEMORY-AWARE] GPU memory: {free_bytes / 1e9:.2f} GB free, {total_bytes / 1e9:.2f} GB total")
+                    logger.debug(f"[MEMORY-AWARE] Calculated K_pool: {self.K_pool} (allows {self.K_pool} nets in parallel)")
+                    logger.debug(f"[MEMORY-AWARE] Per-net memory: {bytes_per_net / 1e6:.1f} MB")
+                    logger.debug(f"[MEMORY-AWARE] Total pool memory: {self.K_pool * bytes_per_net / 1e9:.2f} GB")
                 else:
                     N_max = 5_000_000  # Conservative max nodes
 
@@ -2348,11 +2364,11 @@ class CUDADijkstra:
                 frontier_words = (N_max + 31) // 32  # Number of 32-bit words needed
                 self.near_bits_pool = cp.zeros((self.K_pool, frontier_words), dtype=cp.uint32)  # Phase B: 1 bit/node
                 self.far_bits_pool = cp.zeros((self.K_pool, frontier_words), dtype=cp.uint32)   # Phase B: 1 bit/node
-                logger.info(f"[STAMP-POOL] Allocated device pools: K={self.K_pool}, N={N_max}")
-                logger.info(f"[PHASE-A] Using uint16 stamps (16 MB memory savings per net)")
-                logger.info(f"[ATOMIC-KEY] Using 64-bit atomic keys for cycle-proof parent updates")
+                logger.debug(f"[STAMP-POOL] Allocated device pools: K={self.K_pool}, N={N_max}")
+                logger.debug(f"[PHASE-A] Using uint16 stamps (16 MB memory savings per net)")
+                logger.debug(f"[ATOMIC-KEY] Using 64-bit atomic keys for cycle-proof parent updates")
                 frontier_bytes = ((N_max + 31) // 32) * 4  # uint32 words * 4 bytes/word
-                logger.info(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB -> {frontier_bytes/1e6:.1f} MB per net)")
+                logger.debug(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB -> {frontier_bytes/1e6:.1f} MB per net)")
 
             # Slice pool instead of allocating new arrays (NO ZEROING!)
             gen = self.current_gen
@@ -2385,17 +2401,17 @@ class CUDADijkstra:
                 strides=(0, shared_weights.itemsize)
             )
 
-            logger.info(f"[SHARED-CSR-FIX] Using as_strided for zero-copy broadcast")
-            logger.info(f"[SHARED-CSR-FIX] batch_indptr: shape={batch_indptr.shape}, strides={batch_indptr.strides}")
-            logger.info(f"[SHARED-CSR-FIX] batch_weights: shape={batch_weights.shape}, strides={batch_weights.strides}")
+            logger.debug(f"[SHARED-CSR-FIX] Using as_strided for zero-copy broadcast")
+            logger.debug(f"[SHARED-CSR-FIX] batch_indptr: shape={batch_indptr.shape}, strides={batch_indptr.strides}")
+            logger.debug(f"[SHARED-CSR-FIX] batch_weights: shape={batch_weights.shape}, strides={batch_weights.strides}")
 
-            logger.info(f"[SHARED-CSR] Memory saved: {K-1} × {max_edges * 8 / 1e9:.1f} GB = {(K-1) * max_edges * 8 / 1e9:.1f} GB")
+            logger.debug(f"[SHARED-CSR] Memory saved: {K-1} × {max_edges * 8 / 1e9:.1f} GB = {(K-1) * max_edges * 8 / 1e9:.1f} GB")
         else:
             # INDIVIDUAL CSR MODE: Each net has different ROI
             max_roi_size = max(roi[5] for roi in roi_batch)
             max_edges = max(len(roi[3]) if hasattr(roi[3], '__len__') else roi[3].shape[0] for roi in roi_batch)
 
-            logger.info(f"[INDIVIDUAL-CSR] K={K} nets with different ROIs, max_roi_size={max_roi_size}, max_edges={max_edges}")
+            logger.debug(f"[INDIVIDUAL-CSR] K={K} nets with different ROIs, max_roi_size={max_roi_size}, max_edges={max_edges}")
 
             # Allocate separate CSR arrays for each ROI
             batch_indptr = cp.zeros((K, max_roi_size + 1), dtype=cp.int32)
@@ -2430,10 +2446,10 @@ class CUDADijkstra:
                     self.K_pool = K_pool_calculated
                     self._k_pool_calculated = True
 
-                    logger.info(f"[MEMORY-AWARE] GPU memory: {free_bytes / 1e9:.2f} GB free, {total_bytes / 1e9:.2f} GB total")
-                    logger.info(f"[MEMORY-AWARE] Calculated K_pool: {self.K_pool} (allows {self.K_pool} nets in parallel)")
-                    logger.info(f"[MEMORY-AWARE] Per-net memory: {bytes_per_net / 1e6:.1f} MB")
-                    logger.info(f"[MEMORY-AWARE] Total pool memory: {self.K_pool * bytes_per_net / 1e9:.2f} GB")
+                    logger.debug(f"[MEMORY-AWARE] GPU memory: {free_bytes / 1e9:.2f} GB free, {total_bytes / 1e9:.2f} GB total")
+                    logger.debug(f"[MEMORY-AWARE] Calculated K_pool: {self.K_pool} (allows {self.K_pool} nets in parallel)")
+                    logger.debug(f"[MEMORY-AWARE] Per-net memory: {bytes_per_net / 1e6:.1f} MB")
+                    logger.debug(f"[MEMORY-AWARE] Total pool memory: {self.K_pool * bytes_per_net / 1e9:.2f} GB")
                 else:
                     N_max = 5_000_000  # Conservative max nodes
 
@@ -2454,11 +2470,11 @@ class CUDADijkstra:
                 frontier_words = (N_max + 31) // 32  # Number of 32-bit words needed
                 self.near_bits_pool = cp.zeros((self.K_pool, frontier_words), dtype=cp.uint32)  # Phase B: 1 bit/node
                 self.far_bits_pool = cp.zeros((self.K_pool, frontier_words), dtype=cp.uint32)   # Phase B: 1 bit/node
-                logger.info(f"[STAMP-POOL] Allocated device pools: K={self.K_pool}, N={N_max}")
-                logger.info(f"[PHASE-A] Using uint16 stamps (16 MB memory savings per net)")
-                logger.info(f"[ATOMIC-KEY] Using 64-bit atomic keys for cycle-proof parent updates")
+                logger.debug(f"[STAMP-POOL] Allocated device pools: K={self.K_pool}, N={N_max}")
+                logger.debug(f"[PHASE-A] Using uint16 stamps (16 MB memory savings per net)")
+                logger.debug(f"[ATOMIC-KEY] Using 64-bit atomic keys for cycle-proof parent updates")
                 frontier_bytes = ((N_max + 31) // 32) * 4  # uint32 words * 4 bytes/word
-                logger.info(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB -> {frontier_bytes/1e6:.1f} MB per net)")
+                logger.debug(f"[PHASE-B] Using bitset frontiers (8× memory savings: {N_max/1e6:.1f} MB -> {frontier_bytes/1e6:.1f} MB per net)")
 
             # Slice pool instead of allocating new arrays (NO ZEROING!)
             gen = self.current_gen
@@ -2474,7 +2490,7 @@ class CUDADijkstra:
         threshold = cp.full(K, 0.4, dtype=cp.float32)
 
         # CRITICAL: Log K vs roi_batch size to catch off-by-one bugs
-        logger.info(f"[PREPARE-BATCH] K={K}, len(roi_batch)={len(roi_batch)}, will process roi_batch[:K] = {K} elements")
+        logger.debug(f"[PREPARE-BATCH] K={K}, len(roi_batch)={len(roi_batch)}, will process roi_batch[:K] = {K} elements")
 
         sources = []
         sinks = []
@@ -2500,11 +2516,11 @@ class CUDADijkstra:
                         padding_size = (roi_size + 1) - len(indptr_cpu)
                         indptr_cpu = np.concatenate([indptr_cpu, np.full(padding_size, final_val, dtype=indptr_cpu.dtype)])
                         indptr = cp.asarray(indptr_cpu)
-                        logger.info(f"[INDIVIDUAL-CSR-FIX] ROI {i}: Padded indptr from {len(indptr) - padding_size} to {len(indptr)}")
+                        logger.debug(f"[INDIVIDUAL-CSR-FIX] ROI {i}: Padded indptr from {len(indptr) - padding_size} to {len(indptr)}")
                     else:
                         # Truncate to correct size
                         indptr = indptr[:roi_size + 1]
-                        logger.info(f"[INDIVIDUAL-CSR-FIX] ROI {i}: Truncated indptr to {len(indptr)}")
+                        logger.debug(f"[INDIVIDUAL-CSR-FIX] ROI {i}: Truncated indptr to {len(indptr)}")
 
                 # Convert to GPU if needed
                 if not isinstance(indptr, cp.ndarray):
@@ -2530,8 +2546,8 @@ class CUDADijkstra:
             Nx = self.lattice.x_steps
             Ny = self.lattice.y_steps
             Nz = self.lattice.layers
-            logger.info(f"[P0-3] Using procedural coordinates: Nx={Nx}, Ny={Ny}, Nz={Nz}")
-            logger.info(f"[P0-3] Memory saved: {max_roi_size * 3 * 4 / 1e6:.1f} MB (no node_coords array!)")
+            logger.debug(f"[P0-3] Using procedural coordinates: Nx={Nx}, Ny={Ny}, Nz={Nz}")
+            logger.debug(f"[P0-3] Memory saved: {max_roi_size * 3 * 4 / 1e6:.1f} MB (no node_coords array!)")
 
         goal_nodes_array = cp.zeros(K, dtype=cp.int32)
 
@@ -2559,7 +2575,7 @@ class CUDADijkstra:
                     )
 
             batch_bitmaps = cp.zeros((K, bitmap_words), dtype=cp.uint32)
-            logger.info(f"[FIX-7-BITMAP] Validated {K} bitmaps, all have {bitmap_words} words ({bitmap_words*4/1e6:.2f} MB each)")
+            logger.debug(f"[FIX-7-BITMAP] Validated {K} bitmaps, all have {bitmap_words} words ({bitmap_words*4/1e6:.2f} MB each)")
         else:
             # No bitmap filtering - bbox-only mode (iteration 1 wide search)
             # Create dummy all-ones bitmap (all nodes allowed) to avoid None errors in kernel launches
@@ -2571,7 +2587,7 @@ class CUDADijkstra:
                 full_graph_size = max_roi_size
             bitmap_words = (full_graph_size + 31) // 32
             batch_bitmaps = cp.ones((K, bitmap_words), dtype=cp.uint32) * 0xFFFFFFFF
-            logger.info(f"[BBOX-ONLY] Bitmap filtering DISABLED (using all-ones bitmap covering {full_graph_size} nodes = {bitmap_words} words)")
+            logger.debug(f"[BBOX-ONLY] Bitmap filtering DISABLED (using all-ones bitmap covering {full_graph_size} nodes = {bitmap_words} words)")
 
         # Initialize sources/sinks for all nets
         # roi_batch is already sliced to K at the top of function
@@ -2652,7 +2668,7 @@ class CUDADijkstra:
         # Convert sources/sinks to CuPy int32 arrays for consistent indexing
         sources = cp.asarray(sources, dtype=cp.int32)
         sinks = cp.asarray(sinks, dtype=cp.int32)
-        logger.info(f"[PREPARE-BATCH] Converted sources/sinks to CuPy arrays: sources.shape={sources.shape}, sinks.shape={sinks.shape}")
+        logger.debug(f"[PREPARE-BATCH] Converted sources/sinks to CuPy arrays: sources.shape={sources.shape}, sinks.shape={sinks.shape}")
 
         # Phase B: Create legacy near_mask/far_mask views by unpacking bitsets
         # This maintains backward compatibility with legacy delta-stepping code
@@ -2669,10 +2685,10 @@ class CUDADijkstra:
         # Build directly from roi_batch to ensure K consistency
         sources_cp = cp.asarray([roi[0] for roi in roi_batch], dtype=cp.int32)
         sinks_cp = cp.asarray([roi[1] for roi in roi_batch], dtype=cp.int32)
-        logger.info(f"[SOURCES-SINKS] Converted to CuPy: sources.shape={sources_cp.shape}, sinks.shape={sinks_cp.shape}")
+        logger.debug(f"[SOURCES-SINKS] Converted to CuPy: sources.shape={sources_cp.shape}, sinks.shape={sinks_cp.shape}")
         # DEBUG: Check for duplicates
         unique_sources = int(cp.unique(sources_cp).size)
-        logger.info(f"[SOURCES-DEBUG] Unique sources: {unique_sources}/{K} (sample: {cp.asnumpy(sources_cp[:5]).tolist()})")
+        logger.debug(f"[SOURCES-DEBUG] Unique sources: {unique_sources}/{K} (sample: {cp.asnumpy(sources_cp[:5]).tolist()})")
 
         data_dict = {
             'K': K,
@@ -2730,14 +2746,14 @@ class CUDADijkstra:
             data_dict['via_segment_weight'] = via_segment_weight
             data_dict['pres_fac'] = pres_fac
 
-            logger.info(f"[GPU-VIA-POOL] Transferred via_seg_prefix to GPU: shape={via_seg_prefix_gpu.shape}, segZ={segZ}, weight={via_segment_weight}, pres_fac={pres_fac}")
+            logger.debug(f"[GPU-VIA-POOL] Transferred via_seg_prefix to GPU: shape={via_seg_prefix_gpu.shape}, segZ={segZ}, weight={via_segment_weight}, pres_fac={pres_fac}")
         else:
             # Via pooling disabled - pass dummy values
             data_dict['via_seg_prefix_gpu'] = None
             data_dict['segZ'] = 0
             data_dict['via_segment_weight'] = 0.0
             data_dict['pres_fac'] = 1.0
-            logger.info("[GPU-VIA-POOL] Via segment pooling DISABLED (via_seg_prefix not found)")
+            logger.debug("[GPU-VIA-POOL] Via segment pooling DISABLED (via_seg_prefix not found)")
 
         # Verify all per-ROI arrays have shape[0] == K
         for key in ['dist', 'parent', 'near_bits', 'far_bits', 'near_mask', 'far_mask',
@@ -2757,7 +2773,7 @@ class CUDADijkstra:
             logger.error(f"[K-INVARIANT-FAIL] sinks.shape[0]={sinks_cp.shape[0]} != K={K}")
             raise ValueError(f"K-consistency check failed: sinks.shape[0]={sinks_cp.shape[0]} != K={K}")
         
-        logger.info(f"[K-INVARIANT-PASS] All per-ROI arrays have shape[0]={K}")
+        logger.debug(f"[K-INVARIANT-PASS] All per-ROI arrays have shape[0]={K}")
 
         # Phase 1: Increment generation for next batch (MUST be before return!)
         # Phase A: Wrap generation counter to prevent uint16 overflow (max 65535)
@@ -2804,7 +2820,7 @@ class CUDADijkstra:
             n_src = int(data['sources'].shape[0])
             n_dst = int(data['sinks'].shape[0])
         assert n_src == K and n_dst == K, f"K mismatch: K={K} sources={n_src} sinks={n_dst}"
-        logger.info(f"[_run_near_far] Using K={K}, sources.shape={n_src}, sinks.shape={n_dst}")
+        logger.debug(f"[_run_near_far] Using K={K}, sources.shape={n_src}, sinks.shape={n_dst}")
 
 # Route to delta-stepping if enabled (proper Delta-stepping with bucket-based priority queue)
         # Temporarily force wavefront for iteration-1 debugging
@@ -2814,11 +2830,11 @@ class CUDADijkstra:
         if False:  # Disabled delta-stepping for K-consistency testing
             # Get delta value from config (fallback to 0.5mm)
             delta = GPUConfig.DELTA_VALUE if hasattr(GPUConfig, 'DELTA_VALUE') else 0.5
-            logger.info(f"[CUDA-PATHFINDING] Routing to DELTA-STEPPING algorithm (delta={delta:.3f}mm)")
+            logger.debug(f"[CUDA-PATHFINDING] Routing to DELTA-STEPPING algorithm (delta={delta:.3f}mm)")
             return self._run_delta_stepping(data, K, delta, roi_batch)
 
         # Otherwise use BFS wavefront (fast but incorrect cost ordering)
-        logger.info(f"[CUDA-WAVEFRONT] Starting BFS wavefront algorithm for {K} ROIs (WARNING: ignores cost ordering)")
+        logger.debug(f"[CUDA-WAVEFRONT] Starting BFS wavefront algorithm for {K} ROIs (WARNING: ignores cost ordering)")
 
         # Adaptive iteration budget for MASSIVE PARALLEL routing
         # For large batches on full graph, need enough iterations for longest path
@@ -2830,7 +2846,7 @@ class CUDADijkstra:
                 # For massive parallel batches: budget for worst-case path
                 # Board diagonal ~600 steps, increased to 2000 for better convergence
                 max_iterations = 2000
-                logger.info(f"[MASSIVE-PARALLEL] Routing {batch_size} nets on full graph with {max_iterations} iterations")
+                logger.debug(f"[MASSIVE-PARALLEL] Routing {batch_size} nets on full graph with {max_iterations} iterations")
             else:
                 # ROIs: scale with size
                 max_iterations = min(4096, roi_size // 100 + 500)
@@ -2839,7 +2855,7 @@ class CUDADijkstra:
         start_time = time.perf_counter()
 
         # DIAGNOSTIC: Check if destinations are reachable
-        logger.info(f"[DEBUG-GPU] Validating ROI sources and destinations")
+        logger.debug(f"[DEBUG-GPU] Validating ROI sources and destinations")
         invalid_rois = []
         for roi_idx in range(K):
             src = int(data['sources'][roi_idx].item())
@@ -2885,14 +2901,14 @@ class CUDADijkstra:
             bit_pos = src % 32
             frontier[roi_idx, word_idx] = cp.uint32(1) << bit_pos
 
-        logger.info(f"[BIT-FRONTIER] Memory: {K}×{max_roi_size} uint8 ({K*max_roi_size/1e6:.1f}MB) -> "
+        logger.debug(f"[BIT-FRONTIER] Memory: {K}×{max_roi_size} uint8 ({K*max_roi_size/1e6:.1f}MB) -> "
                    f"{K}×{frontier_words} uint32 ({K*frontier_words*4/1e6:.1f}MB) = {8.0:.1f}× reduction")
 
         # GUARDED DIAGNOSTICS: Only when debugging
         if DEBUG_VERBOSE_GPU:
             # DIAGNOSTIC: Verify frontier bits are actually set
             frontier_check = int(cp.count_nonzero(frontier))
-            logger.info(f"[FRONTIER-INIT] After initialization: {frontier_check} non-zero words (expected ~{K})")
+            logger.debug(f"[FRONTIER-INIT] After initialization: {frontier_check} non-zero words (expected ~{K})")
 
             # Check first few ROIs have their source bit set
             for roi_idx in range(min(3, K)):
@@ -2901,7 +2917,7 @@ class CUDADijkstra:
                 bit_pos = src % 32
                 word_val = int(frontier[roi_idx, word_idx])
                 bit_set = (word_val >> bit_pos) & 1
-                logger.info(f"[FRONTIER-INIT] ROI {roi_idx}: src={src}, word={word_idx}, bit={bit_pos}, word_val={word_val:08x}, bit_set={bit_set}")
+                logger.debug(f"[FRONTIER-INIT] ROI {roi_idx}: src={src}, word={word_idx}, bit={bit_pos}, word_val={word_val:08x}, bit_set={bit_set}")
 
             # DIAGNOSTIC: Check initial state
             for roi_idx in range(min(3, K)):  # Check first 3 ROIs
@@ -2909,24 +2925,24 @@ class CUDADijkstra:
                 sink = int(data['sinks'][roi_idx].item())
                 src_dist = float(data['dist'][roi_idx, src])
                 sink_dist = float(data['dist'][roi_idx, sink])
-                logger.info(f"[CUDA-WAVEFRONT] ROI {roi_idx}: src={src} (dist={src_dist}), "
+                logger.debug(f"[CUDA-WAVEFRONT] ROI {roi_idx}: src={src} (dist={src_dist}), "
                            f"sink={sink} (dist={sink_dist})")
 
-        logger.info(f"[CUDA-WAVEFRONT] Starting parallel wavefront expansion (max {max_iterations} iterations)")
+        logger.debug(f"[CUDA-WAVEFRONT] Starting parallel wavefront expansion (max {max_iterations} iterations)")
 
         # P1-6: PERSISTENT KERNEL OPTION (experimental)
         # Hardcoded via GPUConfig.USE_PERSISTENT_KERNEL (was USE_PERSISTENT_KERNEL env var)
         use_persistent = GPUConfig.USE_PERSISTENT_KERNEL if hasattr(GPUConfig, 'USE_PERSISTENT_KERNEL') else False
 
         if use_persistent:
-            logger.info("[P1-6] PERSISTENT KERNEL enabled - attempting single-launch execution")
+            logger.debug("[P1-6] PERSISTENT KERNEL enabled - attempting single-launch execution")
             try:
                 iters = self._run_persistent_kernel(data, K, frontier)
                 if iters >= 0:
-                    logger.info(f"[P1-6] PERSISTENT KERNEL succeeded in {iters} iterations")
+                    logger.debug(f"[P1-6] PERSISTENT KERNEL succeeded in {iters} iterations")
                     # Continue to path reconstruction below (skip iterative loop)
                     elapsed = time.perf_counter() - start_time
-                    logger.info(f"[CUDA-WAVEFRONT] GPU pathfinding complete: {elapsed:.4f}s total")
+                    logger.debug(f"[CUDA-WAVEFRONT] GPU pathfinding complete: {elapsed:.4f}s total")
                     # Jump to path reconstruction
                     return self._reconstruct_paths(data, K)
                 else:
@@ -2938,7 +2954,7 @@ class CUDADijkstra:
         for iteration in range(max_iterations):
             # FIX: Check for empty frontier (count non-zero words, not sum uint32 values!)
             if int(cp.count_nonzero(frontier)) == 0:
-                logger.info(f"[CUDA-WAVEFRONT] Terminated: no active frontiers")
+                logger.debug(f"[CUDA-WAVEFRONT] Terminated: no active frontiers")
                 break
 
             # FAST WAVEFRONT EXPANSION - Process entire frontier in parallel!
@@ -2954,7 +2970,7 @@ class CUDADijkstra:
                 min_sink_dist = float(cp.min(sink_dists_gpu).get())  # Compute min on GPU
                 reached_count = int(cp.sum(sink_dists_gpu < 1e9).get())  # Count on GPU
 
-                logger.info(f"[CUDA-WAVEFRONT] Iteration {iteration}: {reached_count}/{K} sinks reached, "
+                logger.debug(f"[CUDA-WAVEFRONT] Iteration {iteration}: {reached_count}/{K} sinks reached, "
                           f"min_sink_dist={min_sink_dist:.2f}")
 
             # SPEEDUP: Disable expensive diagnostic logging in hot loop
@@ -2981,7 +2997,7 @@ class CUDADijkstra:
             batch_id = id(data)
             if sinks_reached_count == K and batch_id not in self._first_all_sinks_iter:
                 self._first_all_sinks_iter[batch_id] = iteration
-                logger.info(f"[STABILIZATION] All sinks reached at iteration {iteration}, "
+                logger.debug(f"[STABILIZATION] All sinks reached at iteration {iteration}, "
                            f"continuing for {EXTRA_ITERS_AFTER_ALL_SINKS} more iterations to find alternatives...")
 
             # Balanced termination: respect both MIN_ITERS and EXTRA_ITERS
@@ -2992,12 +3008,12 @@ class CUDADijkstra:
                 frontier_empty = int(cp.count_nonzero(frontier)) == 0
 
                 if iteration >= MIN_ITERS and iters_since_all_sinks >= EXTRA_ITERS_AFTER_ALL_SINKS:
-                    logger.info(f"[STABILIZATION] Terminating: iteration {iteration} >= MIN_ITERS and "
+                    logger.debug(f"[STABILIZATION] Terminating: iteration {iteration} >= MIN_ITERS and "
                                f"{iters_since_all_sinks} >= EXTRA_ITERS after sinks")
                     break
 
                 if frontier_empty and iteration >= MIN_ITERS:
-                    logger.info(f"[STABILIZATION] Early termination: frontier empty at iteration {iteration}")
+                    logger.debug(f"[STABILIZATION] Early termination: frontier empty at iteration {iteration}")
                     break
 
             # Periodic logging (reduced frequency for speedup)
@@ -3005,7 +3021,7 @@ class CUDADijkstra:
                 # FIX: Count ROIs with any set bits (not sum of uint32 values!)
                 active_rois = int(cp.count_nonzero(cp.count_nonzero(frontier, axis=1)))
                 # Note: nodes_expanded already comes from compaction so it's correct
-                logger.info(f"[CUDA-WAVEFRONT] Iteration {iteration}: {active_rois}/{K} ROIs active, "
+                logger.debug(f"[CUDA-WAVEFRONT] Iteration {iteration}: {active_rois}/{K} ROIs active, "
                           f"expanded={nodes_expanded}")
 
             # Progress check: warn if taking too long
@@ -3013,13 +3029,13 @@ class CUDADijkstra:
                 logger.warning(f"[CUDA-WAVEFRONT] Iteration {iteration}: algorithm taking longer than expected")
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(f"[CUDA-WAVEFRONT] Complete in {iteration+1} iterations, {elapsed_ms:.1f}ms "
+        logger.debug(f"[CUDA-WAVEFRONT] Complete in {iteration+1} iterations, {elapsed_ms:.1f}ms "
                    f"({elapsed_ms/(iteration+1):.2f}ms/iter)")
 
         # Reconstruct paths
         paths = self._reconstruct_paths(data, K)
         found = sum(1 for p in paths if p)
-        logger.info(f"[CUDA-WAVEFRONT] Paths found: {found}/{K} ({100*found/K:.1f}% success rate)")
+        logger.debug(f"[CUDA-WAVEFRONT] Paths found: {found}/{K} ({100*found/K:.1f}% success rate)")
 
         # VALIDATION: Log path statistics
         if found > 0:
@@ -3027,7 +3043,7 @@ class CUDADijkstra:
             avg_len = sum(path_lengths) / len(path_lengths)
             max_len = max(path_lengths)
             min_len = min(path_lengths)
-            logger.info(f"[CUDA-WAVEFRONT] Path stats: avg={avg_len:.1f}, min={min_len}, max={max_len} nodes")
+            logger.debug(f"[CUDA-WAVEFRONT] Path stats: avg={avg_len:.1f}, min={min_len}, max={max_len} nodes")
 
             # DIAGNOSTIC: Check X-coordinate exploration in first 3 paths
             if self.lattice and K >= 3:
@@ -3037,7 +3053,7 @@ class CUDADijkstra:
                         x_coords = [self.lattice.idx_to_coord(node_idx)[0] for node_idx in path[:20]]  # First 20 nodes
                         x_min, x_max = min(x_coords), max(x_coords)
                         x_range = x_max - x_min
-                        logger.info(f"[PATH-DIAG] ROI {roi_idx}: X-range {x_min}-{x_max} (span={x_range}), len={len(path)}")
+                        logger.debug(f"[PATH-DIAG] ROI {roi_idx}: X-range {x_min}-{x_max} (span={x_range}), len={len(path)}")
 
         return paths
 
@@ -3110,7 +3126,7 @@ class CUDADijkstra:
             flat_idx = out_indices[:total_active]
         else:
             # BASELINE: CPU compaction using cp.nonzero (needs unpacking)
-            logger.info("[BASELINE] Using cp.nonzero for compaction (USE_GPU_COMPACTION=0)")
+            logger.debug("[BASELINE] Using cp.nonzero for compaction (USE_GPU_COMPACTION=0)")
             # Unpack bitset for cp.nonzero (CuPy doesn't support axis, use ravel+reshape)
             frontier_mask = cp.unpackbits(frontier_bytes.ravel(), bitorder='little')
             frontier_mask = frontier_mask.reshape(K, -1)[:, :max_roi_size]
@@ -3140,19 +3156,19 @@ class CUDADijkstra:
 
             # Add sanity logging after compaction
             n_rois = int(cp.unique(roi_ids).size)
-            logger.info(f"[ACTIVE-SET] total_active={total_active}, unique_rois={n_rois}")
+            logger.debug(f"[ACTIVE-SET] total_active={total_active}, unique_rois={n_rois}")
             if n_rois < 10:
                 heads = cp.asnumpy(cp.stack([roi_ids[:16], node_ids[:16]], axis=1)) if total_active >= 16 else cp.asnumpy(cp.stack([roi_ids, node_ids], axis=1))
                 logger.debug(f"[ACTIVE-HEAD] (roi,node)[:16] = {heads.tolist()}")
 
             # Check compacted indices
             if total_active > 0:
-                logger.info(f"[COMPACTION] total_active={total_active}, first 3 nodes:")
+                logger.debug(f"[COMPACTION] total_active={total_active}, first 3 nodes:")
                 for i in range(min(3, total_active)):
                     roi = int(roi_ids[i])
                     node = int(node_ids[i])
                     src_expected = int(data['sources'][roi].item()) if roi < len(data['sources']) else -1
-                    logger.info(f"[COMPACTION]   [{i}] roi={roi}, node={node} (expected src={src_expected})")
+                    logger.debug(f"[COMPACTION]   [{i}] roi={roi}, node={node} (expected src={src_expected})")
 
         # Use compacted kernel for ANY sparse frontier
         # Compaction overhead is negligible compared to scanning 4.2M nodes
@@ -3195,7 +3211,7 @@ class CUDADijkstra:
             [], data, current_iteration
         )
 
-        logger.info(f"[RR-WAVEFRONT] iteration={current_iteration}, rr_alpha={float(rr_alpha)}, jitter={float(jitter_eps)}")
+        logger.debug(f"[RR-WAVEFRONT] iteration={current_iteration}, rr_alpha={float(rr_alpha)}, jitter={float(jitter_eps)}")
 
         # P0-5: CUDA Event instrumentation
         start_event = cp.cuda.Event()
@@ -3203,9 +3219,9 @@ class CUDADijkstra:
 
         # Log compaction benefit (only first time)
         if not hasattr(self, '_compaction_logged'):
-            logger.info(f"[ACTIVE-LIST] Processing {total_active} active nodes (vs {K * data['max_roi_size']:,} total)")
-            logger.info(f"[ACTIVE-LIST] Sparsity={100*sparsity:.3f}% -> {1/sparsity:.0f}× fewer memory accesses!")
-            logger.info(f"[ACTIVE-LIST] Launching over {total_active} items (not {K} blocks) for better occupancy")
+            logger.debug(f"[ACTIVE-LIST] Processing {total_active} active nodes (vs {K * data['max_roi_size']:,} total)")
+            logger.debug(f"[ACTIVE-LIST] Sparsity={100*sparsity:.3f}% -> {1/sparsity:.0f}× fewer memory accesses!")
+            logger.debug(f"[ACTIVE-LIST] Launching over {total_active} items (not {K} blocks) for better occupancy")
             self._compaction_logged = True
 
         # Allocate new frontier
@@ -3297,19 +3313,19 @@ class CUDADijkstra:
         # P0-5: Time kernel execution
         start_event.record()
         # BATCH SANITY CHECK
-        logger.info(f"[BATCH-SANITY] active_list_kernel: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape} node_ids.shape={node_ids.shape}")
-        logger.info(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
+        logger.debug(f"[BATCH-SANITY] active_list_kernel: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape} node_ids.shape={node_ids.shape}")
+        logger.debug(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
         self.active_list_kernel((grid_size,), (block_size,), args)
 
         # INSTRUMENTATION: Log bitmap blocking
         blocked_count = int(blocked_counter[0])
         if use_bitmap_flag and blocked_count > 0:
-            logger.info(f"[BITMAP-DEBUG] Blocked {blocked_count:,} neighbors by owner bitmap")
+            logger.debug(f"[BITMAP-DEBUG] Blocked {blocked_count:,} neighbors by owner bitmap")
         # Removed spammy warning about 0 neighbors blocked - this is normal
         if rr_alpha > 0.0:
-            logger.info(f"[KERNEL-RR-WAVEFRONT] Active: alpha={float(rr_alpha)}, window={int(window_cols)}")
+            logger.debug(f"[KERNEL-RR-WAVEFRONT] Active: alpha={float(rr_alpha)}, window={int(window_cols)}")
         if jitter_eps > 0.0:
-            logger.info(f"[KERNEL-JITTER-WAVEFRONT] Active: eps={float(jitter_eps)}")
+            logger.debug(f"[KERNEL-JITTER-WAVEFRONT] Active: eps={float(jitter_eps)}")
         end_event.record()
         end_event.synchronize()
         kernel_ms = cp.cuda.get_elapsed_time(start_event, end_event)
@@ -3324,12 +3340,12 @@ class CUDADijkstra:
         if DEBUG_VERBOSE_GPU:
             # DIAGNOSTIC: Check if kernel wrote anything to new_frontier
             new_frontier_words_set = int(cp.count_nonzero(new_frontier))
-            logger.info(f"[KERNEL-OUTPUT] new_frontier has {new_frontier_words_set} non-zero words (out of {K * frontier_words} total)")
+            logger.debug(f"[KERNEL-OUTPUT] new_frontier has {new_frontier_words_set} non-zero words (out of {K * frontier_words} total)")
 
             # Count nodes expanded (count set BITS, not sum of uint32 values!)
             nodes_expanded_mask = cp.unpackbits(new_frontier.view(cp.uint8).ravel(), bitorder='little')
             nodes_expanded_actual = int(cp.count_nonzero(nodes_expanded_mask))
-            logger.info(f"[KERNEL-OUTPUT] After unpacking: {nodes_expanded_actual} bits set (expanded nodes)")
+            logger.debug(f"[KERNEL-OUTPUT] After unpacking: {nodes_expanded_actual} bits set (expanded nodes)")
 
             # Track ROI activity after kernel execution
             if nodes_expanded_actual > 0:
@@ -3338,7 +3354,7 @@ class CUDADijkstra:
                 if new_flat_idx.size > 0:
                     new_roi_ids = (new_flat_idx // data['max_roi_size']).astype(cp.int32)
                     n_active_rois = int(cp.unique(new_roi_ids).size)
-                    logger.info(f"[ACTIVE-SET] After kernel: unique_rois={n_active_rois}, total_expanded={nodes_expanded_actual}")
+                    logger.debug(f"[ACTIVE-SET] After kernel: unique_rois={n_active_rois}, total_expanded={nodes_expanded_actual}")
                     if n_active_rois < 10:
                         unique_rois_list = cp.asnumpy(cp.unique(new_roi_ids)).tolist()
                         logger.debug(f"[ACTIVE-ROIS] Active ROI IDs: {unique_rois_list}")
@@ -3349,7 +3365,7 @@ class CUDADijkstra:
             edges_relaxed = total_active * edges_per_node
             edges_per_sec = edges_relaxed / (kernel_ms / 1000.0) if kernel_ms > 0 else 0
 
-            logger.info(f"[GPU-PERF] active={total_active:,} ({active_pct:.4f}%), "
+            logger.debug(f"[GPU-PERF] active={total_active:,} ({active_pct:.4f}%), "
                        f"compact={compact_ms:.3f}ms, kernel={kernel_ms:.3f}ms, "
                        f"edges/sec={edges_per_sec/1e6:.2f}M")
 
@@ -3386,21 +3402,21 @@ class CUDADijkstra:
                 indptr_stride = 0
                 indices_stride = 0
                 weights_stride = 0
-                logger.info(f"[CUDA-WAVEFRONT] Detected shared CSR (stride=0), using zero-copy broadcast")
+                logger.debug(f"[CUDA-WAVEFRONT] Detected shared CSR (stride=0), using zero-copy broadcast")
             else:
                 # Per-ROI CSR: stride = number of elements in one ROI's row
                 indptr_stride = indptr_arr.shape[1]  # max_roi_size + 1
                 indices_stride = indices_arr.shape[1]  # max_edges
                 weights_stride = weights_arr.shape[1]  # max_edges
-                logger.info(f"[CUDA-WAVEFRONT] Per-ROI CSR, strides=({indptr_stride}, {indices_stride}, {weights_stride})")
+                logger.debug(f"[CUDA-WAVEFRONT] Per-ROI CSR, strides=({indptr_stride}, {indices_stride}, {weights_stride})")
         else:
             # Fallback: assume contiguous
             indptr_stride = max_roi_size + 1
             indices_stride = max_edges
             weights_stride = max_edges
-            logger.info(f"[CUDA-WAVEFRONT] Assuming contiguous per-ROI CSR")
+            logger.debug(f"[CUDA-WAVEFRONT] Assuming contiguous per-ROI CSR")
 
-        logger.info(f"[CUDA-WAVEFRONT] Launching {grid_size} blocks × {block_size} threads for {K} ROIs ({max_roi_size:,} nodes each)")
+        logger.debug(f"[CUDA-WAVEFRONT] Launching {grid_size} blocks × {block_size} threads for {K} ROIs ({max_roi_size:,} nodes each)")
 
         # VALIDATION: Sanity checks before kernel launch
         assert K > 0, f"Invalid K={K}"
@@ -3412,9 +3428,9 @@ class CUDADijkstra:
 
         # Log memory layout for debugging
         if is_shared_csr:
-            logger.info(f"[CUDA-WAVEFRONT] Shared CSR mode: ALL {K} ROIs use same graph (memory saved: {(K-1)*max_edges*8/1e6:.1f} MB)")
+            logger.debug(f"[CUDA-WAVEFRONT] Shared CSR mode: ALL {K} ROIs use same graph (memory saved: {(K-1)*max_edges*8/1e6:.1f} MB)")
         else:
-            logger.info(f"[CUDA-WAVEFRONT] Per-ROI CSR mode: Each ROI has dedicated CSR copy")
+            logger.debug(f"[CUDA-WAVEFRONT] Per-ROI CSR mode: Each ROI has dedicated CSR copy")
 
         # CRITICAL FIX: Don't call .ravel() on broadcast CSR arrays!
         # .ravel() materializes the broadcast, copying stride-0 arrays into contiguous memory
@@ -3476,7 +3492,7 @@ class CUDADijkstra:
         )
 
         if is_shared_csr:
-            logger.info(f"[CUDA-WAVEFRONT] CSR arrays: indptr shape={indptr_arr.shape}, indices shape={indices_arr.shape}, A*={'enabled' if data['use_astar'] else 'disabled'}")
+            logger.debug(f"[CUDA-WAVEFRONT] CSR arrays: indptr shape={indptr_arr.shape}, indices shape={indices_arr.shape}, A*={'enabled' if data['use_astar'] else 'disabled'}")
         self.wavefront_kernel((grid_size,), (block_size,), args)
 
         # Synchronize to ensure kernel completion
@@ -3507,7 +3523,7 @@ class CUDADijkstra:
         """
         import time
 
-        logger.info(f"[PERSISTENT-KERNEL] Initializing device-side queues for {K} ROIs")
+        logger.debug(f"[PERSISTENT-KERNEL] Initializing device-side queues for {K} ROIs")
 
         max_roi_size = data['max_roi_size']
 
@@ -3516,7 +3532,7 @@ class CUDADijkstra:
         # Conservative: max_roi_size * 10 (assumes max 10× expansion per iteration)
         max_queue_size = min(max_roi_size * 10, 50_000_000)  # Cap at 50M entries (200MB per queue)
 
-        logger.info(f"[PERSISTENT-KERNEL] Allocating queues: {max_queue_size:,} entries ({max_queue_size*4/1e6:.1f} MB each)")
+        logger.debug(f"[PERSISTENT-KERNEL] Allocating queues: {max_queue_size:,} entries ({max_queue_size*4/1e6:.1f} MB each)")
 
         queue_a = cp.zeros(max_queue_size, dtype=cp.int32)
         queue_b = cp.zeros(max_queue_size, dtype=cp.int32)
@@ -3552,7 +3568,7 @@ class CUDADijkstra:
         queue_a[:total_initial] = packed
         size_a[0] = total_initial
 
-        logger.info(f"[PERSISTENT-KERNEL] Initialized queue with {total_initial:,} active nodes")
+        logger.debug(f"[PERSISTENT-KERNEL] Initialized queue with {total_initial:,} active nodes")
 
         # Get CSR arrays and strides
         indptr_arr = data['batch_indptr']
@@ -3565,13 +3581,13 @@ class CUDADijkstra:
             indptr_stride = 0
             indices_stride = 0
             weights_stride = 0
-            logger.info("[PERSISTENT-KERNEL] Using shared CSR (stride=0)")
+            logger.debug("[PERSISTENT-KERNEL] Using shared CSR (stride=0)")
         else:
             # Per-ROI arrays
             indptr_stride = indptr_arr.shape[1] if len(indptr_arr.shape) > 1 else max_roi_size + 1
             indices_stride = indices_arr.shape[1] if len(indices_arr.shape) > 1 else data['max_edges']
             weights_stride = weights_arr.shape[1] if len(weights_arr.shape) > 1 else data['max_edges']
-            logger.info(f"[PERSISTENT-KERNEL] Using per-ROI CSR (strides={indptr_stride}, {indices_stride}, {weights_stride})")
+            logger.debug(f"[PERSISTENT-KERNEL] Using per-ROI CSR (strides={indptr_stride}, {indices_stride}, {weights_stride})")
 
         # Prepare kernel arguments
         args = (
@@ -3602,7 +3618,7 @@ class CUDADijkstra:
         block_size = 256
         grid_size = 256  # Use many blocks for good occupancy
 
-        logger.info(f"[PERSISTENT-KERNEL] Launching cooperative kernel: {grid_size} blocks × {block_size} threads = {grid_size*block_size:,} total threads")
+        logger.debug(f"[PERSISTENT-KERNEL] Launching cooperative kernel: {grid_size} blocks × {block_size} threads = {grid_size*block_size:,} total threads")
 
         # NOTE: Cooperative kernel launch requires special API
         # CuPy's RawKernel doesn't directly support launchCooperativeKernel
@@ -3623,8 +3639,8 @@ class CUDADijkstra:
             elapsed = time.perf_counter() - start_time
 
             iters = int(iterations_out[0])
-            logger.info(f"[PERSISTENT-KERNEL] Completed {iters} iterations in {elapsed*1000:.2f} ms ({elapsed*1000/max(iters,1):.3f} ms/iter)")
-            logger.info(f"[PERSISTENT-KERNEL] Compare to iterative: ~{iters*0.007:.2f} ms launch overhead eliminated")
+            logger.debug(f"[PERSISTENT-KERNEL] Completed {iters} iterations in {elapsed*1000:.2f} ms ({elapsed*1000/max(iters,1):.3f} ms/iter)")
+            logger.debug(f"[PERSISTENT-KERNEL] Compare to iterative: ~{iters*0.007:.2f} ms launch overhead eliminated")
 
             return iters
 
@@ -3699,9 +3715,9 @@ class CUDADijkstra:
         if current_iteration <= 3:
             rr_alpha = 0.12
             jitter_eps = 0.001
-            logger.info(f"[RR-ENABLE] YES - iteration {current_iteration} <= 3")
-            logger.info(f"[ROUNDROBIN-PARAMS] iteration={current_iteration}, rr_alpha={rr_alpha}, window_cols={window_cols}")
-            logger.info(f"[ROUNDROBIN-KERNEL] Active for iteration {current_iteration}: alpha={rr_alpha}, window={window_cols} cols")
+            logger.debug(f"[RR-ENABLE] YES - iteration {current_iteration} <= 3")
+            logger.debug(f"[ROUNDROBIN-PARAMS] iteration={current_iteration}, rr_alpha={rr_alpha}, window_cols={window_cols}")
+            logger.debug(f"[ROUNDROBIN-KERNEL] Active for iteration {current_iteration}: alpha={rr_alpha}, window={window_cols} cols")
             logger.debug(f"[RR-SAMPLE] First 5 ROIs: pref_layers={pref_layers[:min(5,K)]}, src_x={src_x_coords[:min(5,K)]}")
         else:
             rr_alpha = 0.0
@@ -3709,9 +3725,9 @@ class CUDADijkstra:
             logger.debug(f"[RR-ENABLE] NO - iteration {current_iteration} > 3")
             #             logger.debug(f"[ROUNDROBIN-KERNEL] RR disabled for iteration {current_iteration}, jitter still active")
 
-        logger.info(f"[JITTER-ENABLE] YES - jitter_eps={jitter_eps}")
-        logger.info(f"[JITTER-PARAMS] jitter_eps={jitter_eps}")
-        logger.info(f"[JITTER-KERNEL] jitter_eps={jitter_eps} (breaks ties, prevents elevator shafts)")
+        logger.debug(f"[JITTER-ENABLE] YES - jitter_eps={jitter_eps}")
+        logger.debug(f"[JITTER-PARAMS] jitter_eps={jitter_eps}")
+        logger.debug(f"[JITTER-KERNEL] jitter_eps={jitter_eps} (breaks ties, prevents elevator shafts)")
 
         return pref_layers_gpu, src_x_coords_gpu, rr_alpha, window_cols, jitter_eps
 
@@ -3744,11 +3760,11 @@ class CUDADijkstra:
         cp.get_default_memory_pool().free_all_blocks()
 
         K = len(roi_batch)
-        logger.info(f"[AGENT-B1-PERSISTENT] Routing {K} nets with single-launch persistent kernel")
+        logger.debug(f"[AGENT-B1-PERSISTENT] Routing {K} nets with single-launch persistent kernel")
 
         # Log actual GPU memory state
         free_bytes, total_bytes = cp.cuda.Device().mem_info
-        logger.info(f"[AGENT-B1-PERSISTENT] GPU memory: {(total_bytes - free_bytes) / 1e9:.2f} GB used, {free_bytes / 1e9:.2f} GB free of {total_bytes / 1e9:.2f} GB total")
+        logger.debug(f"[AGENT-B1-PERSISTENT] GPU memory: {(total_bytes - free_bytes) / 1e9:.2f} GB used, {free_bytes / 1e9:.2f} GB free of {total_bytes / 1e9:.2f} GB total")
 
         import numpy as np
         import time
@@ -3774,7 +3790,7 @@ class CUDADijkstra:
         queue_a[:K] = packed_srcs
         size_a[0] = K
 
-        logger.info(f"[AGENT-B1-PERSISTENT] Initialized queue with {K} source nodes")
+        logger.debug(f"[AGENT-B1-PERSISTENT] Initialized queue with {K} source nodes")
 
         # Get CSR arrays and detect strides
         indptr_arr = data['batch_indptr']
@@ -3785,12 +3801,12 @@ class CUDADijkstra:
             indptr_stride = 0
             indices_stride = 0
             weights_stride = 0
-            logger.info("[AGENT-B1-PERSISTENT] Using shared CSR (stride=0)")
+            logger.debug("[AGENT-B1-PERSISTENT] Using shared CSR (stride=0)")
         else:
             indptr_stride = indptr_arr.shape[1] if len(indptr_arr.shape) > 1 else max_roi_size + 1
             indices_stride = indices_arr.shape[1] if len(indices_arr.shape) > 1 else data['max_edges']
             weights_stride = weights_arr.shape[1] if len(weights_arr.shape) > 1 else data['max_edges']
-            logger.info(f"[AGENT-B1-PERSISTENT] Using per-ROI CSR (strides={indptr_stride})")
+            logger.debug(f"[AGENT-B1-PERSISTENT] Using per-ROI CSR (strides={indptr_stride})")
 
         # Phase D: OOM Protection updated - no longer need contiguous buffer memory check
         # since we now use strided pool access (Phase D). Pool is already allocated.
@@ -3802,11 +3818,11 @@ class CUDADijkstra:
                 logger.error(f"  Falling back to basic mode")
                 use_stamps = False
             else:
-                logger.info(f"[PHASE-D-MEMORY] Batch size {K} fits in K_pool {self.K_pool} - using strided pool access")
+                logger.debug(f"[PHASE-D-MEMORY] Batch size {K} fits in K_pool {self.K_pool} - using strided pool access")
 
         if use_stamps:
             # Agent B1: Use stamped kernel with backtrace
-            logger.info("[AGENT-B1-PERSISTENT] Using stamped kernel with device-side backtrace")
+            logger.debug("[AGENT-B1-PERSISTENT] Using stamped kernel with device-side backtrace")
 
             # Allocate staging buffer for paths
             max_path_nodes = K * 1000  # Conservative: 1000 nodes per path max
@@ -3833,7 +3849,7 @@ class CUDADijkstra:
                 dist_stamp[i, src_node] = gen
                 parent_stamp[i, src_node] = gen
 
-            logger.info(f"[AGENT-B1-PERSISTENT] Initialized {K} source nodes with generation {gen}")
+            logger.debug(f"[AGENT-B1-PERSISTENT] Initialized {K} source nodes with generation {gen}")
 
             # Phase D: STRIDED POOL ACCESS (eliminates 4.26 GB contiguous buffer copies)
             #
@@ -3844,8 +3860,8 @@ class CUDADijkstra:
             # The kernel computes per-net slices using:
             #   float* dist_val = dist_val_pool_base + (size_t)net * pool_stride;
 
-            logger.info(f"[PHASE-D] Using strided pool access (no contiguous copies needed)")
-            logger.info(f"[PHASE-D] Memory saved: {K * max_roi_size * 4 * 4 / 1e9:.2f} GB")
+            logger.debug(f"[PHASE-D] Using strided pool access (no contiguous copies needed)")
+            logger.debug(f"[PHASE-D] Memory saved: {K * max_roi_size * 4 * 4 / 1e9:.2f} GB")
 
             # Get pool stride (number of elements between consecutive net slices)
             # For [K_pool, N_max] array, stride between rows is N_max elements
@@ -3855,7 +3871,7 @@ class CUDADijkstra:
             assert self.dist_val_pool.shape == (self.K_pool, pool_stride), "Pool shape mismatch"
             assert K <= self.K_pool, f"Batch size {K} exceeds K_pool {self.K_pool}"
 
-            logger.info(f"[AGENT-B1-MEMORY-AWARE] Pool stride: {pool_stride}, max_roi_size: {max_roi_size}")
+            logger.debug(f"[AGENT-B1-MEMORY-AWARE] Pool stride: {pool_stride}, max_roi_size: {max_roi_size}")
 
             # Get use_bitmap flag from data dict
             use_bitmap_flag = 1 if data.get('use_bitmap', False) else 0  # Default FALSE for iter-1 compatibility
@@ -3866,11 +3882,11 @@ class CUDADijkstra:
             )
 
             # Pre-launch verification logging
-            logger.info(f"[KERNEL-LAUNCH] About to launch stamped kernel with:")
-            logger.info(f"  rr_alpha={float(rr_alpha)}, window_cols={int(window_cols)}")
-            logger.info(f"  jitter_eps={float(jitter_eps)}")
-            logger.info(f"  pref_layers shape={pref_layers_gpu.shape}, dtype={pref_layers_gpu.dtype}")
-            logger.info(f"  src_x_coords shape={src_x_coords_gpu.shape}, dtype={src_x_coords_gpu.dtype}")
+            logger.debug(f"[KERNEL-LAUNCH] About to launch stamped kernel with:")
+            logger.debug(f"  rr_alpha={float(rr_alpha)}, window_cols={int(window_cols)}")
+            logger.debug(f"  jitter_eps={float(jitter_eps)}")
+            logger.debug(f"  pref_layers shape={pref_layers_gpu.shape}, dtype={pref_layers_gpu.dtype}")
+            logger.debug(f"  src_x_coords shape={src_x_coords_gpu.shape}, dtype={src_x_coords_gpu.dtype}")
 
             # Allocate and initialize 64-bit atomic keys
             INF_KEY = cp.uint64((0x7f800000 << 32) | 0xffffffff)
@@ -3879,7 +3895,7 @@ class CUDADijkstra:
             SRC_KEY = cp.uint64((cp.uint64(zero_bits) << 32) | 0xffffffff)
             for i in range(K):
                 best_key[i, srcs[i]] = SRC_KEY
-            logger.info(f"[ATOMIC-KEY] Initialized 64-bit keys for {K} ROIs")
+            logger.debug(f"[ATOMIC-KEY] Initialized 64-bit keys for {K} ROIs")
 
             # Get via segment pooling arrays from data dict
             # These are transferred from unified_pathfinder when via_segment_pooling is enabled
@@ -3890,12 +3906,12 @@ class CUDADijkstra:
 
             # If via pooling not enabled, pass dummy values
             if via_seg_prefix_gpu is None or segZ == 0:
-                logger.info("[GPU-VIA-POOL] Via segment pooling disabled (segZ=0 or no arrays)")
+                logger.debug("[GPU-VIA-POOL] Via segment pooling disabled (segZ=0 or no arrays)")
                 via_seg_prefix_gpu = cp.zeros(1, dtype=cp.float32)  # Dummy array
                 segZ = 0
                 via_segment_weight = 0.0
             else:
-                logger.info(f"[GPU-VIA-POOL] Via segment pooling ENABLED: segZ={segZ}, weight={via_segment_weight}, pres_fac={pres_fac_current}")
+                logger.debug(f"[GPU-VIA-POOL] Via segment pooling ENABLED: segZ={segZ}, weight={via_segment_weight}, pres_fac={pres_fac_current}")
 
             args = (
                 queue_a, queue_b, size_a, size_b, max_queue_size,
@@ -3941,18 +3957,18 @@ class CUDADijkstra:
 
             # Diagnostic logging (can be disabled for production)
             if True:  # Set to True for debugging
-                logger.info(f"[DEBUG] Kernel input: K={K}, max_roi_size={max_roi_size}, generation={gen}")
-                logger.info(f"[DEBUG] src nodes: {srcs[:min(5,K)].get()}")
-                logger.info(f"[DEBUG] dst nodes: {dsts[:min(5,K)].get()}")
-                logger.info(f"[DEBUG] goal_coords shape: {data['goal_coords'].shape}")
-                logger.info(f"[DEBUG] Initial queue size: {size_a[0].get()}")
-                logger.info(f"[DEBUG] Initial queue contents: {queue_a[:min(5,K)].get()}")
+                logger.debug(f"[DEBUG] Kernel input: K={K}, max_roi_size={max_roi_size}, generation={gen}")
+                logger.debug(f"[DEBUG] src nodes: {srcs[:min(5,K)].get()}")
+                logger.debug(f"[DEBUG] dst nodes: {dsts[:min(5,K)].get()}")
+                logger.debug(f"[DEBUG] goal_coords shape: {data['goal_coords'].shape}")
+                logger.debug(f"[DEBUG] Initial queue size: {size_a[0].get()}")
+                logger.debug(f"[DEBUG] Initial queue contents: {queue_a[:min(5,K)].get()}")
                 # Check source initialization
                 for i in range(min(3, K)):
                     src = int(srcs[i])
-                    logger.info(f"[DEBUG] ROI {i}: src={src}, dist={float(dist_val[i, src])}, stamp={int(dist_stamp[i, src])}")
+                    logger.debug(f"[DEBUG] ROI {i}: src={src}, dist={float(dist_val[i, src])}, stamp={int(dist_stamp[i, src])}")
 
-            logger.info(f"[AGENT-B1-PERSISTENT] Launching stamped kernel: {grid_size} blocks × {block_size} threads")
+            logger.debug(f"[AGENT-B1-PERSISTENT] Launching stamped kernel: {grid_size} blocks × {block_size} threads")
             start_time = time.perf_counter()
 
             try:
@@ -3963,16 +3979,16 @@ class CUDADijkstra:
 
                 iters = int(iterations_out[0])
                 found_count = int(goal_reached.sum())
-                logger.info(f"[AGENT-B1-PERSISTENT] Completed in {elapsed*1000:.2f} ms ({iters} iterations)")
-                logger.info(f"[AGENT-B1-PERSISTENT] Found paths: {found_count}/{K}")
-                logger.info(f"[AGENT-B1-PERSISTENT] Launch overhead saved: ~{iters*0.007:.2f} ms")
+                logger.debug(f"[AGENT-B1-PERSISTENT] Completed in {elapsed*1000:.2f} ms ({iters} iterations)")
+                logger.debug(f"[AGENT-B1-PERSISTENT] Found paths: {found_count}/{K}")
+                logger.debug(f"[AGENT-B1-PERSISTENT] Launch overhead saved: ~{iters*0.007:.2f} ms")
 
                 # Diagnostic logging (can be disabled for production)
                 stage_count_val = int(stage_count[0])
                 if False:  # Set to True for debugging
-                    logger.info(f"[DEBUG] goal_reached: {goal_reached.get()[:min(5,K)]}")
-                    logger.info(f"[DEBUG] iterations: {iters}")
-                    logger.info(f"[DEBUG] stage_count: {stage_count_val}")
+                    logger.debug(f"[DEBUG] goal_reached: {goal_reached.get()[:min(5,K)]}")
+                    logger.debug(f"[DEBUG] iterations: {iters}")
+                    logger.debug(f"[DEBUG] stage_count: {stage_count_val}")
 
                 # Reconstruct paths from staging buffer
                 paths = []
@@ -4013,7 +4029,7 @@ class CUDADijkstra:
 
         if not use_stamps:
             # Fallback: Use basic persistent kernel (no stamps/backtrace)
-            logger.info("[AGENT-B1-PERSISTENT] Using basic persistent kernel (fallback)")
+            logger.debug("[AGENT-B1-PERSISTENT] Using basic persistent kernel (fallback)")
 
             # Initialize source distances
             data['dist'][:] = cp.inf
@@ -4049,7 +4065,7 @@ class CUDADijkstra:
             block_size = 256
             grid_size = 256
 
-            logger.info(f"[AGENT-B1-PERSISTENT] Launching basic kernel: {grid_size} blocks × {block_size} threads")
+            logger.debug(f"[AGENT-B1-PERSISTENT] Launching basic kernel: {grid_size} blocks × {block_size} threads")
             start_time = time.perf_counter()
 
             try:
@@ -4058,14 +4074,14 @@ class CUDADijkstra:
                 elapsed = time.perf_counter() - start_time
 
                 iters = int(iterations_out[0])
-                logger.info(f"[AGENT-B1-PERSISTENT] Completed in {elapsed*1000:.2f} ms ({iters} iterations)")
+                logger.debug(f"[AGENT-B1-PERSISTENT] Completed in {elapsed*1000:.2f} ms ({iters} iterations)")
 
                 # Reconstruct paths on CPU
                 data['sinks'] = [roi[1] for roi in roi_batch]
                 paths = self._reconstruct_paths(data, K)
 
                 found = sum(1 for p in paths if p)
-                logger.info(f"[AGENT-B1-PERSISTENT] Found paths: {found}/{K}")
+                logger.debug(f"[AGENT-B1-PERSISTENT] Found paths: {found}/{K}")
 
                 return paths
 
@@ -4208,7 +4224,7 @@ class CUDADijkstra:
                     logger.error(f"[PARENT-VALIDATE]   ROI {roi_idx}: {violations[roi_idx]} bad parents")
                 logger.error(f"[PARENT-VALIDATE] Corruption in SEARCH PHASE - parent writes are invalid!")
             else:
-                logger.info(f"[PARENT-VALIDATE] 0 parent-CSR mismatches ✓ Parents are valid!")
+                logger.debug(f"[PARENT-VALIDATE] 0 parent-CSR mismatches ✓ Parents are valid!")
 
             # Calculate strides (pool strides, not max_roi_size!)
             parent_stride_val = self.parent_val_pool.shape[1] if self.parent_val_pool is not None else max_roi_size
@@ -4266,14 +4282,14 @@ class CUDADijkstra:
             new_transfer_mb = (K * max_path_len * 4 + K * 4) / 1e6  # paths + lengths
             savings_mb = old_transfer_mb - new_transfer_mb
 
-            logger.info(f"[GPU-BACKTRACE] Reconstructed {K} paths in {elapsed_ms:.2f}ms on GPU")
-            logger.info(f"[GPU-BACKTRACE] Transfer: {new_transfer_mb:.2f} MB (saved {savings_mb:.2f} MB vs CPU method)")
+            logger.debug(f"[GPU-BACKTRACE] Reconstructed {K} paths in {elapsed_ms:.2f}ms on GPU")
+            logger.debug(f"[GPU-BACKTRACE] Transfer: {new_transfer_mb:.2f} MB (saved {savings_mb:.2f} MB vs CPU method)")
 
             return paths
 
         else:
             # CPU PATH RECONSTRUCTION (for small ROIs, faster due to low overhead)
-            logger.info(f"[CPU-BACKTRACE] Using CPU path reconstruction for {K} small ROIs ({max_roi_size:,} nodes)")
+            logger.debug(f"[CPU-BACKTRACE] Using CPU path reconstruction for {K} small ROIs ({max_roi_size:,} nodes)")
 
             # Transfer to CPU (acceptable for small ROIs)
             parent_cpu = data['parent'].get()
@@ -4398,9 +4414,9 @@ class CUDADijkstra:
             n_src = int(data['sources'].shape[0])
             n_dst = int(data['sinks'].shape[0])
         assert n_src == K and n_dst == K, f"K mismatch: K={K} sources={n_src} sinks={n_dst}"
-        logger.info(f"[_run_delta_stepping] Using K={K}, sources.shape={n_src}, sinks.shape={n_dst}")
+        logger.debug(f"[_run_delta_stepping] Using K={K}, sources.shape={n_src}, sinks.shape={n_dst}")
 
-        logger.info(f"[DELTA-STEPPING] Starting with K={K} ROIs, delta={delta:.3f}")
+        logger.debug(f"[DELTA-STEPPING] Starting with K={K} ROIs, delta={delta:.3f}")
 
         # Adaptive iteration budget
         if roi_batch and len(roi_batch) > 0:
@@ -4409,7 +4425,7 @@ class CUDADijkstra:
 
             if roi_size > 1_000_000:  # Full graph
                 max_iterations = 2000
-                logger.info(f"[DELTA-STEPPING] Full graph routing: {batch_size} nets, {max_iterations} iterations")
+                logger.debug(f"[DELTA-STEPPING] Full graph routing: {batch_size} nets, {max_iterations} iterations")
             else:
                 max_iterations = min(4096, roi_size // 100 + 500)
         else:
@@ -4455,8 +4471,8 @@ class CUDADijkstra:
             bit_pos = src % 32
             buckets[roi_idx, 0, word_idx] = cp.uint32(1) << bit_pos
 
-        logger.info(f"[DELTA-STEPPING] Initialized {max_buckets} buckets with width {delta:.3f}")
-        logger.info(f"[DELTA-STEPPING] Memory: {K}×{max_buckets}×{frontier_words} uint32 = "
+        logger.debug(f"[DELTA-STEPPING] Initialized {max_buckets} buckets with width {delta:.3f}")
+        logger.debug(f"[DELTA-STEPPING] Memory: {K}×{max_buckets}×{frontier_words} uint32 = "
                    f"{K*max_buckets*frontier_words*4/1e6:.1f}MB")
 
         # Main delta-stepping loop
@@ -4472,7 +4488,7 @@ class CUDADijkstra:
                 current_bucket += 1
 
             if current_bucket >= max_buckets:
-                logger.info(f"[DELTA-STEPPING] All buckets empty at iteration {iteration}")
+                logger.debug(f"[DELTA-STEPPING] All buckets empty at iteration {iteration}")
                 break
 
             # Get nodes in current bucket
@@ -4499,25 +4515,25 @@ class CUDADijkstra:
             sinks_reached = int(cp.sum(sink_dists_check < 1e9).get())  # Single transfer
 
             if iteration % 50 == 0 or iteration < 3:
-                logger.info(f"[DELTA-STEPPING] Iter {iteration}: bucket={current_bucket}, "
+                logger.debug(f"[DELTA-STEPPING] Iter {iteration}: bucket={current_bucket}, "
                           f"nodes={bucket_node_count}, expanded={nodes_expanded}, "
                           f"sinks_reached={sinks_reached}/{K}")
 
             # Early termination when all sinks reached
             if sinks_reached == K:
-                logger.info(f"[DELTA-STEPPING] All sinks reached at iteration {iteration}")
+                logger.debug(f"[DELTA-STEPPING] All sinks reached at iteration {iteration}")
                 break
 
             iteration += 1
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(f"[DELTA-STEPPING] Complete in {iteration+1} iterations, {elapsed_ms:.1f}ms "
+        logger.debug(f"[DELTA-STEPPING] Complete in {iteration+1} iterations, {elapsed_ms:.1f}ms "
                    f"({elapsed_ms/(iteration+1):.2f}ms/iter)")
 
         # Reconstruct paths
         paths = self._reconstruct_paths(data, K)
         found = sum(1 for p in paths if p)
-        logger.info(f"[DELTA-STEPPING] Paths found: {found}/{K} ({100*found/K:.1f}% success)")
+        logger.debug(f"[DELTA-STEPPING] Paths found: {found}/{K} ({100*found/K:.1f}% success)")
 
         return paths
 
@@ -4635,8 +4651,8 @@ class CUDADijkstra:
         )
 
         # BATCH SANITY CHECK
-        logger.info(f"[BATCH-SANITY] delta_stepping active_list: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape}")
-        logger.info(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
+        logger.debug(f"[BATCH-SANITY] delta_stepping active_list: K={K} total_active={total_active} roi_ids.shape={roi_ids.shape}")
+        logger.debug(f"[BATCH-SANITY] dist.shape={data['dist'].shape} parent.shape={data['parent'].shape}")
         self.active_list_kernel((grid_size,), (block_size,), args)
         cp.cuda.Stream.null.synchronize()
 
@@ -4680,7 +4696,7 @@ class CUDADijkstra:
         import heapq
         import numpy as np
 
-        logger.info(f"[CUDA-FALLBACK] Using CPU Dijkstra for {len(roi_batch)} ROIs")
+        logger.debug(f"[CUDA-FALLBACK] Using CPU Dijkstra for {len(roi_batch)} ROIs")
 
         paths = []
         # roi_batch now has 13 elements: (src, dst, indptr, indices, weights, roi_size, roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz)
@@ -4749,7 +4765,7 @@ class CUDADijkstra:
                 else:
                     paths.append(None)
             else:
-                logger.info(f"[CPU-FALLBACK] ROI {roi_idx}: No path found from {src} to {sink}")
+                logger.debug(f"[CPU-FALLBACK] ROI {roi_idx}: No path found from {src} to {sink}")
                 paths.append(None)
 
         return paths
@@ -5179,7 +5195,7 @@ class CUDADijkstra:
 
         Expected speedup: ~2× (halves search depth)
         """
-        logger.info(f"[BIDIR-A*] Starting bi-directional search: src={source}, dst={sink}, ε={epsilon}")
+        logger.debug(f"[BIDIR-A*] Starting bi-directional search: src={source}, dst={sink}, ε={epsilon}")
 
         num_nodes = adjacency_csr.shape[0]
 
@@ -5189,7 +5205,7 @@ class CUDADijkstra:
         weights_fwd = edge_costs
 
         # Build backward graph (transpose CSR)
-        logger.info(f"[BIDIR-A*] Building backward graph (CSR transpose)")
+        logger.debug(f"[BIDIR-A*] Building backward graph (CSR transpose)")
         indptr_bwd, indices_bwd, weights_bwd = self._transpose_csr(
             indptr_fwd, indices_fwd, weights_fwd, num_nodes
         )
@@ -5228,7 +5244,7 @@ class CUDADijkstra:
         best_path_cost = float('inf')
         meeting_point = -1
 
-        logger.info(f"[BIDIR-A*] Starting alternating expansion (max {max_iterations} iters)")
+        logger.debug(f"[BIDIR-A*] Starting alternating expansion (max {max_iterations} iters)")
 
         for iteration in range(max_iterations):
             # Check termination
@@ -5236,7 +5252,7 @@ class CUDADijkstra:
             bwd_active = int(cp.sum(frontier_bwd))
 
             if fwd_active == 0 and bwd_active == 0:
-                logger.info(f"[BIDIR-A*] No active frontiers at iteration {iteration}")
+                logger.debug(f"[BIDIR-A*] No active frontiers at iteration {iteration}")
                 break
 
             # Expand forward frontier
@@ -5275,7 +5291,7 @@ class CUDADijkstra:
                     if path_cost < best_path_cost:
                         best_path_cost = path_cost
                         meeting_point = int(v)
-                        logger.info(f"[BIDIR-A*] New best meeting point: {meeting_point}, cost={best_path_cost:.2f}")
+                        logger.debug(f"[BIDIR-A*] New best meeting point: {meeting_point}, cost={best_path_cost:.2f}")
 
             # Termination check (simplified - no A* heuristic)
             # In practice, should use: min_f_fwd + min_f_bwd >= (1+ε) × best_path_cost
@@ -5283,12 +5299,12 @@ class CUDADijkstra:
             if best_path_cost < float('inf'):
                 # Found meeting point - continue for a few more iterations
                 if iteration > 10:  # Small buffer for exploration
-                    logger.info(f"[BIDIR-A*] Terminating at iteration {iteration}")
+                    logger.debug(f"[BIDIR-A*] Terminating at iteration {iteration}")
                     break
 
             # Periodic logging
             if iteration % 50 == 0 or iteration < 3:
-                logger.info(f"[BIDIR-A*] Iter {iteration}: fwd_frontier={fwd_active}, bwd_frontier={bwd_active}, "
+                logger.debug(f"[BIDIR-A*] Iter {iteration}: fwd_frontier={fwd_active}, bwd_frontier={bwd_active}, "
                           f"best_cost={best_path_cost:.2f}")
 
         # Reconstruct path
@@ -5296,7 +5312,7 @@ class CUDADijkstra:
             logger.warning(f"[BIDIR-A*] No path found")
             return None
 
-        logger.info(f"[BIDIR-A*] Reconstructing path through meeting point {meeting_point}")
+        logger.debug(f"[BIDIR-A*] Reconstructing path through meeting point {meeting_point}")
 
         # Transfer to CPU for reconstruction
         parent_fwd_cpu = parent_fwd.get()
@@ -5322,7 +5338,7 @@ class CUDADijkstra:
         # Join paths (avoid duplicating meeting point)
         full_path = fwd_path + bwd_path
 
-        logger.info(f"[BIDIR-A*] Path found: length={len(full_path)}, cost={best_path_cost:.2f}")
+        logger.debug(f"[BIDIR-A*] Path found: length={len(full_path)}, cost={best_path_cost:.2f}")
         return full_path
 
     def _unpack_frontier(self, frontier_packed, num_nodes):
@@ -5428,11 +5444,11 @@ class CUDADijkstra:
         import numpy as np
         from cupyx.scipy.sparse import csr_matrix
 
-        logger.info(f"[BIDIR-BATCH] Processing {len(roi_batch)} ROIs with bi-directional search")
+        logger.debug(f"[BIDIR-BATCH] Processing {len(roi_batch)} ROIs with bi-directional search")
 
         paths = []
         for roi_idx, (src, dst, indptr, indices, weights, roi_size, roi_bitmap, bbox_minx, bbox_maxx, bbox_miny, bbox_maxy, bbox_minz, bbox_maxz) in enumerate(roi_batch):
-            logger.info(f"[BIDIR-BATCH] ROI {roi_idx}/{len(roi_batch)}: src={src}, dst={dst}, size={roi_size}")
+            logger.debug(f"[BIDIR-BATCH] ROI {roi_idx}/{len(roi_batch)}: src={src}, dst={dst}, size={roi_size}")
 
             # Convert to CuPy arrays
             if not isinstance(indptr, cp.ndarray):
@@ -5461,7 +5477,7 @@ class CUDADijkstra:
                 paths.append(None)
 
         found = sum(1 for p in paths if p)
-        logger.info(f"[BIDIR-BATCH] Complete: {found}/{len(roi_batch)} paths found")
+        logger.debug(f"[BIDIR-BATCH] Complete: {found}/{len(roi_batch)} paths found")
         return paths
 
     def find_path_fullgraph_gpu_seeds(self, costs, src_seeds, dst_targets, ub_hint=None, *,
@@ -5484,7 +5500,7 @@ class CUDADijkstra:
         import numpy as np
         import cupy as cp
 
-        logger.info(f"[GPU-SEEDS] Starting full-graph SSSP: {len(src_seeds)} sources -> {len(dst_targets)} targets")
+        logger.debug(f"[GPU-SEEDS] Starting full-graph SSSP: {len(src_seeds)} sources -> {len(dst_targets)} targets")
 
         # Validate inputs
         if len(src_seeds) == 0 or len(dst_targets) == 0:
@@ -5494,7 +5510,7 @@ class CUDADijkstra:
         # Get graph dimensions
         num_nodes = len(self.indptr) - 1
         num_edges = len(self.indices)
-        logger.info(f"[GPU-SEEDS] Full graph: {num_nodes} nodes, {num_edges} edges")
+        logger.debug(f"[GPU-SEEDS] Full graph: {num_nodes} nodes, {num_edges} edges")
 
         # Initialize distance and parent arrays
         dist = cp.full(num_nodes, cp.inf, dtype=cp.float32)
@@ -5505,7 +5521,7 @@ class CUDADijkstra:
         dst_targets_gpu = cp.asarray(dst_targets, dtype=cp.int32)
 
         # Initialize source seeds (supersource via seeding)
-        logger.info(f"[GPU-SEEDS] Initialized {len(src_seeds)} source seeds with dist=0")
+        logger.debug(f"[GPU-SEEDS] Initialized {len(src_seeds)} source seeds with dist=0")
         for seed in src_seeds_gpu:
             dist[int(seed)] = 0.0
 
@@ -5513,7 +5529,7 @@ class CUDADijkstra:
         dst_bitmap = cp.zeros(num_nodes, dtype=cp.bool_)
         for target in dst_targets_gpu:
             dst_bitmap[int(target)] = True
-        logger.info(f"[GPU-SEEDS] Created destination bitmap for {len(dst_targets)} targets")
+        logger.debug(f"[GPU-SEEDS] Created destination bitmap for {len(dst_targets)} targets")
 
         # Initialize bit-packed frontier (K=1, frontier_words)
         frontier_words = (num_nodes + 31) // 32
@@ -5523,12 +5539,12 @@ class CUDADijkstra:
             word_idx = seed_val // 32
             bit_pos = seed_val % 32
             frontier[0, word_idx] |= (1 << bit_pos)  # Access with [0, word_idx]
-        logger.info(f"[GPU-SEEDS] Initialized frontier with {len(src_seeds)} seeds")
+        logger.debug(f"[GPU-SEEDS] Initialized frontier with {len(src_seeds)} seeds")
 
         # Allocate stamp pools if needed (device-resident optimization)
         if self.dist_val_pool is None or self.dist_val_pool.shape[1] < num_nodes:
             N_max = max(num_nodes, 5_000_000)
-            logger.info(f"[GPU-SEEDS] Allocated stamp pools: N_max={N_max}")
+            logger.debug(f"[GPU-SEEDS] Allocated stamp pools: N_max={N_max}")
             self.dist_val_pool = cp.full((1, N_max), cp.inf, dtype=cp.float32)
             self.parent_val_pool = cp.full((1, N_max), -1, dtype=cp.int32)
             # Allocate 64-bit atomic key pool (cycle-proof parent updates)
@@ -5583,7 +5599,7 @@ class CUDADijkstra:
 
             # Count allowed nodes for sanity
             total_bits_set = int(cp.count_nonzero(roi_bitmaps))
-            logger.info(f"[GPU-SEEDS] Owner-aware bitmap: {bitmap_words} words, ~{total_bits_set} bits set, seeds force-allowed")
+            logger.debug(f"[GPU-SEEDS] Owner-aware bitmap: {bitmap_words} words, ~{total_bits_set} bits set, seeds force-allowed")
         else:
             # Default: all bits set (no filtering)
             roi_bitmaps = cp.full((1, bitmap_words), 0xFFFFFFFF, dtype=cp.uint32)
@@ -5628,21 +5644,21 @@ class CUDADijkstra:
         best_dst = None
         best_dist = float('inf')
 
-        logger.info(f"[GPU-SEEDS] Starting wavefront expansion (max {max_iterations} iterations)")
+        logger.debug(f"[GPU-SEEDS] Starting wavefront expansion (max {max_iterations} iterations)")
 
         # OPTIMIZATION: Use persistent kernel (single launch) if enabled
         use_persistent = getattr(self, '_enable_persistent_kernel', False)
 
         if use_persistent:
-            logger.info("[GPU-SEEDS] Using PERSISTENT kernel (single launch)")
+            logger.debug("[GPU-SEEDS] Using PERSISTENT kernel (single launch)")
             # Import persistent kernel module
             from . import persistent_kernel as pk
 
             # Compile kernel on first use
             if self._persistent_kernel is None:
-                logger.info("[GPU-SEEDS] Compiling persistent kernel with cooperative groups...")
+                logger.debug("[GPU-SEEDS] Compiling persistent kernel with cooperative groups...")
                 self._persistent_kernel = pk.create_persistent_kernel()
-                logger.info("[GPU-SEEDS] Persistent kernel compiled successfully!")
+                logger.debug("[GPU-SEEDS] Persistent kernel compiled successfully!")
 
             # Launch persistent kernel with stamp pool arrays
             best_dst_result, best_dist_result, iterations_done = pk.launch_persistent_kernel(
@@ -5660,7 +5676,7 @@ class CUDADijkstra:
                 max_iterations=max_iterations
             )
 
-            logger.info(f"[GPU-SEEDS] Persistent kernel complete: {iterations_done} iterations, dist={best_dist_result:.2f}")
+            logger.debug(f"[GPU-SEEDS] Persistent kernel complete: {iterations_done} iterations, dist={best_dist_result:.2f}")
 
             if best_dst_result < 0:
                 logger.warning("[GPU-SEEDS] No path found via persistent kernel")
@@ -5671,7 +5687,7 @@ class CUDADijkstra:
             iteration = iterations_done
 
         else:
-            logger.info("[GPU-SEEDS] Using MULTI-LAUNCH kernel (Python loop)")
+            logger.debug("[GPU-SEEDS] Using MULTI-LAUNCH kernel (Python loop)")
             # Wavefront expansion loop
             for iteration in range(max_iterations):
                 # OPTIMIZATION: Only log progress every 100 iterations to reduce overhead
@@ -5679,7 +5695,7 @@ class CUDADijkstra:
                     active_count = int(cp.count_nonzero(frontier))
                     target_dists = self.dist_val_pool[0, dst_targets_gpu]
                     min_target_dist = float(cp.min(target_dists))
-                    logger.info(f"[GPU-SEEDS] Iteration {iteration}: frontier_words={active_count}, min_target_dist={min_target_dist}")
+                    logger.debug(f"[GPU-SEEDS] Iteration {iteration}: frontier_words={active_count}, min_target_dist={min_target_dist}")
 
                 # Expand wavefront (reuses existing infrastructure)
                 # Note: frontier is modified in-place by _expand_wavefront_parallel
@@ -5701,12 +5717,12 @@ class CUDADijkstra:
                         best_idx = int(cp.argmin(target_dists))
                         best_dst = int(dst_targets_gpu[best_idx])
                         best_dist = min_dist
-                        logger.info(f"[GPU-SEEDS] Path found at iteration {iteration+1}: best_dst={best_dst}, dist={best_dist:.2f}")
+                        logger.debug(f"[GPU-SEEDS] Path found at iteration {iteration+1}: best_dst={best_dst}, dist={best_dist:.2f}")
                         break
 
                     # Check upper bound hint
                     if ub_hint is not None and min_dist > ub_hint:
-                        logger.info(f"[GPU-SEEDS] Exceeding upper bound hint {ub_hint} at iteration {iteration}")
+                        logger.debug(f"[GPU-SEEDS] Exceeding upper bound hint {ub_hint} at iteration {iteration}")
                         break
 
                 # OPTIMIZATION: Only check for empty frontier periodically (every 50 iters) or near end
@@ -5714,7 +5730,7 @@ class CUDADijkstra:
                 if iteration % 50 == 0 or iteration > max_iterations - 10:
                     active_count = int(cp.count_nonzero(frontier))
                     if active_count == 0:
-                        logger.info(f"[GPU-SEEDS] Frontier empty at iteration {iteration}")
+                        logger.debug(f"[GPU-SEEDS] Frontier empty at iteration {iteration}")
                         break
 
         # Check final state
@@ -5722,7 +5738,7 @@ class CUDADijkstra:
             logger.warning(f"[GPU-SEEDS] No path found after {iteration+1} iterations")
             return None
 
-        logger.info(f"[GPU-SEEDS] Path found in {iteration+1} iterations ({best_dist:.2f}ms)")
+        logger.warning(f"[GPU-SEEDS] Path found in {iteration+1} iterations ({best_dist:.2f}ms)")
 
         # Reconstruct path from best_dst back to source
         path = []
@@ -5746,6 +5762,6 @@ class CUDADijkstra:
             return None
 
         path.reverse()
-        logger.info(f"[GPU-SEEDS] Path reconstructed: length={len(path)}, from seed={path[0]} to target={best_dst}")
+        logger.debug(f"[GPU-SEEDS] Path reconstructed: length={len(path)}, from seed={path[0]} to target={best_dst}")
 
         return path
