@@ -819,12 +819,21 @@ class EdgeAccountant:
             if 0 <= idx < self.E:
                 self.present[idx] = float(count)
 
+    @profile_time
     def commit_path(self, edge_indices: List[int]):
         """Add path and keep present in sync"""
+        if not edge_indices:
+            return
+        # Update canonical dict (CPU dict — loop is fast for typical path lengths)
         for idx in edge_indices:
             self.canonical[idx] = self.canonical.get(idx, 0) + 1
-            # Keep present in sync during iteration
-            self.present[idx] = self.present[idx] + 1
+        # Vectorized scatter-add on present — replaces per-element GPU indexing
+        arr = self.xp.asarray(edge_indices, dtype=np.int64)
+        if self.use_gpu:
+            import cupyx
+            cupyx.scatter_add(self.present, arr, self.xp.ones(len(arr), dtype=self.present.dtype))
+        else:
+            np.add.at(self.present, arr, 1.0)
 
     def clear_path(self, edge_indices: List[int]):
         """Remove path and keep present in sync"""
@@ -2504,6 +2513,7 @@ class PathFinderRouter:
             retarget_count=0
         )
 
+    @profile_time
     def _get_portal_seeds(self, portal: Portal) -> List[Tuple[int, float]]:
         """
         Get portal entry point seeds for routing.
@@ -2524,6 +2534,7 @@ class PathFinderRouter:
         seeds.append((node_idx, cost))
         return seeds
 
+    @profile_time
     def _build_routing_seeds(self, portal_seeds_list):
         """
         Convert portal seeds from (node_idx, cost) tuples to plain node_idx arrays.
@@ -2968,6 +2979,7 @@ class PathFinderRouter:
         self._edge_src = edge_src
         logger.debug(f"[EDGE-SRC-MAP] Built mapping for {num_edges:,} edges")
 
+    @profile_time
     def _mark_via_barrel_ownership_for_path(self, net_name: str, path: List[int]) -> None:
         """
         Mark via barrel nodes as owned by this net IMMEDIATELY after commit.
@@ -5649,20 +5661,39 @@ class PathFinderRouter:
             }
             logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on CPU in {time.perf_counter() - t0:.3f}s")
 
+    @profile_time
     def _path_to_edges(self, node_path: List[int]) -> List[int]:
-        """Nodes → edge indices via on-the-fly CSR scan (no dict needed)"""
-        out = []
-        indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
-        indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
+        """Nodes → edge indices via vectorized NumPy broadcast search (cached CPU arrays)"""
+        if len(node_path) < 2:
+            return []
 
-        for u, v in zip(node_path, node_path[1:]):
-            s, e = int(indptr[u]), int(indptr[u+1])
-            # Linear scan over neighbors (small degree in Manhattan lattice, so fast)
-            for ei in range(s, e):
-                if int(indices[ei]) == v:
-                    out.append(ei)
-                    break
-        return out
+        # Cache CPU copies once — graph never changes after build.
+        # Avoids a full PCIe GPU→CPU transfer (~60 MB) on every call.
+        if not hasattr(self, '_indptr_cpu') or self._indptr_cpu is None:
+            self._indptr_cpu = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else np.asarray(self.graph.indptr)
+            self._indices_cpu = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else np.asarray(self.graph.indices)
+        indptr  = self._indptr_cpu
+        indices = self._indices_cpu
+
+        nodes     = np.asarray(node_path, dtype=np.int64)
+        u_arr     = nodes[:-1]
+        v_arr     = nodes[1:]
+        row_start = indptr[u_arr]           # (N-1,)
+        row_end   = indptr[u_arr + 1]       # (N-1,)
+        row_len   = row_end - row_start     # (N-1,)
+        max_row   = int(row_len.max())
+        if max_row == 0:
+            return []
+
+        # Broadcast (N-1) × max_row candidate edge array, clipped to valid range
+        offsets    = np.arange(max_row, dtype=np.int64)              # (max_row,)
+        edge_cands = row_start[:, None] + offsets[None, :]           # (N-1, max_row)
+        valid      = offsets[None, :] < row_len[:, None]             # (N-1, max_row)
+        safe_cands = np.minimum(edge_cands, len(indices) - 1)
+        neighbors  = np.where(valid, indices[safe_cands], -1)        # (N-1, max_row)
+        match      = neighbors == v_arr[:, None]                     # (N-1, max_row)
+        edge_col   = match.argmax(axis=1)                            # (N-1,)  first True col
+        return (row_start + edge_col).tolist()
 
     def _detect_barrel_conflicts(self) -> Tuple[np.ndarray, int]:
         """
