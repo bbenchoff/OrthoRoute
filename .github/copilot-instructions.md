@@ -501,6 +501,7 @@ The router enforces `keepout_tracks` and `keepout_vias` via `_apply_keepout_obst
 
 **Needs Work:**
 - ⚠️ No unit tests
+- ⚠️ No regression test for routing quality (see `docs/contributing.md` TODO: Automated Regression Test)
 - ⚠️ Large classes need refactoring (`unified_pathfinder.py` ~5,967 lines)
 - ⚠️ `_build_owner_bitmap_for_fullgraph` still called per-net (~0.9ms × 512 = ~460ms/iter) — candidate for once-per-iter caching
 - ⚠️ Configuration consolidation
