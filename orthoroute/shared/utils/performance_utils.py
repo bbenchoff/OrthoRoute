@@ -1,4 +1,5 @@
 """Performance monitoring utilities."""
+import os
 import time
 import logging
 import psutil
@@ -33,6 +34,8 @@ def profile_time(func: Callable) -> Callable:
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        if os.environ.get('ORTHO_DEBUG', '0') != '1':
+            return func(*args, **kwargs)
         start = time.perf_counter()
         result = func(*args, **kwargs)
         end = time.perf_counter()

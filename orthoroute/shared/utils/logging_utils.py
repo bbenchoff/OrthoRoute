@@ -11,17 +11,13 @@ from ..configuration.settings import LoggingSettings
 def setup_logging(settings: LoggingSettings) -> None:
     """Setup logging configuration based on settings.
 
-    Args:
-        settings: Logging settings configuration
+    NOTE: This function is currently unused — init_logging() is the active
+    entry point called from main.py. Kept for potential future use.
+    ORTHO_DEBUG=1 is the single control knob for file log verbosity.
     """
-    # Create root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, settings.level.upper()))
-
-    # Clear existing handlers
     root_logger.handlers.clear()
 
-    # Create formatter
     formatter = logging.Formatter(
         fmt=settings.format_string,
         datefmt=settings.date_format
@@ -29,60 +25,52 @@ def setup_logging(settings: LoggingSettings) -> None:
 
     # Console handler with Windows Unicode fix
     if settings.console_output:
-        # Fix Windows console Unicode issues
         if hasattr(sys.stdout, "reconfigure"):
             try:
                 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
                 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
-
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(getattr(logging, settings.level.upper()))
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
 
     # File handler
     if settings.file_output:
         try:
-            # Ensure log directory exists
             log_path = Path(settings.log_file)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # Create rotating file handler with Windows-compatible settings
             file_handler = logging.handlers.RotatingFileHandler(
                 filename=settings.log_file,
                 maxBytes=settings.max_file_size_mb * 1024 * 1024,
                 backupCount=settings.backup_count,
                 encoding='utf-8',
-                delay=True  # Don't open file until first log - prevents Windows locking issues
+                delay=True
             )
-            file_handler.setLevel(getattr(logging, settings.level.upper()))
             file_handler.setFormatter(formatter)
             root_logger.addHandler(file_handler)
-
         except Exception as e:
-            # If file logging fails, log to console
             root_logger.error(f"Failed to setup file logging: {e}")
 
-    # Set component-specific levels
+    # Component-specific levels
     for component, level in settings.component_levels.items():
-        component_logger = logging.getLogger(component)
-        component_logger.setLevel(getattr(logging, level.upper()))
+        logging.getLogger(component).setLevel(getattr(logging, level.upper()))
 
-    # Configure handlers: DEBUG to file, WARNING to console
-    root_logger.setLevel(logging.DEBUG)  # Allow all levels through
+    # Override all handler levels to respect ORTHO_DEBUG:
+    #   Console  → WARNING  (always)
+    #   File     → WARNING  (normal) / DEBUG (when ORTHO_DEBUG=1)
+    import os
+    debug_mode = os.environ.get('ORTHO_DEBUG', '0') == '1'
+    file_level = logging.DEBUG if debug_mode else logging.WARNING
+    root_logger.setLevel(logging.DEBUG)  # Allow all levels through; handlers filter
     for h in root_logger.handlers:
         if isinstance(h, logging.StreamHandler) and h.stream == sys.stdout:
-            # Console handler: WARNING only
             h.setLevel(logging.WARNING)
         else:
-            # File handlers: DEBUG level
-            h.setLevel(logging.DEBUG)
+            h.setLevel(file_level)
 
-    # Log startup message
-    root_logger.warning("[LOG] Console: WARNING only (full logs in logs/ directory)")
-    root_logger.info("OrthoRoute logging initialized with file+console handlers")
+    mode_label = "DEBUG" if debug_mode else "WARNING"
+    root_logger.warning(f"[LOG] Console: WARNING only | File: {mode_label} (set ORTHO_DEBUG=1 for full logs)")
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -139,14 +127,21 @@ class ContextLogger:
 
 
 def init_logging():
-    """Initialize logging with DEBUG to file, WARNING to console.
+    """Initialize logging.
 
-    This prevents Claude Code memory overflow while preserving full logs for debugging.
-    - File (logs/latest.log): DEBUG level - everything
-    - Console (stdout): WARNING level - critical messages only
+    Normal mode  (ORTHO_DEBUG unset / '0'):
+        File  → WARNING  (~66 milestone lines/run incl. [ROUTING START] + [ITER N] timing)
+        Console → WARNING
+
+    Debug mode (ORTHO_DEBUG=1):
+        File  → DEBUG (full detail, thousands of lines)
+        Console → WARNING
     """
     import os
     from datetime import datetime
+
+    debug_mode = os.environ.get('ORTHO_DEBUG', '0') == '1'
+    file_level = logging.DEBUG if debug_mode else logging.WARNING
 
     # Create logs directory
     os.makedirs("logs", exist_ok=True)
@@ -165,31 +160,31 @@ def init_logging():
 
     fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-    # FILE HANDLER 1: latest.log (DEBUG level - everything)
+    # FILE HANDLER 1: latest.log
     fh_latest = logging.FileHandler(latest_log, mode='w', encoding='utf-8')
-    fh_latest.setLevel(logging.DEBUG)
+    fh_latest.setLevel(file_level)
     fh_latest.setFormatter(fmt)
 
-    # FILE HANDLER 2: timestamped log (DEBUG level - everything)
+    # FILE HANDLER 2: timestamped log
     fh_timestamped = logging.FileHandler(timestamped_log, mode='w', encoding='utf-8')
-    fh_timestamped.setLevel(logging.DEBUG)
+    fh_timestamped.setLevel(file_level)
     fh_timestamped.setFormatter(fmt)
 
-    # CONSOLE HANDLER: WARNING only (prevents memory overflow)
+    # CONSOLE HANDLER: WARNING only
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.WARNING)
     console_handler.setFormatter(fmt)
 
     # Configure root logger
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)  # Allow DEBUG through (handlers will filter)
+    root.setLevel(logging.DEBUG)  # Allow all levels through; handlers filter
     root.addHandler(fh_latest)
     root.addHandler(fh_timestamped)
     root.addHandler(console_handler)
 
     # Log startup message
-    root.info(f"[LOGGING] Full logs: {latest_log} and {timestamped_log}")
-    root.warning(f"[LOGGING] Console: WARNING only (full logs in logs/ directory)")
+    mode_label = "DEBUG" if debug_mode else "WARNING"
+    root.warning(f"[LOG] File: {mode_label} | {latest_log} + {timestamped_log} (set ORTHO_DEBUG=1 for full logs)")
 
 
 def get_context_logger(name: str, **context) -> ContextLogger:

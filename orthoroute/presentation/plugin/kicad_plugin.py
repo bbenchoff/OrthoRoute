@@ -40,7 +40,8 @@ class KiCadPlugin:
     def _setup_logging(self):
         """Setup logging configuration for plugin."""
         # NOTE: Logging already configured by init_logging() in main.py
-        # init_logging() sets up: DEBUG→file (logs/), WARNING→console
+        # Normal mode:  WARNING→file (~66 milestone lines/run), WARNING→console
+        # Debug mode:   DEBUG→file (full detail), WARNING→console  [set ORTHO_DEBUG=1]
         # DO NOT modify handler levels here to prevent console spam
         pass
     

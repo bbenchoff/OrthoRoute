@@ -30,7 +30,7 @@ def setup_environment():
     config = initialize_config()
 
     # NOTE: setup_logging() disabled to prevent duplicate handlers
-    # init_logging() already configured DEBUG→file, WARNING→console
+    # init_logging() already configured: WARNING→file (normal) / DEBUG→file (ORTHO_DEBUG=1), WARNING→console
     # setup_logging(config.get_settings().logging)
 
     return config

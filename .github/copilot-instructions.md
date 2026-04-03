@@ -68,6 +68,36 @@ pytest --cov=orthoroute
 python main.py --test-manhattan  # Requires KiCad running
 ```
 
+#### Environment Variables — Set Before Running Tests
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ORTHO_DEBUG` | `0` | Master debug switch. `1` = full DEBUG log file + iteration screenshots |
+| `ORTHO_SCREENSHOT_FREQ` | `1` | Save screenshot every N iterations (only when `ORTHO_DEBUG=1`) |
+| `ORTHO_SCREENSHOT_SCALE` | `8` | PNG resolution multiplier for screenshots |
+
+**Normal (production) run — no env vars needed:**
+```powershell
+# Log file captures WARNING+ (~66 milestone lines including [ROUTING START] and per-iteration
+# timing: iter=Xs  total=Xs); no screenshots generated
+python main.py plugin
+```
+
+**Debug / profiling run:**
+```powershell
+$env:ORTHO_DEBUG = '1'              # full DEBUG log + screenshots
+$env:ORTHO_SCREENSHOT_FREQ = '5'   # every 5 iterations (reduce I/O)
+python main.py plugin
+# Analyse profiling output:
+$log = "<plugin_dir>\logs\latest.log"
+Get-Content $log | Select-String "\[PROFILE\]" | ...
+```
+
+**Tear down after testing:**
+```powershell
+Remove-Item Env:ORTHO_DEBUG, Env:ORTHO_SCREENSHOT_FREQ, Env:ORTHO_SCREENSHOT_SCALE -ErrorAction SilentlyContinue
+```
+
 ---
 
 ## Architecture
@@ -374,7 +404,16 @@ pip install -e ".[dev,gpu,gui]"
 6. **Console output too noisy during routing**
    - Console handler is set to WARNING+ — only milestones, errors, and `[PROFILE]` lines should appear
    - If INFO messages flood the console, a logger call was accidentally promoted — check recent changes to `unified_pathfinder.py`
-   - Full detail is always in the log file (DEBUG+)
+   - Full detail is only in the log file when `ORTHO_DEBUG=1`; default file level is `CRITICAL`
+
+7. **Log file is empty / only has startup lines**
+   - Default file log level is `WARNING` — you should see ~66 milestone lines including `[ROUTING START]` and `[ITER N]` with timing
+   - Set `$env:ORTHO_DEBUG = '1'` before launching KiCad to get full DEBUG output
+
+8. **Screenshots not being saved**
+   - Screenshots are disabled in normal mode
+   - Set `$env:ORTHO_DEBUG = '1'` to enable; files appear in `debug_output/run_<timestamp>/`
+   - Control frequency with `ORTHO_SCREENSHOT_FREQ` and resolution with `ORTHO_SCREENSHOT_SCALE`
 
 ### Architectural Pitfalls
 
@@ -453,14 +492,17 @@ The router enforces `keepout_tracks` and `keepout_vias` via `_apply_keepout_obst
 - ✅ Keepout rule area extraction, visualization, router enforcement, right-click inspection
 - ✅ PCB viewer layer visibility controls
 - ✅ `build.py` correctly packages `orthoroute.json` and validates it
-- ✅ Logging reclassified in `unified_pathfinder.py` — console shows ~66 WARNING milestones per run; file captures full DEBUG detail (was 799 MB, now significantly reduced)
+- ✅ Logging reclassified in `unified_pathfinder.py` — console shows ~66 WARNING milestones per run
+- ✅ Log file defaults to `CRITICAL` (normal mode); `ORTHO_DEBUG=1` enables full DEBUG detail
+- ✅ Iteration screenshots disabled by default; opt-in via `ORTHO_DEBUG=1` (PNG write offloaded to background thread — zero routing stall)
 - ✅ `@profile_time` decorator available in `shared/utils/performance_utils.py`
 - ✅ `copy_to_kicad.ps1` — portable dev sync script (resolves KiCad path via `MyDocuments`)
+- ✅ `_path_to_edges` vectorized (180× speedup); `commit_path` vectorized (9× speedup) — iter time 22s → 11s
 
 **Needs Work:**
 - ⚠️ No unit tests
 - ⚠️ Large classes need refactoring (`unified_pathfinder.py` ~5,967 lines)
-- ⚠️ `@profile_time` not yet applied to core algorithm functions — unprofiled routing time unknown
+- ⚠️ `_build_owner_bitmap_for_fullgraph` still called per-net (~0.9ms × 512 = ~460ms/iter) — candidate for once-per-iter caching
 - ⚠️ Configuration consolidation
 
 See [docs/contributing.md](../docs/contributing.md) for detailed contribution guidance.

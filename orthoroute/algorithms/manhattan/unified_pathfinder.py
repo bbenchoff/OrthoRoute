@@ -524,7 +524,6 @@ except ImportError:
 # Local imports
 from ...domain.models.board import Board
 from .pathfinder.kicad_geometry import KiCadGeometry
-from ...shared.utils.performance_utils import profile_time
 
 # GPU pathfinding
 try:
@@ -819,7 +818,6 @@ class EdgeAccountant:
             if 0 <= idx < self.E:
                 self.present[idx] = float(count)
 
-    @profile_time
     def commit_path(self, edge_indices: List[int]):
         """Add path and keep present in sync"""
         if not edge_indices:
@@ -2513,7 +2511,6 @@ class PathFinderRouter:
             retarget_count=0
         )
 
-    @profile_time
     def _get_portal_seeds(self, portal: Portal) -> List[Tuple[int, float]]:
         """
         Get portal entry point seeds for routing.
@@ -2534,7 +2531,6 @@ class PathFinderRouter:
         seeds.append((node_idx, cost))
         return seeds
 
-    @profile_time
     def _build_routing_seeds(self, portal_seeds_list):
         """
         Convert portal seeds from (node_idx, cost) tuples to plain node_idx arrays.
@@ -2708,7 +2704,6 @@ class PathFinderRouter:
                         if key not in self._via_keepouts_map:
                             self._via_keepouts_map[key] = net_id
 
-    @profile_time
     def _rebuild_via_usage_from_committed(self):
         """Incrementally update via column/segment usage from committed net paths.
 
@@ -2859,80 +2854,95 @@ class PathFinderRouter:
         """
         Rebuild node ownership map from portal reservations and committed vias.
 
-        This is THE solution to via barrel conflicts:
-        - Track which net owns each node (via barrels occupy nodes, not just edges)
-        - Enforce via ROI bitmap masking (O(ROI_size) per net, not O(N×M)!)
-        - Works for both full-graph and ROI routing
+        Vectorized rewrite: replaces O(N_hops) Python idx_to_coord calls with
+        NumPy arithmetic decode, and replaces 10k-entry keepout dict iteration
+        with a single vectorized key extraction.
 
-        Performance: O(portals + via_count × avg_span) = milliseconds, not minutes!
+        flat_idx = z*(Nx*Ny) + y*Nx + x  →  z=idx//plane, y=(idx%plane)//Nx, x=idx%Nx
         """
         if not hasattr(self, 'node_owner'):
             return
 
-        # Reset to all free
         self.node_owner.fill(-1)
-
         owned_count = 0
 
-        # 1. PORTAL RESERVATIONS: DISABLED - causing frontier empty issues
-        # TODO: Debug why portal reservations block source seeds
-        # if hasattr(self, 'portals') and self.portals:
-        #     for pad_id, portal in self.portals.items():
-        #         net_name = pad_id.rsplit('-', 1)[0] if '-' in pad_id else pad_id
-        #         net_id = self._get_net_id(net_name)
-        #         x_idx, y_idx = portal.x_idx, portal.y_idx
-        #         for z in range(1, self.lattice.layers - 1):
-        #             node_idx = self.lattice.node_idx(x_idx, y_idx, z)
-        #             self.node_owner[node_idx] = net_id
-        #             owned_count += 1
+        Nx    = self._Nx           # x_steps
+        Ny    = self._Ny           # y_steps
+        plane = Nx * Ny            # nodes per layer
 
-        # 2. COMMITTED VIA BARRELS: Mark nodes occupied by routed vias
+        # ── Part 1: Committed via barrels ────────────────────────────────────
+        # Decode every path at once with NumPy; inner z-range loop is tiny
+        # (only fires for actual vias, ~1-5 per path).
+        all_barrel_nodes  = []
+        all_barrel_owners = []
+
         for net_name, path in self.net_paths.items():
             if not path or len(path) < 2:
                 continue
-
             net_id = self._get_net_id(net_name)
+            nodes  = np.asarray(path, dtype=np.int64)
+            u_nodes = nodes[:-1]; v_nodes = nodes[1:]
 
-            # Walk path and find layer transitions (vias)
-            for i in range(len(path) - 1):
-                u, v = path[i], path[i+1]
-                xu, yu, zu = self.lattice.idx_to_coord(u)
-                xv, yv, zv = self.lattice.idx_to_coord(v)
+            # Vectorized coordinate decode (no Python idx_to_coord calls)
+            u_z = u_nodes // plane;  v_z = v_nodes // plane
+            u_r = u_nodes %  plane;  v_r = v_nodes %  plane
+            u_y = u_r // Nx;         v_y = v_r // Nx
+            u_x = u_r %  Nx;         v_x = v_r %  Nx
 
-                # Via: same (x,y), different z
-                if xu == xv and yu == yv and zu != zv:
-                    # Mark ALL nodes in the via barrel span
-                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
-                    for z in range(z_lo, z_hi + 1):
-                        node_idx = self.lattice.node_idx(xu, yu, z)
-                        self.node_owner[node_idx] = net_id
-                        owned_count += 1
+            # Via transitions: same (x,y), different z
+            via_mask = (u_x == v_x) & (u_y == v_y) & (u_z != v_z)
+            if not np.any(via_mask):
+                continue
 
-        # 3. ESCAPE VIA COLUMNS: Mark internal-layer nodes from via keepouts (escape vias!)
-        # This is THE missing piece - escape vias in _via_keepouts_map weren't in node_owner!
+            vx   = u_x[via_mask].astype(np.int32)
+            vy   = u_y[via_mask].astype(np.int32)
+            z_lo = np.minimum(u_z[via_mask], v_z[via_mask]).astype(np.int32)
+            z_hi = np.maximum(u_z[via_mask], v_z[via_mask]).astype(np.int32)
+
+            # Expand each via's z-range (small inner loop: ~3 iters avg)
+            for i in range(len(vx)):
+                xi = int(vx[i]); yi = int(vy[i])
+                for z_val in range(int(z_lo[i]), int(z_hi[i]) + 1):
+                    all_barrel_nodes.append(z_val * plane + yi * Nx + xi)
+                    all_barrel_owners.append(net_id)
+
+        if all_barrel_nodes:
+            barrel_arr = np.asarray(all_barrel_nodes, dtype=np.int32)
+            owner_arr  = np.asarray(all_barrel_owners, dtype=np.int32)
+            self.node_owner[barrel_arr] = owner_arr
+            owned_count += len(barrel_arr)
+
+        # ── Part 2: Escape via keepouts ───────────────────────────────────────
+        # Vectorized key extraction replaces 10k+ Python dict iteration calls.
         if hasattr(self, '_via_keepouts_map') and self._via_keepouts_map:
-            escape_owned = 0
-            for (z, xu, yu), owner_net in self._via_keepouts_map.items():
-                # Skip F.Cu (z=0) so source seeds aren't blocked
-                if z <= 0:
-                    continue
-                node_idx = self.lattice.node_idx(xu, yu, z)
-                net_id_int = self._get_net_id(owner_net)
-                # First owner wins (don't thrash ownership)
-                if self.node_owner[node_idx] == -1:
-                    self.node_owner[node_idx] = net_id_int
-                    owned_count += 1
-                    escape_owned += 1
-
-            if escape_owned > 0:
-                logger.debug(f"[NODE-OWNER] Escape via columns marked: {escape_owned:,} internal layer nodes")
+            esc_keys = list(self._via_keepouts_map.keys())   # [(z, xu, yu), ...]
+            esc_nets = list(self._via_keepouts_map.values())
+            k_arr  = np.array(esc_keys, dtype=np.int32)      # (K, 3)
+            z_arr  = k_arr[:, 0]
+            xu_arr = k_arr[:, 1]
+            yu_arr = k_arr[:, 2]
+            # Skip F.Cu (z=0) so source seeds aren't blocked
+            mask = z_arr > 0
+            if np.any(mask):
+                z_f  = z_arr[mask];  xu_f = xu_arr[mask];  yu_f = yu_arr[mask]
+                nodes_esc = (z_f.astype(np.int64) * plane
+                             + yu_f.astype(np.int64) * Nx
+                             + xu_f).astype(np.int32)
+                idx_where = np.where(mask)[0]
+                owner_ids_esc = np.fromiter(
+                    (self._get_net_id(esc_nets[i]) for i in idx_where),
+                    dtype=np.int32, count=int(mask.sum())
+                )
+                # First-owner-wins: only write where node is still free
+                free_mask = self.node_owner[nodes_esc] == -1
+                self.node_owner[nodes_esc[free_mask]] = owner_ids_esc[free_mask]
+                owned_count += int(free_mask.sum())
 
         logger.debug(f"[NODE-OWNER] Marked {owned_count:,} nodes as owned ({owned_count*100//self.lattice.num_nodes}% of graph)")
-        # NOTE: Node ownership enforced via bitmap filtering in GPU kernels, not cost penalties!
+        # NOTE: Ownership enforced via bitmap filtering in GPU kernels, not cost penalties.
 
-        # Sync full array to GPU once per iteration rebuild (avoids per-net upload)
+        # Sync full array to GPU once per rebuild (avoids per-net upload)
         try:
-            import cupy as cp
             self.node_owner_gpu = cp.asarray(self.node_owner)
             logger.debug("[NODE-OWNER] Synced node_owner to GPU")
         except Exception:
@@ -2979,7 +2989,6 @@ class PathFinderRouter:
         self._edge_src = edge_src
         logger.debug(f"[EDGE-SRC-MAP] Built mapping for {num_edges:,} edges")
 
-    @profile_time
     def _mark_via_barrel_ownership_for_path(self, net_name: str, path: List[int]) -> None:
         """
         Mark via barrel nodes as owned by this net IMMEDIATELY after commit.
@@ -3835,8 +3844,13 @@ class PathFinderRouter:
         logger.warning("[BARREL-CONFLICT-INIT] Building edge_src_map once before routing")
         self._ensure_edge_src_map()
 
+        routing_start_time = time.time()
+        logger.warning(f"[ROUTING START] {len(tasks)} nets  max_iters={cfg.max_iterations}  "
+                       f"pres_fac_init={pres_fac:.2f}  pres_fac_mult={pres_fac_mult:.2f}")
+
         for it in range(1, cfg.max_iterations + 1):
             self.iteration = it
+            iter_start_time = time.time()
             logger.debug(f"[ITER {it}] pres_fac={pres_fac:.2f}")
 
             # Log iteration 1 always-connect policy
@@ -4119,7 +4133,9 @@ class PathFinderRouter:
             # Clean consolidated iteration summary (WARNING level so it shows in console)
             status = "✓ CONVERGED" if over_sum == 0 else f"overuse={over_sum}"
             barrel_info = f"  barrel={barrel_conflicts}" if barrel_conflicts > 0 else ""
-            logger.warning(f"[ITER {it:3d}] nets={routed}/{routed+failed}  {status}  edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}")
+            iter_elapsed = time.time() - iter_start_time
+            cumulative_elapsed = time.time() - routing_start_time
+            logger.warning(f"[ITER {it:3d}] nets={routed}/{routed+failed}  {status}  edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}  iter={iter_elapsed:.1f}s  total={cumulative_elapsed:.1f}s")
 
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0) - only first 3 iterations
             if it <= 3:
@@ -5661,7 +5677,6 @@ class PathFinderRouter:
             }
             logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on CPU in {time.perf_counter() - t0:.3f}s")
 
-    @profile_time
     def _path_to_edges(self, node_path: List[int]) -> List[int]:
         """Nodes → edge indices via vectorized NumPy broadcast search (cached CPU arrays)"""
         if len(node_path) < 2:

@@ -238,6 +238,37 @@ Typical use case: Cloud GPU routing
 
 Upload your .ORP file to a cloud GPU instance (Vast.ai, RunPod, etc.), run the routing there, then download the .ORS file back to your local machine for import. This allows routing large boards on powerful GPUs with more memory. Details on the file format are available [in the docs](docs/ORP_ORS_file_formats.md)
 
+### Debug Mode & Logging
+
+By default OrthoRoute runs in **normal mode** — minimal log output, no iteration screenshots:
+
+| Behaviour | Normal mode (default) | Debug mode (`ORTHO_DEBUG=1`) |
+|---|---|---|
+| Log file level | `WARNING` only (~66 milestone lines/run) | `DEBUG` (full detail) |
+| Iteration screenshots | Disabled | Saved to `debug_output/` at 8× resolution |
+| Screenshot frequency | — | Every N iterations (`ORTHO_SCREENSHOT_FREQ`) |
+| Screenshot scale | — | 8× default (`ORTHO_SCREENSHOT_SCALE`) |
+
+**Enable debug mode before launching KiCad (PowerShell):**
+```powershell
+$env:ORTHO_DEBUG = '1'
+start kicad          # or however you launch KiCad
+```
+
+**Fine-tune screenshot output:**
+```powershell
+$env:ORTHO_DEBUG             = '1'   # master switch
+$env:ORTHO_SCREENSHOT_FREQ   = '5'   # screenshot every 5 iterations
+$env:ORTHO_SCREENSHOT_SCALE  = '4'   # 4× resolution instead of 8×
+```
+
+**Disable again:**
+```powershell
+Remove-Item Env:ORTHO_DEBUG
+```
+
+Log files are always written to `<plugin_dir>/logs/` regardless of mode.
+
 ### There's something wrong with the KiCad IPC API
 
 For reasons I don't comprehend, the KiCad IPC API only works when the "Select Items" (the arrow pointer) is active and nothing is selected. The API doesn't work if you're trying to route tracks or drawing text. If you do, something like this message will pop up:

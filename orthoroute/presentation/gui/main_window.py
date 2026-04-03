@@ -1140,9 +1140,12 @@ class PCBViewer(QWidget):
         menu.exec(event.globalPos())
 
     def debug_screenshot(self, filename_prefix: str = "debug_routing", scale_factor: int = 1, output_dir: str = None):
-        """Capture screenshot of the PCB viewer for debugging with optional high-res rendering"""
+        """Capture screenshot of the PCB viewer for debugging with optional high-res rendering.
+        The Qt render happens on the calling (GUI) thread; the PNG write is offloaded to a
+        background thread so routing is not stalled by disk I/O."""
         try:
             import os
+            import threading
             from datetime import datetime
 
             # Determine output directory
@@ -1157,37 +1160,34 @@ class PCBViewer(QWidget):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
             filename = f"{debug_dir}/{filename_prefix}_{timestamp}.png"
 
-            # Capture the widget at specified resolution
+            # --- Render on GUI thread (must not be moved to background) ---
             if scale_factor > 1:
-                # High-res rendering
                 widget_size = self.size()
                 scaled_size = widget_size * scale_factor
 
-                # Create high-res image
                 image = QImage(scaled_size, QImage.Format.Format_ARGB32)
                 image.fill(Qt.GlobalColor.transparent)
 
-                # Render widget to image with scaling
                 painter = QPainter(image)
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
                 painter.scale(scale_factor, scale_factor)
                 self.render(painter)
                 painter.end()
-
-                # Save the image
-                success = image.save(filename, "PNG")
             else:
-                # Standard resolution
-                pixmap = self.grab()
-                success = pixmap.save(filename, "PNG")
+                image = self.grab().toImage()
 
-            if success:
-                print(f"DEBUG: Screenshot saved to {filename} (scale={scale_factor}x)")
-                return filename
-            else:
-                print(f"DEBUG: Failed to save screenshot to {filename}")
-                return None
+            # --- Write PNG in background thread (non-blocking) ---
+            def _save(img, path, sf):
+                ok = img.save(path, "PNG")
+                if ok:
+                    print(f"DEBUG: Screenshot saved to {path} (scale={sf}x)")
+                else:
+                    print(f"DEBUG: Failed to save screenshot to {path}")
+
+            t = threading.Thread(target=_save, args=(image, filename, scale_factor), daemon=True)
+            t.start()
+            return filename
 
         except Exception as e:
             print(f"DEBUG: Screenshot error: {e}")
@@ -2139,14 +2139,14 @@ class OrthoRouteMainWindow(QMainWindow):
                         self.pcb_viewer.update()
                         QApplication.processEvents()
 
-                    # Memory-efficient screenshot controls
+                    # Screenshots: off by default, enabled only in debug mode (ORTHO_DEBUG=1)
                     import os
-                    disable_screenshots = os.environ.get('ORTHO_NO_SCREENSHOTS', '0') == '1'
+                    debug_mode = os.environ.get('ORTHO_DEBUG', '0') == '1'
                     screenshot_freq = int(os.environ.get('ORTHO_SCREENSHOT_FREQ', '1'))
                     screenshot_scale = int(os.environ.get('ORTHO_SCREENSHOT_SCALE', '8'))
 
-                    # Only capture screenshots if enabled and at appropriate frequency
-                    if not disable_screenshots and (iteration % screenshot_freq == 0):
+                    # Only capture screenshots in debug mode and at appropriate frequency
+                    if debug_mode and (iteration % screenshot_freq == 0):
                         screenshot_name = f"{iteration+3:02d}_iteration_{iteration:02d}"
                         self.pcb_viewer.show_airwires = False  # Hide airwires for clarity
                         self.pcb_viewer.fit_to_view()
