@@ -10,6 +10,37 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 
+def profile_time(func: Callable) -> Callable:
+    """Decorator to measure and print execution time in milliseconds.
+
+    Simple lightweight decorator for quick performance profiling.
+    Adapted from kicad_pdn project.
+    Uses WARNING level for console visibility (OrthoRoute routing logs use WARNING).
+
+    Args:
+        func: Function to profile
+
+    Returns:
+        Wrapped function that prints execution time
+
+    Example:
+        @profile_time
+        def expensive_operation():
+            # ... do work ...
+            pass
+
+        # Output: [PROFILE] expensive_operation: 123.45ms
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        end = time.perf_counter()
+        logger.warning(f"[PROFILE] {func.__name__}: {(end-start)*1000:.2f}ms")
+        return result
+    return wrapper
+
+
 @dataclass
 class PerformanceMetrics:
     """Container for performance metrics."""

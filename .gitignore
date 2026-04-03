@@ -179,5 +179,3 @@ iteration_*.md
 orthoroute.log.*
 orthoroute_debug.log
 orthoroute_debug.log.*
-
-copy_to_kicad.ps1

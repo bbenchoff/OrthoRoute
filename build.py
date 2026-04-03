@@ -249,6 +249,15 @@ class OrthoRouteBuildSystem:
                 shutil.copy2(icon_src, pkg / dst_name)
                 logger.info(f"  [OK] {dst_name}")
 
+        # graphics/kicad_theme.json — color theme for PCB viewer
+        (pkg / "graphics").mkdir(exist_ok=True)
+        theme_src = gfx / "kicad_theme.json"
+        if theme_src.exists():
+            shutil.copy2(theme_src, pkg / "graphics" / "kicad_theme.json")
+            logger.info("  [OK] graphics/kicad_theme.json")
+        else:
+            logger.warning("  [WARN] graphics/kicad_theme.json not found — PCB viewer will use fallback colors")
+
         # requirements.txt, LICENSE, orthoroute.json (runtime config)
         for fname in ("requirements.txt", "LICENSE", "orthoroute.json"):
             f = self.project_root / fname

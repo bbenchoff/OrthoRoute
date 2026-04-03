@@ -1,8 +1,25 @@
-# OrthoRoute - AI Agent Workspace Instructions
+# OrthoRoute — Agent Workspace Instructions
 
-**OrthoRoute** is a GPU-accelerated PCB autorouter for KiCad that uses the PathFinder negotiated congestion algorithm on a Manhattan lattice to route high-density boards (tested up to 32 layers, 3,200 pads). This is research code transitioning to production—expect interesting algorithms but rough edges.
+GPU-accelerated PCB autorouter for KiCad (PathFinder / Manhattan lattice, up to 32 layers, 3 200 pads). Research code transitioning to production. See [README](../README.md) and the [build log](https://bbenchoff.github.io/pages/OrthoRoute.html) for full background.
 
-For comprehensive project background, see the [build log](https://bbenchoff.github.io/pages/OrthoRoute.html) and [README](../README.md).
+---
+
+## Agent Workflow — REQUIRED
+
+**Always follow this sequence when making any code or config change:**
+
+1. **Make the change** — edit source files in the repo
+2. **Sync to KiCad** — run `.\copy_to_kicad.ps1` immediately after every change
+3. **Wait for user confirmation** — user tests in KiCad and confirms it works
+4. **Commit locally** — only after explicit user approval ("commit", "looks good", etc.)
+5. **Never push** to remote git without explicit user instruction
+
+```powershell
+# Step 2 — always run this after changes, before asking the user to test
+.\copy_to_kicad.ps1
+```
+
+> Do NOT commit before the user has tested. Do NOT push to remote unless asked.
 
 ---
 
@@ -174,10 +191,12 @@ python build.py --deploy
 
 **Dev sync (faster than rebuild):**
 ```powershell
-# copy_to_kicad.ps1 — syncs source files directly to OneDrive 3rdparty location
-# Included in .gitignore. Copies: main.py, swig_init.py, orthoroute/ subpackages,
-# graphics/, domain/models/board.py, algorithms/manhattan/unified_pathfinder.py
-.\copy_to_kicad.ps1
+# copy_to_kicad.ps1 — syncs all .py sources + orthoroute.json directly to the
+# local KiCad plugin folder. Resolves the destination via
+# [Environment]::GetFolderPath('MyDocuments') so it works on any machine
+# regardless of OneDrive / corporate folder redirection.
+.\copy_to_kicad.ps1          # quiet — shows summary only
+.\copy_to_kicad.ps1 -Verbose # shows each file copied
 ```
 
 **Plugin logs** (written every run):
@@ -295,10 +314,12 @@ pip install -e ".[dev,gpu,gui]"
 | [orthoroute.json](../orthoroute.json)         | Default configuration (copied into built package) |
 | [presentation/pipeline.py](../orthoroute/presentation/pipeline.py) | Shared execution pipeline (CLI + GUI) |
 | [presentation/plugin/kicad_plugin.py](../orthoroute/presentation/plugin/kicad_plugin.py) | KiCad plugin entry point |
-| [algorithms/manhattan/unified_pathfinder.py](../orthoroute/algorithms/manhattan/unified_pathfinder.py) | Main routing engine (3,936 lines) |
+| [algorithms/manhattan/unified_pathfinder.py](../orthoroute/algorithms/manhattan/unified_pathfinder.py) | Main routing engine (~5,967 lines) |
 | [infrastructure/kicad/rich_kicad_interface.py](../orthoroute/infrastructure/kicad/rich_kicad_interface.py) | IPC board data extraction (pads, tracks, vias, zones, keepouts) |
 | [presentation/gui/main_window.py](../orthoroute/presentation/gui/main_window.py) | PCB viewer — rendering + display controls |
 | [domain/models/board.py](../orthoroute/domain/models/board.py) | Board aggregate root (nets, layers, keepouts) |
+| [shared/utils/performance_utils.py](../orthoroute/shared/utils/performance_utils.py) | `@profile_time` decorator — logs `[PROFILE] func: Xms` at WARNING |
+| [shared/utils/logging_utils.py](../orthoroute/shared/utils/logging_utils.py) | `setup_logging()` — console WARNING+, file DEBUG+ (rotating) |
 
 ### Test Boards
 
@@ -349,6 +370,11 @@ pip install -e ".[dev,gpu,gui]"
 5. **Log file flooded with identical lines during panning/zooming**
    - All per-paint-event messages in `_draw_tracks`, `_draw_vias`, `_draw_zones` are at DEBUG level
    - If you see them at INFO it means a regression — check those three methods
+
+6. **Console output too noisy during routing**
+   - Console handler is set to WARNING+ — only milestones, errors, and `[PROFILE]` lines should appear
+   - If INFO messages flood the console, a logger call was accidentally promoted — check recent changes to `unified_pathfinder.py`
+   - Full detail is always in the log file (DEBUG+)
 
 ### Architectural Pitfalls
 
@@ -427,10 +453,14 @@ The router enforces `keepout_tracks` and `keepout_vias` via `_apply_keepout_obst
 - ✅ Keepout rule area extraction, visualization, router enforcement, right-click inspection
 - ✅ PCB viewer layer visibility controls
 - ✅ `build.py` correctly packages `orthoroute.json` and validates it
+- ✅ Logging reclassified in `unified_pathfinder.py` — console shows ~66 WARNING milestones per run; file captures full DEBUG detail (was 799 MB, now significantly reduced)
+- ✅ `@profile_time` decorator available in `shared/utils/performance_utils.py`
+- ✅ `copy_to_kicad.ps1` — portable dev sync script (resolves KiCad path via `MyDocuments`)
 
 **Needs Work:**
 - ⚠️ No unit tests
-- ⚠️ Large classes need refactoring
+- ⚠️ Large classes need refactoring (`unified_pathfinder.py` ~5,967 lines)
+- ⚠️ `@profile_time` not yet applied to core algorithm functions — unprofiled routing time unknown
 - ⚠️ Configuration consolidation
 
 See [docs/contributing.md](../docs/contributing.md) for detailed contribution guidance.
