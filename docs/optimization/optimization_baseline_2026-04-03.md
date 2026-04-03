@@ -13,12 +13,20 @@ Successfully routed a **18-layer backplane** with **512 nets**, **1,604 pads** i
 
 **Run history:**
 
-| Date | Change | Time | Iter | Result |
-|------|--------|------|------|--------|
-| Apr 3 (baseline) | Multi-launch kernel | 47.9 min | 74 | 512/512 ✓ |
-| Apr 3 (persistent kernel) | Persistent CUDA kernel + bitmap fix | **25 min** | 70 | 512/512 ✓ |
+| Run | Date | Change | Total Time | Iter avg | Result | Notes |
+|-----|------|--------|------------|----------|--------|-------|
+| 1 | Apr 3 | Baseline — multi-launch kernel | 47.9 min | ~39s | 512/512 ✓ | 74 iters |
+| 2 | Apr 3 | Persistent CUDA kernel enabled | **25 min** | ~20s | 512/512 ✓ | 70 iters, **2× gain** |
+| 3 | Apr 3 | `cp.scatter_add` vectorized bitmap loops | ~25 min | ~22s | 512/512 ✓ | Bug fix run — `cp.scatter_add` doesn't exist, fixed to `cupyx.scatter_add` + bitmap OR corruption fix |
+| 4 | Apr 3 | GPU-resident `node_owner_gpu` + zero-upload bitmap | ~25 min | ~22s | 512/512 ✓ | **No measurable improvement** — bottleneck was not bitmap upload |
 
-**Current bottleneck**: Python bitmap construction — `int(seed)` loop in `find_path_fullgraph_gpu_seeds()` triggers ~100 GPU→CPU syncs per net, dominating per-net time at ~50ms vs 3–24ms kernel GPU time. See [OPTIMIZATION_QUICK_REF.md](OPTIMIZATION_QUICK_REF.md) for the vectorized fix.
+**Current bottleneck**: Unknown — per-net wall time is ~90–130ms but GPU kernel time is only 4–22ms. The ~70–100ms gap remains after eliminating bitmap loops and bitmap upload. Likely candidates: Python path reconstruction overhead, `_path_to_edges()`, `commit_path()`, or per-net accounting in Python.
+
+**What did NOT help**:
+- Vectorizing `int(seed)` loops → fixed correctness (bug), no measurable perf gain
+- Building bitmap on GPU (`node_owner_gpu`) → no measurable speedup (upload was not the bottleneck)
+
+See [OPTIMIZATION_QUICK_REF.md](OPTIMIZATION_QUICK_REF.md) for current priority table.
 
 **Initial Finding (corrected)**: `_rebuild_via_usage_from_committed()` was believed to be the #1 target.
 **Live-run correction (April 3, 2026)**: After profiling 40 iterations and 3,311 GPU paths, the via rebuild consumes **~1% of routing time**. The real bottleneck was the **MULTI-LAUNCH Python→CUDA loop** — now replaced by the persistent kernel. New bottleneck is Python bitmap construction (~50ms/net).
@@ -83,10 +91,11 @@ Successfully routed a **18-layer backplane** with **512 nets**, **1,604 pads** i
 | Priority | Target | Measured Cost | % of per-net | Status |
 |----------|--------|--------------|--------------|--------|
 | ✅ **DONE** | MULTI-LAUNCH Python→CUDA overhead | ~980s / run | was ~95% | **Fixed — persistent kernel** |
-| 🔴 **#1 (new)** | Python bitmap construction (int-loop GPU→CPU syncs) | ~50ms/net | **~65%** | Vectorize with `cp.scatter_add` |
-| 🟡 **#2** | GPU→CPU convergence check | ~10ms/net | **~13%** | Check less frequently or on-device |
-| 🟡 **#3** | `initialize_graph()` | 20.9s once | one-time | GPU-accelerated CSR build |
-| 🟢 **#4 (was #1)** | `_rebuild_via_usage_from_committed()` | ~11s / run | **~1%** | Already incremental; low priority |
+| ✅ **DONE (bug fix)** | `int(seed)` loops — bitmap/frontier init | ~50ms/net estimated | n/a | Fixed correctness; **no perf gain measured** |
+| ✅ **DONE (no gain)** | GPU-resident `node_owner_gpu` + zero-upload bitmap | ~56KB/net upload | estimated <5ms | Built, deployed — **no measurable improvement** |
+| 🔴 **#1 (unresolved)** | Unknown ~70–100ms gap per net | ~90–130ms wall vs 4–22ms GPU | **~80%** | Not yet identified — profiling needed |
+| 🟡 **#2** | `initialize_graph()` | 20.9s once | one-time | GPU-accelerated CSR build |
+| 🟢 **#3 (was #1)** | `_rebuild_via_usage_from_committed()` | ~11s / run | **~1%** | Already incremental; low priority |
 
 ---
 

@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 
 try:
     import cupy as cp
+    import cupyx
     import cupyx.scipy.sparse
     CUDA_AVAILABLE = True
 except ImportError:
@@ -5506,25 +5507,21 @@ class CUDADijkstra:
         src_seeds_gpu = cp.asarray(src_seeds, dtype=cp.int32)
         dst_targets_gpu = cp.asarray(dst_targets, dtype=cp.int32)
 
-        # Initialize source seeds (supersource via seeding)
+        # Initialize source seeds (supersource via seeding) — vectorized, zero GPU→CPU syncs
         logger.debug(f"[GPU-SEEDS] Initialized {len(src_seeds)} source seeds with dist=0")
-        for seed in src_seeds_gpu:
-            dist[int(seed)] = 0.0
+        dist[src_seeds_gpu] = 0.0
 
-        # Create destination bitmap for fast termination check
+        # Create destination bitmap for fast termination check — vectorized
         dst_bitmap = cp.zeros(num_nodes, dtype=cp.bool_)
-        for target in dst_targets_gpu:
-            dst_bitmap[int(target)] = True
+        dst_bitmap[dst_targets_gpu] = True
         logger.debug(f"[GPU-SEEDS] Created destination bitmap for {len(dst_targets)} targets")
 
-        # Initialize bit-packed frontier (K=1, frontier_words)
+        # Initialize bit-packed frontier (K=1, frontier_words) — vectorized scatter-or
         frontier_words = (num_nodes + 31) // 32
         frontier = cp.zeros((1, frontier_words), dtype=cp.uint32)  # 2D array for K=1
-        for seed in src_seeds_gpu:
-            seed_val = int(seed)
-            word_idx = seed_val // 32
-            bit_pos = seed_val % 32
-            frontier[0, word_idx] |= (1 << bit_pos)  # Access with [0, word_idx]
+        src_words = (src_seeds_gpu // 32).astype(cp.int32)
+        src_bits  = (src_seeds_gpu & 31).astype(cp.uint32)
+        cupyx.scatter_add(frontier[0], src_words, cp.uint32(1) << src_bits)
         logger.debug(f"[GPU-SEEDS] Initialized frontier with {len(src_seeds)} seeds")
 
         # Allocate stamp pools if needed (device-resident optimization)
@@ -5546,9 +5543,8 @@ class CUDADijkstra:
         INF_KEY = 0x7F800000FFFFFFFF  # +inf (upper 32 bits) | parent=-1 (lower 32 bits)
         # Reset all keys to INF_KEY first
         self.best_key_pool[0, :num_nodes] = INF_KEY
-        # Initialize source seeds with SRC_KEY
-        for seed in src_seeds_gpu:
-            self.best_key_pool[0, int(seed)] = SRC_KEY
+        # Initialize source seeds with SRC_KEY — vectorized, zero GPU→CPU syncs
+        self.best_key_pool[0, src_seeds_gpu] = SRC_KEY
 
         # Determine lattice dimensions for coordinate encoding
         # For full-graph routing: use linear layout
@@ -5567,21 +5563,24 @@ class CUDADijkstra:
         bitmap_words = (num_nodes + 31) // 32
         if allowed_bitmap is not None:
             # Use provided owner-aware bitmap
-            roi_bitmaps = cp.asarray(allowed_bitmap, dtype=cp.uint32).reshape(1, -1)
+            # If already a CuPy array (built on GPU), use directly — no upload needed
+            if isinstance(allowed_bitmap, cp.ndarray):
+                roi_bitmaps = allowed_bitmap.reshape(1, -1)
+            else:
+                roi_bitmaps = cp.asarray(allowed_bitmap, dtype=cp.uint32).reshape(1, -1)
             bitmap_words = int(roi_bitmaps.shape[1])
             use_bitmap = True
 
             # CRITICAL: Force-allow source/dest seeds (prevents frontier empty!)
-            # This happens IN THE GPU CODE to guarantee seeds are always reachable
-            seed_nodes = cp.concatenate([cp.asarray(src_seeds, dtype=cp.int32),
-                                        cp.asarray(dst_targets, dtype=cp.int32)])
-
-            # Proper GPU array operations with correct dtypes
-            for seed in seed_nodes:
-                seed_int = int(seed)
-                word_idx = seed_int // 32
-                bit_idx = seed_int & 31
-                roi_bitmaps[0, word_idx] = roi_bitmaps[0, word_idx] | (cp.uint32(1) << bit_idx)
+            # Build a zero-initialized mask first (scatter_add is safe when starting from 0),
+            # then OR into the bitmap — avoids corrupting bits already set in allowed_bitmap.
+            seed_nodes = cp.unique(cp.concatenate([cp.asarray(src_seeds, dtype=cp.int32),
+                                                   cp.asarray(dst_targets, dtype=cp.int32)]))
+            sd_words = (seed_nodes // 32).astype(cp.int32)
+            sd_bits  = (seed_nodes & 31).astype(cp.uint32)
+            force_mask = cp.zeros(bitmap_words, dtype=cp.uint32)
+            cupyx.scatter_add(force_mask, sd_words, cp.uint32(1) << sd_bits)
+            roi_bitmaps[0] |= force_mask
 
             # Count allowed nodes for sanity
             total_bits_set = int(cp.count_nonzero(roi_bitmaps))

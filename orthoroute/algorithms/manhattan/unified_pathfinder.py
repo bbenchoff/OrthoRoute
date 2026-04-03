@@ -2197,6 +2197,7 @@ class PathFinderRouter:
         # -1 = free, otherwise net_id (mapped to integer)
         # This is THE solution to via barrel conflicts - enforce at node level, not edge level!
         self.node_owner = np.full(self.lattice.num_nodes, -1, dtype=np.int32)
+        self.node_owner_gpu = None  # CuPy mirror — built lazily, kept in sync for GPU bitmap building
         self.net_id_map = {}  # net_name -> integer ID
         self.next_net_id = 0
         logger.debug(f"[NODE-OWNER] Initialized node ownership tracking for {self.lattice.num_nodes:,} nodes")
@@ -2918,6 +2919,14 @@ class PathFinderRouter:
         logger.debug(f"[NODE-OWNER] Marked {owned_count:,} nodes as owned ({owned_count*100//self.lattice.num_nodes}% of graph)")
         # NOTE: Node ownership enforced via bitmap filtering in GPU kernels, not cost penalties!
 
+        # Sync full array to GPU once per iteration rebuild (avoids per-net upload)
+        try:
+            import cupy as cp
+            self.node_owner_gpu = cp.asarray(self.node_owner)
+            logger.debug("[NODE-OWNER] Synced node_owner to GPU")
+        except Exception:
+            self.node_owner_gpu = None
+
     def _get_net_id(self, net_name: str) -> int:
         """Map net name to integer ID for node ownership"""
         if net_name not in self.net_id_map:
@@ -2971,7 +2980,8 @@ class PathFinderRouter:
 
         net_id = self._get_net_id(net_name)
 
-        # Walk path and find via transitions
+        # Walk path and collect all via barrel nodes (vectorized batch write)
+        owned_nodes = []
         for i in range(len(path) - 1):
             u, v = path[i], path[i+1]
             xu, yu, zu = self.lattice.idx_to_coord(u)
@@ -2982,8 +2992,18 @@ class PathFinderRouter:
                 # Mark ALL nodes in via barrel span
                 z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
                 for z in range(z_lo, z_hi + 1):
-                    node_idx = self.lattice.node_idx(xu, yu, z)
-                    self.node_owner[node_idx] = net_id
+                    owned_nodes.append(self.lattice.node_idx(xu, yu, z))
+
+        if owned_nodes:
+            owned_arr = np.array(owned_nodes, dtype=np.int32)
+            self.node_owner[owned_arr] = net_id
+            # Keep GPU mirror in sync if it exists
+            if self.node_owner_gpu is not None:
+                try:
+                    import cupy as cp
+                    self.node_owner_gpu[cp.asarray(owned_arr)] = net_id
+                except Exception:
+                    self.node_owner_gpu = None  # Invalidate — will rebuild next iteration
 
     def _build_owner_bitmap_for_fullgraph(self, current_net: str, force_allow_nodes=None) -> np.ndarray:
         """
@@ -3007,6 +3027,26 @@ class PathFinderRouter:
         net_id = self._get_net_id(current_net)
         owners = self.node_owner  # np.int32[num_nodes]
 
+        # Fast path: build bitmap entirely on GPU — zero CPU work, no PCIe upload
+        if self.node_owner_gpu is not None:
+            try:
+                import cupy as cp
+                net_id_val = cp.int32(net_id)
+                allowed_gpu = (self.node_owner_gpu == -1) | (self.node_owner_gpu == net_id_val)
+                if force_allow_nodes is not None and len(force_allow_nodes) > 0:
+                    allowed_gpu[cp.asarray(np.asarray(force_allow_nodes, dtype=np.int32))] = True
+                # Pack bits: reshape to (words, 32), matmul with powers -> uint32 words
+                n = int(allowed_gpu.size)
+                words = (n + 31) // 32
+                padded = cp.zeros(words * 32, dtype=cp.uint8)
+                padded[:n] = allowed_gpu.view(cp.uint8)
+                powers = cp.uint32(1) << cp.arange(32, dtype=cp.uint32)
+                bitmap_gpu = padded.reshape(words, 32).astype(cp.uint32) @ powers
+                return bitmap_gpu  # CuPy array — no upload needed in find_path_fullgraph_gpu_seeds
+            except Exception:
+                self.node_owner_gpu = None  # Invalidate, fall through to CPU path
+
+        # CPU fallback: build bitmap from numpy node_owner
         # Vectorized: allowed = (free OR owned by current net)
         allowed = (owners == -1) | (owners == net_id)
 
@@ -3016,17 +3056,11 @@ class PathFinderRouter:
 
         n = int(allowed.size)
         words = (n + 31) // 32
-        bitmap = np.zeros(words, dtype=np.uint32)
-
-        # Pack bits into words (vectorized)
-        idx = np.nonzero(allowed)[0].astype(np.int64)
-        if len(idx) > 0:
-            word_indices = (idx >> 5).astype(np.int32)  # idx // 32
-            bit_positions = (idx & 31).astype(np.int32)  # idx % 32
-            bit_values = (1 << bit_positions).astype(np.uint32)
-
-            # OR bits into words (use add.at since bits don't overlap per index)
-            np.add.at(bitmap, word_indices, bit_values)
+        # Vectorized bit-packing via reshape (avoids slow np.add.at)
+        padded = np.zeros(words * 32, dtype=np.uint8)
+        padded[:n] = allowed.view(np.uint8)
+        powers = (np.uint32(1) << np.arange(32, dtype=np.uint32))
+        bitmap = padded.reshape(words, 32).astype(np.uint32) @ powers
 
         return bitmap
 

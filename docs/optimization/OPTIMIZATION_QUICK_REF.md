@@ -1,7 +1,7 @@
 # OrthoRoute Optimization Quick Reference
 
 **Baseline**: April 3, 2026 | **Test**: TestBackplane (512 nets, 18 layers) | **Time**: 44.23 min → **25 min**  
-**Last updated**: April 3, 2026 — persistent kernel enabled, 2× speedup confirmed
+**Last updated**: April 3, 2026 — persistent kernel enabled, bitmap attempts did not improve further
 
 ---
 
@@ -11,6 +11,19 @@
 |------|--------|--------|-------|------|
 | Apr 3 | Persistent CUDA kernel (bitmap fix) | 47.9 min / 39s/iter | **25 min / ~20s/iter** | **~2×** |
 | Apr 3 | cuda_dijkstra.py log reclassification | 861 MB logs | ~10-20 MB logs | log size |
+| Apr 3 | Vectorize `int(seed)` loops → `cupyx.scatter_add` | correctness bug | fixed | **bug fix only** |
+| Apr 3 | GPU-resident `node_owner_gpu` bitmap (zero upload) | 56KB/net upload | 0 upload | **no perf gain** |
+
+---
+
+## ❌ Attempted — No Improvement Found
+
+| Attempt | Hypothesis | Result |
+|---------|------------|--------|
+| Vectorize bitmap init loops (`cp.scatter_add`) | ~100 GPU→CPU syncs costing ~50ms/net | Fixed correctness bug (`cp.scatter_add` → `cupyx.scatter_add` + bitmap OR corruption); **iteration time unchanged** |
+| GPU-resident `node_owner_gpu` + on-GPU bitmap build | 56KB `cp.asarray()` upload per net was bottleneck | Built and deployed; per-iter time: **~22s same as before**; upload was not the bottleneck |
+
+**Conclusion**: The ~70–100ms per-net wall overhead beyond the GPU kernel is **not** in bitmap construction or bitmap upload. Root cause still unidentified.
 
 ---
 
@@ -18,66 +31,47 @@
 
 | Priority | Target | Est. Cost | % of Total | Est. Savings |
 |----------|--------|-----------|------------|--------------|
-| 🔴 **#1** | Python bitmap construction per net | ~50ms/net | **~65% of per-net time** | **2-3×** |
-| 🟡 **#2** | GPU→CPU sync for convergence check | ~10ms/net | **~13%** | reduce check frequency |
-| 🟡 **#3** | `initialize_graph()` | 20.9s once | one-time | 6-8s |
-| 🟢 **#4** | `_rebuild_via_usage_from_committed()` | ~11s/run | **~1%** | minimal |
+| 🔴 **#1 (UNKNOWN)** | Mystery ~70–100ms gap per net | unknown | **~80% of per-net time** | **3–4× if found** |
+| 🟡 **#2** | `initialize_graph()` | 20.9s once | one-time | 6-8s |
+| 🟢 **#3** | `_rebuild_via_usage_from_committed()` | ~11s/run | **~1%** | minimal |
 
-> **Current per-net breakdown** (measured April 3, 2026 with persistent kernel active):
-> - GPU kernel time: **3–24ms** (kernel runs ~150 iterations on-device)
-> - Python bitmap construction + CuPy transfers: **~50ms** ← NEW BOTTLENECK
-> - Total per net: **~58–107ms** (was ~306ms multi-launch)
-
----
-
-## 🔑 Key GPU Finding (April 3, 2026 — post persistent kernel)
+> **Current per-net breakdown** (measured April 3, 2026 after all bitmap optimizations):
+> - GPU kernel time: **4–22ms** (persistent kernel, runs to convergence on-device)
+> - Total wall time per net: **~90–130ms** 
+> - **Unaccounted gap: ~70–100ms** — location unknown, profiling needed
+> - Per iteration (~512 nets): **~22s**
+> - Total run (70 iterations): **~25 min**
 
 ---
 
-## 🔑 Key GPU Finding (April 3, 2026 — post persistent kernel)
+## 🔍 Profiling Plan for Mystery Gap
 
-With persistent kernel active on TestBackplane (18 layers, 512 nets, 446k nodes):
+The ~70–100ms gap per net is not in:
+- GPU kernel execution (measured: 4–22ms)
+- Bitmap construction (eliminated via GPU path)
+- Bitmap upload (eliminated via GPU-resident `node_owner_gpu`)
+- Frontier/dist/parent init (vectorized)
 
-```
-Per-net timing breakdown:
-  GPU persistent kernel (on-device loop):  3–24ms   (~20% of per-net time)
-  Python bitmap construction + cp.asarray: ~50ms    (~65% of per-net time)  ← NEW BOTTLENECK
-  GPU→CPU convergence check (iter % 10):  ~10ms    (~13%)
-  ─────────────────────────────────────────────────────────────────
-  Total per net:                           ~58–107ms  (was ~306ms)
-  Per iteration (88 hotset nets):          ~20s       (was ~39s)
-  Total run (70 iterations):              25 min      (was 47.9 min)
-```
+**Remaining candidates to profile with `@profile_time`**:
+1. `_path_to_edges(path)` — converts node list to edge indices
+2. `commit_path(edge_indices)` — updates accounting arrays
+3. `_mark_via_barrel_ownership_for_path()` — marks node_owner
+4. `_build_routing_seeds()` / `_get_portal_seeds()` — portal lookup
+5. `node_owner_gpu` scatter write in `_mark_via_barrel_ownership_for_path`
+6. Python overhead between `find_path_fullgraph_gpu_seeds()` return and `continue`
 
-**New bottleneck**: `find_path_fullgraph_gpu_seeds()` in `cuda_dijkstra.py` rebuilds the
-`allowed_bitmap` (446k-node uint32 array) on every net call using Python loops:
-
-```python
-for seed in seed_nodes:           # ~50-200 iterations
-    seed_int = int(seed)          # GPU→CPU sync!
-    word_idx = seed_int // 32
-    roi_bitmaps[0, word_idx] = roi_bitmaps[0, word_idx] | (cp.uint32(1) << bit_idx)
-```
-
-Each `int(seed)` forces a GPU→CPU data transfer. With O(100) seeds per net this is
-~100 small PCIe round-trips before the kernel even launches.
-
-**Fix**: Pre-build the bitmap in a single vectorized CuPy kernel call:
-```python
-seed_words = src_seeds_gpu // 32
-seed_bits  = src_seeds_gpu & 31
-cp.bitwise_or.at(roi_bitmaps[0], seed_words, cp.uint32(1) << seed_bits)
-```
+**How to profile**: Add `@profile_time` decorator (from `shared/utils/performance_utils.py`) to each candidate and rerun.
 
 ---
 
-## 📊 Current Baseline (post persistent kernel)
+## 📊 Run History
 
-From 40 iterations, 3,311 paths routed on RTX Turing (compute 75, 4.3 GB VRAM):
-
-```
-Per-net timing breakdown:
-  GPU Dijkstra kernel (MULTI-LAUNCH):  ~16ms   (5% of per-net time)
+| Run | Change | Total Time | Iter avg | Notes |
+|-----|--------|------------|----------|-------|
+| 1 | Multi-launch kernel (baseline) | 47.9 min | ~39s | 74 iters |
+| 2 | Persistent CUDA kernel | **25 min** | ~20s | 70 iters — **2× gain** |
+| 3 | Vectorize bitmap loops (bug fix) | ~25 min | ~22s | Correctness fix, no perf change |
+| 4 | GPU-resident bitmap (zero upload) | ~25 min | ~22s | No improvement — upload wasn't bottleneck |
   Python ↔ CUDA launch overhead:      ~296ms  (95% of per-net time)
   ─────────────────────────────────────────────
   Total per net:                       ~312ms
