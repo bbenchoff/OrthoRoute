@@ -68,6 +68,9 @@ void persistent_sssp_kernel(
     unsigned int* frontier_curr,        // Current frontier (bit-packed)
     unsigned int* frontier_next,        // Next frontier (bit-packed)
     const int frontier_words,           // Number of uint32 words for frontier
+    const unsigned int* allowed_bitmap, // Owner-aware node filter (num_nodes/32 words)
+    const int bitmap_words,             // Number of uint32 words in allowed_bitmap
+    const int use_bitmap,               // 1 = enforce bitmap, 0 = no filtering
     int* settled_flag,                  // Flag: 1 when path found
     int* best_dst,                      // Output: best destination found
     float* best_dist,                   // Output: best distance found
@@ -147,6 +150,14 @@ void persistent_sssp_kernel(
                 for (int e = e0; e < e1; e++) {
                     int neighbor = indices[e];
                     if (neighbor < 0 || neighbor >= num_nodes) continue;
+
+                    // BITMAP CHECK: owner-aware filtering — skip nodes belonging to other nets' pads
+                    if (use_bitmap) {
+                        int nbr_word = neighbor >> 5;
+                        int nbr_bit  = neighbor & 31;
+                        if (nbr_word >= bitmap_words ||
+                            ((allowed_bitmap[nbr_word] >> nbr_bit) & 1u) == 0) continue;
+                    }
 
                     float edge_cost = weights[e];
                     float g_new = node_dist + edge_cost;
@@ -249,6 +260,8 @@ def launch_persistent_kernel(
     parent_gpu,
     best_key_gpu,
     frontier_words,
+    allowed_bitmap_gpu=None,
+    use_bitmap=False,
     max_iterations=2000
 ):
     """
@@ -266,6 +279,9 @@ def launch_persistent_kernel(
         parent_gpu: Parent array (CuPy int32), pre-initialized to -1
         best_key_gpu: 64-bit atomic key array (CuPy uint64), packed dist+parent
         frontier_words: Number of uint32 words for frontier
+        allowed_bitmap_gpu: Owner-aware bitmap (CuPy uint32, shape (bitmap_words,)).
+                            If None, all nodes are allowed (no filtering).
+        use_bitmap: Whether to enforce the bitmap filter (default False).
         max_iterations: Maximum iterations before timeout
 
     Returns:
@@ -275,6 +291,16 @@ def launch_persistent_kernel(
         iterations: Number of iterations performed
     """
     import cupy as cp
+
+    # Prepare bitmap: if none provided, allocate an all-ones dummy (no filtering)
+    if allowed_bitmap_gpu is None or not use_bitmap:
+        bitmap_words = frontier_words  # same size as frontier
+        bitmap_gpu = cp.full(bitmap_words, 0xFFFFFFFF, dtype=cp.uint32)
+        use_bitmap_flag = 0
+    else:
+        bitmap_gpu = cp.asarray(allowed_bitmap_gpu, dtype=cp.uint32).ravel()
+        bitmap_words = int(len(bitmap_gpu))
+        use_bitmap_flag = 1
 
     # Allocate frontier buffers
     frontier_curr = cp.zeros(frontier_words, dtype=cp.uint32)
@@ -314,6 +340,9 @@ def launch_persistent_kernel(
             frontier_curr,
             frontier_next,
             frontier_words,
+            bitmap_gpu,             # Owner-aware node filter
+            bitmap_words,           # Number of bitmap words
+            use_bitmap_flag,        # 1 = enforce bitmap, 0 = no filtering
             settled_flag,
             best_dst,
             best_dist,

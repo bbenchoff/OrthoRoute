@@ -142,26 +142,12 @@ class CUDADijkstra:
 
         # PERFORMANCE: Persistent kernel (compiled on-demand)
         self._persistent_kernel = None
-        self._enable_persistent_kernel = False  # Disabled — see TODO below
-        self._persistent_kernel_version = 2  # Increment to recompile after bug fixes
-        # WHY DISABLED: The persistent kernel (single-launch, device-side queues) does not
-        # accept the `allowed_bitmap` argument used for owner-aware node filtering.
-        # The bitmap prevents a net from routing through nodes that belong to other nets'
-        # pads — omitting it causes routing short-circuits and incorrect results.
-        #
-        # The MULTI-LAUNCH path (Python for-loop, ~150 iterations × ~2ms PCIe round-trip)
-        # passes `allowed_bitmap` through `_expand_wavefront_parallel` → `data['roi_bitmaps']`
-        # on every kernel call. The persistent kernel has no corresponding parameter.
-        #
-        # FIX REQUIRED to enable: Add `allowed_bitmap` (uint32* device pointer) and
-        # `bitmap_words` (int) parameters to the persistent CUDA kernel PTX, then pass
-        # `data['roi_bitmaps']` and `data['bitmap_words']` in launch_persistent_kernel().
-        # The inner loop in the kernel must test `(bitmap[node/32] >> (node%32)) & 1`
-        # before relaxing each neighbor, matching the IN_BITMAP check in the multi-launch
-        # wavefront_expand_all kernel.
-        #
+        self._enable_persistent_kernel = True   # ENABLED: bitmap support added (version 3)
+        self._persistent_kernel_version = 3  # Increment to recompile after bug fixes
+        # Persistent kernel now accepts allowed_bitmap (uint32* flat array) + bitmap_words + use_bitmap.
+        # The inner loop checks (allowed_bitmap[nbr>>5] >> (nbr&31)) & 1 before relaxing each
+        # neighbor — matching the IN_BITMAP check in the multi-launch wavefront_expand_all kernel.
         # EXPECTED SPEEDUP: ~20× per net (306ms → ~15ms), cutting 48-min run to ~3 min.
-        # NOTE: Multi-launch wavefront_expand_all kernel HAS IN_BITMAP check, persistent doesn't
 
         # Compile CUDA kernel for parallel edge relaxation
         self.relax_kernel = cp.RawKernel(r'''
@@ -5660,7 +5646,7 @@ class CUDADijkstra:
                 self._persistent_kernel = pk.create_persistent_kernel()
                 logger.debug("[GPU-SEEDS] Persistent kernel compiled successfully!")
 
-            # Launch persistent kernel with stamp pool arrays
+            # Launch persistent kernel with stamp pool arrays and owner-aware bitmap
             best_dst_result, best_dist_result, iterations_done = pk.launch_persistent_kernel(
                 self._persistent_kernel,
                 indptr_gpu,
@@ -5673,6 +5659,8 @@ class CUDADijkstra:
                 self.parent_val_pool[0, :num_nodes],  # Use stamp pool slice
                 self.best_key_pool[0, :num_nodes],  # Use best_key pool slice for atomic keys
                 frontier_words,
+                allowed_bitmap_gpu=data['roi_bitmaps'][0],  # Flat per-net bitmap (K=1)
+                use_bitmap=bool(data['use_bitmap']),
                 max_iterations=max_iterations
             )
 
