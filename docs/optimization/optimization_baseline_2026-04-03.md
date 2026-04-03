@@ -9,10 +9,19 @@
 
 ## Executive Summary
 
-Successfully routed a **32-layer backplane** with **512 nets**, **3,200 pads**, and **870 via pairs** in **44.23 minutes** (2,654 seconds) with **zero routing failures**.
+Successfully routed a **18-layer backplane** with **512 nets**, **1,604 pads** in **44.23 minutes** initially, reduced to **25 minutes** after persistent kernel optimization.
+
+**Run history:**
+
+| Date | Change | Time | Iter | Result |
+|------|--------|------|------|--------|
+| Apr 3 (baseline) | Multi-launch kernel | 47.9 min | 74 | 512/512 ✓ |
+| Apr 3 (persistent kernel) | Persistent CUDA kernel + bitmap fix | **25 min** | 70 | 512/512 ✓ |
+
+**Current bottleneck**: Python bitmap construction — `int(seed)` loop in `find_path_fullgraph_gpu_seeds()` triggers ~100 GPU→CPU syncs per net, dominating per-net time at ~50ms vs 3–24ms kernel GPU time. See [OPTIMIZATION_QUICK_REF.md](OPTIMIZATION_QUICK_REF.md) for the vectorized fix.
 
 **Initial Finding (corrected)**: `_rebuild_via_usage_from_committed()` was believed to be the #1 target.
-**Live-run correction (April 3, 2026)**: After profiling 40 iterations and 3,311 GPU paths, the via rebuild consumes **~1% of routing time**. The real bottleneck is the **MULTI-LAUNCH Python→CUDA loop**, contributing ~95% of per-net routing time. See [GPU Performance Analysis](#gpu-performance-analysis-live-run-april-3-2026) below.
+**Live-run correction (April 3, 2026)**: After profiling 40 iterations and 3,311 GPU paths, the via rebuild consumes **~1% of routing time**. The real bottleneck was the **MULTI-LAUNCH Python→CUDA loop** — now replaced by the persistent kernel. New bottleneck is Python bitmap construction (~50ms/net).
 
 ---
 
@@ -69,14 +78,15 @@ Successfully routed a **32-layer backplane** with **512 nets**, **3,200 pads**, 
 
 ## Performance Bottlenecks (Prioritized)
 
-> ⚠️ **Priority table revised** after live profiling on April 3, 2026.
-> Original #1 (via rebuild) is actually #3 after real data was collected.
+> Updated April 3, 2026 — persistent kernel active.
 
-| Priority | Target | Measured Cost | % of Routing | Action |
+| Priority | Target | Measured Cost | % of per-net | Status |
 |----------|--------|--------------|--------------|--------|
-| 🔴 **#1 (new)** | MULTI-LAUNCH Python→CUDA overhead | ~980s / run | **~95%** | Activate PERSISTENT KERNEL |
-| 🟡 **#2** | `initialize_graph()` | 20.9s once | one-time | GPU CSR / parallel |
-| 🟢 **#3 (was #1)** | `_rebuild_via_usage_from_committed()` | ~11s / run | **~1%** | Already incremental; deferred |
+| ✅ **DONE** | MULTI-LAUNCH Python→CUDA overhead | ~980s / run | was ~95% | **Fixed — persistent kernel** |
+| 🔴 **#1 (new)** | Python bitmap construction (int-loop GPU→CPU syncs) | ~50ms/net | **~65%** | Vectorize with `cp.scatter_add` |
+| 🟡 **#2** | GPU→CPU convergence check | ~10ms/net | **~13%** | Check less frequently or on-device |
+| 🟡 **#3** | `initialize_graph()` | 20.9s once | one-time | GPU-accelerated CSR build |
+| 🟢 **#4 (was #1)** | `_rebuild_via_usage_from_committed()` | ~11s / run | **~1%** | Already incremental; low priority |
 
 ---
 

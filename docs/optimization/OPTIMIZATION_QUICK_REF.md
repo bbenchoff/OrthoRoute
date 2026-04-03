@@ -1,25 +1,77 @@
 # OrthoRoute Optimization Quick Reference
 
-**Baseline**: April 3, 2026 | **Test**: TestBackplane (512 nets, 32 layers) | **Time**: 44.23 min  
-**Live-run data updated**: April 3, 2026 (40 iters, 3,311 GPU paths profiled)
+**Baseline**: April 3, 2026 | **Test**: TestBackplane (512 nets, 18 layers) | **Time**: 44.23 min → **25 min**  
+**Last updated**: April 3, 2026 — persistent kernel enabled, 2× speedup confirmed
 
 ---
 
-## 🎯 Top Optimization Targets (Revised — live run data)
+## ✅ Completed Optimizations
 
-| Priority | Target | Time | % of Total | Est. Savings |
-|----------|--------|------|------------|--------------|
-| 🔴 **#1** | GPU Python overhead (296ms/path × 3,311 paths) | ~980s/run | **~95% of routing** | **10-20× with persistent kernel** |
-| 🟡 **#2** | `initialize_graph()` | 20.9s | one-time | **6-8s** |
-| 🟢 **#3** | `_rebuild_via_usage_from_committed()` | ~11s/40 iters | **~1%** | minimal — wrong target |
-
-> ⚠️ **Baseline Priority #1 was wrong.** Earlier analysis assumed via rebuild was the main cost.
-> Live profiling showed it is **1% of runtime**. The real bottleneck is the Python/CUDA
-> launch overhead of the MULTI-LAUNCH kernel — 296ms per path vs 16ms of actual GPU compute.
+| Date | Change | Before | After | Gain |
+|------|--------|--------|-------|------|
+| Apr 3 | Persistent CUDA kernel (bitmap fix) | 47.9 min / 39s/iter | **25 min / ~20s/iter** | **~2×** |
+| Apr 3 | cuda_dijkstra.py log reclassification | 861 MB logs | ~10-20 MB logs | log size |
 
 ---
 
-## 🔑 Key GPU Finding (April 3, 2026)
+## 🎯 Next Optimization Targets
+
+| Priority | Target | Est. Cost | % of Total | Est. Savings |
+|----------|--------|-----------|------------|--------------|
+| 🔴 **#1** | Python bitmap construction per net | ~50ms/net | **~65% of per-net time** | **2-3×** |
+| 🟡 **#2** | GPU→CPU sync for convergence check | ~10ms/net | **~13%** | reduce check frequency |
+| 🟡 **#3** | `initialize_graph()` | 20.9s once | one-time | 6-8s |
+| 🟢 **#4** | `_rebuild_via_usage_from_committed()` | ~11s/run | **~1%** | minimal |
+
+> **Current per-net breakdown** (measured April 3, 2026 with persistent kernel active):
+> - GPU kernel time: **3–24ms** (kernel runs ~150 iterations on-device)
+> - Python bitmap construction + CuPy transfers: **~50ms** ← NEW BOTTLENECK
+> - Total per net: **~58–107ms** (was ~306ms multi-launch)
+
+---
+
+## 🔑 Key GPU Finding (April 3, 2026 — post persistent kernel)
+
+---
+
+## 🔑 Key GPU Finding (April 3, 2026 — post persistent kernel)
+
+With persistent kernel active on TestBackplane (18 layers, 512 nets, 446k nodes):
+
+```
+Per-net timing breakdown:
+  GPU persistent kernel (on-device loop):  3–24ms   (~20% of per-net time)
+  Python bitmap construction + cp.asarray: ~50ms    (~65% of per-net time)  ← NEW BOTTLENECK
+  GPU→CPU convergence check (iter % 10):  ~10ms    (~13%)
+  ─────────────────────────────────────────────────────────────────
+  Total per net:                           ~58–107ms  (was ~306ms)
+  Per iteration (88 hotset nets):          ~20s       (was ~39s)
+  Total run (70 iterations):              25 min      (was 47.9 min)
+```
+
+**New bottleneck**: `find_path_fullgraph_gpu_seeds()` in `cuda_dijkstra.py` rebuilds the
+`allowed_bitmap` (446k-node uint32 array) on every net call using Python loops:
+
+```python
+for seed in seed_nodes:           # ~50-200 iterations
+    seed_int = int(seed)          # GPU→CPU sync!
+    word_idx = seed_int // 32
+    roi_bitmaps[0, word_idx] = roi_bitmaps[0, word_idx] | (cp.uint32(1) << bit_idx)
+```
+
+Each `int(seed)` forces a GPU→CPU data transfer. With O(100) seeds per net this is
+~100 small PCIe round-trips before the kernel even launches.
+
+**Fix**: Pre-build the bitmap in a single vectorized CuPy kernel call:
+```python
+seed_words = src_seeds_gpu // 32
+seed_bits  = src_seeds_gpu & 31
+cp.bitwise_or.at(roi_bitmaps[0], seed_words, cp.uint32(1) << seed_bits)
+```
+
+---
+
+## 📊 Current Baseline (post persistent kernel)
 
 From 40 iterations, 3,311 paths routed on RTX Turing (compute 75, 4.3 GB VRAM):
 
@@ -34,32 +86,59 @@ Per-net timing breakdown:
 
 **Root cause**: MULTI-LAUNCH uses a Python `for` loop (~150 iterations) to drive the CUDA
 wavefront, with each iteration being a separate kernel launch + Python→CUDA sync. The
-PERSISTENT KERNEL is already compiled (`[CUDA] Compiled PERSISTENT KERNEL`) but is
-not being activated — device-side queues would eliminate this loop entirely.
+PERSISTENT KERNEL is already compiled (`[CUDA] Compiled PERSISTENT KERNEL`) but was
+not activating — device-side queues eliminate this loop entirely.
 
-**Where to look**: `orthoroute/algorithms/manhattan/pathfinder/cuda_dijkstra.py`
-- Search `MULTI-LAUNCH` and `PERSISTENT KERNEL` to find the routing selection logic
-- The persistent kernel takes over the wavefront loop on-device; Python only launches once
+**RESOLVED April 3, 2026**: Added `allowed_bitmap` param to persistent kernel PTX.
+See `orthoroute/algorithms/manhattan/pathfinder/persistent_kernel.py` — `use_bitmap` flag.
 
 ---
 
-## 📊 Current Baseline
+## 📊 Current Baseline (post persistent kernel)
 
 ```
-Total Time: 44.23 minutes (2,654 seconds)
-├─ Initialization: ~25s
+Total Time: 25 minutes (1,500 seconds)     ← was 47.9 min
+├─ Initialization: ~25s (unchanged)
 │  ├─ initialize_graph: 20.9s
 │  ├─ finalize: 3.95s
-│  └─ keepout_obstacles: 0.15ms ✅ optimized
+│  └─ keepout_obstacles: 0.15ms ✅
 │
-├─ Routing (64 iterations): ~39 min
-│  ├─ GPU overhead (Python→CUDA launch loop): ~95% ← REAL BOTTLENECK
-│  │  └─ MULTI-LAUNCH: 150 kernel launches per net × 512 nets × N iters
-│  ├─ Via rebuilds (64x): ~11s (275ms avg, 1% of total) ← not the target
-│  └─ Via pooling (64x): ~1.6s (25ms avg)
+├─ Routing (70 iterations): ~24 min
+│  ├─ Python bitmap construction (NEW #1): ~50ms/net × 88 hotset × 70 iters ← BOTTLENECK
+│  │  └─ int(seed) GPU→CPU syncs in bitmap loop: ~100 round-trips/net
+│  ├─ GPU persistent kernel: 3–24ms/net ✅ fast
+│  ├─ GPU→CPU convergence check: ~10ms/net (every 10 iters)
+│  ├─ Via rebuilds (70x): ~11s (~1%)
+│  └─ Via pooling (70x): ~1.6s
 │
-└─ Visualization/Output: ~4 min
+└─ Visualization/Output: ~1 min
 ```
+
+---
+
+## 🔧 Next Fix: Vectorize Bitmap Construction
+
+**File**: `cuda_dijkstra.py` → `find_path_fullgraph_gpu_seeds()` ~line 5567
+
+**Current (slow)**:
+```python
+for seed in seed_nodes:           # O(100) GPU→CPU syncs
+    seed_int = int(seed)
+    word_idx = seed_int // 32
+    roi_bitmaps[0, word_idx] = roi_bitmaps[0, word_idx] | (cp.uint32(1) << bit_idx)
+```
+
+**Fix (vectorized)**:
+```python
+seed_words = seed_nodes // 32
+seed_bits  = (seed_nodes & 31).astype(cp.uint32)
+masks = cp.uint32(1) << seed_bits
+# scatter-or into bitmap (one kernel call, zero PCIe round-trips)
+cp.scatter_add(roi_bitmaps[0], seed_words, masks)
+```
+
+Expected gain: reduces per-net Python overhead from ~50ms to ~5ms → total ~3-4× speedup
+(25 min → ~8-10 min).
 
 ---
 
