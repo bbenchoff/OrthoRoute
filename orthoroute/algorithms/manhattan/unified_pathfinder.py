@@ -3845,6 +3845,7 @@ class PathFinderRouter:
         self._ensure_edge_src_map()
 
         routing_start_time = time.time()
+        _iteration_metrics = []  # Collect per-iteration data for regression tests
         logger.warning(f"[ROUTING START] {len(tasks)} nets  max_iters={cfg.max_iterations}  "
                        f"pres_fac_init={pres_fac:.2f}  pres_fac_mult={pres_fac_mult:.2f}")
 
@@ -4136,6 +4137,14 @@ class PathFinderRouter:
             iter_elapsed = time.time() - iter_start_time
             cumulative_elapsed = time.time() - routing_start_time
             logger.warning(f"[ITER {it:3d}] nets={routed}/{routed+failed}  {status}  edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}  iter={iter_elapsed:.1f}s  total={cumulative_elapsed:.1f}s")
+            _iteration_metrics.append({
+                'iter': it,
+                'nets_routed': routed,
+                'overuse_sum': over_sum,
+                'overuse_edges': over_cnt,
+                'iter_time_s': round(iter_elapsed, 2),
+                'total_time_s': round(cumulative_elapsed, 2),
+            })
 
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0) - only first 3 iterations
             if it <= 3:
@@ -4486,7 +4495,7 @@ class PathFinderRouter:
 
         return {
             'success': success,
-            'converged': success,  # Edge convergence = success
+            'converged': success,
             'barrel_conflicts': final_barrel_conflicts,
             'excluded_nets': len(excluded_nets),
             'excluded_net_ids': list(excluded_nets),
@@ -4495,7 +4504,14 @@ class PathFinderRouter:
             'overuse_sum': over_sum,
             'overuse_edges': over_cnt,
             'failed_nets': failed,
-            'layer_recommendation': layer_recommendation
+            'layer_recommendation': layer_recommendation,
+            # Regression test fields
+            'nets_routed': len(tasks) - failed,
+            'total_nets': len(tasks),
+            'overuse_final': over_sum,
+            'iterations': len(_iteration_metrics),
+            'total_time_s': round(time.time() - routing_start_time, 2),
+            'iteration_metrics': _iteration_metrics,
         }
 
     def _analyze_layer_requirements(self, failed_nets: int, overuse_edges: int, overuse_sum: int) -> Dict:
