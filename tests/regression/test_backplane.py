@@ -1,0 +1,290 @@
+"""
+Regression tests for TestBackplane.kicad_pcb.
+
+Test groups:
+  A  — Log health + timing metrics (no routing required)
+  A2 — Board-load verification against golden_board.json (no routing required)
+  B  — Routing quality (requires routing_result fixture → full pipeline run)
+  C  — Write-back verification (requires KiCad API, skipped without it)
+
+Pass/fail policy:
+  HARD FAIL  — test raises AssertionError; marks build broken
+  SOFT WARN  — test calls pytest.warns or logs but never fails; metric tracking only
+
+Only two tests are HARD FAIL:
+  test_all_nets_routed
+  test_convergence
+All others are SOFT WARN (implemented via `warnings.warn`).
+"""
+import re
+import warnings
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _soft(condition: bool, message: str) -> None:
+    """Emit a UserWarning instead of failing when condition is False."""
+    if not condition:
+        warnings.warn(message, UserWarning, stacklevel=2)
+
+
+# ---------------------------------------------------------------------------
+# Group A: Log health + timing metrics
+# ---------------------------------------------------------------------------
+
+class TestLogHealth:
+    """Verify the log file contains no ERROR or CRITICAL entries."""
+
+    def test_no_errors(self, log_content):
+        """SOFT WARN: Unexpected ERROR lines in log."""
+        errors = [ln for ln in log_content.splitlines()
+                  if re.search(r"\bERROR\b", ln) and "[LOG]" not in ln]
+        _soft(not errors,
+              f"Log contains {len(errors)} ERROR line(s):\n" + "\n".join(errors[:5]))
+
+    def test_no_criticals(self, log_content):
+        """SOFT WARN: Any CRITICAL in the log is a serious regression."""
+        crits = [ln for ln in log_content.splitlines() if re.search(r"\bCRITICAL\b", ln)]
+        _soft(not crits,
+              f"Log contains {len(crits)} CRITICAL line(s):\n" + "\n".join(crits[:5]))
+
+
+class TestGPUMode:
+    """Report and verify which compute mode the run used."""
+
+    def test_gpu_mode_detected(self, log_content, gpu_mode):
+        """SOFT WARN: Log the active compute mode. GPU preferred."""
+        mode = "GPU" if gpu_mode else "CPU"
+        _soft(gpu_mode, f"Routing ran in {mode} mode — GPU preferred for performance")
+
+    def test_gpu_mode_matches_available_hardware(self, log_content, gpu_mode):
+        """SOFT WARN: GPU=YES in log but cuda_dijkstra unavailable would be a config error."""
+        if not gpu_mode:
+            pytest.skip("CPU mode — skip GPU consistency check")
+        cuda_ok = "CUDA-COMPILE" in log_content or "Compiled" in log_content
+        _soft(cuda_ok, "GPU=YES but no CUDA kernel compilation found — possible config mismatch")
+
+
+class TestIterationMetrics:
+    """Parse [ITER N] log lines as an alternative source of timing data."""
+
+    @pytest.fixture(scope="class")
+    def iter_lines(self, log_content):
+        pattern = re.compile(
+            r"\[ITER\s+(\d+)\].*?nets=(\d+)/(\d+).*?iter=([0-9.]+)s.*?total=([0-9.]+)s"
+        )
+        rows = []
+        for ln in log_content.splitlines():
+            m = pattern.search(ln)
+            if m:
+                rows.append({
+                    "iter": int(m.group(1)),
+                    "nets_routed": int(m.group(2)),
+                    "total_nets": int(m.group(3)),
+                    "iter_time_s": float(m.group(4)),
+                    "total_time_s": float(m.group(5)),
+                })
+        return rows
+
+    def test_iter_lines_present(self, iter_lines):
+        """SOFT WARN: No [ITER N] lines found – log may be wrong verbosity."""
+        _soft(len(iter_lines) > 0, "No [ITER N] lines found in log")
+
+    def test_iter_avg_time(self, iter_lines, active_metrics):
+        """SOFT WARN: Average iteration time exceeds baseline threshold for active compute mode."""
+        if not iter_lines:
+            pytest.skip("No iteration data in log")
+        avg = sum(r["iter_time_s"] for r in iter_lines) / len(iter_lines)
+        limit = active_metrics["iter_avg_time_s_max"]
+        _soft(avg <= limit, f"Avg iter time {avg:.1f}s > threshold {limit}s (performance regression?)")
+
+    def test_iter_trend_not_exploding(self, iter_lines):
+        """SOFT WARN: Iteration time grows >3× from first to last (runaway cost)."""
+        if len(iter_lines) < 4:
+            pytest.skip("Not enough iterations for trend check")
+        first = iter_lines[0]["iter_time_s"]
+        last = iter_lines[-1]["iter_time_s"]
+        _soft(last <= first * 3, f"Iter time grew {last/first:.1f}× (first={first:.1f}s, last={last:.1f}s)")
+
+    def test_total_time(self, iter_lines, active_metrics):
+        """SOFT WARN: Total routing time exceeds baseline for active compute mode."""
+        if not iter_lines:
+            pytest.skip("No iteration data in log")
+        total = iter_lines[-1]["total_time_s"]
+        limit = active_metrics["total_time_s_max"]
+        _soft(total <= limit, f"Total time {total:.0f}s > threshold {limit:.0f}s")
+
+
+# ---------------------------------------------------------------------------
+# Group A2: Board-load log verification
+# ---------------------------------------------------------------------------
+
+class TestBoardLoad:
+    """Verify board extraction log lines match golden_board.json."""
+
+    def _find(self, log_content, pattern):
+        m = re.search(pattern, log_content)
+        return int(m.group(1)) if m else None
+
+    def test_pad_count(self, log_content, golden_board):
+        found = self._find(log_content, r"(\d+)\s+pads")
+        if found is None:
+            pytest.skip("Pad count line not in log")
+        assert found == golden_board["pads"], \
+            f"Pad count {found} != golden {golden_board['pads']}"
+
+    def test_routable_nets(self, log_content, golden_board):
+        found = self._find(log_content, r"(\d+)\s+routable nets")
+        if found is None:
+            pytest.skip("Routable nets line not in log")
+        assert found == golden_board["routable_nets"], \
+            f"Routable nets {found} != golden {golden_board['routable_nets']}"
+
+    def test_copper_layers(self, log_content, golden_board):
+        found = self._find(log_content, r"(\d+)\s+(?:copper\s+)?layers")
+        if found is None:
+            pytest.skip("Layer count line not in log")
+        assert found == golden_board["copper_layers"], \
+            f"Layer count {found} != golden {golden_board['copper_layers']}"
+
+    def test_lattice_nodes(self, log_content, golden_board):
+        found = self._find(log_content, r"(?:lattice|Total deterministic lattice).*?(\d{5,})\s+nodes")
+        if found is None:
+            pytest.skip("Lattice node count line not in log")
+        assert found == golden_board["lattice_nodes"], \
+            f"Lattice nodes {found} != golden {golden_board['lattice_nodes']}"
+
+    def test_existing_tracks(self, log_content, golden_board):
+        found = self._find(log_content, r"(\d+)\s+tracks")
+        if found is None:
+            pytest.skip("Track count line not in log")
+        tol = int(golden_board["tracks_existing"] * golden_board["tolerance_tracks_pct"])
+        _soft(abs(found - golden_board["tracks_existing"]) <= tol,
+              f"Existing tracks {found} differs >5% from golden {golden_board['tracks_existing']}")
+
+    def test_existing_vias(self, log_content, golden_board):
+        found = self._find(log_content, r"(\d+)\s+vias")
+        if found is None:
+            pytest.skip("Via count line not in log")
+        tol = int(golden_board["vias_existing"] * golden_board["tolerance_vias_pct"])
+        _soft(abs(found - golden_board["vias_existing"]) <= tol,
+              f"Existing vias {found} differs >5% from golden {golden_board['vias_existing']}")
+
+    def test_ipc_adapter_used(self, log_content):
+        """SOFT WARN: Confirm preferred IPC adapter was selected (not SWIG/file fallback)."""
+        used_ipc = "IPC" in log_content or "ipc" in log_content
+        _soft(used_ipc, "IPC adapter may not have been used (check log for SWIG/file fallback)")
+
+
+# ---------------------------------------------------------------------------
+# Group B: Routing quality
+# ---------------------------------------------------------------------------
+
+class TestRoutingQuality:
+    """
+    Core routing quality checks.  HARD FAIL = 100% nets must route.
+    All performance checks are SOFT WARNs.
+    """
+
+    REQUIRED_KEYS = [
+        "success", "converged", "nets_routed", "total_nets",
+        "iterations", "total_time_s", "iteration_metrics",
+        "failed_nets", "overuse_sum", "overuse_edges",
+        "barrel_conflicts", "excluded_nets", "excluded_net_ids",
+        "error_code", "message",
+    ]
+
+    @pytest.mark.parametrize("key", REQUIRED_KEYS)
+    def test_result_has_required_key(self, routing_result, key):
+        """HARD FAIL: routing_result must contain all expected keys."""
+        assert key in routing_result, f"Missing key '{key}' in routing result"
+
+    def test_all_nets_routed(self, routing_result, golden_metrics):
+        """HARD FAIL: Every routable net must be routed."""
+        nets_routed = routing_result.get("nets_routed", 0)
+        total_nets = routing_result.get("total_nets", golden_metrics["total_nets"])
+        assert nets_routed == total_nets, \
+            f"Only {nets_routed}/{total_nets} nets routed — routing regression!"
+
+    def test_convergence(self, routing_result):
+        """HARD FAIL: Router must converge (overuse_final == 0)."""
+        assert routing_result.get("converged", False), \
+            "Router did not converge (overuse edges remain)"
+
+    def test_iteration_budget(self, routing_result, active_metrics):
+        """SOFT WARN: Used more iterations than baseline for active compute mode."""
+        iters = routing_result.get("iterations", 0)
+        limit = active_metrics["iterations_max"]
+        _soft(iters <= limit,
+              f"Used {iters} iterations > baseline {limit} (algorithm efficiency regression?)")
+
+    def test_total_time(self, routing_result, active_metrics):
+        """SOFT WARN: Total routing time exceeds baseline for active compute mode."""
+        t = routing_result.get("total_time_s", 0)
+        limit = active_metrics["total_time_s_max"]
+        _soft(t <= limit, f"Total time {t:.0f}s > baseline {limit:.0f}s")
+
+    def test_overuse_final(self, routing_result, active_metrics):
+        """SOFT WARN: Final overuse count should be zero for a converged run."""
+        overuse = routing_result.get("overuse_final", routing_result.get("overuse_sum", 0))
+        _soft(overuse == 0, f"overuse_final={overuse} (should be 0 after convergence)")
+
+    def test_iter_stability(self, routing_result, active_metrics):
+        """SOFT WARN: No single iteration should take >3× the active mode avg."""
+        metrics = routing_result.get("iteration_metrics", [])
+        if not metrics:
+            pytest.skip("No iteration_metrics in routing result")
+        avg_limit = active_metrics["iter_avg_time_s_max"]
+        spikes = [m for m in metrics if m["iter_time_s"] > avg_limit * 3]
+        _soft(not spikes,
+              f"{len(spikes)} iteration(s) took >3× avg limit ({avg_limit*3:.1f}s): "
+              + ", ".join(f"iter {m['iter']}={m['iter_time_s']:.1f}s" for m in spikes[:3]))
+
+    def test_no_barrel_conflicts(self, routing_result):
+        """SOFT WARN: Via barrel conflicts indicate geometry issues."""
+        bc = routing_result.get("barrel_conflicts", 0)
+        _soft(bc == 0, f"{bc} barrel conflict(s) detected")
+
+    def test_no_excluded_nets(self, routing_result):
+        """SOFT WARN: Excluded nets should stay at zero."""
+        excl = routing_result.get("excluded_nets", 0)
+        _soft(excl == 0, f"{excl} net(s) excluded from routing")
+
+
+# ---------------------------------------------------------------------------
+# Group C: Write-back verification (requires KiCad API)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.requires_kicad
+class TestWriteBack:
+    """
+    Verify that tracks and vias are actually written back to the board.
+    Requires the KiCad Python API to inspect board state post-routing.
+    """
+
+    @pytest.fixture(scope="class")
+    def pre_counts(self, golden_board):
+        return {
+            "tracks": golden_board["tracks_existing"],
+            "vias": golden_board["vias_existing"],
+        }
+
+    def test_writeback_tracks_increased(self, routing_result, pre_counts, board_object):
+        """SOFT WARN: Track count must increase after routing."""
+        post = getattr(board_object, "track_count", None)
+        if post is None:
+            pytest.skip("board_object does not expose track_count")
+        _soft(post > pre_counts["tracks"],
+              f"Track count did not increase: pre={pre_counts['tracks']}, post={post}")
+
+    def test_writeback_vias_increased(self, routing_result, pre_counts, board_object):
+        """SOFT WARN: Via count must increase after routing."""
+        post = getattr(board_object, "via_count", None)
+        if post is None:
+            pytest.skip("board_object does not expose via_count")
+        _soft(post > pre_counts["vias"],
+              f"Via count did not increase: pre={pre_counts['vias']}, post={post}")

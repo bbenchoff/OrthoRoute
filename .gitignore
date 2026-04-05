@@ -126,6 +126,10 @@ standalone_*.py
 quick_*.py
 *temp*.py
 
+# Un-ignore pytest test files inside the tests/ directory
+!tests/**test_*.py
+!tests/**/test_*.py
+
 # Debug output directory
 debug_output/
 
