@@ -13,8 +13,6 @@ I swear to fucking god there is never going to be a discord or slack for this sh
 - Blind/buried via support (870 via pairs)
 
 **What needs work:**
-- ⚠️ No unit tests
-- ⚠️ No regression test for routing quality (see TODO below)
 - ⚠️ Large files (3,936-line UnifiedPathFinder class)
 - ⚠️ Configuration scattered across multiple places
 
@@ -90,110 +88,14 @@ Don't try to refactor the entire 3,936-line UnifiedPathFinder on your first PR. 
 
 ### 2. **Areas That Need Help**
 
-#### **Critical Priority: Tests**
-The project has **zero unit tests**. This is the biggest blocker to refactoring.
+#### **Priority: Tests**
 
----
+Unit tests and regression tests are implemented. See **[tests/README.md](../tests/README.md)** for how to run them and what they cover.
 
-### TODO: Automated Regression Test (TestBackplane)
-
-**Goal**: Run the full routing pipeline headlessly on `TestBoards/TestBackplane.kicad_pcb` and compare results against a stored golden baseline. Catch regressions before they reach users.
-
-**Rules**:
-- The board file is **read-only** — never modify it during the test. Copy to a temp dir if output is needed.
-- Use `python main.py cli TestBoards/TestBackplane.kicad_pcb` (headless, no KiCad running).
-- Or use the `.orp`/`.ors` headless format: `python main.py --headless board.orp --output out.ors`.
-
-**Metrics to capture** (written to `tests/golden_metrics.json`):
-```json
-{
-  "nets_routed": 512,
-  "nets_total": 512,
-  "route_pct": 100.0,
-  "overuse_edges": 0,
-  "iterations": 23,
-  "total_time_s": 220.3
-}
-```
-
-**Pass/fail criteria**:
-| Metric | Tolerance | Rationale |
-|---|---|---|
-| `nets_routed` | exact or better | Must not regress routing success |
-| `overuse_edges` | exact or better | Must not regress convergence |
-| `iterations` | ±10% | PathFinder is non-deterministic |
-| `total_time_s` | ≤ 110% of golden | Must not be more than 10% slower |
-
-**Suggested implementation**:
-```python
-# tests/test_regression_backplane.py
-import json, subprocess, time, pytest
-from pathlib import Path
-
-GOLDEN = Path("tests/golden_metrics.json")
-BOARD  = Path("TestBoards/TestBackplane.kicad_pcb")
-
-def test_backplane_routing_regression():
-    """Headless routing of TestBackplane must not regress vs golden metrics."""
-    assert BOARD.exists(), "Board file missing from repo"
-    assert GOLDEN.exists(), "Golden metrics missing — run pytest --update-golden first"
-
-    golden = json.loads(GOLDEN.read_text())
-    t0 = time.time()
-    result = subprocess.run(
-        ["python", "main.py", "cli", str(BOARD)],
-        capture_output=True, text=True, timeout=600
-    )
-    elapsed = time.time() - t0
-    assert result.returncode == 0, f"Router crashed: {result.stderr[-500:]}"
-
-    # Parse summary from stdout/log
-    metrics = _parse_routing_metrics(result.stdout + result.stderr)
-
-    assert metrics["nets_routed"] >= golden["nets_routed"], \
-        f"Routing regressed: {metrics['nets_routed']} < {golden['nets_routed']}"
-    assert metrics["overuse_edges"] <= golden["overuse_edges"], \
-        f"Overuse regressed: {metrics['overuse_edges']} > {golden['overuse_edges']}"
-    assert abs(metrics["iterations"] - golden["iterations"]) / golden["iterations"] <= 0.10, \
-        f"Iterations outside ±10%: {metrics['iterations']} vs {golden['iterations']}"
-    assert elapsed <= golden["total_time_s"] * 1.10, \
-        f"Timing regressed: {elapsed:.1f}s > {golden['total_time_s'] * 1.10:.1f}s (110% of golden)"
-```
-
-**To update the golden baseline** (after an intentional improvement):
-```powershell
-# Run router, capture metrics, write golden_metrics.json
-python main.py cli TestBoards/TestBackplane.kicad_pcb --export-metrics tests/golden_metrics.json
-# OR: pytest tests/test_regression_backplane.py --update-golden
-```
-
-**Files to create**:
-- `tests/test_regression_backplane.py` — the test
-- `tests/golden_metrics.json` — stored baseline (committed to repo)
-- Add `--export-metrics <path>` flag to `main.py` CLI to emit JSON summary
-
----
-
-**Start here:**
-```python
-# tests/test_lattice_builder.py
-def test_lattice_node_count():
-    """Verify lattice creates correct number of nodes"""
-    builder = LatticeBuilder(Nx=10, Ny=10, Nz=6)
-    lattice = builder.build()
-    assert lattice.num_nodes == 10 * 10 * 6
-
-def test_manhattan_adjacency():
-    """Verify no diagonal edges in graph"""
-    # Check that all edges connect orthogonally
-```
-
-**What to test:**
-- Lattice building (node count, adjacency)
-- CSR matrix construction (integrity checks)
-- Via pooling accounting (usage counts)
-- Portal escape planning (DRC compliance)
-- Pad mapping (nearest node finding)
+Good first contributions:
+- Add tests for `pad_escape_planner.py` (DRC compliance, portal placement)
+- Add tests for `board_analyzer.py` (layer detection, bounds extraction)
+- Add tests for `CSRGraph.finalize()` (node count, edge count, indptr integrity)
 
 #### **High Priority: Refactoring**
 
@@ -273,26 +175,7 @@ def build_lattice(
 
 ### Testing
 
-**When you add tests (please do!):**
-- Use `pytest`
-- Test files in `tests/` directory
-- Name test files `test_*.py`
-- Name test functions `test_*`
-- One assertion per test (mostly)
-
-**Example:**
-```python
-# tests/test_via_pooling.py
-import pytest
-from orthoroute.algorithms.manhattan.unified_pathfinder import UnifiedPathFinder
-
-def test_via_column_accounting():
-    """Verify via column usage increments correctly"""
-    pf = UnifiedPathFinder()
-    # Setup...
-    pf._increment_via_column_use(x=5, y=10)
-    assert pf.via_col_use[5, 10] == 1
-```
+Use `pytest`. Test files in `tests/`. See **[tests/README.md](../tests/README.md)** for full details.
 
 ### Git Workflow
 
