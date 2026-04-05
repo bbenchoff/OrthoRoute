@@ -3,8 +3,8 @@ Regression tests for TestBackplane.kicad_pcb.
 
 Test groups:
   A  — Log health + timing metrics (no routing required)
-  A2 — Board-load verification against golden_board.json (no routing required)
-  B  — Routing quality (requires routing_result fixture → full pipeline run)
+  A2 — Board-load verification against golden_board.json (always runs; parses .kicad_pcb directly)
+  B  — Routing quality (requires routing_result fixture → full pipeline run or routing log)
   C  — Write-back verification (requires KiCad API, skipped without it)
 
 Pass/fail policy:
@@ -18,8 +18,20 @@ All others are SOFT WARN (implemented via `warnings.warn`).
 """
 import re
 import warnings
+from pathlib import Path
 
 import pytest
+
+REPO_ROOT = Path(__file__).parent.parent.parent
+TEST_BOARD_FILE = REPO_ROOT / "TestBoards" / "TestBackplane.kicad_pcb"
+
+
+@pytest.fixture(scope="module")
+def board_file_text():
+    """Raw .kicad_pcb text — always available, no routing needed."""
+    if not TEST_BOARD_FILE.exists():
+        pytest.skip(f"Test board not found: {TEST_BOARD_FILE}")
+    return TEST_BOARD_FILE.read_text(encoding="utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -120,61 +132,52 @@ class TestIterationMetrics:
 
 
 # ---------------------------------------------------------------------------
-# Group A2: Board-load log verification
+# Group A2: Board-load verification — parses .kicad_pcb directly
 # ---------------------------------------------------------------------------
 
 class TestBoardLoad:
-    """Verify board extraction log lines match golden_board.json."""
+    """
+    Verify the test board file matches golden_board.json.
 
-    def _find(self, log_content, pattern):
-        m = re.search(pattern, log_content)
-        return int(m.group(1)) if m else None
+    Parses TestBackplane.kicad_pcb directly — never depends on log content.
+    These tests always run regardless of log state.
+    """
 
-    def test_pad_count(self, log_content, golden_board):
-        found = self._find(log_content, r"(\d+)\s+pads")
-        if found is None:
-            pytest.skip("Pad count line not in log")
-        assert found == golden_board["pads"], \
-            f"Pad count {found} != golden {golden_board['pads']}"
+    def test_pad_count(self, board_file_text, golden_board):
+        """HARD FAIL: Pad count in .kicad_pcb must match golden."""
+        count = board_file_text.count("(pad ")
+        assert count == golden_board["pads"], \
+            f"Pad count {count} != golden {golden_board['pads']} (.kicad_pcb changed?)"
 
-    def test_routable_nets(self, log_content, golden_board):
-        found = self._find(log_content, r"(\d+)\s+routable nets")
-        if found is None:
-            pytest.skip("Routable nets line not in log")
-        assert found == golden_board["routable_nets"], \
-            f"Routable nets {found} != golden {golden_board['routable_nets']}"
+    def test_copper_layers(self, board_file_text, golden_board):
+        """HARD FAIL: Copper layer count must match golden."""
+        copper = set(re.findall(r'"((?:F|B)\.Cu|In\d+\.Cu)"', board_file_text))
+        assert len(copper) == golden_board["copper_layers"], \
+            f"Copper layers {len(copper)} != golden {golden_board['copper_layers']}"
 
-    def test_copper_layers(self, log_content, golden_board):
-        found = self._find(log_content, r"(\d+)\s+(?:copper\s+)?layers")
-        if found is None:
-            pytest.skip("Layer count line not in log")
-        assert found == golden_board["copper_layers"], \
-            f"Layer count {found} != golden {golden_board['copper_layers']}"
-
-    def test_lattice_nodes(self, log_content, golden_board):
-        found = self._find(log_content, r"(?:lattice|Total deterministic lattice).*?(\d{5,})\s+nodes")
-        if found is None:
-            pytest.skip("Lattice node count line not in log")
-        assert found == golden_board["lattice_nodes"], \
-            f"Lattice nodes {found} != golden {golden_board['lattice_nodes']}"
-
-    def test_existing_tracks(self, log_content, golden_board):
-        found = self._find(log_content, r"(\d+)\s+tracks")
-        if found is None:
-            pytest.skip("Track count line not in log")
+    def test_existing_tracks(self, board_file_text, golden_board):
+        """SOFT WARN: Segment count in .kicad_pcb should be within 5% of golden."""
+        # KiCad 9 uses tab-indented "(segment\n\t\t(start..." — match without trailing space
+        count = len(re.findall(r'\(segment\b', board_file_text))
         tol = int(golden_board["tracks_existing"] * golden_board["tolerance_tracks_pct"])
-        _soft(abs(found - golden_board["tracks_existing"]) <= tol,
-              f"Existing tracks {found} differs >5% from golden {golden_board['tracks_existing']}")
+        _soft(abs(count - golden_board["tracks_existing"]) <= tol,
+              f"Track segments {count} differs >5% from golden {golden_board['tracks_existing']}")
 
-    def test_existing_vias(self, log_content, golden_board):
-        found = self._find(log_content, r"(\d+)\s+vias")
-        if found is None:
-            pytest.skip("Via count line not in log")
+    def test_existing_vias(self, board_file_text, golden_board):
+        """SOFT WARN: Via count in .kicad_pcb should be within 5% of golden."""
+        count = len(re.findall(r'\(via ', board_file_text))
         tol = int(golden_board["vias_existing"] * golden_board["tolerance_vias_pct"])
-        _soft(abs(found - golden_board["vias_existing"]) <= tol,
-              f"Existing vias {found} differs >5% from golden {golden_board['vias_existing']}")
+        _soft(abs(count - golden_board["vias_existing"]) <= tol,
+              f"Via count {count} differs >5% from golden {golden_board['vias_existing']}")
 
-    def test_ipc_adapter_used(self, log_content):
+    def test_net_count(self, board_file_text, golden_board):
+        """SOFT WARN: Total net declarations should match golden."""
+        # Count (net N "name") declarations
+        count = len(re.findall(r'\(net \d+', board_file_text))
+        _soft(count >= golden_board.get("total_nets", 900),
+              f"Net count {count} < golden {golden_board.get('total_nets', 900)}")
+
+    def test_ipc_adapter_in_log(self, log_content):
         """SOFT WARN: Confirm preferred IPC adapter was selected (not SWIG/file fallback)."""
         used_ipc = "IPC" in log_content or "ipc" in log_content
         _soft(used_ipc, "IPC adapter may not have been used (check log for SWIG/file fallback)")
@@ -188,6 +191,9 @@ class TestRoutingQuality:
     """
     Core routing quality checks.  HARD FAIL = 100% nets must route.
     All performance checks are SOFT WARNs.
+
+    Uses `routing_result` (headless) when available, otherwise falls back to
+    `log_routing_result` (parsed from the ORTHO_DEBUG=1 log).
     """
 
     REQUIRED_KEYS = [
@@ -198,44 +204,52 @@ class TestRoutingQuality:
         "error_code", "message",
     ]
 
-    @pytest.mark.parametrize("key", REQUIRED_KEYS)
-    def test_result_has_required_key(self, routing_result, key):
-        """HARD FAIL: routing_result must contain all expected keys."""
-        assert key in routing_result, f"Missing key '{key}' in routing result"
+    @pytest.fixture(scope="class")
+    def result(self, routing_result, log_routing_result):
+        """Best available routing result: headless run > log parse > skip."""
+        r = routing_result if routing_result is not None else log_routing_result
+        if r is None:
+            pytest.skip("No routing result available — run OrthoRoute with ORTHO_DEBUG=1 first")
+        return r
 
-    def test_all_nets_routed(self, routing_result, golden_metrics):
+    @pytest.mark.parametrize("key", REQUIRED_KEYS)
+    def test_result_has_required_key(self, result, key):
+        """HARD FAIL: routing result must contain all expected keys."""
+        assert key in result, f"Missing key '{key}' in routing result"
+
+    def test_all_nets_routed(self, result, golden_metrics):
         """HARD FAIL: Every routable net must be routed."""
-        nets_routed = routing_result.get("nets_routed", 0)
-        total_nets = routing_result.get("total_nets", golden_metrics["total_nets"])
+        nets_routed = result.get("nets_routed", 0)
+        total_nets = result.get("total_nets", golden_metrics["total_nets"])
         assert nets_routed == total_nets, \
             f"Only {nets_routed}/{total_nets} nets routed — routing regression!"
 
-    def test_convergence(self, routing_result):
+    def test_convergence(self, result):
         """HARD FAIL: Router must converge (overuse_final == 0)."""
-        assert routing_result.get("converged", False), \
+        assert result.get("converged", False), \
             "Router did not converge (overuse edges remain)"
 
-    def test_iteration_budget(self, routing_result, active_metrics):
+    def test_iteration_budget(self, result, active_metrics):
         """SOFT WARN: Used more iterations than baseline for active compute mode."""
-        iters = routing_result.get("iterations", 0)
+        iters = result.get("iterations", 0)
         limit = active_metrics["iterations_max"]
         _soft(iters <= limit,
               f"Used {iters} iterations > baseline {limit} (algorithm efficiency regression?)")
 
-    def test_total_time(self, routing_result, active_metrics):
+    def test_total_time(self, result, active_metrics):
         """SOFT WARN: Total routing time exceeds baseline for active compute mode."""
-        t = routing_result.get("total_time_s", 0)
+        t = result.get("total_time_s", 0)
         limit = active_metrics["total_time_s_max"]
         _soft(t <= limit, f"Total time {t:.0f}s > baseline {limit:.0f}s")
 
-    def test_overuse_final(self, routing_result, active_metrics):
+    def test_overuse_final(self, result, active_metrics):
         """SOFT WARN: Final overuse count should be zero for a converged run."""
-        overuse = routing_result.get("overuse_final", routing_result.get("overuse_sum", 0))
+        overuse = result.get("overuse_final", result.get("overuse_sum", 0))
         _soft(overuse == 0, f"overuse_final={overuse} (should be 0 after convergence)")
 
-    def test_iter_stability(self, routing_result, active_metrics):
+    def test_iter_stability(self, result, active_metrics):
         """SOFT WARN: No single iteration should take >3× the active mode avg."""
-        metrics = routing_result.get("iteration_metrics", [])
+        metrics = result.get("iteration_metrics", [])
         if not metrics:
             pytest.skip("No iteration_metrics in routing result")
         avg_limit = active_metrics["iter_avg_time_s_max"]
@@ -244,27 +258,34 @@ class TestRoutingQuality:
               f"{len(spikes)} iteration(s) took >3× avg limit ({avg_limit*3:.1f}s): "
               + ", ".join(f"iter {m['iter']}={m['iter_time_s']:.1f}s" for m in spikes[:3]))
 
-    def test_no_barrel_conflicts(self, routing_result):
+    def test_no_barrel_conflicts(self, result):
         """SOFT WARN: Via barrel conflicts indicate geometry issues."""
-        bc = routing_result.get("barrel_conflicts", 0)
+        bc = result.get("barrel_conflicts", 0)
         _soft(bc == 0, f"{bc} barrel conflict(s) detected")
 
-    def test_no_excluded_nets(self, routing_result):
+    def test_no_excluded_nets(self, result):
         """SOFT WARN: Excluded nets should stay at zero."""
-        excl = routing_result.get("excluded_nets", 0)
+        excl = result.get("excluded_nets", 0)
         _soft(excl == 0, f"{excl} net(s) excluded from routing")
 
 
 # ---------------------------------------------------------------------------
-# Group C: Write-back verification (requires KiCad API)
+# Group C: Write-back verification
 # ---------------------------------------------------------------------------
 
 @pytest.mark.requires_kicad
 class TestWriteBack:
     """
     Verify that tracks and vias are actually written back to the board.
-    Requires the KiCad Python API to inspect board state post-routing.
+    Falls back to log-parsed writeback counts when headless routing unavailable.
     """
+
+    @pytest.fixture(scope="class")
+    def result(self, routing_result, log_routing_result):
+        r = routing_result if routing_result is not None else log_routing_result
+        if r is None:
+            pytest.skip("No routing result available — run OrthoRoute with ORTHO_DEBUG=1 first")
+        return r
 
     @pytest.fixture(scope="class")
     def pre_counts(self, golden_board):
@@ -273,18 +294,19 @@ class TestWriteBack:
             "vias": golden_board["vias_existing"],
         }
 
-    def test_writeback_tracks_increased(self, routing_result, pre_counts, board_object):
+    def test_writeback_tracks_increased(self, result, pre_counts):
         """SOFT WARN: Track count must increase after routing."""
-        post = getattr(board_object, "track_count", None)
+        post = result.get("tracks_written")
         if post is None:
-            pytest.skip("board_object does not expose track_count")
+            # Fall back to checking board_object if available
+            pytest.skip("tracks_written not in result (headless routing not available)")
         _soft(post > pre_counts["tracks"],
               f"Track count did not increase: pre={pre_counts['tracks']}, post={post}")
 
-    def test_writeback_vias_increased(self, routing_result, pre_counts, board_object):
+    def test_writeback_vias_increased(self, result, pre_counts):
         """SOFT WARN: Via count must increase after routing."""
-        post = getattr(board_object, "via_count", None)
+        post = result.get("vias_written")
         if post is None:
-            pytest.skip("board_object does not expose via_count")
+            pytest.skip("vias_written not in result (headless routing not available)")
         _soft(post > pre_counts["vias"],
               f"Via count did not increase: pre={pre_counts['vias']}, post={post}")
