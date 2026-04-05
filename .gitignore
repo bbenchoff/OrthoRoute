@@ -52,8 +52,6 @@ gpu_parallelization.py
 orthoroute.log
 *.tmp
 *.temp
-tests/
-tests/*
 logs/
 logs/*
 checkpoints/

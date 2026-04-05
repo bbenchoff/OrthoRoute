@@ -1,0 +1,41 @@
+{
+  "_comment": "Routing baselines for TestBackplane.kicad_pcb. Separate entries for GPU (preferred) and CPU-only (--cpu-only flag). Update after deliberate algorithm improvements.",
+  "_board": "TestBackplane.kicad_pcb — 1604 pads, 512 nets, 18 layers, 446,472 lattice nodes",
+
+  "nets_routed": 512,
+  "total_nets": 512,
+
+  "gpu": {
+    "_source": "NVIDIA T1200 Laptop GPU (4 GB), OrthoRoute 2026-04-05 — MEASURED",
+    "_note": "Actual run: 65 iterations, 717.5s total, iter1=29.2s, iter_avg=11.0s. 4290 tracks, 2754 vias. Thresholds = measured × 1.25 headroom.",
+    "converged": true,
+    "iterations_max": 80,
+    "total_time_s_max": 900,
+    "iter_avg_time_s_max": 15.0,
+    "iter_1_time_s_max": 40.0,
+    "overuse_final_max": 0,
+    "tracks_delta_min": 4000,
+    "vias_delta_min": 2500
+  },
+
+  "cpu": {
+    "_source": "CPU-only baseline — not yet measured, update after cpu-only run",
+    "_note": "Run: python main.py cli TestBoards/TestBackplane.kicad_pcb --cpu-only",
+    "converged": true,
+    "iterations_max": 120,
+    "total_time_s_max": 7200,
+    "iter_avg_time_s_max": 120.0,
+    "iter_1_time_s_max": 600.0,
+    "overuse_final_max": 0,
+    "tracks_delta_min": 4000,
+    "vias_delta_min": 2500
+  },
+
+  "_thresholds_note": "All *_max/*_min values are soft warnings unless noted HARD FAIL in test docstrings. Tests pick the right block by reading GPU=YES/NO from the log.",
+  "iterations_max": 80,
+  "total_time_s_max": 900,
+  "iter_avg_time_s_max": 15.0,
+  "overuse_final_max": 0,
+  "tracks_delta_min": 4000,
+  "vias_delta_min": 2500
+}
