@@ -57,20 +57,20 @@ def setup_logging(settings: LoggingSettings) -> None:
         logging.getLogger(component).setLevel(getattr(logging, level.upper()))
 
     # Override all handler levels to respect ORTHO_DEBUG:
-    #   Console  → WARNING  (always)
-    #   File     → WARNING  (normal) / DEBUG (when ORTHO_DEBUG=1)
+    #   Console  → ERROR   (always)
+    #   File     → ERROR   (normal) / DEBUG (when ORTHO_DEBUG=1)
     import os
     debug_mode = os.environ.get('ORTHO_DEBUG', '0') == '1'
-    file_level = logging.DEBUG if debug_mode else logging.WARNING
+    file_level = logging.DEBUG if debug_mode else logging.ERROR
     root_logger.setLevel(logging.DEBUG)  # Allow all levels through; handlers filter
     for h in root_logger.handlers:
         if isinstance(h, logging.StreamHandler) and h.stream == sys.stdout:
-            h.setLevel(logging.WARNING)
+            h.setLevel(logging.ERROR)
         else:
             h.setLevel(file_level)
 
-    mode_label = "DEBUG" if debug_mode else "WARNING"
-    root_logger.warning(f"[LOG] Console: WARNING only | File: {mode_label} (set ORTHO_DEBUG=1 for full logs)")
+    mode_label = "DEBUG" if debug_mode else "ERROR"
+    root_logger.error(f"[LOG] Console: ERROR only | File: {mode_label} (set ORTHO_DEBUG=1 for full logs)")
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -130,18 +130,18 @@ def init_logging():
     """Initialize logging.
 
     Normal mode  (ORTHO_DEBUG unset / '0'):
-        File  → WARNING  (~66 milestone lines/run incl. [ROUTING START] + [ITER N] timing)
-        Console → WARNING
+        File    → ERROR   (CRITICAL + ERROR only — silent unless something breaks)
+        Console → ERROR
 
     Debug mode (ORTHO_DEBUG=1):
-        File  → DEBUG (full detail, thousands of lines)
-        Console → WARNING
+        File    → DEBUG (full detail, thousands of lines + [ITER N] timing)
+        Console → ERROR
     """
     import os
     from datetime import datetime
 
     debug_mode = os.environ.get('ORTHO_DEBUG', '0') == '1'
-    file_level = logging.DEBUG if debug_mode else logging.WARNING
+    file_level = logging.DEBUG if debug_mode else logging.ERROR
 
     # Create logs directory
     os.makedirs("logs", exist_ok=True)
@@ -170,9 +170,9 @@ def init_logging():
     fh_timestamped.setLevel(file_level)
     fh_timestamped.setFormatter(fmt)
 
-    # CONSOLE HANDLER: WARNING only
+    # CONSOLE HANDLER: ERROR only
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.WARNING)
+    console_handler.setLevel(logging.ERROR)
     console_handler.setFormatter(fmt)
 
     # Configure root logger
@@ -183,8 +183,8 @@ def init_logging():
     root.addHandler(console_handler)
 
     # Log startup message
-    mode_label = "DEBUG" if debug_mode else "WARNING"
-    root.warning(f"[LOG] File: {mode_label} | {latest_log} + {timestamped_log} (set ORTHO_DEBUG=1 for full logs)")
+    mode_label = "DEBUG" if debug_mode else "ERROR"
+    root.error(f"[LOG] File: {mode_label} | {latest_log} + {timestamped_log} (set ORTHO_DEBUG=1 for full logs)")
 
 
 def get_context_logger(name: str, **context) -> ContextLogger:
