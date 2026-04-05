@@ -188,14 +188,25 @@ def _parse_routing_result_from_log(text: str) -> dict | None:
     """
     Extract routing summary metrics from a ORTHO_DEBUG=1 log.
 
+    Parses three layers of evidence:
+      1. [ITER N] lines          — per-iteration timing + overuse
+      2. End-of-run summary      — ROUTING COMPLETE / [CLEAN] / [FINAL] lines
+      3. Write-back confirmation — "Applied N tracks and N vias to KiCad"
+
     Returns a routing_result-compatible dict, or None if the log has no
     routing completion marker.
+
+    Recognised end-of-run patterns:
+      WARNING - [CLEAN] All nets routed with zero overuse
+      WARNING - ROUTING COMPLETE: All N nets routed successfully with zero overuse!
+      WARNING - [FINAL] Edge routing converged (N barrel conflicts remain - acceptable)
+      INFO    - Applied N tracks and N vias to KiCad          (✅ write-back)
     """
     if "ROUTING COMPLETE" not in text and "CONVERGED" not in text:
         return None
 
     # --- convergence + final iter summary ---
-    # [ITER  65] nets=512/512  ✓ CONVERGED  edges=0 ... barrel=444  iter=4.6s  total=717.5s
+    # [ITER  67] nets=512/512  ✓ CONVERGED  edges=0  via_overuse=0%  barrel=379  iter=4.0s  total=761.2s
     iter_pattern = re.compile(
         r"\[ITER\s+(\d+)\].*?nets=(\d+)/(\d+).*?edges=(\d+).*?barrel=(\d+).*?iter=([0-9.]+)s.*?total=([0-9.]+)s"
     )
@@ -223,33 +234,59 @@ def _parse_routing_result_from_log(text: str) -> dict | None:
 
     last = final_iter or iter_rows[-1]
 
-    # --- writeback tracks / vias ---
-    # Applied 4290 tracks and 2754 vias to KiCad
+    # --- end-of-run summary block ---
+    # [CLEAN] All nets routed with zero overuse
+    clean_zero_overuse = bool(re.search(r"\[CLEAN\] All nets routed with zero overuse", text))
+
+    # ROUTING COMPLETE: All N nets routed successfully with zero overuse!
+    rc_m = re.search(r"ROUTING COMPLETE: All (\d+) nets routed successfully", text)
+    routing_complete_nets = int(rc_m.group(1)) if rc_m else None
+
+    # [FINAL] Edge routing converged (N barrel conflicts remain - acceptable)
+    final_m = re.search(r"\[FINAL\] Edge routing converged \((\d+) barrel conflicts remain", text)
+    final_barrel_conflicts = int(final_m.group(1)) if final_m else last["barrel"]
+
+    # Strong convergence signal: both [CLEAN] and ROUTING COMPLETE present
+    hard_converged = clean_zero_overuse or (rc_m is not None)
+
+    # --- writeback confirmation ---
+    # "Applied 4287 tracks and 2751 vias to KiCad"  (INFO from main_window)
     wb_m = re.search(r"Applied (\d+) tracks and (\d+) vias", text)
     tracks_out = int(wb_m.group(1)) if wb_m else None
     vias_out = int(wb_m.group(2)) if wb_m else None
 
+    # Build summary message
+    if rc_m:
+        message = f"ROUTING COMPLETE: All {routing_complete_nets} nets routed with zero overuse"
+        if final_barrel_conflicts:
+            message += f" ({final_barrel_conflicts} barrel conflicts — acceptable)"
+    else:
+        message = f"Parsed from log: {last['nets_routed']}/{last['total_nets']} nets routed"
+
     return {
         "success": True,
-        "converged": last.get("converged", False),
-        "nets_routed": last["nets_routed"],
+        "converged": hard_converged or last.get("converged", False),
+        "nets_routed": routing_complete_nets or last["nets_routed"],
         "total_nets": last["total_nets"],
         "iterations": last["iter"],
         "total_time_s": last["total_time_s"],
         "iteration_metrics": [
             {"iter": r["iter"], "iter_time_s": r["iter_time_s"]} for r in iter_rows
         ],
-        "failed_nets": last["total_nets"] - last["nets_routed"],
-        "overuse_sum": last["overuse_edges"],
-        "overuse_edges": last["overuse_edges"],
-        "barrel_conflicts": last["barrel"],
+        "failed_nets": last["total_nets"] - (routing_complete_nets or last["nets_routed"]),
+        "overuse_sum": 0 if clean_zero_overuse else last["overuse_edges"],
+        "overuse_edges": 0 if clean_zero_overuse else last["overuse_edges"],
+        "barrel_conflicts": final_barrel_conflicts,
         "excluded_nets": 0,
         "excluded_net_ids": [],
         "error_code": 0,
-        "message": f"Parsed from log: {last['nets_routed']}/{last['total_nets']} nets routed",
-        # writeback bonus fields
+        "message": message,
+        # writeback confirmation
         "tracks_written": tracks_out,
         "vias_written": vias_out,
+        # end-of-run flags
+        "clean_zero_overuse": clean_zero_overuse,
+        "routing_complete_banner": rc_m is not None,
         "_source": "log_parse",
     }
 

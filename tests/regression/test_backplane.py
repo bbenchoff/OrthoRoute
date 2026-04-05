@@ -321,6 +321,35 @@ class TestRoutingQuality:
         excl = result.get("excluded_nets", 0)
         _soft(excl == 0, f"{excl} net(s) excluded from routing")
 
+    def test_routing_complete_banner(self, result):
+        """SOFT WARN: 'ROUTING COMPLETE' banner must appear at end of log.
+
+        Checks that the router emitted:
+          WARNING - ROUTING COMPLETE: All N nets routed successfully with zero overuse!
+        This is the explicit success marker from UnifiedPathFinder.
+        Only meaningful when result came from log_parse (not headless routing).
+        """
+        if result.get("_source") != "log_parse":
+            pytest.skip("Banner check only applies to log-parsed results")
+        _soft(
+            result.get("routing_complete_banner", False),
+            "ROUTING COMPLETE banner not found in log — run may have been interrupted",
+        )
+
+    def test_clean_zero_overuse(self, result):
+        """SOFT WARN: '[CLEAN] All nets routed with zero overuse' line must appear.
+
+        This is the router's explicit declaration that the final state has
+        zero overuse edges, separate from the CONVERGED flag on [ITER N] lines.
+        Only meaningful when result came from log_parse.
+        """
+        if result.get("_source") != "log_parse":
+            pytest.skip("Clean-zero-overuse check only applies to log-parsed results")
+        _soft(
+            result.get("clean_zero_overuse", False),
+            "[CLEAN] marker not found — overuse may not have reached exactly zero",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Group C: Write-back verification
