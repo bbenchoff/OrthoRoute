@@ -184,6 +184,59 @@ class TestBoardLoad:
 
 
 # ---------------------------------------------------------------------------
+# Group A3: Lattice size verification
+# ---------------------------------------------------------------------------
+
+class TestLatticeSize:
+    """
+    Verify the routing lattice dimensions match golden_board.json.
+
+    Parses the 'Lattice: 106×234×18 = 446,472 nodes' WARNING line that
+    UnifiedPathFinder emits at the start of every routing run when
+    ORTHO_DEBUG=1 (or any verbosity ≥ WARNING).
+
+    These tests skip cleanly when the active log is an init-only log with
+    no routing content.
+    """
+
+    @pytest.fixture(scope="class")
+    def lattice(self, log_lattice):
+        """Parsed lattice dict, or skip when not available."""
+        if log_lattice is None:
+            pytest.skip("No 'Lattice: NxNxN = N nodes' line in log — run routing first")
+        return log_lattice
+
+    def test_lattice_nodes(self, lattice, golden_board):
+        """HARD FAIL: Total node count must match golden (lattice size changed)."""
+        assert lattice["nodes"] == golden_board["lattice_nodes"], (
+            f"Lattice nodes {lattice['nodes']:,} != golden {golden_board['lattice_nodes']:,} "
+            f"— grid pitch or board bounds changed?"
+        )
+
+    def test_lattice_layers(self, lattice, golden_board):
+        """HARD FAIL: Layer count in lattice must match board copper layers."""
+        assert lattice["layers"] == golden_board["copper_layers"], (
+            f"Lattice layers {lattice['layers']} != copper_layers {golden_board['copper_layers']}"
+        )
+
+    def test_lattice_dimensions_reported(self, lattice):
+        """SOFT WARN: Log reported lattice cols × rows × layers."""
+        _soft(
+            lattice["cols"] > 0 and lattice["rows"] > 0,
+            f"Unexpected lattice dimensions: {lattice['cols']}×{lattice['rows']}×{lattice['layers']}",
+        )
+
+    def test_lattice_node_product(self, lattice):
+        """SOFT WARN: cols × rows × layers should equal reported node count."""
+        product = lattice["cols"] * lattice["rows"] * lattice["layers"]
+        _soft(
+            product == lattice["nodes"],
+            f"cols×rows×layers={product:,} != nodes={lattice['nodes']:,} "
+            f"(log rounding or partial lattice?)",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Group B: Routing quality
 # ---------------------------------------------------------------------------
 

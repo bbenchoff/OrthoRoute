@@ -263,6 +263,42 @@ def log_routing_result(log_content) -> dict | None:
 # ---------------------------------------------------------------------------
 # GPU / CPU mode detection
 # ---------------------------------------------------------------------------
+# Lattice size parsed from log
+# ---------------------------------------------------------------------------
+
+def _parse_lattice_from_log(text: str) -> dict | None:
+    """
+    Extract lattice dimensions from a log line such as:
+      WARNING - Lattice: 106×234×18 = 446,472 nodes
+
+    Returns dict with keys: cols, rows, layers, nodes, or None if not found.
+    """
+    m = re.search(
+        r"Lattice:\s*(\d+)[×x*](\d+)[×x*](\d+)\s*=\s*([\d,]+)\s*nodes",
+        text,
+    )
+    if not m:
+        return None
+    return {
+        "cols": int(m.group(1)),
+        "rows": int(m.group(2)),
+        "layers": int(m.group(3)),
+        "nodes": int(m.group(4).replace(",", "")),
+    }
+
+
+@pytest.fixture(scope="session")
+def log_lattice(log_content) -> dict | None:
+    """
+    Lattice dimensions parsed from the log.
+
+    Returns dict with keys {cols, rows, layers, nodes}, or None if the log
+    has no 'Lattice: NxNxN = N nodes' line (init-only log or non-debug run).
+    """
+    return _parse_lattice_from_log(log_content)
+
+
+# ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
 def gpu_mode(log_content) -> bool:
