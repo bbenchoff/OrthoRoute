@@ -6,10 +6,28 @@ This folder contains all performance optimization documentation, baselines, and 
 
 ## 📊 Performance Baselines
 
+### [Baseline: April 8, 2026](optimization_baseline_2026-04-08.md) ⚠️ **CURRENT**
+**TestBackplane routing analysis (512 nets, 18 layers, 17.5 minutes)**
+
+Performance regression detected vs. April 5 baseline:
+- 46% slower than best performance (11.96 min → 17.5 min)
+- Average iteration time: 15.7s (vs. 11.0s on April 5)
+- Root cause investigation required
+- Full profiling data with `ORTHO_DEBUG=1` needed
+
+### [Baseline: April 5, 2026](optimization_baseline_2026-04-05.md) ✅ **BEST PERFORMANCE**
+**TestBackplane routing analysis (512 nets, 18 layers, 11.96 minutes)**
+
+Best documented performance:
+- 4× faster than April 3 baseline
+- 2× faster than April 3 persistent kernel
+- 11.0s average iteration time
+- 512/512 nets routed with zero overuse
+
 ### [Baseline: April 3, 2026](optimization_baseline_2026-04-03.md)
 **TestBackplane routing analysis (512 nets, 32 layers, 44.23 minutes)**
 
-Complete performance baseline with:
+Original baseline with:
 - Current performance measurements
 - Profiled bottlenecks and priorities
 - Phase-by-phase optimization roadmap
@@ -56,18 +74,27 @@ print(f"GPU kernel: {sum(gpu)/max(1,len(gpu)):.1f}ms avg,  Total/net: {sum(tot)/
 
 ---
 
-## 📈 Optimization Targets (Revised — Live Run April 3, 2026)
+## 📈 Optimization Targets — Status Update
 
-> Priority #1 was corrected after profiling 40 iterations and 3,311 GPU paths.
-> The via rebuild is only 1% of runtime. The Python→CUDA kernel launch loop is 95%.
+### Historical Progression
 
-| Priority | Target | Measured Cost | % of Total | Est. Impact |
-|----------|--------|--------------|------------|-------------|
-| 🔴 **#1** | GPU MULTI-LAUNCH overhead (Python loop per net) | ~980s/run | **~95%** | **10-20× speedup** |
-| 🟡 **#2** | `initialize_graph()` | 20.9s once | one-time | **6-8s** |
-| 🟢 **#3** | `_rebuild_via_usage_from_committed()` | ~11s/run | **~1%** | deferred |
+| Date | Total Time | Avg Iter | Target achieved | Notes |
+|------|------------|----------|-----------------|-------|
+| Apr 3 | 47.9 min | ~39s | Baseline | Multi-launch kernel |
+| Apr 3 | 25 min | ~20s | **2× improvement** | Persistent kernel enabled |
+| Apr 5 | **11.96 min** | **11.0s** | **4× improvement** ✅ | **Best performance** |
+| Apr 8 | 17.5 min | 15.7s | ⚠️ **46% regression** | Regression investigation needed |
 
-**Revised Target**: 44 min → **3-5 min** (10-20× faster, conditional on persistent kernel)
+### Current Investigation Priorities (April 8, 2026)
+
+| Priority | Target | Status | Action |
+|----------|--------|--------|--------|
+| 🔴 **#1** | Identify Apr 8 regression root cause | Unknown | Profile with `ORTHO_DEBUG=1` |
+| 🔴 **#2** | Verify GPU persistent kernel usage | Unclear | Check actual kernel mode in logs |
+| 🟡 **#3** | Measure debug screenshot overhead | ~5-10% | Test without `ORTHO_SCREENSHOT_FREQ` |
+| 🟢 **#4** | Code diff analysis Apr 5 → Apr 8 | Pending | Git log review |
+
+**Target**: Restore **11.96 min** performance from April 5 baseline
 
 ---
 

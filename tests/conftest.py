@@ -139,18 +139,36 @@ def board_object(board_file):
         return None
     if board is None:
         return None
-    total_pads = sum(len(getattr(n, 'pads', [])) for n in getattr(board, 'nets', []))
+    # Pads are on components, not on nets in the domain model
+    total_pads = sum(len(getattr(c, 'pads', [])) for c in getattr(board, 'components', []))
     if total_pads < 10:
         return None
     return board
 
 
 @pytest.fixture(scope="session")
-def router(board_object):
+def hardware_gpu() -> bool:
     """
-    Create and initialise a UnifiedPathFinder instance for the test board.
-    Returns None when board_object is unavailable.
+    True when CuPy is installed and a CUDA device responds correctly.
+
+    Checks three things:
+      1. CuPy importable
+      2. A basic GPU operation succeeds (catches driver errors)
+      3. At least one CUDA device is visible
+    Always returns a bool — never skips or raises.
     """
+    try:
+        import cupy as cp
+        test = cp.array([1, 2, 3], dtype=cp.float32)
+        _ = int(cp.sum(test))          # forces a synchronous GPU op
+        _ = cp.cuda.Device(0).id       # confirms at least device 0 exists
+        return True
+    except Exception:
+        return False
+
+
+def _make_router(board_object, use_gpu: bool):
+    """Create, initialise, map pads, and precompute escape portals. Returns None on error."""
     if board_object is None:
         return None
     try:
@@ -158,24 +176,296 @@ def router(board_object):
             UnifiedPathFinder,
             PathFinderConfig,
         )
-        _router = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=False)
-        _router.initialize_graph(board_object)
-        _router.map_all_pads(board_object)
-        return _router
+        r = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=use_gpu)
+        r.initialize_graph(board_object)
+        r.map_all_pads(board_object)
+        # CRITICAL: build escape portals before route_multiple_nets (required for _parse_requests)
+        r.precompute_all_pad_escapes(board_object)
+        return r
     except Exception:
         return None
 
 
 @pytest.fixture(scope="session")
+def router(board_object):
+    """CPU router instance (use_gpu=False). Returns None when board unavailable."""
+    return _make_router(board_object, use_gpu=False)
+
+
+@pytest.fixture(scope="session")
+def router_gpu(board_object, hardware_gpu):
+    """GPU router instance (use_gpu=True). Returns None when GPU unavailable."""
+    if not hardware_gpu:
+        return None
+    return _make_router(board_object, use_gpu=True)
+
+
+def _normalize_routing_result(raw: dict, board_object=None, source: str = "headless") -> dict:
+    """Normalise a raw UnifiedPathFinder result dict to the standard key schema.
+
+    The router may return either:
+      - Full schema (modern):  dict with 'nets_routed', 'total_nets', etc. already set
+      - Minimal schema (legacy): {'success', 'paths', 'converged'} only
+
+    This function adds any missing keys with safe defaults so callers always see
+    the full interface.  Existing keys in *raw* are always preserved.
+    """
+    if raw is None:
+        return None
+    paths = raw.get("paths", {})
+    # Prefer the router's own nets_routed count; fall back to len(paths)
+    nets_routed = raw.get("nets_routed", len(paths) if isinstance(paths, dict) else 0)
+    total_nets = raw.get(
+        "total_nets",
+        len(getattr(board_object, "nets", [])) if board_object else nets_routed,
+    )
+    defaults = {
+        "success": False,
+        "converged": False,
+        "nets_routed": nets_routed,
+        "total_nets": total_nets,
+        "iterations": 0,
+        "total_time_s": 0.0,
+        "iteration_metrics": [],
+        "failed_nets": total_nets - nets_routed,
+        "overuse_sum": 0,
+        "overuse_edges": 0,
+        "barrel_conflicts": 0,
+        "excluded_nets": 0,
+        "excluded_net_ids": [],
+        "error_code": 0,
+        "message": f"Headless routing result ({source})",
+        "_source": source,
+        "_paths": paths,
+    }
+    # Merge: raw values win over defaults
+    return {**defaults, **raw, "_source": source, "_paths": paths}
+
+
+@pytest.fixture(scope="session")
 def routing_result(board_object, router):
     """
-    Run routing once and cache the result for the entire test session.
-    Returns None when headless routing is unavailable (board parse failed).
+    CPU routing result cached for the entire test session, normalised to the
+    standard key schema. Returns None when headless routing unavailable.
     """
     if board_object is None or router is None:
         return None
     try:
-        return router.route_multiple_nets(board_object.nets)
+        raw = router.route_multiple_nets(board_object.nets)
+        if not raw:
+            return None
+        return _normalize_routing_result(raw, board_object, source="headless_cpu")
+    except Exception:
+        return None
+
+
+@pytest.fixture(scope="session")
+def routing_result_gpu(board_object, router_gpu):
+    """
+    GPU routing result cached for the entire test session, normalised to the
+    standard key schema. Returns None when GPU unavailable or board parse failed.
+    """
+    if board_object is None or router_gpu is None:
+        return None
+    try:
+        raw = router_gpu.route_multiple_nets(board_object.nets)
+        if not raw:
+            return None
+        return _normalize_routing_result(raw, board_object, source="headless_gpu")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Fast / sample routing fixtures for TestHeadlessRouting
+#
+# Running the full 510-net board on CPU takes 10–15 minutes — far too slow
+# for a regular test session.  These fixtures route a small sample (20 nets,
+# max 3 iterations) just to verify the end-to-end pipeline is working.
+# ---------------------------------------------------------------------------
+
+_HEADLESS_SAMPLE_NETS = 20    # number of nets to route in sample tests
+_HEADLESS_MAX_ITER = 3        # stop after 3 iterations (enough to verify pipeline)
+
+
+def _make_sample_router(board_object, use_gpu: bool):
+    """Create a router configured for quick sample routing (reduced iterations)."""
+    if board_object is None:
+        return None
+    try:
+        from orthoroute.algorithms.manhattan.unified_pathfinder import (
+            UnifiedPathFinder,
+            PathFinderConfig,
+        )
+        cfg = PathFinderConfig()
+        cfg.max_iterations = _HEADLESS_MAX_ITER
+        r = UnifiedPathFinder(config=cfg, use_gpu=use_gpu)
+        r.initialize_graph(board_object)
+        r.map_all_pads(board_object)
+        r.precompute_all_pad_escapes(board_object)
+        return r
+    except Exception:
+        return None
+
+
+@pytest.fixture(scope="session")
+def routing_result_sample_cpu(board_object):
+    """
+    Fast CPU routing result: routes the first N routable nets with reduced
+    iteration budget.  Used by TestHeadlessRouting to verify the CPU pipeline
+    without the full session-length routing run.
+    Returns None when board load failed.
+    """
+    r = _make_sample_router(board_object, use_gpu=False)
+    if r is None:
+        return None
+    # Pick a small sample of routable nets (≥2 pads each)
+    routable = [n for n in getattr(board_object, "nets", [])
+                if len(getattr(n, "pads", [])) >= 2]
+    sample = routable[:_HEADLESS_SAMPLE_NETS]
+    if not sample:
+        return None
+    try:
+        raw = r.route_multiple_nets(sample)
+        if raw is None:
+            return None
+        return _normalize_routing_result(raw, board_object=None, source="sample_cpu")
+    except Exception:
+        return None
+
+
+@pytest.fixture(scope="session")
+def routing_result_sample_gpu(board_object, hardware_gpu):
+    """
+    Fast GPU routing result: routes the first N routable nets with reduced
+    iteration budget.  Used by TestHeadlessRouting to verify the GPU pipeline.
+    Returns None when GPU unavailable or board load failed.
+    """
+    if not hardware_gpu:
+        return None
+    r = _make_sample_router(board_object, use_gpu=True)
+    if r is None:
+        return None
+    routable = [n for n in getattr(board_object, "nets", [])
+                if len(getattr(n, "pads", [])) >= 2]
+    sample = routable[:_HEADLESS_SAMPLE_NETS]
+    if not sample:
+        return None
+    try:
+        raw = r.route_multiple_nets(sample)
+        if raw is None:
+            return None
+        return _normalize_routing_result(raw, board_object=None, source="sample_gpu")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Tiny synthetic board for fast smoke tests (no .kicad_pcb file required)
+#
+# Layout: 4 ICs at corners of a 20 mm × 20 mm board, 4 copper layers.
+# Each IC has 4 pads in a 1 mm pitch 2×2 grid.  8 nets cross-connect pads
+# between opposite ICs.  The lattice is ~200×200 nodes → routes in < 5 s.
+# ---------------------------------------------------------------------------
+
+_SMOKE_NETS = 100   # number of nets in the synthetic smoke board
+
+
+def _build_smoke_board():
+    """Return a synthetic Board for smoke tests (no file I/O).
+
+    Layout: two 100-pin connectors (J1 top row, J2 bottom row) on a
+    105 mm × 30 mm board with 4 copper layers.  100 straight-through nets
+    link J1 pin N to J2 pin N — parallel vertical traces with no crossings.
+    Routes in a few seconds, no congestion.  Goal: verify the full
+    initialize → escape → route pipeline without a long wait.
+    """
+    from orthoroute.domain.models.board import Board, Component, Net, Pad, Layer, Coordinate
+
+    layers = [
+        Layer(name="F.Cu",   type="signal", stackup_position=0),
+        Layer(name="In1.Cu", type="signal", stackup_position=1),
+        Layer(name="In2.Cu", type="signal", stackup_position=2),
+        Layer(name="B.Cu",   type="signal", stackup_position=3),
+    ]
+
+    # Two connectors: J1 at y=5 mm (top), J2 at y=25 mm (bottom)
+    # 100 pads each at 1 mm pitch starting at x=3 mm
+    pads_j1: list = []
+    pads_j2: list = []
+    for i in range(_SMOKE_NETS):
+        x = 3.0 + i * 1.0
+        pads_j1.append(Pad(
+            id=str(i + 1), component_id="J1", net_id=None,
+            position=Coordinate(x, 5.0), size=(0.6, 0.6), drill_size=0.3, layer="F.Cu",
+        ))
+        pads_j2.append(Pad(
+            id=str(i + 1), component_id="J2", net_id=None,
+            position=Coordinate(x, 25.0), size=(0.6, 0.6), drill_size=0.3, layer="F.Cu",
+        ))
+
+    components = [
+        Component(id="J1", reference="J1", value="HDR100", footprint="Connector_PinHeader_2.54mm",
+                  position=Coordinate(3.0 + (_SMOKE_NETS - 1) * 0.5, 5.0), pads=pads_j1),
+        Component(id="J2", reference="J2", value="HDR100", footprint="Connector_PinHeader_2.54mm",
+                  position=Coordinate(3.0 + (_SMOKE_NETS - 1) * 0.5, 25.0), pads=pads_j2),
+    ]
+
+    # Straight-through: J1 pin N → J2 pin N (parallel vertical traces)
+    # Simple routing, no crossing — enough to exercise the full pipeline
+    nets: list = []
+    for i in range(_SMOKE_NETS):
+        net_id = str(i + 1)
+        j1_pad = pads_j1[i]
+        j2_pad = pads_j2[i]
+        j1_pad.net_id = net_id
+        j2_pad.net_id = net_id
+        nets.append(Net(id=net_id, name=f"NET_{i + 1:03d}", pads=[j1_pad, j2_pad]))
+
+    return Board(
+        id="smoke_test", name="SmokeTestBoard",
+        components=components, nets=nets, layers=layers, layer_count=4,
+    )
+
+
+@pytest.fixture(scope="session")
+def smoke_board():
+    """Synthetic 2-connector, 100-net board; never skips — built from domain objects."""
+    try:
+        return _build_smoke_board()
+    except Exception as exc:
+        pytest.fail(f"Failed to build synthetic smoke board: {exc}")
+
+
+@pytest.fixture(scope="session")
+def routing_result_smoke_cpu(smoke_board):
+    """
+    CPU routing on the synthetic smoke board (100 cross-connected nets, 4 layers).
+    Should complete in under 60 seconds.
+    """
+    r = _make_router(smoke_board, use_gpu=False)
+    if r is None:
+        return None
+    try:
+        raw = r.route_multiple_nets(smoke_board.nets)
+        return _normalize_routing_result(raw, smoke_board, source="smoke_cpu")
+    except Exception:
+        return None
+
+
+@pytest.fixture(scope="session")
+def routing_result_smoke_gpu(smoke_board, hardware_gpu):
+    """
+    GPU routing on the synthetic smoke board.  Returns None when GPU unavailable.
+    """
+    if not hardware_gpu:
+        return None
+    r = _make_router(smoke_board, use_gpu=True)
+    if r is None:
+        return None
+    try:
+        raw = r.route_multiple_nets(smoke_board.nets)
+        return _normalize_routing_result(raw, smoke_board, source="smoke_gpu")
     except Exception:
         return None
 
@@ -202,7 +492,7 @@ def _parse_routing_result_from_log(text: str) -> dict | None:
       WARNING - [FINAL] Edge routing converged (N barrel conflicts remain - acceptable)
       INFO    - Applied N tracks and N vias to KiCad          (✅ write-back)
     """
-    if "ROUTING COMPLETE" not in text and "CONVERGED" not in text:
+    if "ROUTING COMPLETE" not in text:
         return None
 
     # --- convergence + final iter summary ---

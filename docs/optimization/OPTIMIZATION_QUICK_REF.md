@@ -1,7 +1,8 @@
 # OrthoRoute Optimization Quick Reference
 
-**Baseline**: April 3, 2026 | **Test**: TestBackplane (512 nets, 18 layers) | **Time**: 44.23 min → **25 min**  
-**Last updated**: April 3, 2026 — persistent kernel enabled, bitmap attempts did not improve further
+**Baseline**: April 3, 2026 | **Best**: April 5, 2026 (**11.96 min**) | **Current**: April 8, 2026 (17.5 min ⚠️ **regression**)  
+**Test Board**: TestBackplane (512 nets, 18 layers)  
+**Last updated**: April 8, 2026 — regression detected, investigation required
 
 ---
 
@@ -10,6 +11,7 @@
 | Date | Change | Before | After | Gain |
 |------|--------|--------|-------|------|
 | Apr 3 | Persistent CUDA kernel (bitmap fix) | 47.9 min / 39s/iter | **25 min / ~20s/iter** | **~2×** |
+| Apr 5 | Algorithm improvements (unspecified) | 25 min / 20s/iter | **11.96 min / 11.0s/iter** | **~4× vs baseline** ✅ |
 | Apr 3 | cuda_dijkstra.py log reclassification | 861 MB logs | ~10-20 MB logs | log size |
 | Apr 3 | Vectorize `int(seed)` loops → `cupyx.scatter_add` | correctness bug | fixed | **bug fix only** |
 | Apr 3 | GPU-resident `node_owner_gpu` bitmap (zero upload) | 56KB/net upload | 0 upload | **no perf gain** |
@@ -27,20 +29,22 @@
 
 ---
 
-## 🎯 Next Optimization Targets
+## 🎯 Current Priority: Regression Investigation (April 8, 2026)
 
-| Priority | Target | Est. Cost | % of Total | Est. Savings |
-|----------|--------|-----------|------------|--------------|
-| 🔴 **#1 (UNKNOWN)** | Mystery ~70–100ms gap per net | unknown | **~80% of per-net time** | **3–4× if found** |
-| 🟡 **#2** | `initialize_graph()` | 20.9s once | one-time | 6-8s |
-| 🟢 **#3** | `_rebuild_via_usage_from_committed()` | ~11s/run | **~1%** | minimal |
+| Priority | Target | Status | Action |
+|----------|--------|--------|--------|
+| 🔴 **#1** | Identify April 8 regression cause | Unknown | Profile with `ORTHO_DEBUG=1` |
+| 🔴 **#2** | Verify GPU persistent kernel is active | Unclear | Check log for kernel mode |
+| 🟡 **#3** | Measure debug screenshot overhead (69 files) | ~5-10% possible | Test without screenshots |
+| 🟢 **#4** | Code diff Apr 5 → Apr 8 | Pending | Git log analysis |
 
-> **Current per-net breakdown** (measured April 3, 2026 after all bitmap optimizations):
-> - GPU kernel time: **4–22ms** (persistent kernel, runs to convergence on-device)
-> - Total wall time per net: **~90–130ms** 
-> - **Unaccounted gap: ~70–100ms** — location unknown, profiling needed
-> - Per iteration (~512 nets): **~22s**
-> - Total run (70 iterations): **~25 min**
+**Goal**: Restore April 5 best performance (11.96 min / 11.0s per iteration)
+
+> **April 8 per-iteration breakdown** (limited log data, no `ORTHO_DEBUG=1`):
+> - Average iteration: **15.7s** (vs. 11.0s on April 5)
+> - Regression: **+4.7s per iteration (+43%)**
+> - Total run (67 iterations): **17.5 min** (vs. 11.96 min on April 5)
+> - GPU kernel operational but performance degraded
 
 ---
 
@@ -65,12 +69,14 @@ The ~70–100ms gap per net is not in:
 ---
 
 ## 📊 Run History
-
-| Run | Change | Total Time | Iter avg | Notes |
-|-----|--------|------------|----------|-------|
-| 1 | Multi-launch kernel (baseline) | 47.9 min | ~39s | 74 iters |
-| 2 | Persistent CUDA kernel | **25 min** | ~20s | 70 iters — **2× gain** |
-| 3 | Vectorize bitmap loops (bug fix) | ~25 min | ~22s | Correctness fix, no perf change |
+Date | Change | Total Time | Iter avg | Iters | Status |
+|-----|------|--------|------------|----------|-------|--------|
+| 1 | Apr 3 | Multi-launch kernel (baseline) | 47.9 min | ~39s | 74 | Baseline |
+| 2 | Apr 3 | Persistent CUDA kernel | **25 min** | ~20s | 70 | **2× gain** |
+| 3 | Apr 3 | Vectorize bitmap loops (bug fix) | ~25 min | ~22s | — | Correctness fix |
+| 4 | Apr 3 | GPU-resident bitmap (zero upload) | ~25 min | ~22s | — | No improvement |
+| **5** | **Apr 5** | **Algorithm improvements** | **11.96 min** | **11.0s** | **65** | **✅ BEST** |
+| **6** | **Apr 8** | **Current state** | **17.5 min** | **15.7s** | **67** | **⚠️ 46% regression**
 | 4 | GPU-resident bitmap (zero upload) | ~25 min | ~22s | No improvement — upload wasn't bottleneck |
   Python ↔ CUDA launch overhead:      ~296ms  (95% of per-net time)
   ─────────────────────────────────────────────

@@ -103,7 +103,34 @@ class TestRouteMultipleNetsReturnShape:
         assert isinstance(result, dict)
 
     def test_required_keys_are_defined(self):
-        """Smoke test: the REQUIRED_KEYS set itself is non-empty and sane."""
-        assert len(self.REQUIRED_KEYS) >= 10
-        assert "nets_routed" in self.REQUIRED_KEYS
-        assert "iteration_metrics" in self.REQUIRED_KEYS
+        """route_multiple_nets with a real board returns a dict with all REQUIRED_KEYS.
+
+        Uses KiCadFileParser to load TestBackplane.kicad_pcb. Skips if the
+        parser can't load enough pads. The empty-input case intentionally
+        returns {} — verified by test_empty_request_returns_minimal_dict.
+        """
+        from pathlib import Path
+        board_file = Path(__file__).parent.parent.parent / "TestBoards" / "TestBackplane.kicad_pcb"
+        if not board_file.exists():
+            pytest.skip("TestBackplane.kicad_pcb not found")
+        try:
+            from orthoroute.infrastructure.kicad.file_parser import KiCadFileParser
+            board = KiCadFileParser().load_board(str(board_file))
+        except Exception:
+            pytest.skip("KiCadFileParser could not load board")
+        if board is None:
+            pytest.skip("board loaded as None")
+        total_pads = sum(len(getattr(n, "pads", [])) for n in getattr(board, "nets", []))
+        if total_pads < 10:
+            pytest.skip(f"Only {total_pads} pads loaded — insufficient for routing test")
+
+        from orthoroute.algorithms.manhattan.unified_pathfinder import (
+            UnifiedPathFinder,
+            PathFinderConfig,
+        )
+        router = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=False)
+        router.initialize_graph(board)
+        router.map_all_pads(board)
+        result = router.route_multiple_nets(board.nets[:1])
+        missing = self.REQUIRED_KEYS - result.keys()
+        assert not missing, f"route_multiple_nets result missing keys: {sorted(missing)}"

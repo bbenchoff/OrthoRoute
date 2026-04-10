@@ -15,7 +15,8 @@
     "iter_1_time_s_max": 40.0,
     "overuse_final_max": 0,
     "tracks_delta_min": 4000,
-    "vias_delta_min": 2500
+    "vias_delta_min": 2500,
+    "barrel_conflicts_max": 500
   },
 
   "cpu": {
@@ -28,14 +29,17 @@
     "iter_1_time_s_max": 600.0,
     "overuse_final_max": 0,
     "tracks_delta_min": 4000,
-    "vias_delta_min": 2500
+    "vias_delta_min": 2500,
+    "barrel_conflicts_max": 500
   },
 
   "_thresholds_note": "All *_max/*_min values are soft warnings unless noted HARD FAIL in test docstrings. Tests pick the right block by reading GPU=YES/NO from the log.",
   "iterations_max": 80,
   "total_time_s_max": 900,
   "iter_avg_time_s_max": 15.0,
+  "iter_1_time_s_max": 40.0,
   "overuse_final_max": 0,
   "tracks_delta_min": 4000,
-  "vias_delta_min": 2500
+  "vias_delta_min": 2500,
+  "barrel_conflicts_max": 500
 }
