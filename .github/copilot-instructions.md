@@ -27,16 +27,17 @@ GPU-accelerated PCB autorouter for KiCad (PathFinder / Manhattan lattice, up to 
 ```powershell
 pip install -r requirements.txt                              # Install deps
 python build.py                                              # Build: build/OrthoRoute-1.0.0.zip
-.\copy_to_kicad.ps1                                         # Dev sync to KiCad plugin folder
+python build.py --deploy                                     # Build + install to KiCad plugin folder
+.\copy_to_kicad.ps1                                         # Fast dev sync (Python + config only)
 python main.py plugin                                        # Run with GUI (KiCad must be open)
-python main.py cli TestBoards/TestBackplane.kicad_pcb        # CLI mode
 python main.py --test-manhattan                              # Built-in GUI acceptance test
+pytest tests/                                                # Run test suite (unit + regression)
 ```
 
-**Debug mode:** `$env:ORTHO_DEBUG = '1'` → full DEBUG log + screenshots in `debug_output/`.
+**Debug mode:** `.\launch_kicad_debug.ps1` or `$env:ORTHO_DEBUG = '1'` → full DEBUG log + screenshots in `debug_output/`.
 Tear down: `Remove-Item Env:ORTHO_DEBUG, Env:ORTHO_SCREENSHOT_FREQ, Env:ORTHO_SCREENSHOT_SCALE -ErrorAction SilentlyContinue`
 
-⚠️ **No unit tests exist.** `pytest` finds nothing. Use built-in acceptance tests above. See [docs/contributing.md](../docs/contributing.md).
+**Testing:** 167 unit tests + 63 regression tests. See [tests/README.md](../tests/README.md) and [tests/run_golden_regression.md](../tests/run_golden_regression.md).
 
 ---
 
@@ -76,19 +77,29 @@ Key patterns: Repository, Strategy (`RoutingEngine`), CQRS, `EventBus`.
 | [orthoroute/shared/utils/performance_utils.py](../orthoroute/shared/utils/performance_utils.py) | `@profile_time` → logs `[PROFILE] func: Xms` at WARNING — **only when `ORTHO_DEBUG=1`** |
 | [orthoroute/shared/utils/logging_utils.py](../orthoroute/shared/utils/logging_utils.py) | `init_logging()` — active entry point; console ERROR+, file ERROR (normal) or DEBUG (`ORTHO_DEBUG=1`) |
 
-**Test board:** `TestBoards/TestBackplane.kicad_pcb` — 32-layer backplane, 3,200 pads, 870 via pairs.
+**Test board:** `TestBoards/TestBackplane.kicad_pcb` — 18-layer backplane (73.1×97.3mm), 1,604 pads, 512 nets. **Golden result:** 18.4 min, 512/512 nets routed, zero overuse (Apr 10, 2026).
 
 ---
 
 ## KiCad Integration
 
-Three adapters tried in order: **IPC API** (KiCad 9.0+, preferred) → **SWIG** → **File Parser**.
+**Plugin Installation:**
+- Plugin folder: `Documents/KiCad/9.0/3rdparty/plugins/com_github_bbenchoff_orthoroute`
+- Name must use underscores (not dots) for Python import compatibility
+- Manual install required due to [KiCad bug #19465](https://gitlab.com/kicad/code/kicad/-/issues/19465)
+- Icons (`icon-24.png`, `icon-64.png`) + metadata (`plugin.json`, `metadata.json`) required for toolbar button
+- See [docs/plugin_manager_integration.md](../docs/plugin_manager_integration.md)
 
-Plugin folder name must be exactly `com_github_bbenchoff_orthoroute` (underscores, no spaces). Manual install required due to [KiCad bug #19465](https://gitlab.com/kicad/code/kicad/-/issues/19465). See [docs/plugin_manager_integration.md](../docs/plugin_manager_integration.md).
+**Board Data Adapters (tried in order):**
+1. **IPC API** (KiCad 9.0+, preferred) — via `rich_kicad_interface.py`
+2. **SWIG** (pcbnew module) — legacy fallback
+3. **File Parser** — ⚠️ currently broken, returns 0 pads/nets
 
-Logs: `<plugin_dir>/logs/latest.log` and `<plugin_dir>/logs/run_<timestamp>.log`.
+**Logs:**
+- Plugin mode: `<plugin_dir>/logs/latest.log`, `<plugin_dir>/logs/run_<timestamp>.log`
+- Repo mode: `<repo>/logs/latest.log`
 
-GPU (127× speedup) requires NVIDIA + CuPy. Fallback: `--cpu-only`. See [docs/cloud_gpu_setup.md](../docs/cloud_gpu_setup.md).
+**GPU:** 127× speedup requires NVIDIA + CuPy. Fallback: `--cpu-only`. See [docs/cloud_gpu_setup.md](../docs/cloud_gpu_setup.md).
 
 ---
 
@@ -115,3 +126,4 @@ GPU (127× speedup) requires NVIDIA + CuPy. Fallback: `--cpu-only`. See [docs/cl
 - [docs/ORP_ORS_file_formats.md](../docs/ORP_ORS_file_formats.md) — headless cloud routing formats
 - [docs/layer_compaction.md](../docs/layer_compaction.md) — layer reduction strategies
 - [docs/optimization/](../docs/optimization/) — profiling baselines and logging review
+- [docs/optimization/golden_result_2026-04-10.md](../docs/optimization/golden_result_2026-04-10.md) — **GOLDEN STANDARD**: regression baseline, 512/512 nets, zero overuse, GPU benchmarks

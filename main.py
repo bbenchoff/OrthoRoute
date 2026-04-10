@@ -648,10 +648,11 @@ def run_headless(
 
 
 def run_cli(board_file: str, output_dir: str = ".", config_path: Optional[str] = None):
-    """Run command line interface using unified pipeline (same as GUI)."""
+    """Run command line interface using IPC API (requires KiCad running with board open)."""
     try:
-        from orthoroute.infrastructure.kicad.file_parser import KiCadFileParser
+        from orthoroute.infrastructure.kicad.rich_kicad_interface import RichKiCadInterface
         from orthoroute.algorithms.manhattan.unified_pathfinder import UnifiedPathFinder, PathFinderConfig
+        from orthoroute.domain.models.board import Board, Net, Pad, Component, Coordinate
 
         # Initialize configuration if custom path provided
         if config_path:
@@ -659,20 +660,101 @@ def run_cli(board_file: str, output_dir: str = ".", config_path: Optional[str] =
 
         config = setup_environment()
 
-        # Load board
-        logging.info(f"Loading board from: {board_file}")
-        parser = KiCadFileParser()
-        board = parser.load_board(board_file)
-
-        if not board:
-            logging.error("Failed to load board file")
+        # Load board via IPC API (same as GUI mode)
+        logging.info(f"[CLI] Connecting to KiCad to load board: {board_file}")
+        logging.info("[CLI] NOTE: KiCad must be running with the board file open")
+        
+        kicad_interface = RichKiCadInterface()
+        
+        if not kicad_interface.connect():
+            logging.error("[CLI] Failed to connect to KiCad IPC API")
+            logging.error("[CLI] Make sure:")
+            logging.error("[CLI]   1. KiCad is running")
+            logging.error("[CLI]   2. The board file is open in PCB Editor")
+            logging.error("[CLI]   3. IPC API is enabled in KiCad preferences")
             sys.exit(1)
+        
+        logging.info("[CLI] Connected to KiCad IPC API successfully")
+        
+        # Get board data
+        board_data = kicad_interface.get_board_data()
+        
+        if not board_data or len(board_data.get('pads', [])) == 0:
+            logging.error("[CLI] No valid board data found")
+            logging.error("[CLI] Make sure the PCB file is open in KiCad with components and pads")
+            sys.exit(1)
+        
+        logging.info(f"[CLI] Loaded board data: {len(board_data.get('pads', []))} pads, {len(board_data.get('nets', {}))} nets")
+        
+        # Convert board_data to Board domain object
+        board_name = board_data.get('filename', 'CLI Board')
+        bounds = board_data.get('bounds', (0, 0, 100, 100))
+        layer_count = board_data.get('layers', 2)
+        if isinstance(layer_count, list):
+            layer_count = len(layer_count)
+        
+        board = Board(id="cli_board", name=board_name, layer_count=layer_count)
+        board.nets = []
+        board.components = []
+        board._kicad_bounds = bounds  # Store original KiCad bounds
+        
+        # Create components from board_data
+        components_dict = {}
+        components_data = board_data.get('components', [])
+        logging.info(f"[CLI] Processing {len(components_data)} components")
+        for comp_data in components_data:
+            if isinstance(comp_data, dict):
+                comp_id = comp_data.get('name', comp_data.get('id', ''))
+                if comp_id:
+                    component = Component(
+                        id=comp_id,
+                        reference=comp_id,
+                        value=comp_data.get('value', ''),
+                        footprint=comp_data.get('footprint', ''),
+                        position=Coordinate(x=comp_data.get('x', 0.0), y=comp_data.get('y', 0.0)),
+                        angle=comp_data.get('rotation', 0.0)
+                    )
+                    components_dict[comp_id] = component
+                    board.components.append(component)
+        
+        # Convert nets and pads from board_data
+        nets_data = board_data.get('nets', {})
+        logging.info(f"[CLI] Processing {len(nets_data)} nets")
+        for net_id, net_info in nets_data.items():
+            net = Net(id=net_id, name=net_info.get('name', net_id))
+            net.pads = []
+            
+            # Add pads from net data
+            for pad_ref in net_info.get('pads', []):
+                if isinstance(pad_ref, dict):
+                    pad_name = pad_ref.get('name', '')
+                    component_id = pad_ref.get('component', '')
+                    if not component_id and '.' in pad_name:
+                        component_id = pad_name.split('.')[0]
+                    
+                    pad = Pad(
+                        id=pad_name or f"{component_id}.{pad_ref.get('pin', '')}",
+                        component_id=component_id,
+                        net_id=net_id,
+                        position=Coordinate(x=pad_ref.get('x', 0.0), y=pad_ref.get('y', 0.0)),
+                        size=(pad_ref.get('width', 0.2), pad_ref.get('height', 0.2)),
+                        layer=pad_ref.get('layer', 'F.Cu')
+                    )
+                    net.pads.append(pad)
+                    
+                    # Add pad to component if it exists
+                    if component_id in components_dict:
+                        if not hasattr(components_dict[component_id], 'pads'):
+                            components_dict[component_id].pads = []
+                        components_dict[component_id].pads.append(pad)
+            
+            board.nets.append(net)
+        
+        logging.info(f"[CLI] Created board: {board.name} with {len(board.nets)} nets, {len(board.components)} components, {layer_count} layers")
 
-        logging.info(f"Loaded board: {board.name} with {len(board.nets)} nets")
-
-        # Create UnifiedPathFinder (same as GUI) - FORCE CPU-ONLY
-        pf = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=False)
-        logging.info(f"[CLI] Created UnifiedPathFinder with instance_tag={pf._instance_tag}")
+        # Create UnifiedPathFinder with GPU enabled (same as GUI)
+        pf = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=True)
+        logging.info(f"[CLI] Created UnifiedPathFinder with GPU enabled, instance_tag={pf._instance_tag}")
 
         # Use unified pipeline (SAME THREE CALLS AS GUI)
         logging.info("[CLI] Step 1: Building lattice & CSR...")
@@ -697,6 +779,10 @@ def run_cli(board_file: str, output_dir: str = ".", config_path: Optional[str] =
             geom = pf.get_geometry_payload()
             logging.info(f"[CLI] Generated {len(geom.tracks)} track objects, {len(geom.vias)} via objects")
             logging.info(f"[CLI] Results would be saved to: {output_dir}")
+            logging.warning("=" * 80)
+            logging.warning("[CLI] ROUTING COMPLETE - ALL STEPS FINISHED SUCCESSFULLY")
+            logging.warning("=" * 80)
+            sys.exit(0)  # ✅ Clean exit after successful routing
         else:
             logging.warning("[CLI] No copper generated")
             sys.exit(1)
@@ -720,8 +806,8 @@ Examples:
   %(prog)s plugin                       # Run as KiCad plugin with GUI
   %(prog)s plugin --no-gui              # Run as KiCad plugin without GUI
   %(prog)s --test-manhattan             # Run automated Manhattan routing test
-  %(prog)s cli board.kicad_pcb          # Route board via CLI
-  %(prog)s cli board.kicad_pcb -o out/  # Route and save to directory
+  %(prog)s cli board.kicad_pcb          # Route board via CLI (KiCad must be running with board open)
+  %(prog)s cli board.kicad_pcb -o out/  # Route and save to directory (KiCad must be running)
   %(prog)s headless input.ORP           # Headless cloud routing mode
   %(prog)s headless input.ORP -o out.ORS --max-iterations 250
         """
@@ -742,10 +828,10 @@ Examples:
     )
     
     # CLI mode
-    cli_parser = subparsers.add_parser('cli', help='Command line interface')
+    cli_parser = subparsers.add_parser('cli', help='Command line interface (requires KiCad running with board open)')
     cli_parser.add_argument(
         'board_file',
-        help='KiCad board file (.kicad_pcb)'
+        help='KiCad board file (.kicad_pcb) - must be open in KiCad'
     )
     cli_parser.add_argument(
         '-o', '--output',

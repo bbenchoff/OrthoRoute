@@ -63,6 +63,24 @@ if (Test-Path "$src\graphics\kicad_theme.json") {
     Sync-File "$src\graphics\kicad_theme.json" "$dst\graphics\kicad_theme.json"
 }
 
+# --- plugin.json and metadata.json (KiCad plugin registration) ------------
+# Copy from build/ directory if available, otherwise create minimal versions
+$buildDir = Join-Path $src "build\com_github_bbenchoff_orthoroute"
+if (Test-Path "$buildDir\plugin.json") {
+    Sync-File "$buildDir\plugin.json" "$dst\plugin.json"
+}
+if (Test-Path "$buildDir\metadata.json") {
+    Sync-File "$buildDir\metadata.json" "$dst\metadata.json"
+}
+
+# --- Icon files (toolbar icon support) -------------------------------------
+if (Test-Path "$buildDir\icon-24.png") {
+    Sync-File "$buildDir\icon-24.png" "$dst\icon-24.png"
+}
+if (Test-Path "$buildDir\icon-64.png") {
+    Sync-File "$buildDir\icon-64.png" "$dst\icon-64.png"
+}
+
 # --- orthoroute/ package (all .py files, preserving sub-directory structure)
 Get-ChildItem -Path "$src\orthoroute" -Recurse -Filter "*.py" | ForEach-Object {
     $rel = $_.FullName.Substring("$src\orthoroute".Length)   # e.g. \algorithms\manhattan\unified_pathfinder.py

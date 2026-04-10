@@ -54,6 +54,65 @@ def mock_pathfinder_via(mock_lattice_via):
     pf.via_col_cap = np.ones(mock_lattice_via.x_steps * mock_lattice_via.y_steps, dtype=np.float32)
     pf.via_seg_cap = np.ones(mock_lattice_via.x_steps * mock_lattice_via.y_steps * (mock_lattice_via.layers - 1), dtype=np.float32)
     
+    # Configure _mark_via_barrel_ownership_for_path method
+    def mock_mark_via_ownership(net_name, path):
+        """Mark via ownership for all layer transitions in path."""
+        for i in range(len(path) - 1):
+            idx1, idx2 = path[i], path[i + 1]
+            x1, y1, z1 = pf.lattice.idx_to_coord(idx1)
+            x2, y2, z2 = pf.lattice.idx_to_coord(idx2)
+            
+            # Layer transition = via
+            if z1 != z2 and x1 == x2 and y1 == y2:
+                pf.via_barrel_owners[(x1, y1)] = net_name
+    
+    # Configure _build_owner_bitmap_for_fullgraph method
+    def mock_build_owner_bitmap(net_name, force_allow_nodes=None):
+        """Build bitmap: True = accessible, False = blocked by other net's via."""
+        bitmap = np.ones(pf.N, dtype=bool)
+        
+        # Block nodes at positions owned by other nets
+        for (x, y), owner in pf.via_barrel_owners.items():
+            if owner != net_name:
+                # Block all layers at this XY position
+                for z in range(pf.lattice.layers):
+                    node_idx = pf.lattice.coord_to_idx(x, y, z)
+                    bitmap[node_idx] = False
+        
+        # Force allow override
+        if force_allow_nodes:
+            for node_idx in force_allow_nodes:
+                bitmap[node_idx] = True
+        
+        return bitmap
+    
+    # Configure _detect_barrel_conflicts method
+    def mock_detect_barrel_conflicts():
+        """Detect via barrel conflicts based on usage vs capacity."""
+        conflict_bitmap = np.zeros(pf.N, dtype=np.float32)
+        conflict_count = 0
+        
+        # Check column overuse
+        for col_idx in range(len(pf.via_col_use)):
+            if pf.via_col_use[col_idx] > pf.via_col_cap[col_idx]:
+                # Mark all layers at this XY position
+                y, x = divmod(col_idx, pf.lattice.x_steps)
+                for z in range(pf.lattice.layers):
+                    node_idx = pf.lattice.coord_to_idx(x, y, z)
+                    conflict_bitmap[node_idx] = pf.via_col_use[col_idx] - pf.via_col_cap[col_idx]
+                conflict_count += 1
+        
+        # Check segment overuse
+        for seg_idx in range(len(pf.via_seg_use)):
+            if pf.via_seg_use[seg_idx] > pf.via_seg_cap[seg_idx]:
+                conflict_count += 1
+        
+        return conflict_bitmap, conflict_count
+    
+    pf._mark_via_barrel_ownership_for_path = mock_mark_via_ownership
+    pf._build_owner_bitmap_for_fullgraph = mock_build_owner_bitmap
+    pf._detect_barrel_conflicts = mock_detect_barrel_conflicts
+    
     return pf
 
 

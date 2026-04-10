@@ -57,6 +57,85 @@ def mock_pathfinder_small(mock_lattice_small):
     pf.graph.indptr = np.zeros(pf.N + 1, dtype=np.int32)
     pf.graph.indices = np.array([], dtype=np.int32)
     
+    # Configure extract_roi_geometric to return proper tuple
+    def mock_extract_roi_geometric(src, dst, corridor_buffer=2, layer_margin=1, portal_seeds=None):
+        # Build ROI containing src, dst, portal seeds, and corridor nodes
+        roi_set = {src, dst}
+        if portal_seeds:
+            roi_set.update([node_id for node_id, _ in portal_seeds])
+        
+        # Calculate L-shaped corridor size based on distance and buffer
+        src_x, src_y, src_z = pf.lattice.idx_to_coord(src)
+        dst_x, dst_y, dst_z = pf.lattice.idx_to_coord(dst)
+        
+        # L-corridor nodes: horizontal + vertical spans with buffer
+        x_dist = abs(dst_x - src_x)
+        y_dist = abs(dst_y - src_y)
+        z_dist = abs(dst_z - src_z)
+        
+        # Estimate ROI size: corridor grows quadratically with buffer
+        base_distance = max(20, x_dist + y_dist)  # Ensure minimum corridor size
+        buffer_multiplier = 1 + (corridor_buffer ** 2)  # 1→2, 5→26 strong differentiation
+        num_layers = max(1, z_dist + layer_margin * 2)
+        target_nodes = min(base_distance * buffer_multiplier * num_layers, pf.max_roi_nodes)
+        
+        # Add nodes between src and dst in a corridor pattern
+        min_node = min(src, dst)
+        max_node = max(src, dst)
+        
+        # Add corridor nodes (simplified as sequential range for mock)
+        step = max(1, (max_node - min_node) // max(1, target_nodes))
+        
+        for i in range(min_node, max_node, step):
+            if len(roi_set) >= target_nodes:
+                break
+            roi_set.add(i)
+        
+        roi_nodes = np.array(sorted(roi_set), dtype=np.int32)
+        
+        # Truncate if needed (should not happen if target_nodes calculated correctly)
+        if len(roi_nodes) > pf.max_roi_nodes:
+            # Keep src, dst, portal seeds
+            critical = {src, dst}
+            if portal_seeds:
+                critical.update([node_id for node_id, _ in portal_seeds])
+            other = [n for n in roi_nodes if n not in critical]
+            roi_nodes = np.array(sorted(critical) + other[:pf.max_roi_nodes - len(critical)], dtype=np.int32)
+        
+        global_to_roi = np.full(pf.N, -1, dtype=np.int32)
+        global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
+        
+        return roi_nodes, global_to_roi
+    
+    # Configure extract_roi_bfs similarly
+    def mock_extract_roi_bfs(src, dst, initial_radius=10, portal_seeds=None):
+        # BFS-based ROI (radius-based size)
+        roi_list = [src, dst]
+        if portal_seeds:
+            roi_list.extend([node_id for node_id, _ in portal_seeds])
+        
+        # Radius-based expansion: larger radius = more nodes
+        num_extra = initial_radius * 5  # Scale with radius
+        roi_list.extend(range(max(src, dst) + 1, min(max(src, dst) + num_extra + 1, pf.N)))
+        
+        roi_nodes = np.array(list(set(roi_list)), dtype=np.int32)
+        
+        # Truncate if needed
+        if len(roi_nodes) > pf.max_roi_nodes:
+            critical = [src, dst]
+            if portal_seeds:
+                critical.extend([node_id for node_id, _ in portal_seeds])
+            other = [n for n in roi_nodes if n not in critical]
+            roi_nodes = np.array(critical + other[:pf.max_roi_nodes - len(critical)], dtype=np.int32)
+        
+        global_to_roi = np.full(pf.N, -1, dtype=np.int32)
+        global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
+        
+        return roi_nodes, global_to_roi
+    
+    pf.extract_roi_geometric = mock_extract_roi_geometric
+    pf.extract_roi_bfs = mock_extract_roi_bfs
+    
     return pf
 
 

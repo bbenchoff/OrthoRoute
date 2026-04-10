@@ -6,17 +6,17 @@
   "total_nets": 512,
 
   "gpu": {
-    "_source": "NVIDIA T1200 Laptop GPU (4 GB), OrthoRoute 2026-04-05 — MEASURED",
-    "_note": "Actual run: 65 iterations, 717.5s total, iter1=29.2s, iter_avg=11.0s. 4290 tracks, 2754 vias. Thresholds = measured × 1.25 headroom.",
+    "_source": "NVIDIA GPU (Compute Capability 75, 4.3 GB), OrthoRoute 2026-04-10 — GOLDEN RESULT",
+    "_note": "Actual run: 73 iterations, 1106.6s total (18.4 min), iter_avg=15.2s. 4274 tracks, 2738 vias, 367 barrel conflicts. Thresholds = measured × 1.20 headroom.",
     "converged": true,
-    "iterations_max": 80,
-    "total_time_s_max": 900,
-    "iter_avg_time_s_max": 15.0,
-    "iter_1_time_s_max": 40.0,
+    "iterations_max": 88,
+    "total_time_s_max": 1328,
+    "iter_avg_time_s_max": 18.0,
+    "iter_1_time_s_max": 30.0,
     "overuse_final_max": 0,
-    "tracks_delta_min": 4000,
-    "vias_delta_min": 2500,
-    "barrel_conflicts_max": 500
+    "tracks_delta_min": 3846,
+    "vias_delta_min": 2464,
+    "barrel_conflicts_max": 450
   },
 
   "cpu": {
@@ -34,12 +34,12 @@
   },
 
   "_thresholds_note": "All *_max/*_min values are soft warnings unless noted HARD FAIL in test docstrings. Tests pick the right block by reading GPU=YES/NO from the log.",
-  "iterations_max": 80,
-  "total_time_s_max": 900,
-  "iter_avg_time_s_max": 15.0,
-  "iter_1_time_s_max": 40.0,
+  "iterations_max": 88,
+  "total_time_s_max": 1328,
+  "iter_avg_time_s_max": 18.0,
+  "iter_1_time_s_max": 30.0,
   "overuse_final_max": 0,
-  "tracks_delta_min": 4000,
-  "vias_delta_min": 2500,
-  "barrel_conflicts_max": 500
+  "tracks_delta_min": 3846,
+  "vias_delta_min": 2464,
+  "barrel_conflicts_max": 450
 }

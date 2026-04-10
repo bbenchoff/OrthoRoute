@@ -40,10 +40,15 @@ cd OrthoRoute
 # Install dependencies
 pip install -r requirements.txt
 
-# Run a quick test
+# Run tests to verify setup
+pytest tests/                    # All tests (unit + regression)
+pytest tests/unit/ -v            # Unit tests only (167 tests)
+pytest tests/regression/ -v      # Regression tests (63 tests)
+
+# Run a quick acceptance test
 python main.py --test-manhattan
 
-# Or launch the GUI (requires KiCad running)
+# Or launch the plugin (requires KiCad running with a board open)
 python main.py plugin
 ```
 
@@ -88,14 +93,26 @@ Don't try to refactor the entire 3,936-line UnifiedPathFinder on your first PR. 
 
 ### 2. **Areas That Need Help**
 
-#### **Priority: Tests**
+#### **Testing: Foundation Established ✅**
 
-Unit tests and regression tests are implemented. See **[tests/README.md](../tests/README.md)** for how to run them and what they cover.
+**Current Status:**
+- ✅ **167 unit tests** passing (algorithms, graph building, data structures)
+- ✅ **63 regression tests** passing (validates against golden result baseline)
+- ✅ **Golden result documented**: April 10, 2026 — 512/512 nets routed, zero overuse, 18.4 min
+- ✅ **Test suite ready** for CI/CD integration
 
-Good first contributions:
-- Add tests for `pad_escape_planner.py` (DRC compliance, portal placement)
-- Add tests for `board_analyzer.py` (layer detection, bounds extraction)
-- Add tests for `CSRGraph.finalize()` (node count, edge count, indptr integrity)
+**Test Coverage:**
+- Unit tests: `pad_escape_planner.py`, `board_analyzer.py`, via conflict resolution, geometry validation
+- Regression tests: board loading, routing quality, convergence, performance metrics, iteration stability
+- Golden baseline: TestBackplane.kicad_pcb (18 layers, 1,604 pads, 512 nets)
+
+**Where You Can Help:**
+- Add tests for edge cases (zero-pad nets, single-layer boards, dense BGA fanouts)
+- Improve test documentation (more inline comments explaining test intent)
+- Add property-based tests (hypothesis library) for graph integrity
+- Implement mocking for KiCad API calls (currently uses real IPC connections)
+
+See **[tests/README.md](../tests/README.md)** and **[tests/run_golden_regression.md](../tests/run_golden_regression.md)** for complete test documentation.
 
 #### **High Priority: Refactoring**
 

@@ -106,37 +106,54 @@ _Testing / examples are the following_:
 
 ## Quick Start
 
-**KiCAD IS CURRENTLY BROKEN** with regards to support of IPC API plugins installed via the Content and Plugin manager. The workaround is to run this outside the Content and Plugin manager. This is documented here:
-
-- https://gitlab.com/kicad/code/kicad/-/issues/19465
-- https://forum.kicad.info/t/kicad-9-0-python-api-ipc-api/57236
-
-The fix is upcoming, but has not been released yet. **To run this, do the following:**
-
-- Clone the OrthoRoute repo
-- in the OrthoRoute/ folder, run `pip install -r requirements.txt`
-- Once that's done, run `python main.py`, with a board open in KiCad, and 'Enable KiCad API' selected in Preferences -> Plugins
-
-
+**Installation:** OrthoRoute is a KiCad plugin that works with KiCad 9.0+. Due to [KiCad bug #19465](https://gitlab.com/kicad/code/kicad/-/issues/19465), manual installation is currently required (Plugin & Content Manager support coming soon).
 
 ### Prerequisites
 - **KiCad 9.0+** with IPC API support
-- **Python 3.12+**
+- **Python 3.10+** (3.11 recommended)
 - **PyQt6**
-- **kipy** (KiCad IPC client)
+- **CuPy** (optional, for GPU acceleration)
+- **NVIDIA GPU with CUDA** (optional, provides 127× speedup)
 
-### Installation
+### Installation Methods
 
-1. **Download**: Get the latest release or clone the repository
-2. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. **Run**: Start OrthoRoute with your KiCad project open
-   ```bash
-   cd src
-   python main.py
-   ```
+**Method 1: Build and Deploy (Recommended for Development)**
+```bash
+# Clone the repository
+git clone https://github.com/bbenchoff/OrthoRoute.git
+cd OrthoRoute
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Build and install to KiCad plugin folder
+python build.py --deploy
+
+# Restart KiCad to load the plugin
+```
+
+**Method 2: Fast Dev Sync (For Active Development)**
+```bash
+# After making code changes, sync to KiCad without rebuilding
+.\copy_to_kicad.ps1  # Windows PowerShell
+
+# Restart KiCad to reload changes
+```
+
+**Method 3: Manual Installation**
+1. Download the [latest release](https://github.com/bbenchoff/OrthoRoute/releases) (OrthoRoute-X.X.X.zip)
+2. Extract to: `Documents/KiCad/9.0/3rdparty/plugins/`
+3. Ensure folder name is exactly: `com_github_bbenchoff_orthoroute`
+4. Restart KiCad
+
+### First Run
+
+1. **Open KiCad** and load a PCB design
+2. **Enable IPC API**: `Preferences → Plugins → Enable Python API`
+3. **Launch OrthoRoute**: 
+   - Click the toolbar icon, OR
+   - `Tools → External Plugins → OrthoRoute`
+4. **Route your board** using the GUI interface
 
 ## Will it work with _my_ GPU?
 
@@ -186,20 +203,30 @@ Plus graph structure, node ownership, buffers: +20-25 GB
 
 ## Usage
 
-### GUI Mode (Recommended)
-1. **Open your PCB** in KiCad 9.0+ with IPC API enabled
-2. **Launch OrthoRoute Plugin** via the Plugin Manager
-3. **Route your nets** - OrthoRoute will automatically:
+### Plugin Mode (Recommended)
+1. **Open your PCB** in KiCad 9.0+ with IPC API enabled (`Preferences → Plugins → Enable Python API`)
+2. **Launch OrthoRoute** via toolbar icon or `Tools → External Plugins → OrthoRoute`
+3. **Configure routing** (algorithm, layers, parameters)
+4. **Click "Start Routing"** - OrthoRoute will:
    - Extract board data via KiCad IPC API
    - Build 3D routing lattice (multi-layer Manhattan routing)
-   - Map all pads to the routing graph
+   - Map pads to routing graph
    - Route nets using GPU-accelerated PathFinder
-4. **Monitor progress** in the interactive PCB viewer
-5. **Import back to KiCad**
+5. **Monitor progress** in the interactive PCB viewer
+6. **Review results** - tracks and vias are automatically added to KiCad
 
-### CLI Mode (For Development)
-1. **Navigate to the OrthoRoute Folder** Wherever it's installed via KiCad
-2. **Run from CLI**: `python main.py --test-manhattan`
+### Standalone Mode (For Testing)
+```bash
+# Built-in acceptance test (synthetic board routing)
+python main.py --test-manhattan
+
+# Run regression tests
+pytest tests/                                    # All tests (unit + regression)
+pytest tests/regression/test_backplane.py -v    # Full regression suite (63 tests)
+pytest tests/unit/ -v                           # Unit tests only (167 tests)
+```
+
+**Note:** CLI mode (`python main.py cli board.kicad_pcb`) is designed for development/debugging and requires KiCad to be running with the board open in PCB Editor.
 
 ### Cloud (Headless, Kicad-less) Mode
 Headless mode is designed for instances when you would like to route a board, but it won't fit in your GPU. This mode is actually several functions that allow for running a routing algorithm _without KiCad_.
