@@ -11,6 +11,21 @@ ROUTING COMPLETE: All 512 nets routed successfully with zero overuse!
 ✓ CONVERGED  edges=0  via_overuse=0%  barrel=367
 ```
 
+## Headless Cross-Check (Same Day)
+
+A later headless run using the file parser also achieved full convergence and stayed within golden thresholds.
+
+| Metric | Golden (Plugin IPC) | Headless (Log `run_20260410_184636.log`) | Status |
+|--------|----------------------|-------------------------------------------|--------|
+| Nets Routed | 512/512 | 512/512 | ✅ |
+| Converged | True | True | ✅ |
+| Iterations | 73 | 64 | ✅ (<= 88 threshold) |
+| Total Time | 1106.6s | 565.0s | ✅ (<= 1328s threshold) |
+| Final Overuse | 0 | 0 | ✅ |
+| Barrel Conflicts | 367 | 305 | ✅ (<= 450 threshold) |
+
+This confirms headless regression viability after the pad coordinate transform fix in the file parser.
+
 ---
 
 ## Test Configuration

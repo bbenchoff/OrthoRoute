@@ -22,12 +22,23 @@ pytest regression/test_backplane.py -v
 ### Option 2: Headless Test Suite (Limited)
 
 ```powershell
+# Full headless routing + golden comparison (GPU recommended)
+python tests/regression/run_headless_routing.py
+
+# Validate an existing log only (no re-route)
+python tests/regression/run_headless_routing.py --log-only
+
+# Validate a specific log file
+python tests/regression/run_headless_routing.py --log-only --log-file logs/run_20260410_184636.log
+
 # Quick smoke test (20 nets, 3 iterations, ~30 seconds)
 pytest tests/regression/test_backplane.py::TestHeadlessRouting -v
-
-# NOTE: File parser is currently broken, so full headless routing unavailable
-# Use Option 1 for complete validation
 ```
+
+Headless timeout policy:
+- Base timeout is `gpu.total_time_s_max` from `tests/regression/golden_metrics.json`.
+- The runner applies a +10% buffer.
+- The run is accepted only if the log contains `ROUTING COMPLETE` and log-derived completion time is within timeout.
 
 ---
 
@@ -54,6 +65,25 @@ pytest tests/regression/test_backplane.py::TestHeadlessRouting -v
 | **Barrel Conflicts** | 367 | ≤ 450 | SOFT WARN |
 | **Lattice Nodes** | 446,472 | Must match exactly | **HARD FAIL** |
 | **Lattice Layers** | 18 | Must match exactly | **HARD FAIL** |
+
+---
+
+## Latest Headless Validation (April 10, 2026 @ 18:46)
+
+Source log: `logs/run_20260410_184636.log`
+
+| Metric | Golden Baseline | Latest Headless Run | Result |
+|--------|------------------|---------------------|--------|
+| Nets Routed | 512/512 | 512/512 | PASS |
+| Converged | True | True | PASS |
+| Iterations | 73 (golden), threshold <= 88 | 64 | PASS |
+| Total Time | 1106.6s (golden), threshold <= 1328s | 565.0s | PASS |
+| Final Overuse | 0 | 0 | PASS |
+| Barrel Conflicts | 367 (golden), threshold <= 450 | 305 | PASS |
+
+Notes:
+- This confirms the file-parser coordinate fix restored full headless convergence.
+- The latest headless run completed faster than the golden plugin run while meeting all thresholds.
 
 ---
 

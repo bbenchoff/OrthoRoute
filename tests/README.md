@@ -11,6 +11,7 @@ tests/
 │   ├── test_performance_utils.py
 │   └── test_routing_engine.py
 └── regression/                   # Full-pipeline tests (require KiCad run first)
+    ├── run_headless_routing.py    # Full headless backplane routing + golden comparison
     ├── test_backplane.py
     ├── golden_board.json          # Board signature — update if .kicad_pcb changes
     └── golden_metrics.json        # Routing baselines — update after algorithm improvements
@@ -29,6 +30,12 @@ python -m pytest tests/unit/ -v --cov=orthoroute --cov-report=term-missing
 
 # Full regression suite (needs logs/latest.log from a KiCad run)
 python -m pytest tests/regression/ -v
+
+# Full headless backplane route + timeout/log completion check + golden compare
+python tests/regression/run_headless_routing.py
+
+# Log-only validation against timeout/completion (no reroute)
+python tests/regression/run_headless_routing.py --log-only
 
 # Everything
 python -m pytest tests/ -v
@@ -101,7 +108,7 @@ These areas belong in `tests/regression/` or require a running KiCad process:
 | Area | Why excluded |
 |---|---|
 | `infrastructure/kicad/rich_kicad_interface.py` | Requires KiCad IPC process |
-| `infrastructure/kicad/file_parser.py` | S-expression parser can't load TestBackplane headlessly |
+| `infrastructure/kicad/file_parser.py` | Covered by dedicated parser tests and headless regression runner |
 | `presentation/pipeline.py` — full pipeline run | Requires a board with pads |
 | `algorithms/manhattan/unified_pathfinder.py` — `_pathfinder_negotiation` | ~6 k-line monolith; full run too slow for unit suite |
 | `presentation/gui/main_window.py` | Requires PyQt6 display |
@@ -132,9 +139,9 @@ Board under test: **TestBackplane.kicad_pcb** — 18 copper layers, 1,604 pads, 
 
 | Group | Class(es) | Trigger | Current status |
 |---|---|---|---|
-| **A** — Log health | `TestLogHealth`, `TestIterationMetrics` | `log_content` fixture (needs `logs/latest.log`) | Skipped (no log file headlessly) |
+| **A** — Log health | `TestLogHealth`, `TestIterationMetrics` | `log_content` fixture (needs `logs/latest.log`) | Runs when a routing log exists |
 | **A2** — Board load | `TestBoardLoad` | `log_content` fixture | Skipped (no log file headlessly) |
-| **B** — Routing quality | `TestRoutingQuality` | `routing_result` fixture (board must load with ≥ 10 pads) | Skipped (KiCad file parser fails headlessly) |
+| **B** — Routing quality | `TestRoutingQuality` | `routing_result` fixture (board must load with ≥ 10 pads) | Runs with KiCad or headless parser load |
 | **C** — Write-back | `TestWriteBack` | `routing_result` + KiCad IPC | Skipped (KiCad IPC not available headlessly) |
 
 Groups B and C activate automatically when run inside a KiCad session (IPC adapter) or when the file parser successfully loads the board.
@@ -144,11 +151,10 @@ Groups B and C activate automatically when run inside a KiCad session (IPC adapt
 The `log_path` fixture calls `pytest.skip()` when `logs/latest.log` doesn't exist.
 Run OrthoRoute via KiCad with `ORTHO_DEBUG=1` first — then re-run the regression suite.
 
-#### Why Groups B/C skip headlessly
+#### Why Group C still skips headlessly
 
-`KiCadFileParser` returns 0 pads on the complex TestBackplane (regex-based S-expression parser).
-`board_object` fixture detects < 10 pads and skips:
-> `"board parsing failed headlessly; run via KiCad to enable routing tests"`
+Write-back tests require an active KiCad IPC session. Headless routing validates
+algorithmic convergence but does not apply tracks/vias to a live KiCad board.
 
 ### Pass/fail policy
 

@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
+import math
 from ...domain.models.board import Board, Component, Net, Pad, Layer, Coordinate
 from ...domain.models.constraints import DRCConstraints, NetClass
 
@@ -107,12 +108,24 @@ class KiCadFileParser:
         """Extract component (footprint) information."""
         components = []
         
-        # Find all footprint definitions
-        footprint_pattern = r'\(footprint\s+"([^"]+)"\s+(.*?)\n\s*\)'
+        # Find all footprint definitions - match balanced parentheses
+        # Use a more robust pattern that handles nested structures
+        footprint_starts = [(m.start(), m.group(1)) for m in re.finditer(r'\(footprint\s+"([^"]+)"', content)]
         
-        for match in re.finditer(footprint_pattern, content, re.DOTALL):
-            footprint_lib = match.group(1)
-            footprint_content = match.group(2)
+        for start_pos, footprint_lib in footprint_starts:
+            # Find the matching closing parenthesis
+            depth = 0
+            end_pos = start_pos
+            for i in range(start_pos, len(content)):
+                if content[i] == '(':
+                    depth += 1
+                elif content[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i + 1
+                        break
+            
+            footprint_content = content[start_pos:end_pos]
             
             # Extract footprint details
             component = {
@@ -126,23 +139,31 @@ class KiCadFileParser:
                 'pads': []
             }
             
-            # Extract reference
-            ref_match = re.search(r'\(fp_text\s+reference\s+"([^"]+)"', footprint_content)
+            # Extract reference - try both modern (property) and legacy (fp_text) formats
+            ref_match = re.search(r'\(property\s+"Reference"\s+"([^"]+)"', footprint_content)
+            if not ref_match:
+                ref_match = re.search(r'\(fp_text\s+reference\s+"([^"]+)"', footprint_content)
             if ref_match:
                 component['reference'] = ref_match.group(1)
             
-            # Extract value
-            val_match = re.search(r'\(fp_text\s+value\s+"([^"]+)"', footprint_content)
+            # Extract value - try both modern (property) and legacy (fp_text) formats
+            val_match = re.search(r'\(property\s+"Value"\s+"([^"]+)"', footprint_content)
+            if not val_match:
+                val_match = re.search(r'\(fp_text\s+value\s+"([^"]+)"', footprint_content)
             if val_match:
                 component['value'] = val_match.group(1)
             
-            # Extract position
-            pos_match = re.search(r'\(at\s+([\d.-]+)\s+([\d.-]+)(?:\s+([\d.-]+))?\)', footprint_content)
-            if pos_match:
-                component['x'] = float(pos_match.group(1))
-                component['y'] = float(pos_match.group(2))
-                if pos_match.group(3):
-                    component['angle'] = float(pos_match.group(3))
+            # Extract position - match first (at ...) after footprint declaration
+            # Look for footprint-level at, not pad-level
+            header_end = footprint_content.find('\n', footprint_content.find('(footprint'))
+            if header_end > 0:
+                header_section = footprint_content[:min(header_end + 200, len(footprint_content))]
+                pos_match = re.search(r'\(at\s+([\d.-]+)\s+([\d.-]+)(?:\s+([\d.-]+))?\)', header_section)
+                if pos_match:
+                    component['x'] = float(pos_match.group(1))
+                    component['y'] = float(pos_match.group(2))
+                    if pos_match.group(3):
+                        component['angle'] = float(pos_match.group(3))
             
             # Extract layer
             layer_match = re.search(r'\(layer\s+"([^"]+)"\)', footprint_content)
@@ -161,14 +182,36 @@ class KiCadFileParser:
         """Extract pad information from footprint."""
         pads = []
         
-        # Find all pad definitions
-        pad_pattern = r'\(pad\s+"([^"]+)"\s+(\w+)\s+(\w+)\s+(.*?)\)'
+        # Find all pad definitions - use balanced parentheses matching
+        pad_starts = [m.start() for m in re.finditer(r'\(pad\s+"', footprint_content)]
         
-        for match in re.finditer(pad_pattern, footprint_content, re.DOTALL):
-            pad_number = match.group(1)
-            pad_type = match.group(2)  # thru_hole, smd, etc.
-            pad_shape = match.group(3)  # circle, rect, etc.
-            pad_details = match.group(4)
+        for start_pos in pad_starts:
+            # Find the matching closing parenthesis for this pad
+            depth = 0
+            end_pos = start_pos
+            for i in range(start_pos, len(footprint_content)):
+                if footprint_content[i] == '(':
+                    depth += 1
+                elif footprint_content[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i + 1
+                        break
+            
+            pad_text = footprint_content[start_pos:end_pos]
+            
+            # Extract pad number, type, and shape from the pad declaration line
+            pad_header_match = re.search(r'\(pad\s+"([^"]*)"\s+(\w+)\s+(\w+)', pad_text)
+            if not pad_header_match:
+                continue
+            
+            pad_number = pad_header_match.group(1)
+            pad_type = pad_header_match.group(2)  # thru_hole, smd, np_thru_hole, etc.
+            pad_shape = pad_header_match.group(3)  # circle, rect, etc.
+            
+            # Skip non-plated holes (np_thru_hole)
+            if pad_type == 'np_thru_hole' or not pad_number:
+                continue
             
             pad = {
                 'id': f"{component_ref}_{pad_number}",
@@ -185,29 +228,33 @@ class KiCadFileParser:
             }
             
             # Extract position
-            pos_match = re.search(r'\(at\s+([\d.-]+)\s+([\d.-]+)', pad_details)
+            pos_match = re.search(r'\(at\s+([\d.-]+)\s+([\d.-]+)', pad_text)
             if pos_match:
                 pad['x'] = float(pos_match.group(1))
                 pad['y'] = float(pos_match.group(2))
             
             # Extract size
-            size_match = re.search(r'\(size\s+([\d.-]+)\s+([\d.-]+)', pad_details)
+            size_match = re.search(r'\(size\s+([\d.-]+)\s+([\d.-]+)', pad_text)
             if size_match:
                 pad['width'] = float(size_match.group(1))
                 pad['height'] = float(size_match.group(2))
             
             # Extract drill size
-            drill_match = re.search(r'\(drill\s+([\d.-]+)', pad_details)
+            drill_match = re.search(r'\(drill\s+([\d.-]+)', pad_text)
             if drill_match:
                 pad['drill_size'] = float(drill_match.group(1))
             
-            # Extract layers
-            layers_match = re.search(r'\(layers\s+"([^"]+)"', pad_details)
+            # Extract layers - can be single or multiple layers
+            layers_match = re.search(r'\(layers\s+([^)]+)\)', pad_text)
             if layers_match:
-                pad['layer'] = layers_match.group(1)
+                layers_str = layers_match.group(1)
+                # Extract first layer name (handle both "F.Cu" and multiple layers)
+                first_layer_match = re.search(r'"([^"]+)"', layers_str)
+                if first_layer_match:
+                    pad['layer'] = first_layer_match.group(1)
             
             # Extract net
-            net_match = re.search(r'\(net\s+(\d+)\s+"([^"]*)"', pad_details)
+            net_match = re.search(r'\(net\s+(\d+)\s+"([^"]*)"', pad_text)
             if net_match:
                 net_code = int(net_match.group(1))
                 if net_code > 0:  # Skip unconnected (net 0)
@@ -419,8 +466,44 @@ class KiCadFileParser:
                     shape=pad_data.get('shape', 'circle')
                 )
                 component.pads.append(pad)
-            
-            board.add_component(component)
+            # Add components — pad positions transformed to absolute board coordinates
+            for comp_data in board_data.get('components', []):
+                comp_x = comp_data.get('x', 0)
+                comp_y = comp_data.get('y', 0)
+                comp_angle = comp_data.get('angle', 0)
+                angle_rad = math.radians(comp_angle)
+                cos_a = math.cos(angle_rad)
+                sin_a = math.sin(angle_rad)
+
+                component = Component(
+                    id=comp_data.get('reference', ''),
+                    reference=comp_data.get('reference', ''),
+                    value=comp_data.get('value', ''),
+                    footprint=comp_data.get('footprint', ''),
+                    position=Coordinate(comp_x, comp_y),
+                    angle=comp_angle,
+                    layer=comp_data.get('layer', 'F.Cu')
+                )
+
+                # Transform pad positions from component-local to absolute board coordinates
+                for pad_data in comp_data.get('pads', []):
+                    local_x = pad_data.get('x', 0)
+                    local_y = pad_data.get('y', 0)
+                    abs_x = comp_x + local_x * cos_a - local_y * sin_a
+                    abs_y = comp_y + local_x * sin_a + local_y * cos_a
+                    pad = Pad(
+                        id=pad_data['id'],
+                        component_id=component.id,
+                        net_id=pad_data.get('net_id'),
+                        position=Coordinate(abs_x, abs_y),
+                        size=(pad_data.get('width', 1.0), pad_data.get('height', 1.0)),
+                        drill_size=pad_data.get('drill_size'),
+                        layer=pad_data.get('layer', 'F.Cu'),
+                        shape=pad_data.get('shape', 'circle')
+                    )
+                    component.pads.append(pad)
+
+                board.add_component(component)
         
         # Add nets
         for net_data in board_data.get('nets', []):
