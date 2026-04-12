@@ -5,6 +5,10 @@
 **Test Board**: TestBackplane.kicad_pcb  
 **Purpose**: Establish performance baseline for future optimization work
 
+> **Update (April 12, 2026):** Automated optimization workflow now available!  
+> See [optimization_workflow.md](optimization_workflow.md) for complete guide.  
+> Use `.\scripts\optimize_and_validate.ps1` for automated testing and validation.
+
 ---
 
 ## Executive Summary

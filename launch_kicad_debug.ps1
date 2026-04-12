@@ -19,18 +19,24 @@
 .PARAMETER NoScreenshots
     Skip screenshots entirely (log only, no PNG output).
 
+.PARAMETER RunValidation
+    Run automated smoke test validation after KiCad exits.
+    Calls scripts/optimize_and_validate.ps1 with smoke test.
+
 .EXAMPLE
     .\launch_kicad_debug.ps1
     .\launch_kicad_debug.ps1 -KiCadVersion 10.0
     .\launch_kicad_debug.ps1 -ScreenshotFreq 10 -ScreenshotScale 4
     .\launch_kicad_debug.ps1 -NoScreenshots
+    .\launch_kicad_debug.ps1 -RunValidation  # Run smoke test after KiCad exits
 #>
 
 param(
     [string]$KiCadVersion   = "9.0",
     [int]   $ScreenshotFreq  = 5,
     [int]   $ScreenshotScale = 8,
-    [switch]$NoScreenshots
+    [switch]$NoScreenshots,
+    [switch]$RunValidation
 )
 
 $kicadExe = "C:\Program Files\KiCad\$KiCadVersion\bin\kicad.exe"
@@ -100,5 +106,34 @@ try {
         Get-Content $pluginLog | Select-Object -Last 40
     } else {
         Write-Host "  No log found at: $pluginLog" -ForegroundColor Yellow
+    }
+    
+    # --- Optional validation step ---
+    if ($RunValidation) {
+        Write-Host ""
+        Write-Host "=== Running Automated Validation ===" -ForegroundColor Cyan
+        Write-Host "  Smoke test (100 nets, <30s) to verify routing still works..."
+        Write-Host ""
+        
+        $validateScript = Join-Path $PSScriptRoot "scripts\optimize_and_validate.ps1"
+        if (Test-Path $validateScript) {
+            try {
+                & $validateScript -SkipDeploy -TestBoard smoke
+                $validationExit = $LASTEXITCODE
+                
+                Write-Host ""
+                if ($validationExit -eq 0) {
+                    Write-Host "✅ VALIDATION PASSED: Routing successful" -ForegroundColor Green
+                } elseif ($validationExit -eq 2) {
+                    Write-Host "⚠️ VALIDATION WARNING: Performance regression detected" -ForegroundColor Yellow
+                } else {
+                    Write-Host "❌ VALIDATION FAILED: Routing errors detected (exit code $validationExit)" -ForegroundColor Red
+                }
+            } catch {
+                Write-Host "❌ Validation script error: $_" -ForegroundColor Red
+            }
+        } else {
+            Write-Warning "Validation script not found: $validateScript"
+        }
     }
 }

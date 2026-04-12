@@ -28,6 +28,32 @@ This confirms headless regression viability after the pad coordinate transform f
 
 ---
 
+## Validation Workflow (April 12, 2026 Update)
+
+After establishing this golden result as the baseline, the optimization workflow was enhanced with automated validation tools:
+
+**Smoke test (fast validation checkpoint):**
+```powershell
+.\scripts\optimize_and_validate.ps1 -Compare tests/regression/smoke_metrics.json
+# 100 nets, <30s, validates correctness before full backplane test
+```
+
+**Full backplane validation:**
+```powershell
+.\scripts\optimize_and_validate.ps1 -ProfileMode -TestBoard backplane -Compare tests/regression/golden_metrics.json
+# 512 nets, 11-18 min, compares against this golden result
+```
+
+**Log analysis:**
+```powershell
+python scripts/analyze_log.py --compare tests/regression/golden_metrics.json
+# Extracts metrics and validates against thresholds
+```
+
+**See:** [optimization_workflow.md](optimization_workflow.md) for complete optimization workflow guide with automated validation.
+
+---
+
 ## Test Configuration
 
 | Parameter | Value |

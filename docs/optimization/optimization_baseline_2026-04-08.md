@@ -5,6 +5,10 @@
 **Test Board**: TestBackplane.kicad_pcb  
 **Purpose**: Track routing performance and identify regression vs. April 5 baseline
 
+> **Update (April 12, 2026):** Automated optimization workflow now available!  
+> See [optimization_workflow.md](optimization_workflow.md) for complete guide.  
+> To investigate this regression: `python scripts/analyze_log.py --compare tests/regression/golden_metrics.json`
+
 ---
 
 ## Executive Summary

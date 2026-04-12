@@ -142,6 +142,31 @@ Expected gain: reduces per-net Python overhead from ~50ms to ~5ms → total ~3-4
 
 ---
 
+## ⚡ Validation Workflow (NEW)
+
+**Automated optimization cycle** with [scripts/optimize_and_validate.ps1](../../scripts/optimize_and_validate.ps1):
+
+```powershell
+# Quick smoke test (100 nets, <30s) — fast validation checkpoint
+.\scripts\optimize_and_validate.ps1 -Compare tests/regression/smoke_metrics.json
+
+# Full backplane test (512 nets, 11-18 min) with profiling
+.\scripts\optimize_and_validate.ps1 -ProfileMode -TestBoard backplane -Compare tests/regression/golden_metrics.json
+
+# Analyze results
+python scripts/analyze_log.py --compare tests/regression/golden_metrics.json
+```
+
+**Exit codes:**
+- `0` = PASS (routing succeeded, validations passed) ✅ Safe to commit
+- `1` = FAIL (routing failed, hard errors) ❌ Fix bugs
+- `2` = WARN (performance regression detected) ⚠️ Investigate
+- `3` = ERROR (prerequisites missing) 🔧 Fix environment
+
+**See:** [docs/optimization/optimization_workflow.md](optimization_workflow.md) for complete workflow guide
+
+---
+
 ## 🔧 Before Optimization: Setup
 
 ### 1. Add @profile_time Decorators
@@ -172,6 +197,30 @@ python main.py cli TestBoards/TestBackplane.kicad_pcb
 ---
 
 ## 📈 Performance Analysis Commands
+
+**NEW: Use standalone log parser** ([scripts/analyze_log.py](../../scripts/analyze_log.py)):
+
+```powershell
+# Quick analysis of latest run
+python scripts/analyze_log.py
+
+# Compare against golden metrics
+python scripts/analyze_log.py --compare tests/regression/golden_metrics.json
+
+# Export as JSON for automation
+python scripts/analyze_log.py --json > metrics.json
+
+# Analyze specific log file
+python scripts/analyze_log.py --log-file logs/run_20260410_184636.log
+```
+
+**Output includes:**
+- Routing summary (nets routed, iterations, convergence)
+- Profiling data (top functions by total time)
+- Golden comparison (PASS/WARN/FAIL status)
+- Lattice dimensions, GPU mode detection
+
+**Legacy manual analysis** (for custom queries):
 
 ```python
 # Analyze a completed run log (Python — avoids PowerShell multi-line issues)

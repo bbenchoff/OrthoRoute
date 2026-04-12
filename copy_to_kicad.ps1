@@ -4,9 +4,12 @@
 #
 # Usage:  .\copy_to_kicad.ps1
 #         .\copy_to_kicad.ps1 -Verbose   # show each copied file
+#         .\copy_to_kicad.ps1 -Validate  # run smoke test after copy
 
 [CmdletBinding()]
-param()
+param(
+    [switch]$Validate
+)
 
 $src = $PSScriptRoot
 
@@ -91,3 +94,35 @@ Get-ChildItem -Path "$src\orthoroute" -Recurse -Filter "*.py" | ForEach-Object {
 $status = if ($script:errors -eq 0) { "OK" } else { "ERRORS" }
 Write-Host "[$status] $($script:copied) file(s) copied, $($script:errors) error(s)"
 if ($script:errors -gt 0) { exit 1 }
+
+# --- Optional validation step ---
+if ($Validate) {
+    Write-Host ""
+    Write-Host "=== Running Quick Validation ===" -ForegroundColor Cyan
+    Write-Host "  Smoke test (100 nets, <30s) to check for breakage..."
+    Write-Host ""
+    
+    $validateScript = Join-Path $src "scripts\optimize_and_validate.ps1"
+    if (Test-Path $validateScript) {
+        try {
+            & $validateScript -SkipDeploy -TestBoard smoke -Compare "tests/regression/smoke_metrics.json"
+            $validationExit = $LASTEXITCODE
+            
+            Write-Host ""
+            if ($validationExit -eq 0) {
+                Write-Host "✅ VALIDATION PASSED: Changes safe to use" -ForegroundColor Green
+            } elseif ($validationExit -eq 2) {
+                Write-Host "⚠️ VALIDATION WARNING: Performance regression detected" -ForegroundColor Yellow
+            } else {
+                Write-Host "❌ VALIDATION FAILED: Routing errors detected (exit code $validationExit)" -ForegroundColor Red
+                exit $validationExit
+            }
+        } catch {
+            Write-Host "❌ Validation script error: $_" -ForegroundColor Red
+            exit 3
+        }
+    } else {
+        Write-Warning "Validation script not found: $validateScript"
+        Write-Host "  Skipping validation (script creation in progress?)"
+    }
+}

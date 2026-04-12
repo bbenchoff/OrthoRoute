@@ -40,6 +40,21 @@ Original baseline with:
 
 ## 🔧 Optimization Tools & Systems
 
+### [Optimization Workflow](optimization_workflow.md) ✨ **NEW**
+**Complete guide for making performance optimizations with automated validation**
+
+- Automated optimization cycle: deploy → test → validate
+- Regression detection with golden metrics comparison
+- Profiling best practices and bottleneck identification
+- Before/after measurement and documentation standards
+
+### [Scripts (scripts/)](../../scripts/)
+**Automation tools for optimization workflows**
+
+- [analyze_log.py](../../scripts/analyze_log.py) — Standalone log parser with golden comparison
+- [optimize_and_validate.ps1](../../scripts/optimize_and_validate.ps1) — Automated test + validation wrapper
+- Exit codes: 0=PASS, 1=FAIL, 2=WARN (performance regression), 3=ERROR
+
 ### [Current Logging Review](CURRENT_LOGGING_REVIEW.md)
 **Analysis of existing logging patterns in `unified_pathfinder.py`**
 
@@ -51,15 +66,35 @@ Original baseline with:
 
 ## 🎯 Quick Start
 
-### Run Baseline Test
+### Optimization Workflow (Recommended)
+```powershell
+# 1. Quick smoke test validation (100 nets, <30s)
+.\scripts\optimize_and_validate.ps1 -Compare tests/regression/smoke_metrics.json
+
+# 2. Full backplane test with profiling (512 nets, 11-18 min)
+.\scripts\optimize_and_validate.ps1 -ProfileMode -TestBoard backplane -Compare tests/regression/golden_metrics.json
+
+# 3. Analyze results
+python scripts/analyze_log.py --compare tests/regression/golden_metrics.json
+```
+
+**See:** [optimization_workflow.md](optimization_workflow.md) for complete workflow guide
+
+### Manual Baseline Test
 ```powershell
 # Standard performance test
 python main.py cli TestBoards/TestBackplane.kicad_pcb
 ```
 
 ### Analyze Performance
+```powershell
+# NEW: Standalone log parser (recommended)
+python scripts/analyze_log.py
+python scripts/analyze_log.py --compare tests/regression/golden_metrics.json
+
+# Legacy manual analysis (for custom queries)
+```
 ```python
-# Use Python — avoids PowerShell multi-line paste issues with large logs
 import re, os
 log = r"<plugin_dir>/logs/latest.log"
 lines = open(log, encoding="utf-8", errors="ignore").readlines()
