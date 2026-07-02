@@ -663,24 +663,43 @@ def run_cli(board_file: str, output_dir: str = ".", config_path: Optional[str] =
 
         logging.info(f"Loaded board: {board.name} with {len(board.nets)} nets")
 
+        # Hard-fail on an empty parse: a 0-net/0-pad board means the file
+        # parser did not understand the input (previously this fell through
+        # to "No copper generated" with no hint at the real cause).
+        pad_count = sum(len(getattr(net, 'pads', [])) for net in board.nets)
+        if len(board.nets) == 0 or pad_count == 0:
+            msg = (
+                f"Parsed 0 routable content from {board_file} "
+                f"(nets={len(board.nets)}, pads-on-nets={pad_count}). "
+                "The file parser likely does not support this board's format."
+            )
+            logging.error(f"[CLI] {msg}")
+            print(f"CLI FAILED: {msg}", file=sys.stderr)
+            sys.exit(1)
+
         # Create UnifiedPathFinder (same as GUI) - FORCE CPU-ONLY
         pf = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=False)
         logging.info(f"[CLI] Created UnifiedPathFinder with instance_tag={pf._instance_tag}")
 
-        # Use unified pipeline (SAME THREE CALLS AS GUI)
+        # Use unified pipeline (SAME CALL SEQUENCE AS GUI/headless).
+        # precompute_all_pad_escapes is mandatory: without portals,
+        # _parse_requests silently drops every net.
         logging.info("[CLI] Step 1: Building lattice & CSR...")
         pf.initialize_graph(board)
 
         logging.info("[CLI] Step 2: Mapping pads to lattice...")
         pf.map_all_pads(board)
 
-        logging.info("[CLI] Step 3: Preparing routing runtime...")
+        logging.info("[CLI] Step 3: Planning pad escapes (portals)...")
+        pf.precompute_all_pad_escapes(board)
+
+        logging.info("[CLI] Step 4: Preparing routing runtime...")
         pf.prepare_routing_runtime()
 
-        logging.info("[CLI] Step 4: Routing nets...")
+        logging.info("[CLI] Step 5: Routing nets...")
         pf.route_multiple_nets(board.nets)
 
-        logging.info("[CLI] Step 5: Emitting geometry...")
+        logging.info("[CLI] Step 6: Emitting geometry...")
         tracks, vias = pf.emit_geometry(board)
 
         logging.info(f"[CLI] Routing completed: {tracks} tracks, {vias} vias")
