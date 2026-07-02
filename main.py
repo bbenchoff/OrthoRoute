@@ -195,56 +195,73 @@ def run_headless_autoroute():
 
 
 def run_tiny_via_test():
-    """Run tiny 2-layer via test case to verify via pathfinding works."""
+    """Run tiny 4-layer via test case to verify via pathfinding works.
+
+    The board must have 4 copper layers: lateral routing edges exist only on
+    inner layers (build_graph excludes F.Cu and B.Cu), so a 2-layer board
+    yields an empty graph. Two SMD pads on F.Cu at a diagonal offset force
+    the routed path to use both inner layers (one H-only, one V-only), which
+    guarantees at least one via edge in the routing graph.
+    """
     try:
         config = setup_environment()
-        print("Starting tiny 2-layer via test...")
-        logging.info("Starting tiny 2-layer via test...")
+        print("Starting tiny 4-layer via test...")
+        logging.info("Starting tiny 4-layer via test...")
 
         from orthoroute.algorithms.manhattan.unified_pathfinder import UnifiedPathFinder, PathFinderConfig
         from orthoroute.domain.models.board import Board, Net, Pad, Component, Coordinate
 
-        # Create minimal 2-layer board with source L0, sink L1 at same (u,v)
         logging.info("[VIA-TEST] Creating minimal test board...")
 
-        # Create a simple board
         board = Board(id="via_test", name="Via Test Board")
-        board.layer_count = 2  # Only 2 layers for simple test
+        board.layer_count = 4  # F.Cu, In1.Cu, In2.Cu, B.Cu
 
-        # Create simple components and pads
-        pos = Coordinate(x=0.0, y=0.0)
-        comp1 = Component(id="comp1", reference="U1", value="Test", footprint="Test", position=pos)
-        comp2 = Component(id="comp2", reference="U2", value="Test", footprint="Test", position=pos)
+        # Two SMD pads on F.Cu, diagonally offset so the route needs both
+        # inner layers (H + V) and therefore at least one graph via edge.
+        pos1 = Coordinate(x=1.0, y=1.0)
+        pos2 = Coordinate(x=5.0, y=5.0)
+        comp1 = Component(id="comp1", reference="U1", value="Test", footprint="Test", position=pos1)
+        comp2 = Component(id="comp2", reference="U2", value="Test", footprint="Test", position=pos2)
 
-        # Pads at same position but different layers (requires via)
-        pad1 = Pad(id="pad1", component_id=comp1.id, position=pos, layer="F.Cu", size=(1.0, 1.0), net_id=None)
-        pad2 = Pad(id="pad2", component_id=comp2.id, position=pos, layer="B.Cu", size=(1.0, 1.0), net_id=None)
+        pad1 = Pad(id="pad1", component_id=comp1.id, position=pos1, layer="F.Cu", size=(1.0, 1.0), net_id=None)
+        pad2 = Pad(id="pad2", component_id=comp2.id, position=pos2, layer="F.Cu", size=(1.0, 1.0), net_id=None)
+        comp1.pads.append(pad1)
+        comp2.pads.append(pad2)
 
-        # Create a net connecting the pads
-        net = Net(id="net1", name="TEST_NET")
-        pad1.net_id = net.id
-        pad2.net_id = net.id
-        net.pad_ids = [pad1.id, pad2.id]
-        board.nets = [net]
+        # Net must carry the Pad objects: _calc_bounds and _parse_requests
+        # both walk net.pads, and the escape planner only portals pads that
+        # belong to a routable net.
+        net = Net(id="net1", name="TEST_NET", pads=[pad1, pad2])
+        board.add_component(comp1)
+        board.add_component(comp2)
+        board.add_net(net)
 
         logging.info(f"[VIA-TEST] Created test board with {len(board.nets)} nets")
 
         # Create UnifiedPathFinder with CPU-only mode
         pf_config = PathFinderConfig()
+        # The 3.0mm ROUTING_MARGIN is 7.5 grid steps at 0.4mm pitch, so pads
+        # land exactly half a pitch off-grid; allow the escape planner to snap
+        # them to the nearest column instead of rejecting at the 0.5 default.
+        pf_config.portal_x_snap_max = 0.75
         pf = UnifiedPathFinder(config=pf_config, use_gpu=False)
         logging.info(f"[VIA-TEST] Created UnifiedPathFinder with instance_tag={pf._instance_tag}")
 
-        # Build lattice
+        # Full live call sequence: skipping precompute_all_pad_escapes leaves
+        # nets portal-less and _parse_requests silently drops them.
         logging.info("[VIA-TEST] Building lattice/registry...")
         pf.initialize_graph(board)
         pf.map_all_pads(board)
+        pf.precompute_all_pad_escapes(board)
         pf.prepare_routing_runtime()
 
-        # Check via creation
-        if hasattr(pf, 'via_edge_ids') and len(pf.via_edge_ids) > 0:
-            logging.info(f"[VIA-TEST] Via edges created: {len(pf.via_edge_ids)}")
+        # Check via creation (graph edge_kind: 0 = lateral, 1 = via)
+        via_edge_count = int(pf._via_edges.sum()) if getattr(pf, '_via_edges', None) is not None else 0
+        if via_edge_count > 0:
+            logging.info(f"[VIA-TEST] Via edges created: {via_edge_count}")
         else:
             logging.error("[VIA-TEST] No via edges created!")
+            print("VIA TEST FAILED: No via edges created")
             sys.exit(1)
 
         # Route the test net
@@ -255,26 +272,27 @@ def run_tiny_via_test():
         logging.info("[VIA-TEST] Checking results...")
         tracks, vias = pf.emit_geometry(board)
 
-        # Verify via usage
-        via_eids = getattr(pf, 'via_edge_ids', [])
-        vias_used = 0
-        if hasattr(pf, 'owner') and hasattr(pf, 'e_is_via'):
-            owned_edges = np.where(pf.owner != -1)[0]
-            vias_used = int(np.sum(pf.e_is_via[owned_edges])) if len(owned_edges) > 0 else 0
+        # Verify via usage by counting layer changes along the routed path
+        routed_path = pf.net_paths.get(net.name, [])
+        plane_size = pf.lattice.x_steps * pf.lattice.y_steps
+        vias_used = sum(
+            1 for a, b in zip(routed_path, routed_path[1:])
+            if a // plane_size != b // plane_size
+        )
 
         logging.info(f"[VIA-TEST] Results: tracks={tracks} vias={vias} vias_used={vias_used}")
 
         # Assertions
-        assert len(via_eids) > 0, "No via edges created"
+        assert via_edge_count > 0, "No via edges created"
+        assert len(routed_path) >= 2, f"Net {net.name} was not routed (path={routed_path})"
         assert vias_used >= 1, f"No vias used in routing: vias_used={vias_used}"
 
-        owned_edges = np.where(pf.owner != -1)[0]
-        assert len(owned_edges) > 0, "No edges owned after routing"
+        present = pf.accounting.present
+        present = present.get() if hasattr(present, 'get') else present
+        present_nonzero = int(np.count_nonzero(present))
+        assert present_nonzero > 0, f"present usage is zero: {present_nonzero}"
 
-        present_nonzero = int(np.count_nonzero(pf.present_cost > 0))
-        assert present_nonzero > 0, f"present_cost is zero: {present_nonzero}"
-
-        print(f"VIA TEST PASSED: vias_used={vias_used} owned_edges={len(owned_edges)} present_nonzero={present_nonzero}")
+        print(f"VIA TEST PASSED: vias_used={vias_used} path_nodes={len(routed_path)} present_nonzero={present_nonzero}")
         logging.info("[VIA-TEST] All assertions passed!")
         sys.exit(0)
 
