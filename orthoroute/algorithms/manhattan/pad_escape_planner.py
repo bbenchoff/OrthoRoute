@@ -237,7 +237,10 @@ class PadEscapePlanner:
         for comp in getattr(board, "components", []):
             for pad in getattr(comp, "pads", []):
                 # Skip through-hole pads
-                drill = getattr(pad, 'drill', 0.0)
+                drill = getattr(pad, 'drill', None)
+                if drill is None:
+                    # Domain Pad objects (file-parser path) name it drill_size
+                    drill = getattr(pad, 'drill_size', None) or 0.0
                 if drill > 0:
                     continue
 
@@ -265,7 +268,10 @@ class PadEscapePlanner:
 
         # Board-level pads
         for pad in getattr(board, "pads", []):
-            drill = getattr(pad, 'drill', 0.0)
+            drill = getattr(pad, 'drill', None)
+            if drill is None:
+                # Domain Pad objects (file-parser path) name it drill_size
+                drill = getattr(pad, 'drill_size', None) or 0.0
             if drill > 0:
                 continue
 

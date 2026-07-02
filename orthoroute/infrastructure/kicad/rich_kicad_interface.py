@@ -42,7 +42,7 @@ class BoardData:
 
 def fetch_board_and_drc():
     """Fetch board and DRC data using IPC API (proper method)"""
-    from kicad import KiCad
+    from kipy import KiCad
 
     try:
         kc = KiCad()                                   # IPC session (nng under the hood)
