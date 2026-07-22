@@ -95,3 +95,29 @@ def test_deterministic_across_runs(routed):
     pf2.route_multiple_nets(board2.nets)
 
     assert list(pf2.net_paths["TEST_NET"]) == first_path
+
+
+def test_two_layer_route_end_to_end():
+    """Regression for #18/#13: a 2-layer board must route, not crash.
+
+    Previously initialize_graph raised ValueError("No edges") because no
+    inner layers exist on a 2-layer board and lateral edges were only
+    emitted for inner layers.
+    """
+    board = make_two_pad_board(layer_count=2)
+    config = PathFinderConfig()
+    config.portal_x_snap_max = 0.75
+    pf = UnifiedPathFinder(config=config, use_gpu=False)
+
+    pf.initialize_graph(board)
+    pf.map_all_pads(board)
+    pf.precompute_all_pad_escapes(board)
+    pf.prepare_routing_runtime()
+    pf.route_multiple_nets(board.nets)
+    tracks, vias = pf.emit_geometry(board)
+
+    path = pf.net_paths.get("TEST_NET", [])
+    assert len(path) >= 2, "2-layer net was not routed"
+    assert tracks > 0
+    total, count = pf.accounting.compute_overuse(pf)
+    assert (total, count) == (0, 0)

@@ -654,8 +654,11 @@ class CSRGraph:
         self.indices = None
         self.base_costs = None
 
-        # Pre-allocate numpy array if capacity known (memory efficient)
-        if edge_capacity:
+        # Pre-allocate numpy array if capacity known (memory efficient).
+        # NOTE: must test against None, not truthiness - a capacity of 0 is
+        # a real (degenerate) value and previously fell into the list path,
+        # producing a confusing bare "No edges" error.
+        if edge_capacity is not None:
             self._edge_array = np.zeros(edge_capacity, dtype=[('src', 'i4'), ('dst', 'i4'), ('cost', 'f4')])
             self._edge_idx = 0
             self._use_array = True
@@ -676,15 +679,18 @@ class CSRGraph:
         import time
         start = time.time()
 
+        E = self._edge_idx if self._use_array else len(self._edges)
+        if E == 0:
+            raise ValueError(
+                "Routing graph has no edges. This usually means no routing "
+                "layers were derived from the board (check layer_count and "
+                "lattice bounds).")
+
         if self._use_array:
             # Already in numpy array (pre-allocated)
-            E = self._edge_idx
             edge_array = self._edge_array[:E]  # Trim to actual size
             logger.info(f"Finalizing CSR: {E:,} edges from pre-allocated array")
         else:
-            if not self._edges:
-                raise ValueError("No edges")
-            E = len(self._edges)
 
             # Convert to numpy array for memory-efficient sorting
             logger.info(f"Converting {E:,} edges to numpy array...")
@@ -1134,6 +1140,12 @@ class Lattice3D:
         The escape planner creates stubs on F.Cu, and PathFinder must be able
         to create vias from F.Cu to whatever internal layer it chooses.
         """
+        if layer_count <= 2:
+            # 2-layer board: there are no inner layers, so F.Cu/B.Cu are the
+            # routing layers and the only via is the (0,1) through-hole.
+            logger.info("[VIA-PAIRS] 2-layer board: through vias only")
+            return {(0, 1), (1, 0)}
+
         # Check config for via policy (default to FULL blind/buried)
         allow_any = True  # ALWAYS allow full blind/buried for convergence
 
@@ -1192,11 +1204,19 @@ class Lattice3D:
                               Layers are indexed 0..N-1.
             use_gpu: Enable GPU acceleration
         """
+        # Lateral routing layers: inner layers only (outer layers are reserved
+        # for pads/escapes), EXCEPT on 2-layer boards where no inner layers
+        # exist and F.Cu/B.Cu must carry the lateral routing themselves.
+        if self.layers > 2:
+            lateral_layers = range(1, self.layers - 1)
+        else:
+            lateral_layers = range(self.layers)
+
         # Count edges to pre-allocate array (avoids MemoryError with 30M edges)
         edge_count = 0
 
-        # Count H/V edges (exclude outer layers 0 and self.layers-1)
-        for z in range(1, self.layers - 1):
+        # Count H/V edges
+        for z in lateral_layers:
             if self.layer_dir[z] == 'h':
                 edge_count += 2 * self.y_steps * (self.x_steps - 1)
             else:  # 'v'
@@ -1210,8 +1230,8 @@ class Lattice3D:
         logger.info(f"Pre-allocating for {edge_count:,} edges ({via_edge_count:,} via edges for {len(legal_via_pairs_set)} pairs)")
         graph = CSRGraph(use_gpu, edge_capacity=edge_count)
 
-        # Build lateral edges (H/V discipline, exclude outer layers 0 and self.layers-1)
-        for z in range(1, self.layers - 1):
+        # Build lateral edges (H/V discipline)
+        for z in lateral_layers:
             direction = self.layer_dir[z]
 
             if direction == 'h':
@@ -2144,8 +2164,10 @@ class PathFinderRouter:
                 self.via_col_pres = np.zeros((Nx, Ny), dtype=np.float32)
                 logger.info(f"[VIA-POOL] Column pooling enabled (CPU): capacity={self.via_col_cap[0,0]} per (x,y)")
 
-        if getattr(self.config, "via_segment_pooling", True):
+        if getattr(self.config, "via_segment_pooling", True) and Nz > 2:
             # Segments between routing layers (1..Nz-2): segment z→z+1 stored at index z-1
+            # Skipped entirely when Nz <= 2: a 2-layer board has only through
+            # vias and no segments to pool (consumers all hasattr-guard).
             self._segZ = Nz - 2  # Number of routing layers
             if use_via_gpu:
                 self.via_seg_cap = cp.full((Nx, Ny, self._segZ), int(getattr(self.config, "via_segment_capacity", 2)), dtype=cp.int8)
