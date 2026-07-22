@@ -180,3 +180,9 @@ iteration_*.md
 orthoroute.log.*
 orthoroute_debug.log
 orthoroute_debug.log.*
+
+# The tracked pytest suite lives in tests/. The rules above (test_*.py,
+# tests/, tests/*) would otherwise ignore it, so re-include every .py under
+# tests/ (test modules AND conftest.py, which holds the shared fixtures).
+!tests/
+!tests/*.py
