@@ -418,20 +418,28 @@ class RichKiCadInterface:
             board_tracks = _ipc_retry(board.get_tracks, "get_tracks", max_retries=3, sleep_s=0.5)
             logger.info(f"Found {len(board_tracks)} tracks using KiCad API")
             
+            from kipy.board_types import BoardLayer
+
             for track in board_tracks:
                 try:
+                    # kipy proto objects: Vector2 start/end and width in nm,
+                    # layer as a BoardLayer enum ("BL_F_Cu" -> "F.Cu").
+                    layer_name = BoardLayer.Name(track.layer)
+                    if layer_name.startswith('BL_'):
+                        layer_name = layer_name[3:].replace('_', '.')
+
                     track_data = {
-                        'start_x': track.get('start_x', 0),
-                        'start_y': track.get('start_y', 0),
-                        'end_x': track.get('end_x', 0),
-                        'end_y': track.get('end_y', 0),
-                        'width': track.get('width', 0.2),
-                        'layer': track.get('layer', 'F.Cu'),
-                        'net_name': track.get('net_name', '')
+                        'start_x': track.start.x / 1_000_000,
+                        'start_y': track.start.y / 1_000_000,
+                        'end_x': track.end.x / 1_000_000,
+                        'end_y': track.end.y / 1_000_000,
+                        'width': track.width / 1_000_000,
+                        'layer': layer_name,
+                        'net_name': track.net.name if track.net else ''
                     }
-                    
+
                     tracks.append(track_data)
-                    
+
                 except Exception as e:
                     logger.warning(f"Error extracting track: {e}")
                     continue
