@@ -1,10 +1,10 @@
 """Tests for the synthetic backplane generator and metrics harness.
 
-These pin harness correctness (board structure, metrics collection), NOT
-routing quality: as of 2026-07 the engine does not reliably converge
-multi-net boards on CPU (measured baseline: a 4-net trivially-routable
-board ends at overuse=40 after max iterations). Tightening the quality
-assertions here IS the scoreboard for the negotiation/punch-in work.
+Also the convergence scoreboard: the 2x4 neighbor board MUST fully route
+with zero overuse (it does so in 1 iteration since the ownership-as-cost /
+escape-planner fixes; before them it stranded a net and hit the iteration
+cap). If the completeness/overuse assertions here regress, a negotiation
+change broke convergence.
 """
 
 import pytest
@@ -94,7 +94,9 @@ class TestMetricsHarness:
         assert m["board"]["pads"] == 8
         assert m["lattice"]["layers"] == 4
         assert m["completion"]["total_nets"] == 4
-        assert m["completion"]["routed_nets"] >= 1
+        assert m["completion"]["routed_nets"] == 4, "trivial board must fully route"
+        assert m["completion"]["complete"] is True
+        assert m["convergence"]["overuse_total"] == 0, "trivial board must converge"
         assert m["convergence"]["iterations"] is not None
         assert m["copper"]["wirelength_mm"] > 0
         assert m["copper"]["layers_used"], "no layer carried copper"

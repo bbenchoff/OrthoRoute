@@ -577,6 +577,10 @@ class PathFinderConfig:
     20%+ convergence regression. Prefer infrastructure improvements over tuning.
     """
     max_iterations: int = 40  # Extended to give convergence more time
+    # Ownership-as-cost: entering a node owned by another net costs
+    # owner_penalty_base * pres_fac instead of being hard-forbidden, so
+    # barrel conflicts are negotiated like any other congestion.
+    owner_penalty_base: float = 25.0
     # CONVERGENCE SCHEDULE (BALANCED BASED ON DIAGNOSTICS):
     pres_fac_init: float = 1.0   # Start gentle (iteration 1)
     pres_fac_mult: float = 1.10  # Gentler exponential to keep history competitive (was 1.15)
@@ -1801,8 +1805,14 @@ class SimpleDijkstra:
         self._gpu_path_count = 0
         self._cpu_path_count = 0
 
-    def find_path_roi(self, src: int, dst: int, costs, roi_nodes, global_to_roi) -> Optional[List[int]]:
-        """Find shortest path within ROI subgraph using heap-based Dijkstra (O(E log V))"""
+    def find_path_roi(self, src: int, dst: int, costs, roi_nodes, global_to_roi,
+                      node_penalty=None) -> Optional[List[int]]:
+        """Find shortest path within ROI subgraph using heap-based Dijkstra (O(E log V)).
+
+        node_penalty: optional float32 array, ROI-local (len == len(roi_nodes)).
+        Added to the edge cost when ENTERING that ROI node - used to price
+        nodes owned by other nets (ownership-as-cost) without removing them.
+        """
         import numpy as np
         import heapq
 
@@ -1872,6 +1882,8 @@ class SimpleDijkstra:
                     continue
 
                 alt = du + float(costs[ei])
+                if node_penalty is not None:
+                    alt += float(node_penalty[v_roi])
                 if alt < dist[v_roi]:
                     dist[v_roi] = alt
                     parent[v_roi] = u_roi
@@ -1891,9 +1903,13 @@ class SimpleDijkstra:
 
     def find_path_multisource_multisink(self, src_seeds: List[Tuple[int, float]],
                                         dst_targets: List[Tuple[int, float]],
-                                        costs, roi_nodes, global_to_roi) -> Optional[Tuple[List[int], int, int]]:
+                                        costs, roi_nodes, global_to_roi,
+                                        node_penalty=None) -> Optional[Tuple[List[int], int, int]]:
         """
         Find shortest path from any source to any destination with portal entry costs.
+
+        node_penalty: optional ROI-local float32 array added when entering a
+        node (ownership-as-cost, see find_path_roi).
 
         Returns: (path, entry_layer, exit_layer) or None
         """
@@ -1963,6 +1979,8 @@ class SimpleDijkstra:
                     continue
 
                 alt = du + float(costs[ei])
+                if node_penalty is not None:
+                    alt += float(node_penalty[v_roi])
                 if alt < dist[v_roi]:
                     dist[v_roi] = alt
                     parent[v_roi] = u_roi
@@ -2910,37 +2928,33 @@ class PathFinderRouter:
 
         return bitmap
 
-    def _filter_roi_by_ownership(self, roi_nodes: np.ndarray, current_net: str) -> np.ndarray:
+    def _build_owner_penalty(self, roi_nodes: np.ndarray, current_net: str) -> Optional[np.ndarray]:
         """
-        Filter ROI nodes to exclude nodes owned by OTHER nets (owner-aware).
+        Build a ROI-local node penalty pricing nodes owned by OTHER nets.
 
-        This prevents routing through via barrels occupied by other nets.
-        Fast vectorized operation: O(ROI_size) instead of O(N×M)!
-
-        Args:
-            roi_nodes: Array of node indices in ROI
-            current_net: Net currently being routed
+        Ownership-as-cost: entering a foreign-owned node (a via barrel or
+        escape column) costs owner_penalty_base * pres_fac on top of the edge
+        cost. Early iterations can cross barrels cheaply (greedy connect);
+        as pres_fac escalates, foreign barrels become prohibitively expensive
+        and nets negotiate around them. This replaced a hard ROI filter that
+        removed owned nodes entirely - which could strip a net's OWN
+        endpoints and made barrel conflicts unresolvable by negotiation.
 
         Returns:
-            Filtered roi_nodes array (nodes owned by other nets removed)
+            float32 array (len == len(roi_nodes)) or None if nothing owned.
         """
         if not hasattr(self, 'node_owner'):
-            return roi_nodes
+            return None
 
         current_net_id = self._get_net_id(current_net)
-
-        # Vectorized ownership check (FAST!)
         owners = self.node_owner[roi_nodes]
-        # Keep nodes that are free (-1) OR owned by current net
-        keep_mask = (owners == -1) | (owners == current_net_id)
+        foreign = (owners != -1) & (owners != current_net_id)
+        if not foreign.any():
+            return None
 
-        filtered_roi = roi_nodes[keep_mask]
-        blocked = len(roi_nodes) - len(filtered_roi)
-
-        if blocked > 0:
-            logger.debug(f"[NODE-OWNER] Net {current_net}: filtered {blocked:,}/{len(roi_nodes):,} ROI nodes owned by other nets")
-
-        return filtered_roi
+        weight = (float(getattr(self.config, 'owner_penalty_base', 25.0))
+                  * float(getattr(self, '_pres_fac_now', 1.0)))
+        return foreign.astype(np.float32) * weight
 
     def _track_escape_vias_in_via_usage(self):
         """
@@ -3561,6 +3575,7 @@ class PathFinderRouter:
 
         for it in range(1, cfg.max_iterations + 1):
             self.iteration = it
+            self._pres_fac_now = pres_fac  # read by _build_owner_penalty
             logger.info(f"[ITER {it}] pres_fac={pres_fac:.2f}")
 
             # Log iteration 1 always-connect policy
@@ -4622,16 +4637,16 @@ class PathFinderRouter:
             # Add missing portal nodes to ROI
             if nodes_to_add:
                 roi_nodes = np.append(roi_nodes, nodes_to_add)
-                # Rebuild mapping to include new nodes
-                global_to_roi = np.full(len(costs), -1, dtype=np.int32)
+                # Rebuild mapping to include new nodes (node-indexed: size N)
+                global_to_roi = np.full(self.N, -1, dtype=np.int32)
                 global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
 
-            # OWNER-AWARE FILTERING: Remove nodes owned by OTHER nets
-            # This prevents routing through via barrels - THE FIX for dangling vias!
-            roi_nodes = self._filter_roi_by_ownership(roi_nodes, net_id)
-            # Rebuild mapping after ownership filtering
-            global_to_roi = np.full(len(costs), -1, dtype=np.int32)
-            global_to_roi[roi_nodes] = np.arange(len(roi_nodes), dtype=np.int32)
+            # OWNERSHIP-AS-COST: price nodes owned by OTHER nets instead of
+            # removing them from the ROI. The old hard filter stripped nets'
+            # own endpoints when a neighbor's barrel claimed them ("BUG: src
+            # not in ROI") and forced ever-wilder detours - barrel conflicts
+            # are congestion, and congestion is negotiated, not walled off.
+            owner_penalty = self._build_owner_penalty(roi_nodes, net_id)
 
             # Final sanity check
             if global_to_roi[src] < 0:
@@ -4659,7 +4674,8 @@ class PathFinderRouter:
             if use_portals:
                 # Route with multi-source/multi-sink using portal seeds
                 result = self.solver.find_path_multisource_multisink(
-                    src_seeds, dst_targets, costs, roi_nodes, global_to_roi
+                    src_seeds, dst_targets, costs, roi_nodes, global_to_roi,
+                    node_penalty=owner_penalty
                 )
                 if result:
                     path, entry_layer, exit_layer = result
@@ -4668,7 +4684,8 @@ class PathFinderRouter:
             if not use_portals or not path:
                 if idx == 0 and use_portals:
                     logger.info(f"[DEBUG] Portal routing failed, falling back to normal routing")
-                path = self.solver.find_path_roi(src, dst, costs, roi_nodes, global_to_roi)
+                path = self.solver.find_path_roi(src, dst, costs, roi_nodes, global_to_roi,
+                                                 node_penalty=owner_penalty)
             pathfinding_time = time.time() - pathfinding_start
 
             # If ROI fails and we haven't exhausted fallback quota, try larger ROI
@@ -4689,8 +4706,10 @@ class PathFinderRouter:
                         roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
                             src_portal_node, dst_portal_node, initial_radius=fallback_radius, stagnation_bonus=roi_margin_bonus * 2
                         )
+                        owner_penalty = self._build_owner_penalty(roi_nodes, net_id)
                         result = self.solver.find_path_multisource_multisink(
-                            src_seeds, dst_targets, costs, roi_nodes, global_to_roi
+                            src_seeds, dst_targets, costs, roi_nodes, global_to_roi,
+                            node_penalty=owner_penalty
                         )
                         if result:
                             path, entry_layer, exit_layer = result
@@ -4699,7 +4718,9 @@ class PathFinderRouter:
                     roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
                         src, dst, initial_radius=fallback_radius, stagnation_bonus=roi_margin_bonus * 2
                     )
-                    path = self.solver.find_path_roi(src, dst, costs, roi_nodes, global_to_roi)
+                    owner_penalty = self._build_owner_penalty(roi_nodes, net_id)
+                    path = self.solver.find_path_roi(src, dst, costs, roi_nodes, global_to_roi,
+                                                     node_penalty=owner_penalty)
 
                 self.full_graph_fallback_count += 1
 
@@ -4844,46 +4865,62 @@ class PathFinderRouter:
         return max(0.55, discount)  # Never go below 0.55 (45% off maximum)
 
     def _retarget_portals_for_net(self, net_id: str):
-        """Retarget portals when a net fails repeatedly"""
+        """Retarget both portals when a net fails repeatedly."""
         if net_id not in self.net_pad_ids:
             return
+        for pad_id in self.net_pad_ids[net_id]:
+            self._retarget_portal(pad_id)
 
-        src_pad_id, dst_pad_id = self.net_pad_ids[net_id]
+    def _retarget_portal(self, pad_id: str):
+        """Move one portal to a new candidate position, safely.
 
-        # Retarget source portal
-        if src_pad_id in self.portals:
-            portal = self.portals[src_pad_id]
-            # Try flipping direction first
-            if portal.retarget_count == 0:
-                portal.direction = -portal.direction
-                portal.y_idx = portal.y_idx - 2 * portal.direction * portal.delta_steps  # Flip to other side
-                portal.retarget_count += 1
-                logger.debug(f"Retargeted portal for {src_pad_id}: flipped direction")
-            # Then try different delta
-            elif portal.retarget_count == 1:
-                # Try delta closer to preferred
-                new_delta = self.config.portal_delta_pref
-                if new_delta != portal.delta_steps:
-                    delta_change = new_delta - portal.delta_steps
-                    portal.y_idx += portal.direction * delta_change
-                    portal.delta_steps = new_delta
-                    portal.retarget_count += 1
-                    logger.debug(f"Retargeted portal for {src_pad_id}: adjusted delta to {new_delta}")
+        Strategy 0: flip to the other side of the pad.
+        Strategy 1: adjust length toward portal_delta_pref.
+        The move is rejected (attempt still consumed) if the new cell is
+        off-lattice or already claimed by another portal.
 
-        # Retarget destination portal (same logic)
-        if dst_pad_id in self.portals:
-            portal = self.portals[dst_pad_id]
-            if portal.retarget_count == 0:
-                portal.direction = -portal.direction
-                portal.y_idx = portal.y_idx - 2 * portal.direction * portal.delta_steps
-                portal.retarget_count += 1
-            elif portal.retarget_count == 1:
-                new_delta = self.config.portal_delta_pref
-                if new_delta != portal.delta_steps:
-                    delta_change = new_delta - portal.delta_steps
-                    portal.y_idx += portal.direction * delta_change
-                    portal.delta_steps = new_delta
-                    portal.retarget_count += 1
+        NOTE: the previous version flipped direction and then applied
+        y - 2*direction*delta with the ALREADY-flipped direction, moving the
+        via 2*delta FURTHER on the original side - off the lattice for edge
+        pads (crashed ROI extraction with out-of-range node indices).
+        """
+        portal = self.portals.get(pad_id)
+        if portal is None:
+            return
+
+        if portal.retarget_count == 0:
+            # Flip to the other side: y_pad - d*delta  ==  y_old + 2*(-d)*delta
+            new_dir = -portal.direction
+            new_delta = portal.delta_steps
+            new_y = portal.y_idx + 2 * new_dir * portal.delta_steps
+        elif portal.retarget_count == 1:
+            new_dir = portal.direction
+            new_delta = self.config.portal_delta_pref
+            if new_delta == portal.delta_steps:
+                return
+            new_y = portal.y_idx + new_dir * (new_delta - portal.delta_steps)
+        else:
+            return
+
+        portal.retarget_count += 1
+
+        if not (0 <= new_y < self.lattice.y_steps):
+            logger.debug(f"Retarget rejected for {pad_id}: y={new_y} off-lattice")
+            return
+
+        cells = getattr(getattr(self, 'escape_planner', None),
+                        '_occupied_portal_cells', None)
+        if cells is not None:
+            if (portal.x_idx, new_y) in cells:
+                logger.debug(f"Retarget rejected for {pad_id}: cell occupied")
+                return
+            cells.discard((portal.x_idx, portal.y_idx))
+            cells.add((portal.x_idx, new_y))
+
+        portal.direction = new_dir
+        portal.delta_steps = new_delta
+        portal.y_idx = new_y
+        logger.debug(f"Retargeted portal for {pad_id}: dir={new_dir} delta={new_delta} y={new_y}")
 
     def _rebuild_usage_from_committed_nets(self, keep_net_ids: Set[str]):
         """
