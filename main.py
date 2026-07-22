@@ -158,26 +158,30 @@ def run_headless_autoroute():
 
         logging.info(f"[HEADLESS] Loaded board: {board.name} with {len(board.nets)} nets")
 
-        # Check if board has nets to route
+        # Hard-fail on an empty parse: routing 0 nets is not a passing test
+        # (previously this printed HEADLESS TEST PASSED with tracks=0).
         if len(board.nets) == 0:
-            logging.warning("[HEADLESS] Board has no nets to route - this will test lattice build only")
-            print("HEADLESS TEST: Board has no nets - lattice build test only")
+            msg = (f"Board '{board.name}' loaded with 0 nets - the board "
+                   "source/parser did not produce routable content")
+            logging.error(f"[HEADLESS] {msg}")
+            print(f"HEADLESS TEST FAILED: {msg}", file=sys.stderr)
+            sys.exit(1)
 
         # Create UnifiedPathFinder with same config as GUI but force CPU-only
         pf_config = PathFinderConfig()
         pf = UnifiedPathFinder(config=pf_config, use_gpu=False)
         logging.info(f"[HEADLESS] Created UnifiedPathFinder with instance_tag={pf._instance_tag}")
 
+        # Full live call sequence: skipping precompute_all_pad_escapes leaves
+        # nets portal-less and _parse_requests silently drops them.
         logging.info("[HEADLESS] Building lattice/registry...")
         pf.initialize_graph(board)
         pf.map_all_pads(board)
+        pf.precompute_all_pad_escapes(board)
         pf.prepare_routing_runtime()
 
-        if len(board.nets) > 0:
-            logging.info("[HEADLESS] Starting PathFinder negotiation...")
-            pf.route_multiple_nets(board.nets)
-        else:
-            logging.info("[HEADLESS] Skipping routing - no nets available")
+        logging.info("[HEADLESS] Starting PathFinder negotiation...")
+        pf.route_multiple_nets(board.nets)
 
         logging.info("[HEADLESS] Emitting geometry...")
         tracks, vias = pf.emit_geometry(board)
@@ -598,42 +602,38 @@ def run_headless(
             compress=True
         )
 
-        # If we got here, export succeeded (would have raised exception otherwise)
-        if True:
-            logging.warning("=" * 80)
-            logging.warning("ROUTING COMPLETE!")
-            logging.warning("=" * 80)
-            logging.warning(f"Solution file: {output_file}")
-            logging.warning(f"Total runtime: {total_time/60:.1f} minutes")
-            logging.warning(f"Iterations: {len(iteration_metrics)}")
+        # If we got here, export succeeded (it raises on failure)
+        logging.warning("=" * 80)
+        logging.warning("ROUTING COMPLETE!")
+        logging.warning("=" * 80)
+        logging.warning(f"Solution file: {output_file}")
+        logging.warning(f"Total runtime: {total_time/60:.1f} minutes")
+        logging.warning(f"Iterations: {len(iteration_metrics)}")
 
-            # Report convergence status
-            if fully_converged:
-                logging.warning(f"Converged: YES ✓")
-            else:
-                logging.warning(f"Converged: NO")
-
-            logging.warning(f"Geometry: {tracks} tracks, {vias} vias")
-
-            # Report barrel conflicts if present (known limitation)
-            if barrel_conflicts > 0:
-                logging.warning(f"Barrel conflicts: {barrel_conflicts} (via overlaps - see docs/barrel_conflicts_explained.md)")
-            else:
-                logging.warning(f"Barrel conflicts: 0 ✓")
-
-            # Report excluded nets if any
-            if excluded_nets > 0:
-                logging.warning(f"Excluded nets: {excluded_nets} (unroutable - gave up after 10 attempts)")
-            else:
-                logging.warning(f"Excluded nets: 0 ✓")
-
-            logging.warning("=" * 80)
-            logging.warning(f"Next step: Import {output_file} into KiCad (Ctrl+I)")
-            logging.warning("=" * 80)
-            sys.exit(0)
+        # Report convergence status
+        if fully_converged:
+            logging.warning(f"Converged: YES ✓")
         else:
-            logging.error("[HEADLESS] Failed to export solution")
-            sys.exit(1)
+            logging.warning(f"Converged: NO")
+
+        logging.warning(f"Geometry: {tracks} tracks, {vias} vias")
+
+        # Report barrel conflicts if present (known limitation)
+        if barrel_conflicts > 0:
+            logging.warning(f"Barrel conflicts: {barrel_conflicts} (via overlaps - see docs/barrel_conflicts_explained.md)")
+        else:
+            logging.warning(f"Barrel conflicts: 0 ✓")
+
+        # Report excluded nets if any
+        if excluded_nets > 0:
+            logging.warning(f"Excluded nets: {excluded_nets} (unroutable - gave up after 10 attempts)")
+        else:
+            logging.warning(f"Excluded nets: 0 ✓")
+
+        logging.warning("=" * 80)
+        logging.warning(f"Next step: Import {output_file} into KiCad (Ctrl+I)")
+        logging.warning("=" * 80)
+        sys.exit(0)
 
     except Exception as e:
         logging.error(f"[HEADLESS] Fatal error: {e}", exc_info=True)
