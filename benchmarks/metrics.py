@@ -1,0 +1,93 @@
+"""Routing metrics collection.
+
+Turns a routed PathFinderRouter into a JSON-serializable dict answering
+the questions that matter for the speed / fewer-layers work: which layers
+actually carry copper, how much wirelength and how many vias, did every
+net route, how many iterations did convergence take, and how long each
+phase cost. Run-over-run comparison is the whole point - keep keys stable.
+"""
+
+import subprocess
+from typing import Dict, Optional
+
+
+def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None) -> Dict:
+    """Collect metrics from a routed PathFinderRouter instance.
+
+    Args:
+        pf: Router after route_multiple_nets (and ideally emit_geometry).
+        board: The routed domain Board.
+        timings: Optional {phase_name: seconds} measured by the caller.
+
+    Returns:
+        JSON-serializable metrics dict.
+    """
+    plane = pf.lattice.x_steps * pf.lattice.y_steps
+    pitch = pf.lattice.pitch
+
+    lateral_steps_per_layer: Dict[int, int] = {}
+    via_transitions = 0
+    routed_nets = 0
+
+    for _, path in pf.net_paths.items():
+        if len(path) < 2:
+            continue
+        routed_nets += 1
+        for a, b in zip(path, path[1:]):
+            za, zb = a // plane, b // plane
+            if za == zb:
+                lateral_steps_per_layer[za] = lateral_steps_per_layer.get(za, 0) + 1
+            else:
+                via_transitions += 1
+
+    total_nets = len(board.nets)
+    total_lateral = sum(lateral_steps_per_layer.values())
+    overuse_total, overuse_count = pf.accounting.compute_overuse(pf)
+
+    return {
+        "board": {
+            "name": board.name,
+            "layer_count": board.layer_count,
+            "nets": total_nets,
+            "pads": sum(len(getattr(n, "pads", [])) for n in board.nets),
+        },
+        "lattice": {
+            "x_steps": pf.lattice.x_steps,
+            "y_steps": pf.lattice.y_steps,
+            "layers": pf.lattice.layers,
+            "nodes": pf.lattice.num_nodes,
+            "pitch_mm": pitch,
+        },
+        "completion": {
+            "routed_nets": routed_nets,
+            "total_nets": total_nets,
+            "excluded_nets": len(getattr(pf, "_excluded_nets", ())),
+            "complete": routed_nets == total_nets,
+        },
+        "convergence": {
+            "iterations": getattr(pf, "iteration", None),
+            "overuse_total": int(overuse_total),
+            "overuse_count": int(overuse_count),
+        },
+        "copper": {
+            "wirelength_mm": round(total_lateral * pitch, 3),
+            "via_transitions": via_transitions,
+            "lateral_steps_per_layer": {
+                str(z): n for z, n in sorted(lateral_steps_per_layer.items())
+            },
+            "layers_used": sorted(lateral_steps_per_layer.keys()),
+            "layers_used_count": len(lateral_steps_per_layer),
+        },
+        "timings_s": {k: round(v, 3) for k, v in (timings or {}).items()},
+        "git_sha": _git_sha(),
+    }
+
+
+def _git_sha() -> Optional[str]:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or None
+    except Exception:
+        return None

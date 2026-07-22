@@ -186,3 +186,6 @@ orthoroute_debug.log.*
 # tests/ (test modules AND conftest.py, which holds the shared fixtures).
 !tests/
 !tests/*.py
+
+# Benchmark outputs
+benchmarks/results/
