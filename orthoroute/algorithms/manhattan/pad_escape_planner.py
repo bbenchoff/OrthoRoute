@@ -354,8 +354,12 @@ class PadEscapePlanner:
 
                 # Entry layer for gap-filling portals (distribute across all routing layers)
                 # Use random layer selection to encourage even layer utilization
-                gap_routing_layers = list(range(1, self.lattice.layers))
-                gap_entry_layer = random.choice(gap_routing_layers) if gap_routing_layers else 1
+                # Same contract as pad portals: inner layers only (see above)
+                if self.lattice.layers > 2:
+                    gap_routing_layers = list(range(1, self.lattice.layers - 1))
+                else:
+                    gap_routing_layers = [1]
+                gap_entry_layer = random.choice(gap_routing_layers)
 
                 logger.info(f"[GAP-FILL] Checking for gaps in portal distribution (threshold={gap_threshold} steps)")
 
@@ -558,14 +562,22 @@ class PadEscapePlanner:
 
             # Choose direction based on distance
             if dist_above is not None and dist_below is not None:
-                # Both neighbors exist - choose direction with more space
-                direction = +1 if dist_above > dist_below else -1
+                if dist_above == dist_below:
+                    # Equal gaps (uniform pin pitch - the common case): use a
+                    # UNIFORM direction so escapes run parallel. Opposing
+                    # directions with min_steps=3 meet head-on for pads 6
+                    # steps apart (2.54mm headers on the 0.4mm grid), which
+                    # placed two portal vias on the SAME grid cell.
+                    direction = +1
+                else:
+                    # Choose direction with more space
+                    direction = +1 if dist_above > dist_below else -1
             elif dist_above is not None:
-                # Only neighbor above - go up
-                direction = +1
-            elif dist_below is not None:
-                # Only neighbor below - go down
+                # Only neighbor above - escape AWAY from it (down)
                 direction = -1
+            elif dist_below is not None:
+                # Only neighbor below - escape AWAY from it (up)
+                direction = +1
             else:
                 # No neighbors - use inverted checkerboard (even=DOWN, odd=UP)
                 checkerboard_value = (x_idx + y_idx) % 2
@@ -647,9 +659,14 @@ class PadEscapePlanner:
             # This encourages use of all available routing channels, not just vertical layers
             # Previous code restricted to vertical layers only, causing empty horizontal channels
             # With blind/buried vias, PathFinder can route efficiently between any layer pair
-            ALL_ROUTING_LAYERS = list(range(1, self.lattice.layers))  # Skip layer 0 (F.Cu)
-            if not ALL_ROUTING_LAYERS:
-                ALL_ROUTING_LAYERS = [1, 2]  # Fallback for minimal layer count
+            # MUST match build_graph's lateral layers: inner layers only on
+            # >2-layer boards (B.Cu gets NO edges there - an entry_layer of
+            # layers-1 seeds the portal into a disconnected node!). On
+            # 2-layer boards B.Cu (layer 1) is the only routing layer.
+            if self.lattice.layers > 2:
+                ALL_ROUTING_LAYERS = list(range(1, self.lattice.layers - 1))
+            else:
+                ALL_ROUTING_LAYERS = [1]
             entry_layer = random.choice(ALL_ROUTING_LAYERS)
 
             # DEBUG: Log layer assignment for verification
@@ -725,6 +742,14 @@ class PadEscapePlanner:
         """
         y_idx_portal = y_idx + direction * delta_steps
 
+        # HARD GUARANTEE: one portal via per lattice cell. Two portals on the
+        # same cell share a via barrel - permanent overuse no amount of
+        # negotiation can resolve (and a DRC violation in the output).
+        if not hasattr(self, '_occupied_portal_cells'):
+            self._occupied_portal_cells = set()
+        if (x_idx, y_idx_portal) in self._occupied_portal_cells:
+            return None
+
         # Convert portal to world coordinates
         portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(x_idx, y_idx_portal)
 
@@ -743,7 +768,8 @@ class PadEscapePlanner:
                                                    check_radius=3.0, spatial_index=spatial_index):
                 return None
 
-        # DRC passed! Create portal
+        # DRC passed! Claim the cell and create the portal
+        self._occupied_portal_cells.add((x_idx, y_idx_portal))
         return Portal(
             x_idx=x_idx,
             y_idx=y_idx_portal,
