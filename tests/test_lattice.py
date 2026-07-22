@@ -56,8 +56,10 @@ class TestViaPairs:
         # Inner layers {1,2} full blind/buried + F.Cu transitions, no B.Cu.
         assert pairs == {(1, 2), (2, 1), (0, 1), (1, 0), (0, 2), (2, 0)}
 
-    def test_two_layer_pairs_empty(self, lattice4):
-        assert lattice4.get_legal_via_pairs(2) == set()
+    def test_two_layer_pairs_through_via(self, lattice4):
+        # 2-layer boards have no inner layers: F.Cu/B.Cu route directly and
+        # the only legal via is the (0,1) through-hole (regression: #18).
+        assert lattice4.get_legal_via_pairs(2) == {(0, 1), (1, 0)}
 
 
 class TestGraphBuild:
@@ -79,12 +81,25 @@ class TestGraphBuild:
         expected_lateral = 2 * ys * (xs - 1) + 2 * xs * (ys - 1)  # z=1 (h) + z=2 (v)
         assert E - via_edges == expected_lateral
 
-    def test_two_layer_graph_is_empty(self):
-        # Documented limitation: no inner layers -> no lateral edges, no via
-        # pairs -> build fails loudly rather than routing nothing.
+    def test_two_layer_graph_has_edges(self):
+        # Regression for #18/#13: 2-layer boards used to produce an empty
+        # graph (ValueError("No edges")) because lateral edges were emitted
+        # only for inner layers. F.Cu/B.Cu must carry lateral routing when
+        # no inner layers exist.
         lattice = Lattice3D(BOUNDS, PITCH, layers=2)
-        with pytest.raises(ValueError):
-            lattice.build_graph(via_cost=0.7)
+        graph = lattice.build_graph(via_cost=0.7)
+        E = int(graph.indptr[-1])
+        assert E > 0
+
+        # Lateral edges on BOTH layers (F.Cu 'v', B.Cu 'h') plus through vias.
+        via_edges = int(np.sum(graph.edge_kind))
+        xs, ys = lattice.x_steps, lattice.y_steps
+        expected_lateral = 2 * xs * (ys - 1) + 2 * ys * (xs - 1)  # z=0 (v) + z=1 (h)
+        assert E - via_edges == expected_lateral
+        # 4 directed via edges per grid point: build_graph emits both
+        # directions for each ORDERED pair, so every via is materialized
+        # twice. Redundant-but-harmless; halving it is a planned memory win.
+        assert via_edges == 4 * xs * ys
 
     def test_edge_costs_positive(self, lattice4):
         graph = lattice4.build_graph(via_cost=0.7)
