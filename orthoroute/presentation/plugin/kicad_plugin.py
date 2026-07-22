@@ -178,26 +178,30 @@ class KiCadPlugin:
             
             # ALWAYS try to load from KiCad first, regardless of connection status
             board = None
-            
+            board_source = None  # For error diagnosis: which adapter/file loaded it
+            adapters_tried = []
+
             # Try loading from KiCad APIs first (try all adapters in priority order)
             if not board_file:
                 logger.info("Attempting to load board from KiCad")
-                
+
                 for adapter_name, adapter in self.kicad_adapters:
                     if adapter_name == 'File':
                         continue  # Skip file adapter for KiCad loading
                     
                     try:
                         logger.info(f"Trying {adapter_name} adapter...")
-                        
+                        adapters_tried.append(adapter_name)
+
                         # Try to connect and load
                         if hasattr(adapter, 'connect'):
                             if not adapter.connect():
                                 logger.warning(f"{adapter_name} adapter could not connect")
                                 continue
-                        
+
                         board = adapter.load_board()
                         if board:
+                            board_source = f"{adapter_name} adapter"
                             logger.info(f"Successfully loaded board from KiCad via {adapter_name}: {board.name}")
                             break
                         else:
@@ -230,39 +234,56 @@ class KiCadPlugin:
                 
                 if file_adapter:
                     board = file_adapter.load_board(board_file)
+                    board_source = f"file '{board_file}'"
                 else:
                     logger.error("File adapter not available")
                     return False
-            
+
             if not board:
-                logger.error("Failed to load board from any source")
+                logger.error(f"Failed to load a board from any source "
+                             f"(adapters tried: {', '.join(adapters_tried) or 'none'}). "
+                             "Is KiCad running with a board open and the IPC API enabled?")
                 return False
-            
+
             logger.info(f"Loaded board: {board.name} with {len(board.nets)} nets")
-            
+
+            # Hard-fail on an empty parse instead of "routing" 0 nets and
+            # reporting a generic failure at the end (issue #12).
+            pad_count = sum(len(getattr(net, 'pads', [])) for net in board.nets)
+            if len(board.nets) == 0 or pad_count == 0:
+                logger.error(f"Board '{board.name}' from {board_source} contains no routable "
+                             f"content (nets={len(board.nets)}, pads-on-nets={pad_count}). "
+                             "The source did not produce net/pad data - nothing to route.")
+                return False
+
             # Store board in repository
             self.board_repository.save_board(board)
-            
-            # STEP 1: ONE INSTANCE, THREE FUNCTION CALLS
+
+            # STEP 1: ONE INSTANCE, MANDATORY CALL SEQUENCE (same as GUI/cli)
             logger.info(f"[STEP1] Using single UnifiedPathFinder instance {pf_tag} for end-to-end routing")
-            
-            # Call 1: Initialize graph with board data
+
             logger.info(f"[STEP1-CALL1] pf.initialize_graph(board) with instance {pf_tag}")
             pf.initialize_graph(board)
-            
-            # Call 2: Map all pads to lattice indices
+
             logger.info(f"[STEP1-CALL2] pf.map_all_pads(board) with instance {pf_tag}")
             pf.map_all_pads(board)
-            
-            # Call 3: Route all nets and get results
-            logger.info(f"[STEP1-CALL3] pf.route_multiple_nets(board.nets) with instance {pf_tag}")
+
+            # Mandatory: without portals, _parse_requests silently drops every net
+            logger.info(f"[STEP1-CALL3] pf.precompute_all_pad_escapes(board) with instance {pf_tag}")
+            pf.precompute_all_pad_escapes(board)
+
+            logger.info(f"[STEP1-CALL4] pf.prepare_routing_runtime() with instance {pf_tag}")
+            pf.prepare_routing_runtime()
+
+            logger.info(f"[STEP1-CALL5] pf.route_multiple_nets(board.nets) with instance {pf_tag}")
             results = pf.route_multiple_nets(board.nets)
-            
+
             if results:
                 logger.info(f"[STEP1] End-to-end routing completed successfully with instance {pf_tag}")
                 return True
             else:
-                logger.error(f"[STEP1] End-to-end routing failed with instance {pf_tag} - no results returned")
+                logger.error(f"[STEP1] Routing produced no results for {len(board.nets)} nets "
+                             f"with instance {pf_tag} - see logs/ for the failure point")
                 return False
                 
         except Exception as e:
