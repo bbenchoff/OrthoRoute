@@ -17,6 +17,8 @@ mirror); the expected pad positions below are computed from that rule
 boards).
 """
 
+import json
+
 import pytest
 
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
@@ -148,3 +150,47 @@ class TestKiCad10Dialect:
             "F.Cu", "In1.Cu", "In2.Cu", "B.Cu",
         ]
         assert all(isinstance(name, str) for name in router.config.layer_names)
+
+
+def test_project_netclass_drives_drc_valid_router_geometry(tmp_path):
+    pcb_path = tmp_path / "rules.kicad_pcb"
+    pcb_path.write_text(MODERN, encoding="utf-8")
+    project = {
+        "board": {
+            "design_settings": {
+                "rules": {
+                    "min_track_width": 0.08,
+                    "min_clearance": 0.05,
+                    "min_via_diameter": 0.15,
+                    "min_through_hole_diameter": 0.30,
+                    "min_via_annular_width": 0.0762,
+                }
+            }
+        },
+        "net_settings": {
+            "classes": [{
+                "name": "Default",
+                "track_width": 0.1016,
+                "clearance": 0.1016,
+                "via_diameter": 0.25,
+                "via_drill": 0.15,
+            }]
+        },
+    }
+    pcb_path.with_suffix(".kicad_pro").write_text(
+        json.dumps(project), encoding="utf-8"
+    )
+
+    board = KiCadFileParser().load_board(str(pcb_path))
+    rules = board._design_rules
+    assert rules["default_track_width"] == pytest.approx(0.1016)
+    assert rules["default_clearance"] == pytest.approx(0.1016)
+    assert rules["default_via_drill"] == pytest.approx(0.30)
+    assert rules["default_via_diameter"] == pytest.approx(0.4524)
+
+    router = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=False)
+    router.initialize_graph(board)
+    assert router.config.track_width == pytest.approx(0.1016)
+    assert router.config.clearance == pytest.approx(0.1016)
+    assert router.config.via_drill == pytest.approx(0.30)
+    assert router.config.via_diameter == pytest.approx(0.4524)

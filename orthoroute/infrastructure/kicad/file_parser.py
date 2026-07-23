@@ -352,6 +352,48 @@ class KiCadFileParser:
                             ("min_clearance", "min_track_spacing")):
                         if src_key in pro_rules:
                             rules[dst_key] = float(pro_rules[src_key])
+                    classes = (
+                        settings.get("net_settings", {}).get("classes", [])
+                    )
+                    default_class = next(
+                        (
+                            netclass for netclass in classes
+                            if netclass.get("name") == "Default"
+                        ),
+                        None,
+                    )
+                    if default_class is not None:
+                        for key in (
+                            "track_width",
+                            "clearance",
+                            "via_diameter",
+                            "via_drill",
+                        ):
+                            if key in default_class:
+                                rules[f"default_{key}"] = float(
+                                    default_class[key]
+                                )
+                        rules["netclasses"]["Default"] = dict(
+                            default_class
+                        )
+
+                    # A netclass can request geometry below the board-wide
+                    # fabrication limits. Emit the smallest dimensions that
+                    # satisfy both sets of constraints.
+                    rules["default_track_width"] = max(
+                        rules["default_track_width"],
+                        rules["min_track_width"],
+                    )
+                    rules["default_via_drill"] = max(
+                        rules["default_via_drill"],
+                        rules["min_via_drill"],
+                    )
+                    rules["default_via_diameter"] = max(
+                        rules["default_via_diameter"],
+                        rules["min_via_diameter"],
+                        rules["default_via_drill"]
+                        + 2.0 * rules["min_via_annular_width"],
+                    )
                     logger.info(f"Merged design rules from {pro.name}")
                 except (ValueError, OSError) as e:
                     logger.warning(f"Could not read {pro.name}: {e}")
