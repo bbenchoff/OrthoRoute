@@ -115,3 +115,31 @@ def test_gpu_roi_csr_prices_the_destination_node():
     )
 
     assert weights.tolist() == [7.0, 3.0]
+
+
+def test_gpu_fullgraph_prices_source_seed_node():
+    """A contracted portal seed must pay for ownership at its entry node."""
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CUDA device unavailable")
+    except Exception:
+        pytest.skip("CUDA runtime unavailable")
+
+    graph = types.SimpleNamespace(
+        indptr=cp.asarray([0, 1, 2, 2, 2], dtype=cp.int32),
+        indices=cp.asarray([3, 3], dtype=cp.int32),
+    )
+    solver = CUDADijkstra(graph=graph)
+    path = solver.find_path_fullgraph_gpu_seeds(
+        costs=cp.asarray([1.0, 2.0], dtype=cp.float32),
+        src_seeds=np.asarray([0, 1], dtype=np.int32),
+        dst_targets=np.asarray([3], dtype=np.int32),
+        src_seed_costs=np.zeros(2, dtype=np.float32),
+        dst_target_costs=np.zeros(1, dtype=np.float32),
+        node_penalty=cp.asarray(
+            [100.0, 0.0, 0.0, 0.0], dtype=cp.float32
+        ),
+    )
+
+    assert path == [1, 3]

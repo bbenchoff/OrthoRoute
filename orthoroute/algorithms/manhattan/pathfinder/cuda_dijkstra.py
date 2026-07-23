@@ -5580,6 +5580,28 @@ class CUDADijkstra:
         dst_targets_gpu, dst_target_costs_gpu = _prepare_terminals(
             dst_targets, dst_target_costs, "destination target"
         )
+        if node_penalty is not None:
+            node_penalty_gpu = cp.asarray(
+                node_penalty, dtype=cp.float32
+            ).reshape(1, -1)
+            if node_penalty_gpu.shape[1] != num_nodes:
+                raise ValueError(
+                    f"node_penalty has {node_penalty_gpu.shape[1]} nodes, "
+                    f"expected {num_nodes}"
+                )
+            use_node_penalty = True
+            node_penalty_stride = num_nodes
+            # Source seeds are initialized directly rather than reached by a
+            # relaxation, so the kernel would otherwise never charge their
+            # entry-node ownership cost.
+            src_seed_costs_gpu = (
+                src_seed_costs_gpu
+                + node_penalty_gpu.ravel()[src_seeds_gpu]
+            )
+        else:
+            node_penalty_gpu = self._zero_node_penalty
+            use_node_penalty = False
+            node_penalty_stride = 0
 
         # Initialize bit-packed frontier (K=1, frontier_words)
         frontier_words = (num_nodes + 31) // 32
@@ -5665,19 +5687,6 @@ class CUDADijkstra:
         indptr_gpu = cp.asarray(self.indptr) if not isinstance(self.indptr, cp.ndarray) else self.indptr
         indices_gpu = cp.asarray(self.indices) if not isinstance(self.indices, cp.ndarray) else self.indices
         costs_gpu = cp.asarray(costs) if not isinstance(costs, cp.ndarray) else costs
-        if node_penalty is not None:
-            node_penalty_gpu = cp.asarray(node_penalty, dtype=cp.float32).reshape(1, -1)
-            if node_penalty_gpu.shape[1] != num_nodes:
-                raise ValueError(
-                    f"node_penalty has {node_penalty_gpu.shape[1]} nodes, "
-                    f"expected {num_nodes}"
-                )
-            use_node_penalty = True
-            node_penalty_stride = num_nodes
-        else:
-            node_penalty_gpu = self._zero_node_penalty
-            use_node_penalty = False
-            node_penalty_stride = 0
 
         data = {
             'K': 1,

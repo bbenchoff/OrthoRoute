@@ -240,9 +240,31 @@ def test_columnar_connectors_use_zero_conflict_dynamic_entries():
         for node, cost in portal_seeds
     }
     assert seed_costs[1] == pytest.approx(
-        config.via_cost * config.adjacent_via_step_scale
+        config.via_cost * config.portal_via_discount
     )
     assert seed_costs[3] == pytest.approx(3.0 * seed_costs[1])
+    entry_node = pf.lattice.node_idx(
+        portal.x_idx, portal.y_idx, 1
+    )
+    baseline_costs = dict(pf._get_pad_portal_seeds(
+        pad_id, current_net="N0"
+    )[0])
+    barrel_node = pf.lattice.node_idx(
+        portal.x_idx, portal.y_idx, portal.pad_layer
+    )
+    pf.node_owner[barrel_node] = pf._get_net_id("FOREIGN")
+    pf.path_node_use[barrel_node] = 1
+    occupied_costs = dict(pf._get_pad_portal_seeds(
+        pad_id, current_net="N0"
+    )[0])
+    assert occupied_costs[entry_node] - baseline_costs[entry_node] == (
+        pytest.approx(
+            config.owner_penalty_base
+            + config.path_node_penalty_base
+        )
+    )
+    pf.node_owner[barrel_node] = -1
+    pf.path_node_use[barrel_node] = 0
     entry_layer = portal_seeds[0][0]
     entry_layer = pf.lattice.idx_to_coord(entry_layer)[2]
     geometry = pf.escape_planner._emit_portal_escape_geometry(
