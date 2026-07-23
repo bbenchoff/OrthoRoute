@@ -624,10 +624,6 @@ class PathFinderConfig:
     portal_via_discount: float = 0.15  # Escape via multiplier (85% discount)
     portal_retarget_patience: int = 3  # Iters before retargeting
     portal_candidate_count: int = 6
-    # Cost per physical collision between a candidate F.Cu escape and an
-    # already committed escape. It follows the negotiated-congestion
-    # pressure schedule rather than making early choices into hard walls.
-    escape_penalty_base: float = 1000.0
     escape_preference_penalty: float = 10.0
     escape_replan_patience: int = 2
     escape_replan_limit: int = 3
@@ -3259,6 +3255,23 @@ class PathFinderRouter:
         best_by_node = {}
         portal_by_node = {}
         for portal in candidates:
+            if current_net is not None:
+                committed_conflicts = self._escape_candidate_conflicts(
+                    current_net, pad_id, portal
+                )
+                reserved_conflicts = self._escape_candidate_conflicts(
+                    current_net,
+                    pad_id,
+                    portal,
+                    records=self._escape_reserved_records,
+                    spatial=self._escape_reserved_spatial,
+                )
+                # A zero-conflict global assignment is already known.
+                # Candidate escape geometry that violates either that
+                # reservation or committed copper is physically illegal;
+                # on-grid ownership remains a negotiated cost below.
+                if committed_conflicts or reserved_conflicts:
+                    continue
             candidate_penalty = float(getattr(portal, "score", 0.0))
             candidate_penalty += (
                 self._portal_barrel_history[
@@ -3275,27 +3288,6 @@ class PathFinderRouter:
                 candidate_penalty += float(getattr(
                     self.config, "escape_preference_penalty", 1.0
                 ))
-            if current_net is not None:
-                committed_conflicts = self._escape_candidate_conflicts(
-                    current_net, pad_id, portal
-                )
-                reserved_conflicts = self._escape_candidate_conflicts(
-                    current_net,
-                    pad_id,
-                    portal,
-                    records=self._escape_reserved_records,
-                    spatial=self._escape_reserved_spatial,
-                )
-                conflicts = max(
-                    committed_conflicts, reserved_conflicts
-                )
-                candidate_penalty += (
-                    conflicts
-                    * float(getattr(
-                        self.config, "escape_penalty_base", 1000.0
-                    ))
-                    * float(getattr(self, "_pres_fac_now", 1.0))
-                )
             for node, layer_cost in self._get_portal_seeds(portal):
                 total_cost = layer_cost + candidate_penalty
                 if (
@@ -4814,18 +4806,13 @@ class PathFinderRouter:
             ):
                 self._portal_barrel_history[portal_key] += 1.0
 
-            exact_conflicts = int(getattr(
-                self, "_last_exact_barrel_conflict_count", 0
-            ))
-            escape_conflicts_now = int(getattr(
-                self, "_last_escape_conflict_count", 0
-            ))
-            if exact_conflicts == 0 and escape_conflicts_now > 0:
+            physical_conflicts = int(conflict_count)
+            if physical_conflicts > 0:
                 previous = getattr(
                     self, "_escape_replan_best", float("inf")
                 )
-                if escape_conflicts_now < previous:
-                    self._escape_replan_best = escape_conflicts_now
+                if physical_conflicts < previous:
+                    self._escape_replan_best = physical_conflicts
                     self._escape_replan_stagnant = 0
                 else:
                     self._escape_replan_stagnant = (
@@ -4842,8 +4829,8 @@ class PathFinderRouter:
                 ):
                     logger.warning(
                         "[ESCAPE-REPLAN] Re-solving %d stalled "
-                        "physical escape conflicts",
-                        escape_conflicts_now,
+                        "physical conflicts",
+                        physical_conflicts,
                     )
                     self._plan_escape_assignment()
                     self._escape_replan_count = replans + 1
