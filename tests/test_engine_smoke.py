@@ -9,6 +9,7 @@ import pytest
 
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
     PathFinderConfig,
+    PathFinderRouter,
     UnifiedPathFinder,
 )
 
@@ -265,6 +266,27 @@ def test_columnar_connectors_use_zero_conflict_dynamic_entries():
     )
     pf.node_owner[barrel_node] = -1
     pf.path_node_use[barrel_node] = 0
+    layer_one_node = pf.lattice.node_idx(
+        portal.x_idx, portal.y_idx, 1
+    )
+    layer_three_node = pf.lattice.node_idx(
+        portal.x_idx, portal.y_idx, 3
+    )
+    history_key = (
+        pad_id, portal.x_idx, portal.y_idx, 1
+    )
+    pf._portal_barrel_history[history_key] = 1.0
+    depth_costs = dict(pf._get_pad_portal_seeds(
+        pad_id, current_net="N0"
+    )[0])
+    assert (
+        depth_costs[layer_one_node] - baseline_costs[layer_one_node]
+        == pytest.approx(config.portal_barrel_history_penalty)
+    )
+    assert depth_costs[layer_three_node] == pytest.approx(
+        baseline_costs[layer_three_node]
+    )
+    del pf._portal_barrel_history[history_key]
     entry_layer = portal_seeds[0][0]
     entry_layer = pf.lattice.idx_to_coord(entry_layer)[2]
     geometry = pf.escape_planner._emit_portal_escape_geometry(
@@ -395,7 +417,9 @@ def test_stagnation_rip_clears_all_geometry_ownership():
 
 def test_via_ownership_is_reversible_and_tracks_collisions(routed):
     pf, _, _, _ = routed
-    path = pf.net_paths["TEST_NET"]
+    path = pf._path_without_dynamic_escape_chains(
+        "TEST_NET", pf.net_paths["TEST_NET"]
+    )
     via_nodes = pf._via_nodes_for_path(path)
     original_id = pf._get_net_id("TEST_NET")
     other_id = pf._get_net_id("OTHER_NET")
@@ -408,6 +432,7 @@ def test_via_ownership_is_reversible_and_tracks_collisions(routed):
     _, conflicts = pf._detect_barrel_conflicts()
     assert conflicts > 0
     assert {"TEST_NET", "OTHER_NET"} <= pf._barrel_conflict_nets
+    assert ("OTHER_NET", "TEST_NET") in pf._exact_barrel_pairs
 
     pf._clear_via_barrel_ownership_for_path("OTHER_NET", path)
     assert all(pf.node_owner[node] == original_id for node in via_nodes)
@@ -421,6 +446,213 @@ def test_via_ownership_is_reversible_and_tracks_collisions(routed):
         for members in pf._node_owner_members.values()
         for owner in members
     }
+
+
+def test_explicit_portal_via_detects_nearby_graph_track(routed):
+    """Off-grid terminal copper must participate in convergence."""
+    from dataclasses import replace
+
+    pf, _, _, _ = routed
+    victim = "TEST_NET"
+    edge = next(
+        edge
+        for edge in pf._net_to_edges[victim]
+        if (
+            pf.lattice.idx_to_coord(int(pf._edge_src[edge]))[2]
+            == pf.lattice.idx_to_coord(int(pf.solver.indices[edge]))[2]
+        )
+    )
+    source = int(pf._edge_src[edge])
+    target = int(pf.solver.indices[edge])
+    x0, y0, layer = pf.lattice.idx_to_coord(source)
+    x1, y1, _ = pf.lattice.idx_to_coord(target)
+    start = pf.lattice.geom.lattice_to_world(x0, y0)
+    end = pf.lattice.geom.lattice_to_world(x1, y1)
+    base = pf.net_selected_portals[victim][0]
+    portal = replace(
+        base,
+        x_idx=x0,
+        y_idx=y0,
+        via_x=0.5 * (start[0] + end[0]),
+        via_y=0.5 * (start[1] + end[1]),
+        dynamic_entry=True,
+    )
+    owner = "PORTAL_OWNER"
+    old_selected = pf.net_selected_portals.get(owner)
+    old_layers = pf.net_portal_layers.get(owner)
+    old_pad_ids = pf.net_pad_ids.get(owner)
+    old_path = pf.net_paths.get(owner)
+    try:
+        pf.net_selected_portals[owner] = (portal,)
+        pf.net_portal_layers[owner] = (layer,)
+        pf.net_pad_ids[owner] = ("PORTAL_OWNER_PAD",)
+        pf.net_paths[owner] = [source, target]
+
+        pairs, owners, victims, keys, nodes = (
+            pf._detect_portal_grid_conflicts()
+        )
+
+        assert any(
+            pair[0][0] == owner
+            and pair[1] == victim
+            and pair[2] == "track"
+            for pair in pairs
+        )
+        assert owner in owners
+        assert victim in victims
+        assert ("PORTAL_OWNER_PAD", x0, y0, layer) in keys
+        assert {source, target} <= nodes
+    finally:
+        if old_selected is None:
+            pf.net_selected_portals.pop(owner, None)
+        else:
+            pf.net_selected_portals[owner] = old_selected
+        if old_layers is None:
+            pf.net_portal_layers.pop(owner, None)
+        else:
+            pf.net_portal_layers[owner] = old_layers
+        if old_pad_ids is None:
+            pf.net_pad_ids.pop(owner, None)
+        else:
+            pf.net_pad_ids[owner] = old_pad_ids
+        if old_path is None:
+            pf.net_paths.pop(owner, None)
+        else:
+            pf.net_paths[owner] = old_path
+
+
+def test_committed_portal_clearance_is_a_live_foreign_cost(routed):
+    pf, _, _, _ = routed
+    net_name = "TEST_NET"
+    portal = pf.net_selected_portals[net_name][0]
+    entry_layer = pf.net_portal_layers[net_name][0]
+    nodes = pf._portal_clearance_nodes(portal, entry_layer)
+    net_numeric_id = pf._get_net_id(net_name)
+
+    assert nodes.size
+    assert np.all(
+        pf.portal_clearance_owner[nodes] == net_numeric_id
+    )
+
+    old_pres_fac = getattr(pf, "_pres_fac_now", 1.0)
+    pf._pres_fac_now = 2.0
+    penalty = pf._build_owner_penalty(None, "OTHER_NET")
+    expected = pf.config.owner_penalty_base * pf._pres_fac_now
+    assert np.any(penalty[nodes] >= expected)
+    pf._pres_fac_now = old_pres_fac
+
+
+def test_portal_cleanup_freezes_position_and_entry_depth(routed):
+    pf, _, _, _ = routed
+    net_name = "TEST_NET"
+    pad_id = pf.net_pad_ids[net_name][0]
+    selected = pf.net_selected_portals[net_name][0]
+    selected_layer = pf.net_portal_layers[net_name][0]
+    old_freeze = getattr(pf, "_freeze_selected_portals", False)
+    old_movable = getattr(
+        pf, "_portal_cleanup_movable_nets", set()
+    )
+    try:
+        pf._freeze_selected_portals = True
+        pf._portal_cleanup_movable_nets = set()
+        seeds, portals = pf._get_pad_portal_seeds(
+            pad_id, current_net=net_name
+        )
+        assert len(seeds) == 1
+        node, _ = seeds[0]
+        assert pf.lattice.idx_to_coord(node)[2] == selected_layer
+        assert portals[node] is selected
+
+        pf._portal_cleanup_movable_nets = {net_name}
+        movable_seeds, _ = pf._get_pad_portal_seeds(
+            pad_id, current_net=net_name
+        )
+        assert len(movable_seeds) > 1
+    finally:
+        pf._freeze_selected_portals = old_freeze
+        pf._portal_cleanup_movable_nets = old_movable
+
+
+def test_portal_cleanup_leaves_one_fixed_net_per_conflict_component():
+    pairs = {
+        (("A", "PAD-A", 1, 2), "B", "via"),
+        (("B", "PAD-B", 3, 4), "C", "track"),
+        (("Y", "PAD-Y", 5, 6), "X", "via"),
+    }
+
+    movable = PathFinderRouter._portal_cleanup_movable_components(
+        pairs,
+        {
+            (("C", "PAD-C"), ("D", "PAD-D")),
+            (("Q", "PAD-Q"), ("P", "PAD-P")),
+        },
+        {
+            ("D", "E"),
+            ("R", "S"),
+        },
+    )
+
+    assert movable == {"B", "C", "D", "E", "Q", "S", "Y"}
+
+
+def test_portal_cleanup_prices_exact_foreign_edges(routed):
+    pf, _, _, _ = routed
+    net_name = "TEST_NET"
+    portal = pf.net_selected_portals[net_name][0]
+    entry_layer = pf.net_portal_layers[net_name][0]
+    portal_edges = set(map(
+        int,
+        pf._portal_conflicting_graph_edges(
+            portal, entry_layer
+        ),
+    ))
+    assert portal_edges
+    via_edges = [
+        edge
+        for edge in portal_edges
+        if (
+            pf.lattice.idx_to_coord(
+                int(pf._edge_src[edge])
+            )[2]
+            != pf.lattice.idx_to_coord(
+                int(pf.solver.indices[edge])
+            )[2]
+        )
+    ]
+    assert via_edges
+    for edge in via_edges:
+        source = int(pf._edge_src[edge])
+        target = int(pf.solver.indices[edge])
+        assert pf._edge_index_for_hop(target, source) in portal_edges
+
+    pf._rebuild_portal_cleanup_edge_owners()
+    foreign = set(map(
+        int, pf._portal_cleanup_foreign_edges("OTHER_NET")
+    ))
+    own = set(map(
+        int, pf._portal_cleanup_foreign_edges(net_name)
+    ))
+
+    assert portal_edges <= foreign
+    assert portal_edges.isdisjoint(own)
+
+
+def test_portal_cleanup_makes_foreign_barrels_prohibitive(routed):
+    pf, _, _, _ = routed
+    net_name = "TEST_NET"
+    portal = pf.net_selected_portals[net_name][0]
+    entry_layer = pf.net_portal_layers[net_name][0]
+    nodes = pf._portal_clearance_nodes(portal, entry_layer)
+    old_freeze = getattr(pf, "_freeze_selected_portals", False)
+    try:
+        pf._freeze_selected_portals = True
+        penalty = pf._build_owner_penalty(None, "OTHER_NET")
+        assert np.any(
+            penalty[nodes]
+            >= pf.config.portal_cleanup_node_penalty
+        )
+    finally:
+        pf._freeze_selected_portals = old_freeze
 
 
 def test_path_node_use_prices_tracks_for_later_vias(routed):
@@ -460,6 +692,8 @@ def test_node_conflict_history_persists_once_per_iteration(routed):
     old_iteration = pf.iteration
     had_marker = hasattr(pf, "_node_history_iteration")
     old_marker = getattr(pf, "_node_history_iteration", None)
+    had_nodes = hasattr(pf, "_node_history_nodes")
+    old_nodes = getattr(pf, "_node_history_nodes", None)
     try:
         pf.iteration = old_iteration + 1000
         pf._accumulate_node_conflict_history([node, node])
@@ -487,6 +721,10 @@ def test_node_conflict_history_persists_once_per_iteration(routed):
             pf._node_history_iteration = old_marker
         else:
             del pf._node_history_iteration
+        if had_nodes:
+            pf._node_history_nodes = old_nodes
+        else:
+            del pf._node_history_nodes
 
 
 def test_barrel_owner_routes_before_crossing_track(routed):
@@ -536,6 +774,23 @@ def test_physical_offenders_bypass_edge_hotset_cap(routed):
         pf._net_clean_iters = old_clean
         pf._last_reroute_iter = old_reroute
         pf._prev_hotset = old_hotset
+
+
+def test_physical_offenders_stay_hot_when_edges_are_clean(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    tasks = {
+        "PHYSICAL_OWNER": (path[0], path[-1]),
+        "PHYSICAL_VICTIM": (path[0], path[-1]),
+    }
+    old_physical = getattr(pf, "_barrel_conflict_nets", set())
+    try:
+        pf._barrel_conflict_nets = set(tasks)
+        overuse, _ = pf.accounting.compute_overuse(pf)
+        assert overuse == 0
+        assert set(tasks) <= pf._build_hotset(tasks)
+    finally:
+        pf._barrel_conflict_nets = old_physical
 
 
 def test_adjacent_via_chain_is_one_physical_column(routed):

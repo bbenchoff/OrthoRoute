@@ -84,6 +84,9 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
     escape_conflicts = int(
         getattr(pf, "_last_escape_conflict_count", 0)
     )
+    portal_grid_conflicts = int(
+        getattr(pf, "_last_portal_grid_conflict_count", 0)
+    )
 
     return {
         "board": {
@@ -123,6 +126,7 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             "barrel_conflicts": barrel_conflicts,
             "exact_barrel_conflicts": exact_barrel_conflicts,
             "escape_conflicts": escape_conflicts,
+            "portal_grid_conflicts": portal_grid_conflicts,
         },
         "copper": {
             "wirelength_mm": round(total_lateral * pitch, 3),
