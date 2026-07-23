@@ -145,9 +145,9 @@ class CUDADijkstra:
         # PERFORMANCE: Persistent kernel (compiled on-demand)
         self._persistent_kernel = None
         self._enable_persistent_kernel = True
-        self._persistent_kernel_version = 4
-        # Version 4 supports both the legacy hard bitmap and negotiated
-        # per-node ownership costs.
+        self._persistent_kernel_version = 5
+        # Version 5 uses compact frontier queues, packed atomic parent keys,
+        # and weighted-cost convergence.
         self._zero_node_penalty = cp.zeros(1, dtype=cp.float32)
         self._fullgraph_backtrace_kernel = None
         self._fullgraph_backtrace_buffer = None
@@ -5783,7 +5783,7 @@ class CUDADijkstra:
         # the entire parent array cost 32 MB of PCIe traffic per monster-board
         # net even though typical paths contain only hundreds of nodes.
         path = self._backtrace_fullgraph_path(
-            self.parent_val_pool[0, :num_nodes], best_dst, num_nodes
+            self.best_key_pool[0, :num_nodes], best_dst, num_nodes
         )
         if path is None:
             return None
@@ -5791,15 +5791,15 @@ class CUDADijkstra:
 
         return path
 
-    def _backtrace_fullgraph_path(self, parent_gpu, best_dst, num_nodes):
-        """Backtrace a full-graph parent chain without downloading all parents."""
+    def _backtrace_fullgraph_path(self, best_key_gpu, best_dst, num_nodes):
+        """Backtrace packed atomic parent keys without downloading the graph."""
         import cupy as cp
 
         if self._fullgraph_backtrace_kernel is None:
             self._fullgraph_backtrace_kernel = cp.RawKernel(r'''
             extern "C" __global__
             void backtrace_parent(
-                const int* parent,
+                const unsigned long long* best_key,
                 const int start,
                 const int num_nodes,
                 int* reversed_path,
@@ -5820,7 +5820,9 @@ class CUDADijkstra:
                     }
 
                     reversed_path[length++] = current;
-                    int previous = parent[current];
+                    int previous = (int)(
+                        best_key[current] & 0xFFFFFFFFULL
+                    );
                     if (previous == -1) {
                         metadata[0] = length;
                         metadata[1] = 1;
@@ -5850,7 +5852,7 @@ class CUDADijkstra:
         self._fullgraph_backtrace_kernel(
             (1,), (1,),
             (
-                parent_gpu,
+                best_key_gpu,
                 cp.int32(best_dst),
                 cp.int32(num_nodes),
                 self._fullgraph_backtrace_buffer,
