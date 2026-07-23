@@ -607,6 +607,7 @@ class PathFinderConfig:
     clearance: float = 0.15
     via_diameter: float = 0.25
     via_drill: float = 0.15
+    min_hole_to_hole: float = 0.25
     via_cost: float = 0.7  # Cheaper vias to encourage layer hopping and redistribute load (was 1.0)
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
     span_alpha: float = 0.15  # Span penalty: cost *= (1 + alpha*(span-1))
@@ -1339,6 +1340,16 @@ class Lattice3D:
         """mm → lattice"""
         return self.geom.world_to_lattice(x_mm, y_mm)
 
+    def is_via_site(self, x: int, y: int) -> bool:
+        """Return whether ordinary graph vias may occupy this lattice site."""
+        mode = getattr(self, "_via_site_mode", "all")
+        if mode == "all":
+            return True
+        if mode == "checkerboard":
+            return (x + y) % 2 == 0
+        stride = int(getattr(self, "_via_site_stride", 1))
+        return x % stride == 0 and y % stride == 0
+
     def build_graph(
         self,
         via_cost: float,
@@ -1346,6 +1357,7 @@ class Lattice3D:
         use_gpu=False,
         allow_any_layer_via: bool = False,
         adjacent_via_step_scale: float = 4.0,
+        min_via_center_spacing: float = 0.0,
     ) -> CSRGraph:
         """
         Build graph with H/V constraints and flexible via spans.
@@ -1393,10 +1405,47 @@ class Lattice3D:
             and legal_via_pairs_set
             and all(abs(b - a) == 1 for a, b in legal_via_pairs_set)
         )
-        via_edge_count = 2 * self.x_steps * self.y_steps * len(legal_via_pairs_set)
+        # A via is a physical hole and annulus, not a zero-area graph edge.
+        # If adjacent lattice sites cannot satisfy the board's center-to-
+        # center spacing, restrict vias to a DRC-spaced sublattice. A
+        # checkerboard preserves half the sites while increasing the nearest
+        # site distance from one pitch to sqrt(2) pitches.
+        required_spacing = max(0.0, float(min_via_center_spacing))
+        if required_spacing < self.pitch - 1e-9:
+            via_site_mode = "all"
+            via_site_stride = 1
+        elif required_spacing <= self.pitch * np.sqrt(2.0) + 1e-9:
+            via_site_mode = "checkerboard"
+            via_site_stride = 1
+        else:
+            via_site_mode = "stride"
+            via_site_stride = max(
+                2, int(np.ceil(required_spacing / self.pitch))
+            )
+
+        self._via_site_mode = via_site_mode
+        self._via_site_stride = via_site_stride
+
+        via_site_count = sum(
+            self.is_via_site(x, y)
+            for x in range(self.x_steps)
+            for y in range(self.y_steps)
+        )
+        via_edge_count = (
+            2 * via_site_count * len(legal_via_pairs_set)
+        )
         edge_count += via_edge_count
 
-        logger.info(f"Pre-allocating for {edge_count:,} edges ({via_edge_count:,} via edges for {len(legal_via_pairs_set)} pairs)")
+        logger.info(
+            "Pre-allocating for %s edges (%s via edges for %d pairs "
+            "on %s/%s sites; required spacing %.4fmm)",
+            f"{edge_count:,}",
+            f"{via_edge_count:,}",
+            len(legal_via_pairs_set),
+            f"{via_site_count:,}",
+            f"{self.x_steps * self.y_steps:,}",
+            required_spacing,
+        )
         graph = CSRGraph(use_gpu, edge_capacity=edge_count)
 
         # Build lateral edges (H/V discipline)
@@ -1435,6 +1484,8 @@ class Lattice3D:
 
         for x in range(self.x_steps):
             for y in range(self.y_steps):
+                if not self.is_via_site(x, y):
+                    continue
                 for (z_from, z_to) in legal_via_pairs_set:
                     # Only add if this specific pair is legal
                     span = abs(z_to - z_from)
@@ -1452,6 +1503,15 @@ class Lattice3D:
 
         # LOG what was built
         logger.info(f"Vias: {via_count} edges created")
+        logger.info(
+            "[VIA-SITES] mode=%s stride=%d sites=%d/%d "
+            "nearest_required=%.4fmm",
+            via_site_mode,
+            via_site_stride,
+            via_site_count,
+            self.x_steps * self.y_steps,
+            required_spacing,
+        )
         logger.info(f"Via policy: {len(legal_via_pairs_set)} layer pairs (FULL BLIND/BURIED ENABLED!)")
         for pair in sorted(list(legal_via_pairs_set))[:10]:
             logger.info(f"  Legal via: {pair[0]} ↔ {pair[1]}")
@@ -1468,8 +1528,6 @@ class Lattice3D:
         if sample_size > 0:
             logger.info(f"[MANHATTAN-VALIDATION] Sampling {sample_size} edges to verify H/V discipline...")
             violations = 0
-
-            import numpy as np
 
             # Convert indptr to CPU for validation (if it's on GPU)
             indptr_cpu = graph.indptr if isinstance(graph.indptr, np.ndarray) else graph.indptr.get()
@@ -2343,6 +2401,12 @@ class PathFinderRouter:
                     "default_via_drill", self.config.via_drill
                 )
             )
+            self.config.min_hole_to_hole = float(
+                design_rules.get(
+                    "min_hole_to_hole",
+                    self.config.min_hole_to_hole,
+                )
+            )
         logger.info("=" * 80)
         logger.info("PATHFINDER NEGOTIATED CONGESTION ROUTER - RUNTIME CONFIGURATION")
         logger.info("=" * 80)
@@ -2417,6 +2481,14 @@ class PathFinderRouter:
             allow_any_layer_via=allow_any_layer_via,
             adjacent_via_step_scale=getattr(
                 self.config, "adjacent_via_step_scale", 4.0
+            ),
+            min_via_center_spacing=max(
+                float(self.config.via_diameter)
+                + float(self.config.clearance),
+                float(self.config.via_drill)
+                + float(getattr(
+                    self.config, "min_hole_to_hole", 0.0
+                )),
             ),
         )
         # Lazily populated by _path_to_edges. Invalidate if this router is
@@ -6000,9 +6072,26 @@ class PathFinderRouter:
                                     selected_src_portal,
                                     selected_dst_portal,
                                 )
-                                
+
+                                self.net_selected_portals[net_id] = (
+                                    selected_src_portal,
+                                    selected_dst_portal,
+                                )
+                                if (
+                                    entry_layer is not None
+                                    and exit_layer is not None
+                                ):
+                                    self.net_portal_layers[net_id] = (
+                                        entry_layer, exit_layer
+                                    )
+                                graph_path = (
+                                    self._path_without_dynamic_escape_chains(
+                                        net_id, path
+                                    )
+                                )
+
                                 # Commit path and continue to next net
-                                edge_indices = self._path_to_edges(path)
+                                edge_indices = self._path_to_edges(graph_path)
                                 self.accounting.commit_path(edge_indices)
                                 if live_present_costs:
                                     self.accounting.refresh_live_present_costs(
@@ -6015,12 +6104,6 @@ class PathFinderRouter:
                                 self._mark_via_barrel_ownership_for_path(net_id, path)
                                 self._mark_path_node_use(path)
 
-                                if entry_layer is not None and exit_layer is not None:
-                                    self.net_portal_layers[net_id] = (entry_layer, exit_layer)
-                                self.net_selected_portals[net_id] = (
-                                    selected_src_portal,
-                                    selected_dst_portal,
-                                )
                                 self._mark_escape_occupancy(
                                     net_id,
                                     self.net_selected_portals[net_id],
@@ -6248,11 +6331,22 @@ class PathFinderRouter:
                         selected_src_portal,
                         selected_dst_portal,
                     )
+                    if (
+                        entry_layer is not None
+                        and exit_layer is not None
+                    ):
+                        self.net_portal_layers[net_id] = (
+                            entry_layer, exit_layer
+                        )
                     self._mark_escape_occupancy(
                         net_id,
                         self.net_selected_portals[net_id],
                     )
-                edge_indices = self._path_to_edges(path)
+                graph_path = (
+                    self._path_without_dynamic_escape_chains(net_id, path)
+                    if use_portals else path
+                )
+                edge_indices = self._path_to_edges(graph_path)
                 self.accounting.commit_path(edge_indices)  # bumps present for next iteration
                 if live_present_costs:
                     self.accounting.refresh_live_present_costs(
@@ -7577,7 +7671,7 @@ class PathFinderRouter:
     def _path_without_dynamic_escape_chains(
         self, net_id: str, path: List[int]
     ) -> List[int]:
-        """Remove virtual anchor barrels supplied by explicit escape geometry."""
+        """Remove terminal barrels supplied by explicit escape geometry."""
         selected = self.net_selected_portals.get(net_id)
         layers = self.net_portal_layers.get(net_id)
         if not path or selected is None or layers is None:
@@ -7587,26 +7681,24 @@ class PathFinderRouter:
         end = len(path)
         src_portal, dst_portal = selected
         src_layer, dst_layer = layers
-        if src_portal.dynamic_entry:
-            target = (
-                src_portal.x_idx,
-                src_portal.y_idx,
-                src_layer,
-            )
-            for index, node in enumerate(path):
-                if self.lattice.idx_to_coord(node) == target:
-                    start = index
-                    break
-        if dst_portal.dynamic_entry:
-            target = (
-                dst_portal.x_idx,
-                dst_portal.y_idx,
-                dst_layer,
-            )
-            for index in range(len(path) - 1, start - 1, -1):
-                if self.lattice.idx_to_coord(path[index]) == target:
-                    end = index + 1
-                    break
+        target = (
+            src_portal.x_idx,
+            src_portal.y_idx,
+            src_layer,
+        )
+        for index, node in enumerate(path):
+            if self.lattice.idx_to_coord(node) == target:
+                start = index
+                break
+        target = (
+            dst_portal.x_idx,
+            dst_portal.y_idx,
+            dst_layer,
+        )
+        for index in range(len(path) - 1, start - 1, -1):
+            if self.lattice.idx_to_coord(path[index]) == target:
+                end = index + 1
+                break
         return list(path[start:end])
 
     def _generate_geometry_from_paths(self) -> Tuple[List, List]:

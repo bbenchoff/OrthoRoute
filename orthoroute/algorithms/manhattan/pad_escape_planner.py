@@ -1530,7 +1530,7 @@ class PadEscapePlanner:
                 'escape': True,
             })
 
-        if include_via and portal.dynamic_entry:
+        if include_via:
             entry_layer_name = (
                 self.config.layer_names[entry_layer]
                 if entry_layer < len(self.config.layer_names)
@@ -1545,7 +1545,7 @@ class PadEscapePlanner:
                 "diameter": self.config.via_diameter,
                 "drill": self.config.via_drill,
                 "escape": True,
-                "dynamic_entry": True,
+                "dynamic_entry": bool(portal.dynamic_entry),
             })
 
             anchor_x, anchor_y = self.lattice.geom.lattice_to_world(
