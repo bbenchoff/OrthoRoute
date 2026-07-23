@@ -601,6 +601,12 @@ class PathFinderConfig:
     # enabling use of empty vertical channels. Lower values = more detours, higher completion.
 
     grid_pitch: float = 0.4
+    # Preferred planar axis for each copper layer. None preserves the
+    # historical F.Cu=V, then alternating H/V assignment. A finite
+    # wrong_way_cost_multiplier adds the nonpreferred axis to the graph:
+    # >1 is guided routing, 1 is fully bidirectional, and infinity is strict.
+    preferred_layer_directions: Optional[List[str]] = None
+    wrong_way_cost_multiplier: float = float("inf")
     # Physical output geometry. Parsed KiCad project rules replace these
     # defaults during initialize_graph().
     track_width: float = 0.24
@@ -1223,12 +1229,37 @@ class EdgeAccountant:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Lattice3D:
-    """3D routing lattice with H/V discipline"""
+    """3D routing lattice with configurable preferred H/V discipline."""
 
-    def __init__(self, bounds: Tuple[float, float, float, float], pitch: float, layers: int):
+    def __init__(
+        self,
+        bounds: Tuple[float, float, float, float],
+        pitch: float,
+        layers: int,
+        preferred_layer_directions: Optional[List[str]] = None,
+        wrong_way_cost_multiplier: float = float("inf"),
+    ):
         self.bounds = bounds
         self.pitch = pitch
         self.layers = layers
+        self.preferred_layer_directions = (
+            list(preferred_layer_directions)
+            if preferred_layer_directions is not None
+            else None
+        )
+        self.wrong_way_cost_multiplier = float(
+            wrong_way_cost_multiplier
+        )
+        if (
+            self.wrong_way_cost_multiplier < 1.0
+            or (
+                not np.isfinite(self.wrong_way_cost_multiplier)
+                and self.wrong_way_cost_multiplier != float("inf")
+            )
+        ):
+            raise ValueError(
+                "wrong_way_cost_multiplier must be >= 1 or infinity"
+            )
 
         self.geom = KiCadGeometry(bounds, pitch, layer_count=layers)
         self.x_steps = self.geom.x_steps
@@ -1240,6 +1271,21 @@ class Lattice3D:
 
     def _assign_directions(self) -> List[str]:
         """F.Cu=V (vertical escape routing), internal layers alternate H/V"""
+        if self.preferred_layer_directions is not None:
+            if len(self.preferred_layer_directions) != self.layers:
+                raise ValueError(
+                    "preferred_layer_directions must have one H/V entry "
+                    f"per layer ({self.layers} expected)"
+                )
+            directions = [
+                str(axis).strip().lower()
+                for axis in self.preferred_layer_directions
+            ]
+            if any(axis not in ("h", "v") for axis in directions):
+                raise ValueError(
+                    "preferred_layer_directions entries must be H or V"
+                )
+            return directions
         dirs = []
         for z in range(self.layers):
             if z == 0:
@@ -1251,10 +1297,27 @@ class Lattice3D:
         return dirs
 
     def get_legal_axis(self, layer: int) -> str:
-        """Return 'h' or 'v' for which axis this layer allows."""
+        """Return the preferred planar axis for one layer."""
         if layer >= len(self.layer_dir):
             return 'h' if layer % 2 == 1 else 'v'
         return self.layer_dir[layer]
+
+    def get_allowed_axes(self, layer: int) -> Tuple[str, ...]:
+        """Return planar axes materialized on one layer."""
+        preferred = self.get_legal_axis(layer)
+        if np.isfinite(self.wrong_way_cost_multiplier):
+            other = "v" if preferred == "h" else "h"
+            return (preferred, other)
+        return (preferred,)
+
+    def planar_cost_multiplier(self, layer: int, axis: str) -> float:
+        """Return the preferred/wrong-way cost multiplier for an axis."""
+        normalized = str(axis).lower()
+        if normalized not in self.get_allowed_axes(layer):
+            return float("inf")
+        if normalized == self.get_legal_axis(layer):
+            return 1.0
+        return self.wrong_way_cost_multiplier
 
     def is_legal_planar_edge(self, from_x: int, from_y: int, from_layer: int,
                               to_x: int, to_y: int, to_layer: int) -> bool:
@@ -1269,12 +1332,8 @@ class Lattice3D:
         if dx + dy != 1:
             return False
 
-        # Check layer direction
-        direction = self.get_legal_axis(from_layer)
-        if direction == 'h':
-            return dy == 0 and dx == 1  # Horizontal: only ±X
-        else:
-            return dx == 0 and dy == 1  # Vertical: only ±Y
+        axis = "h" if dx == 1 else "v"
+        return axis in self.get_allowed_axes(from_layer)
 
     def get_legal_via_pairs(
         self, layer_count: int, allow_any_layer_via: bool = False
@@ -1383,11 +1442,12 @@ class Lattice3D:
         # Count edges to pre-allocate array (avoids MemoryError with 30M edges)
         edge_count = 0
 
-        # Count H/V edges
+        # Count preferred and optional wrong-way planar edges.
         for z in lateral_layers:
-            if self.layer_dir[z] == 'h':
+            axes = self.get_allowed_axes(z)
+            if "h" in axes:
                 edge_count += 2 * self.y_steps * (self.x_steps - 1)
-            else:  # 'v'
+            if "v" in axes:
                 edge_count += 2 * self.x_steps * (self.y_steps - 1)
 
         # Explicit spans win; canonicalize them because add_edge emits both
@@ -1481,6 +1541,32 @@ class Lattice3D:
 
                         graph.add_edge(u, v, self.pitch)
                         graph.add_edge(v, u, self.pitch)
+
+        # Add the nonpreferred axis when guided or bidirectional routing is
+        # enabled. Preferred edges above retain their historical base cost.
+        if np.isfinite(self.wrong_way_cost_multiplier):
+            wrong_way_cost = (
+                self.pitch * self.wrong_way_cost_multiplier
+            )
+            for z in lateral_layers:
+                preferred = self.get_legal_axis(z)
+                if preferred == "h":
+                    segments = (
+                        (x, y, x, y + 1)
+                        for x in range(self.x_steps)
+                        for y in range(self.y_steps - 1)
+                    )
+                else:
+                    segments = (
+                        (x, y, x + 1, y)
+                        for y in range(self.y_steps)
+                        for x in range(self.x_steps - 1)
+                    )
+                for x0, y0, x1, y1 in segments:
+                    u = self.node_idx(x0, y0, z)
+                    v = self.node_idx(x1, y1, z)
+                    graph.add_edge(u, v, wrong_way_cost)
+                    graph.add_edge(v, u, wrong_way_cost)
 
         # Build via edges using the SAME legal pairs as pre-allocation
         via_count = 0
@@ -2470,7 +2556,19 @@ class PathFinderRouter:
 
         logger.info(f"Using {self.config.layer_count} layers from board")
 
-        self.lattice = Lattice3D(bounds, self.config.grid_pitch, self.config.layer_count)
+        self.lattice = Lattice3D(
+            bounds,
+            self.config.grid_pitch,
+            self.config.layer_count,
+            preferred_layer_directions=getattr(
+                self.config, "preferred_layer_directions", None
+            ),
+            wrong_way_cost_multiplier=getattr(
+                self.config,
+                "wrong_way_cost_multiplier",
+                float("inf"),
+            ),
+        )
 
         allow_any_layer_via = getattr(
             self.config, "allow_any_layer_via", None
@@ -3024,7 +3122,7 @@ class PathFinderRouter:
             # horizontal entry segment, so only horizontal layers are legal.
             routing_layers = [
                 layer for layer in routing_layers
-                if self.lattice.get_legal_axis(layer) == "h"
+                if "h" in self.lattice.get_allowed_axes(layer)
             ]
         via_base = float(getattr(self.config, "via_cost", 0.7))
         discount = float(getattr(
@@ -4328,12 +4426,10 @@ class PathFinderRouter:
                 self.lattice.layers > 2
                 and layer in (0, self.lattice.layers - 1)
             ):
-                xy_nodes = np.union1d(
-                    xy_nodes,
-                    xy_by_axis[
-                        self.lattice.get_legal_axis(layer)
-                    ],
-                )
+                for axis in self.lattice.get_allowed_axes(layer):
+                    xy_nodes = np.union1d(
+                        xy_nodes, xy_by_axis[axis]
+                    )
             if xy_nodes.size:
                 chunks.append(xy_nodes + layer * plane)
 
@@ -6971,9 +7067,10 @@ class PathFinderRouter:
         bf = float(bias_cpu[z_from])  # Source layer bias
         bt = float(bias_cpu[z_to])    # Target layer bias
 
-        # Check if both layers have same orientation (both H or both V)
-        # Layers alternate: even=H, odd=V (or vice versa, depends on stackup)
-        same_orientation = (z_from % 2) == (z_to % 2)
+        same_orientation = (
+            self.lattice.get_legal_axis(z_from)
+            == self.lattice.get_legal_axis(z_to)
+        )
 
         # Calculate discount based on bias difference
         delta = max(0.0, bf - bt)
@@ -7775,6 +7872,24 @@ class PathFinderRouter:
             return None
         return start + int(matches[0])
 
+    def _iter_planar_segments_in_box(
+        self, layer: int, x_lo: int, x_hi: int, y_lo: int, y_hi: int
+    ):
+        """Yield every graph-planar segment in an inclusive XY box."""
+        for axis in self.lattice.get_allowed_axes(layer):
+            if axis == "h":
+                yield from (
+                    (x_idx, y_idx, x_idx + 1, y_idx)
+                    for y_idx in range(y_lo, y_hi + 1)
+                    for x_idx in range(x_lo, x_hi)
+                )
+            else:
+                yield from (
+                    (x_idx, y_idx, x_idx, y_idx + 1)
+                    for x_idx in range(x_lo, x_hi + 1)
+                    for y_idx in range(y_lo, y_hi)
+                )
+
     def _portal_conflicting_graph_edges(
         self, portal: Portal, entry_layer: int
     ) -> np.ndarray:
@@ -7832,20 +7947,11 @@ class PathFinderRouter:
                 self.lattice.layers > 2
                 and layer in (0, self.lattice.layers - 1)
             ):
-                axis = self.lattice.get_legal_axis(layer)
-                if axis == "h":
-                    segments = (
-                        (x_idx, y_idx, x_idx + 1, y_idx)
-                        for y_idx in range(y_lo, y_hi + 1)
-                        for x_idx in range(x_lo, x_hi)
+                for x0, y0, x1, y1 in (
+                    self._iter_planar_segments_in_box(
+                        layer, x_lo, x_hi, y_lo, y_hi
                     )
-                else:
-                    segments = (
-                        (x_idx, y_idx, x_idx, y_idx + 1)
-                        for x_idx in range(x_lo, x_hi + 1)
-                        for y_idx in range(y_lo, y_hi)
-                    )
-                for x0, y0, x1, y1 in segments:
+                ):
                     start = self.lattice.geom.lattice_to_world(
                         x0, y0
                     )
@@ -8108,20 +8214,11 @@ class PathFinderRouter:
                         and layer in (0, self.lattice.layers - 1)
                     ):
                         continue
-                    axis = self.lattice.get_legal_axis(layer)
-                    if axis == "h":
-                        candidates = (
-                            (x_idx, y_idx, x_idx + 1, y_idx)
-                            for y_idx in range(y_lo, y_hi + 1)
-                            for x_idx in range(x_lo, x_hi)
+                    for x0, y0, x1, y1 in (
+                        self._iter_planar_segments_in_box(
+                            layer, x_lo, x_hi, y_lo, y_hi
                         )
-                    else:
-                        candidates = (
-                            (x_idx, y_idx, x_idx, y_idx + 1)
-                            for x_idx in range(x_lo, x_hi + 1)
-                            for y_idx in range(y_lo, y_hi)
-                        )
-                    for x0, y0, x1, y1 in candidates:
+                    ):
                         start_world = (
                             self.lattice.geom.lattice_to_world(x0, y0)
                         )
@@ -8792,7 +8889,15 @@ class PathFinderRouter:
                         continue  # Skip illegal segment
 
                     # Check layer direction discipline
-                    layer_axis = self.lattice.get_legal_axis(z0)
+                    layer_axis = "h" if dy == 0 else "v"
+                    if layer_axis not in self.lattice.get_allowed_axes(z0):
+                        logger.error(
+                            "[LAYER-VIOLATION] Axis %s is unavailable "
+                            "on layer %d",
+                            layer_axis,
+                            z0,
+                        )
+                        continue
                     if layer_axis == 'h':
                         # H layer: y must be constant (horizontal movement)
                         if dy != 0:
@@ -8879,21 +8984,21 @@ class PathFinderRouter:
             v_count = layer_stats[layer]['v']
             logger.info(f"[LAYER-STATS] {layer}: {h_count} horizontal, {v_count} vertical")
 
-            # Check if layer has wrong direction (extract layer index from name)
-            # Assuming layer names like "In1.Cu", "In2.Cu", etc.
-            if 'In' in layer:
-                try:
-                    layer_str = layer.replace('In', '').replace('.Cu', '')
-                    layer_num = int(layer_str)
-                    # Odd layers (In1, In3) = H, Even layers (In2, In4) = V
-                    expected_dir = 'h' if layer_num % 2 == 1 else 'v'
-
-                    if expected_dir == 'h' and v_count > h_count:
-                        logger.warning(f"[LAYER-DIRECTION] {layer} should be H-dominant but has more V traces!")
-                    elif expected_dir == 'v' and h_count > v_count:
-                        logger.warning(f"[LAYER-DIRECTION] {layer} should be V-dominant but has more H traces!")
-                except (ValueError, IndexError):
-                    pass  # Skip if layer name doesn't match expected pattern
+            try:
+                layer_index = self.config.layer_names.index(layer)
+                expected_dir = self.lattice.get_legal_axis(layer_index)
+                if expected_dir == 'h' and v_count > h_count:
+                    logger.warning(
+                        f"[LAYER-DIRECTION] {layer} is H-preferred "
+                        "but has more V traces"
+                    )
+                elif expected_dir == 'v' and h_count > v_count:
+                    logger.warning(
+                        f"[LAYER-DIRECTION] {layer} is V-preferred "
+                        "but has more H traces"
+                    )
+            except (ValueError, IndexError):
+                pass
 
         return (tracks, vias)
 

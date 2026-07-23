@@ -24,8 +24,15 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
     """
     plane = pf.lattice.x_steps * pf.lattice.y_steps
     pitch = pf.lattice.pitch
+    preferred_axis = getattr(
+        pf.lattice,
+        "get_legal_axis",
+        lambda layer: "h" if layer % 2 == 1 else "v",
+    )
 
     lateral_steps_per_layer: Dict[int, int] = {}
+    preferred_steps_per_layer: Dict[int, int] = {}
+    wrong_way_steps_per_layer: Dict[int, int] = {}
     via_transitions = 0
     via_layer_steps = 0
     routed_path_ids = set()
@@ -45,6 +52,15 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             za, zb = a // plane, b // plane
             if za == zb:
                 lateral_steps_per_layer[za] = lateral_steps_per_layer.get(za, 0) + 1
+                xa = (a % plane) % pf.lattice.x_steps
+                xb = (b % plane) % pf.lattice.x_steps
+                axis = "h" if xa != xb else "v"
+                counter = (
+                    preferred_steps_per_layer
+                    if axis == preferred_axis(za)
+                    else wrong_way_steps_per_layer
+                )
+                counter[za] = counter.get(za, 0) + 1
                 in_vertical_run = False
                 vertical_xy = None
                 vertical_direction = 0
@@ -135,6 +151,15 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             "lateral_steps_per_layer": {
                 str(z): n for z, n in sorted(lateral_steps_per_layer.items())
             },
+            "preferred_steps_per_layer": {
+                str(z): n
+                for z, n in sorted(preferred_steps_per_layer.items())
+            },
+            "wrong_way_steps_per_layer": {
+                str(z): n
+                for z, n in sorted(wrong_way_steps_per_layer.items())
+            },
+            "wrong_way_steps": sum(wrong_way_steps_per_layer.values()),
             "layers_used": sorted(lateral_steps_per_layer.keys()),
             "layers_used_count": len(lateral_steps_per_layer),
         },

@@ -82,6 +82,36 @@ def test_metrics_coalesce_adjacent_layer_hops_into_one_via():
     assert copper["via_layer_steps"] == 2
 
 
+def test_metrics_count_wrong_way_steps():
+    board = SimpleNamespace(
+        name="guided",
+        layer_count=3,
+        nets=[_net("ROUTED", 2)],
+    )
+    lattice = SimpleNamespace(
+        x_steps=3,
+        y_steps=3,
+        layers=3,
+        num_nodes=27,
+        pitch=0.4,
+        get_legal_axis=lambda layer: "h" if layer == 1 else "v",
+    )
+    router = SimpleNamespace(
+        lattice=lattice,
+        # z=1: one preferred +X step, then one wrong-way +Y step.
+        net_paths={"ROUTED": [9, 10, 13]},
+        accounting=_Accounting(),
+        iteration=1,
+        _excluded_nets=set(),
+    )
+
+    copper = collect_route_metrics(router, board)["copper"]
+
+    assert copper["preferred_steps_per_layer"] == {"1": 1}
+    assert copper["wrong_way_steps_per_layer"] == {"1": 1}
+    assert copper["wrong_way_steps"] == 1
+
+
 def test_metrics_report_excluded_and_unrouted_ids():
     board = SimpleNamespace(
         name="partial",

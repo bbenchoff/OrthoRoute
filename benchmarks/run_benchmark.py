@@ -37,6 +37,17 @@ def run(args) -> dict:
 
     config = PathFinderConfig()
     config.portal_x_snap_max = 0.75  # pads sit half a pitch off-grid (see conftest)
+    if args.direction_mode == "strict":
+        config.wrong_way_cost_multiplier = float("inf")
+    elif args.direction_mode == "bidirectional":
+        config.wrong_way_cost_multiplier = 1.0
+    else:
+        config.wrong_way_cost_multiplier = args.wrong_way_multiplier
+    if args.layer_directions:
+        config.preferred_layer_directions = [
+            axis.strip().lower()
+            for axis in args.layer_directions.split(",")
+        ]
     pf = UnifiedPathFinder(config=config, use_gpu=args.use_gpu)
     # Explicit benchmark selection wins over the router's legacy USE_GPU
     # environment override so CPU/GPU comparisons cannot silently swap backends.
@@ -87,6 +98,11 @@ def run(args) -> dict:
         "connectors": args.connectors, "pins": args.pins,
         "layers": args.layers, "pattern": args.pattern, "seed": args.seed,
         "backend": "gpu" if pf.config.use_gpu else "cpu",
+        "direction_mode": args.direction_mode,
+        "wrong_way_cost_multiplier": config.wrong_way_cost_multiplier,
+        "preferred_layer_directions": (
+            config.preferred_layer_directions
+        ),
         "effective_max_iterations": config.max_iterations,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
@@ -107,6 +123,22 @@ def main():
     parser.add_argument("--pattern", choices=["pairs", "neighbor", "bus"],
                         default="pairs")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--direction-mode",
+        choices=["strict", "guided", "bidirectional"],
+        default="strict",
+        help="strict preferred axes, penalized wrong-way, or equal-cost H/V",
+    )
+    parser.add_argument(
+        "--wrong-way-multiplier",
+        type=float,
+        default=4.0,
+        help="nonpreferred-axis cost in guided mode (must be >= 1)",
+    )
+    parser.add_argument(
+        "--layer-directions",
+        help="comma-separated preferred H/V axis for every copper layer",
+    )
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--gpu", dest="use_gpu", action="store_true",
                          help="run the CUDA/CuPy path")
