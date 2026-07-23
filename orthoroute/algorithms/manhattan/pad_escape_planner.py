@@ -859,7 +859,11 @@ class PadEscapePlanner:
                     primary.entry_layer,
                     pad_geometries,
                     spatial_index,
-                    claim_cell=False,
+                    # Candidate terminals are force-allowed by the path
+                    # search, so two pads must never be offered the same
+                    # cell. Reserve every accepted alternative globally just
+                    # like the primary portal.
+                    claim_cell=True,
                     allow_occupied_cell=(
                         primary.x_idx, primary.y_idx
                     ),
