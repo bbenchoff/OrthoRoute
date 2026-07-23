@@ -149,6 +149,9 @@ class CUDADijkstra:
         # Version 4 supports both the legacy hard bitmap and negotiated
         # per-node ownership costs.
         self._zero_node_penalty = cp.zeros(1, dtype=cp.float32)
+        self._fullgraph_backtrace_kernel = None
+        self._fullgraph_backtrace_buffer = None
+        self._fullgraph_backtrace_meta = None
 
         # Compile CUDA kernel for parallel edge relaxation
         self.relax_kernel = cp.RawKernel(r'''
@@ -5539,24 +5542,11 @@ class CUDADijkstra:
         num_edges = len(self.indices)
         logger.info(f"[GPU-SEEDS] Full graph: {num_nodes} nodes, {num_edges} edges")
 
-        # Initialize distance and parent arrays
-        dist = cp.full(num_nodes, cp.inf, dtype=cp.float32)
-        parent = cp.full(num_nodes, -1, dtype=cp.int32)
-
         # Convert seeds to GPU
         # Dedupe before scatter-add: repeated seeds would add the same bit
         # twice and carry into a neighboring frontier bit.
         src_seeds_gpu = cp.unique(cp.asarray(src_seeds, dtype=cp.int32))
         dst_targets_gpu = cp.unique(cp.asarray(dst_targets, dtype=cp.int32))
-
-        # Initialize source seeds (supersource via seeding)
-        logger.info(f"[GPU-SEEDS] Initialized {len(src_seeds)} source seeds with dist=0")
-        dist[src_seeds_gpu] = 0.0
-
-        # Create destination bitmap for fast termination check
-        dst_bitmap = cp.zeros(num_nodes, dtype=cp.bool_)
-        dst_bitmap[dst_targets_gpu] = True
-        logger.info(f"[GPU-SEEDS] Created destination bitmap for {len(dst_targets)} targets")
 
         # Initialize bit-packed frontier (K=1, frontier_words)
         frontier_words = (num_nodes + 31) // 32
@@ -5576,9 +5566,15 @@ class CUDADijkstra:
             INF_KEY = 0x7F800000FFFFFFFF  # float +inf (upper 32) | parent -1 (lower 32)
             self.best_key_pool = cp.full((1, N_max), INF_KEY, dtype=cp.uint64)
 
-        # Copy initial dist/parent into pools
-        self.dist_val_pool[0, :num_nodes] = dist
-        self.parent_val_pool[0, :num_nodes] = parent
+        # Reset the persistent pools in place.  The previous implementation
+        # allocated two redundant full-graph arrays and then copied them into
+        # these pools for every net.
+        dist_view = self.dist_val_pool[0, :num_nodes]
+        parent_view = self.parent_val_pool[0, :num_nodes]
+        dist_view.fill(cp.inf)
+        parent_view.fill(-1)
+        dist_view[src_seeds_gpu] = 0.0
+        logger.info(f"[GPU-SEEDS] Initialized {len(src_seeds)} source seeds with dist=0")
 
         # Initialize best_key_pool for source seeds with SRC_KEY (cost=0, parent=-1)
         SRC_KEY = 0x00000000FFFFFFFF  # cost=0 (upper 32 bits) | parent=-1 (lower 32 bits)
@@ -5783,28 +5779,91 @@ class CUDADijkstra:
 
         logger.info(f"[GPU-SEEDS] Path found in {iteration+1} iterations ({best_dist:.2f}ms)")
 
-        # Reconstruct path from best_dst back to source
-        path = []
-        curr = best_dst
-        parent_cpu = self.parent_val_pool[0, :num_nodes].get()
-        max_path_len = num_nodes * 2  # Safety margin
-
-        while len(path) < max_path_len:
-            path.append(curr)
-            parent_idx = int(parent_cpu[curr])
-
-            if parent_idx == -1:  # Reached source seed
-                # Find which seed this was
-                src_seed = curr
-                break
-
-            curr = parent_idx
-
-        if len(path) >= max_path_len:
-            logger.error(f"[GPU-SEEDS] Path reconstruction exceeded max length {max_path_len}")
+        # Reconstruct on device and transfer only the resulting path.  Copying
+        # the entire parent array cost 32 MB of PCIe traffic per monster-board
+        # net even though typical paths contain only hundreds of nodes.
+        path = self._backtrace_fullgraph_path(
+            self.parent_val_pool[0, :num_nodes], best_dst, num_nodes
+        )
+        if path is None:
             return None
-
-        path.reverse()
         logger.info(f"[GPU-SEEDS] Path reconstructed: length={len(path)}, from seed={path[0]} to target={best_dst}")
 
         return path
+
+    def _backtrace_fullgraph_path(self, parent_gpu, best_dst, num_nodes):
+        """Backtrace a full-graph parent chain without downloading all parents."""
+        import cupy as cp
+
+        if self._fullgraph_backtrace_kernel is None:
+            self._fullgraph_backtrace_kernel = cp.RawKernel(r'''
+            extern "C" __global__
+            void backtrace_parent(
+                const int* parent,
+                const int start,
+                const int num_nodes,
+                int* reversed_path,
+                const int capacity,
+                int* metadata
+            ) {
+                if (blockIdx.x != 0 || threadIdx.x != 0) {
+                    return;
+                }
+
+                int current = start;
+                int length = 0;
+                while (length < capacity) {
+                    if (current < 0 || current >= num_nodes) {
+                        metadata[0] = length;
+                        metadata[1] = -2;
+                        return;
+                    }
+
+                    reversed_path[length++] = current;
+                    int previous = parent[current];
+                    if (previous == -1) {
+                        metadata[0] = length;
+                        metadata[1] = 1;
+                        return;
+                    }
+                    if (previous == current) {
+                        metadata[0] = length;
+                        metadata[1] = -3;
+                        return;
+                    }
+                    current = previous;
+                }
+
+                metadata[0] = length;
+                metadata[1] = 0;
+            }
+            ''', 'backtrace_parent')
+
+        # A persistent search advances at most 2,000 waves.  Keep ample room
+        # for specialized relaxations while bounding cycle/corruption damage.
+        capacity = min(num_nodes, 16384)
+        if (self._fullgraph_backtrace_buffer is None
+                or self._fullgraph_backtrace_buffer.size < capacity):
+            self._fullgraph_backtrace_buffer = cp.empty(capacity, dtype=cp.int32)
+            self._fullgraph_backtrace_meta = cp.empty(2, dtype=cp.int32)
+
+        self._fullgraph_backtrace_kernel(
+            (1,), (1,),
+            (
+                parent_gpu,
+                cp.int32(best_dst),
+                cp.int32(num_nodes),
+                self._fullgraph_backtrace_buffer,
+                cp.int32(capacity),
+                self._fullgraph_backtrace_meta,
+            ),
+        )
+        length, status = self._fullgraph_backtrace_meta.get().tolist()
+        if status != 1 or length <= 0:
+            logger.error(
+                "[GPU-SEEDS] Device backtrace failed "
+                f"(status={status}, length={length}, capacity={capacity})"
+            )
+            return None
+
+        return self._fullgraph_backtrace_buffer[:length].get()[::-1].tolist()
