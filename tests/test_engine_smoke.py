@@ -316,6 +316,40 @@ def test_barrel_owner_routes_before_crossing_track(routed):
     assert ordered.index("BARREL_OWNER") < ordered.index("TRACK_VICTIM")
 
 
+def test_physical_offenders_bypass_edge_hotset_cap(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    physical = {f"PHYSICAL_{index}" for index in range(150)}
+    tasks = {
+        net_id: (path[0], path[-1])
+        for net_id in physical
+    }
+    edge = pf._net_to_edges["TEST_NET"][0]
+    old_present = pf.accounting.present[edge]
+    old_cap = pf.config.hotset_cap
+    old_physical = getattr(pf, "_barrel_conflict_nets", set())
+    old_clean = dict(getattr(pf, "_net_clean_iters", {}))
+    old_reroute = dict(getattr(pf, "_last_reroute_iter", {}))
+    old_hotset = set(getattr(pf, "_prev_hotset", set()))
+    try:
+        pf.accounting.present[edge] = (
+            pf.accounting.capacity[edge] + 1
+        )
+        pf.config.hotset_cap = 1
+        pf._barrel_conflict_nets = physical
+
+        hotset = pf._build_hotset(tasks)
+
+        assert physical <= hotset
+    finally:
+        pf.accounting.present[edge] = old_present
+        pf.config.hotset_cap = old_cap
+        pf._barrel_conflict_nets = old_physical
+        pf._net_clean_iters = old_clean
+        pf._last_reroute_iter = old_reroute
+        pf._prev_hotset = old_hotset
+
+
 def test_adjacent_via_chain_is_one_physical_column(routed):
     """Adjacent graph hops in one barrel count as one physical via."""
     pf, _, _, _ = routed
