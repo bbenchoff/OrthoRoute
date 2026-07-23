@@ -157,6 +157,45 @@ def test_via_ownership_is_reversible_and_tracks_collisions(routed):
     }
 
 
+def test_path_node_use_prices_tracks_for_later_vias(routed):
+    """Planar copper must be visible before a later net chooses a via."""
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    path_nodes = pf._unique_path_nodes(path)
+    via_nodes = set(pf._via_nodes_for_path(path))
+    planar_node = next(node for node in path_nodes if node not in via_nodes)
+
+    pf._rebuild_path_node_use()
+    assert np.all(pf.path_node_use[path_nodes] == 1)
+
+    old_pres_fac = getattr(pf, "_pres_fac_now", 1.0)
+    pf._pres_fac_now = 2.0
+    penalty = pf._build_owner_penalty(None, "OTHER_NET")
+    expected = pf.config.path_node_penalty_base * pf._pres_fac_now
+    assert penalty[planar_node] == pytest.approx(expected)
+    pf._pres_fac_now = old_pres_fac
+
+    pf._clear_path_node_use(path)
+    assert np.all(pf.path_node_use[path_nodes] == 0)
+    pf._mark_path_node_use(path)
+    assert np.all(pf.path_node_use[path_nodes] == 1)
+
+
+def test_barrel_owner_routes_before_crossing_track(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    tasks = {
+        "BARREL_OWNER": (path[0], path[-1]),
+        "TRACK_VICTIM": (path[0], path[-1]),
+    }
+    pf._barrel_owner_nets = {"BARREL_OWNER"}
+    pf._barrel_victim_nets = {"TRACK_VICTIM"}
+
+    ordered = pf._order_nets_by_difficulty(tasks)
+
+    assert ordered.index("BARREL_OWNER") < ordered.index("TRACK_VICTIM")
+
+
 def test_adjacent_via_chain_is_one_physical_column(routed):
     """Adjacent graph hops in one barrel count as one physical via."""
     pf, _, _, _ = routed

@@ -581,6 +581,10 @@ class PathFinderConfig:
     # owner_penalty_base * pres_fac instead of being hard-forbidden, so
     # barrel conflicts are negotiated like any other congestion.
     owner_penalty_base: float = 25.0
+    # A via inserted after a planar route cannot see that track in the
+    # via-only ownership map. Price every occupied path node lightly so
+    # track-via conflicts are symmetric within the same routing pass.
+    path_node_penalty_base: float = 0.05
     # CONVERGENCE SCHEDULE (BALANCED BASED ON DIAGNOSTICS):
     pres_fac_init: float = 1.0   # Start gentle (iteration 1)
     pres_fac_mult: float = 1.10  # Gentler exponential to keep history competitive (was 1.15)
@@ -2399,6 +2403,10 @@ class PathFinderRouter:
         self.node_owner = np.full(self.lattice.num_nodes, -1, dtype=np.int32)
         self._node_owner_members: Dict[int, Set[int]] = {}
         self.node_owner_gpu = None
+        self.path_node_use = np.zeros(
+            self.lattice.num_nodes, dtype=np.int16
+        )
+        self.path_node_use_gpu = None
         self.net_id_map = {}  # net_name -> integer ID
         self.next_net_id = 0
         logger.info(f"[NODE-OWNER] Initialized node ownership tracking for {self.lattice.num_nodes:,} nodes")
@@ -2416,6 +2424,7 @@ class PathFinderRouter:
             try:
                 self.solver.gpu_solver = CUDADijkstra(self.graph, self.lattice)
                 self.node_owner_gpu = cp.asarray(self.node_owner)
+                self.path_node_use_gpu = cp.asarray(self.path_node_use)
                 logger.info("[GPU] CUDA Near-Far Dijkstra enabled (ROI > 5K nodes) with lattice dims")
                 # Log GPU details
                 device = cp.cuda.Device()
@@ -3149,6 +3158,51 @@ class PathFinderRouter:
 
         # REBUILD NODE OWNERSHIP (the correct solution!)
         self._rebuild_node_owner()
+        self._rebuild_path_node_use()
+
+    @staticmethod
+    def _unique_path_nodes(path: List[int]) -> np.ndarray:
+        if not path:
+            return np.empty(0, dtype=np.int32)
+        return np.unique(np.asarray(path, dtype=np.int32))
+
+    def _rebuild_path_node_use(self) -> None:
+        """Rebuild soft node occupancy from all committed routes."""
+        if not hasattr(self, "path_node_use"):
+            return
+        self.path_node_use.fill(0)
+        for path in self.net_paths.values():
+            nodes = self._unique_path_nodes(path)
+            if nodes.size:
+                self.path_node_use[nodes] += 1
+        if self.path_node_use_gpu is not None:
+            self.path_node_use_gpu[:] = cp.asarray(self.path_node_use)
+
+    def _mark_path_node_use(self, path: List[int]) -> None:
+        """Make a newly committed route visible to later routes."""
+        nodes = self._unique_path_nodes(path)
+        if not nodes.size:
+            return
+        self.path_node_use[nodes] += 1
+        if self.path_node_use_gpu is not None:
+            nodes_gpu = cp.asarray(nodes)
+            self.path_node_use_gpu[nodes_gpu] = cp.asarray(
+                self.path_node_use[nodes]
+            )
+
+    def _clear_path_node_use(self, path: List[int]) -> None:
+        """Remove a ripped route from soft node occupancy."""
+        nodes = self._unique_path_nodes(path)
+        if not nodes.size:
+            return
+        self.path_node_use[nodes] = np.maximum(
+            self.path_node_use[nodes] - 1, 0
+        )
+        if self.path_node_use_gpu is not None:
+            nodes_gpu = cp.asarray(nodes)
+            self.path_node_use_gpu[nodes_gpu] = cp.asarray(
+                self.path_node_use[nodes]
+            )
 
     def _rebuild_node_owner(self):
         """
@@ -3396,14 +3450,27 @@ class PathFinderRouter:
         current_net_id = self._get_net_id(current_net)
         owners = self.node_owner if roi_nodes is None else self.node_owner[roi_nodes]
         foreign = (owners != -1) & (owners != current_net_id)
+        path_use = (
+            self.path_node_use
+            if roi_nodes is None else self.path_node_use[roi_nodes]
+        )
+        occupied = path_use > 0
         if roi_nodes is None and force_allow_nodes is not None:
             foreign[force_allow_nodes] = False
-        if not foreign.any():
+            occupied[force_allow_nodes] = False
+        if not foreign.any() and not occupied.any():
             return None
 
         weight = (float(getattr(self.config, 'owner_penalty_base', 25.0))
                   * float(getattr(self, '_pres_fac_now', 1.0)))
-        return foreign.astype(np.float32) * weight
+        path_weight = (
+            float(getattr(self.config, 'path_node_penalty_base', 0.05))
+            * float(getattr(self, '_pres_fac_now', 1.0))
+        )
+        return (
+            foreign.astype(np.float32) * weight
+            + occupied.astype(np.float32) * path_weight
+        )
 
     def _build_owner_penalty_gpu(self, current_net: str,
                                  force_allow_nodes=None):
@@ -3424,6 +3491,16 @@ class PathFinderRouter:
             weight,
             cp.float32(0.0),
         ).astype(cp.float32, copy=False)
+        path_weight = np.float32(
+            float(getattr(self.config, 'path_node_penalty_base', 0.05))
+            * float(getattr(self, '_pres_fac_now', 1.0))
+        )
+        if self.path_node_use_gpu is not None and path_weight > 0:
+            penalty += cp.where(
+                self.path_node_use_gpu > 0,
+                path_weight,
+                cp.float32(0.0),
+            )
         if force_allow_nodes is not None and len(force_allow_nodes) > 0:
             penalty[cp.asarray(force_allow_nodes, dtype=cp.int32)] = 0.0
         return penalty
@@ -4925,7 +5002,21 @@ class PathFinderRouter:
             difficulty = distance * (pin_degree + 1) * (congestion + 1)
             scores.append((difficulty, net_id))
 
-        scores.sort(reverse=True)  # hardest first
+        # When repairing barrel conflicts, commit the barrel owner before the
+        # track that crosses it. Reversing that order recreates an unavoidable
+        # portal via after the victim has already routed through its cell.
+        owner_nets = getattr(self, "_barrel_owner_nets", set())
+        victim_nets = getattr(self, "_barrel_victim_nets", set())
+        scores.sort(
+            key=lambda item: (
+                2 if item[1] in owner_nets and item[1] not in victim_nets
+                else 1 if item[1] in owner_nets
+                else 0,
+                item[0],
+                item[1],
+            ),
+            reverse=True,
+        )
 
         # Apply slight shuffle: rotate order by small random amount
         rotation = random.randint(0, min(5, len(scores) // 10))
@@ -4996,6 +5087,7 @@ class PathFinderRouter:
                 self._clear_via_barrel_ownership_for_path(
                     net_id, self.net_paths[net_id]
                 )
+                self._clear_path_node_use(self.net_paths[net_id])
                 self.accounting.clear_path(old_edges)
                 if live_present_costs:
                     self.accounting.refresh_live_present_costs(old_edges)
@@ -5133,6 +5225,7 @@ class PathFinderRouter:
 
                                 # CRITICAL: Mark via barrel ownership IMMEDIATELY for next net in same iteration!
                                 self._mark_via_barrel_ownership_for_path(net_id, path)
+                                self._mark_path_node_use(path)
 
                                 if entry_layer is not None and exit_layer is not None:
                                     self.net_portal_layers[net_id] = (entry_layer, exit_layer)
@@ -5374,6 +5467,7 @@ class PathFinderRouter:
 
                 # CRITICAL: Mark via barrel ownership IMMEDIATELY for next net in same iteration!
                 self._mark_via_barrel_ownership_for_path(net_id, path)
+                self._mark_path_node_use(path)
 
                 # Store portal entry/exit layers if using portals
                 if use_portals and entry_layer is not None and exit_layer is not None:
@@ -6158,6 +6252,8 @@ class PathFinderRouter:
 
         logger.debug("[BARREL-CONFLICT] Checking for via barrel conflicts...")
         self._barrel_conflict_nets = set()
+        self._barrel_owner_nets = set()
+        self._barrel_victim_nets = set()
 
         # Bail out if node_owner not initialized
         if not hasattr(self, 'node_owner') or self.node_owner is None:
@@ -6236,24 +6332,35 @@ class PathFinderRouter:
 
         if conflict_count > 0:
             conflict_positions = np.flatnonzero(conflict_mask)
-            conflict_net_ids = set(
+            victim_net_ids = set(
                 map(int, edge_net_ids[conflict_positions])
             )
+            owner_net_ids = set()
             conflict_nodes = np.unique(np.concatenate([
                 src_nodes[conflict_positions],
                 dst_nodes[conflict_positions],
             ]))
             for node_idx in conflict_nodes:
-                conflict_net_ids.update(
+                owner_net_ids.update(
                     self._node_owner_members.get(int(node_idx), ())
                 )
             id_to_name = {
                 numeric_id: name
                 for name, numeric_id in self.net_id_map.items()
             }
+            self._barrel_victim_nets = {
+                id_to_name[numeric_id]
+                for numeric_id in victim_net_ids
+                if numeric_id in id_to_name
+            }
+            self._barrel_owner_nets = {
+                id_to_name[numeric_id]
+                for numeric_id in owner_net_ids
+                if numeric_id in id_to_name
+            }
             self._barrel_conflict_nets = {
                 id_to_name[numeric_id]
-                for numeric_id in conflict_net_ids
+                for numeric_id in (victim_net_ids | owner_net_ids)
                 if numeric_id in id_to_name
             }
             logger.info(f"[BARREL-CONFLICT] Detected {conflict_count} conflicts (checked {len(edge_indices)} edges)")
