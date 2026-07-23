@@ -124,6 +124,32 @@ def test_selected_portals_match_path_and_emitted_stubs(routed):
     assert portal_points <= stub_points
 
 
+def test_via_ownership_is_reversible_and_tracks_collisions(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    via_nodes = pf._via_nodes_for_path(path)
+    original_id = pf._get_net_id("TEST_NET")
+    other_id = pf._get_net_id("OTHER_NET")
+
+    pf._rebuild_node_owner()
+    assert all(pf.node_owner[node] == original_id for node in via_nodes)
+
+    pf._mark_via_barrel_ownership_for_path("OTHER_NET", path)
+    assert all(pf.node_owner[node] == -2 for node in via_nodes)
+
+    pf._clear_via_barrel_ownership_for_path("OTHER_NET", path)
+    assert all(pf.node_owner[node] == original_id for node in via_nodes)
+    assert all(
+        pf._node_owner_members[node] == {original_id}
+        for node in via_nodes
+    )
+    assert other_id not in {
+        owner
+        for members in pf._node_owner_members.values()
+        for owner in members
+    }
+
+
 def test_path_respects_hv_discipline(routed):
     """Every lateral step must follow its layer's legal axis."""
     pf, _, _, _ = routed
