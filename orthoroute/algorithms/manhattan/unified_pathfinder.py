@@ -3353,21 +3353,21 @@ class PathFinderRouter:
                     records=self._escape_reserved_records,
                     spatial=self._escape_reserved_spatial,
                 )
-                # A zero-conflict global assignment is already known.
-                # Candidate escape geometry that violates either that
-                # reservation or committed copper is physically illegal;
-                # on-grid ownership remains a negotiated cost below.
-                if committed_conflicts:
-                    continue
+                # When the global assignment is exact, preserve it as a hard
+                # physical reservation. Otherwise both reserved and already
+                # committed escape geometry remain expensive negotiated
+                # congestion. Making committed geometry a wall can eliminate
+                # every seed and strand the net before Pathfinder can rip the
+                # conflicting owner.
                 if (
                     getattr(self, "_escape_reservations_strict", False)
                     and reserved_conflicts
                 ):
                     continue
             candidate_penalty = float(getattr(portal, "score", 0.0))
-            if current_net is not None and reserved_conflicts:
+            if current_net is not None:
                 candidate_penalty += (
-                    reserved_conflicts
+                    (committed_conflicts + reserved_conflicts)
                     * float(getattr(
                         self.config,
                         "escape_reservation_penalty",
