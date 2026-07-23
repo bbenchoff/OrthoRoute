@@ -4672,6 +4672,12 @@ class PathFinderRouter:
         with fine ROI, lower via cost, higher history gain, and max 60 hotset.
         """
         logger.info("[DETAIL] Extracting conflict subgraph...")
+        original_paths = {
+            net_id: list(path)
+            for net_id, path in self.net_paths.items()
+        }
+        original_selected_portals = dict(self.net_selected_portals)
+        original_portal_layers = dict(self.net_portal_layers)
 
         present = self.accounting.present.get() if self.accounting.use_gpu else self.accounting.present
         cap = self.accounting.capacity.get() if self.accounting.use_gpu else self.accounting.capacity
@@ -4733,6 +4739,23 @@ class PathFinderRouter:
             logger.info(f"[DETAIL {detail_it}/10] overuse={over_sum} edges={over_cnt}")
 
             if over_sum == 0:
+                unrouted = {
+                    net_id
+                    for net_id in tasks
+                    if not self.net_paths.get(net_id)
+                }
+                if unrouted:
+                    conflict_nets = unrouted
+                    conflict_tasks.update({
+                        net_id: tasks[net_id]
+                        for net_id in unrouted
+                    })
+                    logger.info(
+                        "[DETAIL] Edge-clean state still has %d "
+                        "unrouted nets; continuing",
+                        len(unrouted),
+                    )
+                    continue
                 self._rebuild_node_owner()
                 _, barrel_conflicts = self._detect_barrel_conflicts()
                 self._last_barrel_conflict_count = barrel_conflicts
@@ -4777,6 +4800,25 @@ class PathFinderRouter:
 
         # Detail pass exhausted
         logger.warning(f"[DETAIL] Failed to reach zero: final overuse={best_overuse}")
+        # A refinement attempt is speculative. Do not return a lower-overuse
+        # state that achieved it by dropping nets.
+        self.net_paths.clear()
+        self.net_paths.update(original_paths)
+        self.net_selected_portals.clear()
+        self.net_selected_portals.update(original_selected_portals)
+        self.net_portal_layers.clear()
+        self.net_portal_layers.update(original_portal_layers)
+        self.accounting.canonical.clear()
+        self.accounting.present.fill(0)
+        self._net_to_edges.clear()
+        self._edge_to_nets.clear()
+        for net_id, path in self.net_paths.items():
+            if not path or len(path) < 2:
+                continue
+            edge_indices = self._path_to_edges(path)
+            self.accounting.commit_path(edge_indices)
+            self._update_net_edge_tracking(net_id, edge_indices)
+        self._rebuild_via_usage_from_committed()
         return {'success': False, 'error_code': 'DETAIL-INCOMPLETE', 'overuse_sum': best_overuse}
 
     def _order_nets_by_difficulty(self, tasks: Dict[str, Tuple[int, int]]) -> List[str]:
