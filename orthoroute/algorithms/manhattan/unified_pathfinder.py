@@ -4480,7 +4480,11 @@ class PathFinderRouter:
 
             # STEP 6: Terminate?
             if failed == 0 and over_sum == 0:
-                barrel_conflicts = getattr(self, '_last_barrel_conflict_count', 0)
+                # A zero edge-overuse state is rare and worth a fresh audit;
+                # never trust a skipped/stale barrel count for export.
+                self._rebuild_node_owner()
+                _, barrel_conflicts = self._detect_barrel_conflicts()
+                self._last_barrel_conflict_count = barrel_conflicts
                 if barrel_conflicts == 0:
                     logger.info("[SUCCESS] Zero overuse, zero failed nets, AND zero barrel conflicts!")
                 else:
@@ -4499,7 +4503,9 @@ class PathFinderRouter:
                 if barrel_conflicts > 0:
                     logger.warning(f"[CONVERGENCE] Edge overuse=0 but {barrel_conflicts} barrel conflicts remain")
                     logger.warning(f"[CONVERGENCE] Continuing to iteration {it+1} to resolve barrel conflicts...")
-                    # Don't return yet - continue iterating to resolve barrel conflicts
+                    self._last_ripped = set(
+                        getattr(self, "_barrel_conflict_nets", ())
+                    )
                 else:
                     # TRUE convergence: zero edge overuse AND zero barrel conflicts
                     logger.info("[COLLISION] 0 edges over capacity ✓ PERFECT!")
@@ -4591,14 +4597,18 @@ class PathFinderRouter:
             logger.info(f"ROUTING COMPLETE: All {len(tasks)} nets routed successfully with zero overuse!")
             logger.info("="*80)
 
-        # Determine success based on edge convergence
-        # Note: Barrel conflicts are reported but don't affect success/convergence
-        final_barrel_conflicts = getattr(self, '_last_barrel_conflict_count', 0)
+        # Final success requires a fresh physical barrel audit as well as
+        # edge capacity. A via collision is an electrical short.
+        self._rebuild_node_owner()
+        _, final_barrel_conflicts = self._detect_barrel_conflicts()
+        self._last_barrel_conflict_count = final_barrel_conflicts
         excluded_nets = getattr(self, '_excluded_nets', set())
-        success = (failed == 0 and over_sum == 0)
-
-        if success and final_barrel_conflicts > 0:
-            logger.info(f"[FINAL] Edge routing converged ({final_barrel_conflicts} barrel conflicts remain - acceptable)")
+        success = (
+            failed == 0
+            and over_sum == 0
+            and final_barrel_conflicts == 0
+            and not excluded_nets
+        )
 
         if excluded_nets:
             logger.warning(f"[FINAL] {len(excluded_nets)} nets excluded as unroutable: {list(excluded_nets)[:10]}...")
@@ -4729,6 +4739,24 @@ class PathFinderRouter:
             logger.info(f"[DETAIL {detail_it}/10] overuse={over_sum} edges={over_cnt}")
 
             if over_sum == 0:
+                self._rebuild_node_owner()
+                _, barrel_conflicts = self._detect_barrel_conflicts()
+                self._last_barrel_conflict_count = barrel_conflicts
+                if barrel_conflicts:
+                    conflict_nets = set(
+                        getattr(self, "_barrel_conflict_nets", ())
+                    )
+                    conflict_tasks.update({
+                        net_id: tasks[net_id]
+                        for net_id in conflict_nets
+                        if net_id in tasks
+                    })
+                    logger.info(
+                        "[DETAIL] Edge-clean state has %d barrel "
+                        "conflicts; continuing",
+                        barrel_conflicts,
+                    )
+                    continue
                 logger.info("[DETAIL] SUCCESS: Zero overuse achieved")
                 # Log GPU vs CPU pathfinding statistics
                 total_paths = self._gpu_path_count + self._cpu_path_count
@@ -6023,6 +6051,7 @@ class PathFinderRouter:
         import numpy as np
 
         logger.debug("[BARREL-CONFLICT] Checking for via barrel conflicts...")
+        self._barrel_conflict_nets = set()
 
         # Bail out if node_owner not initialized
         if not hasattr(self, 'node_owner') or self.node_owner is None:
@@ -6097,6 +6126,27 @@ class PathFinderRouter:
         conflict_count = len(conflict_edge_indices)
 
         if conflict_count > 0:
+            conflict_positions = np.flatnonzero(conflict_mask)
+            conflict_net_ids = set(
+                map(int, edge_net_ids[conflict_positions])
+            )
+            for position in conflict_positions:
+                for node_idx in (
+                    int(src_nodes[position]),
+                    int(dst_nodes[position]),
+                ):
+                    conflict_net_ids.update(
+                        self._node_owner_members.get(node_idx, ())
+                    )
+            id_to_name = {
+                numeric_id: name
+                for name, numeric_id in self.net_id_map.items()
+            }
+            self._barrel_conflict_nets = {
+                id_to_name[numeric_id]
+                for numeric_id in conflict_net_ids
+                if numeric_id in id_to_name
+            }
             logger.info(f"[BARREL-CONFLICT] Detected {conflict_count} conflicts (checked {len(edge_indices)} edges)")
         else:
             logger.info(f"[BARREL-CONFLICT] No conflicts found (checked {len(edge_indices)} edges)")

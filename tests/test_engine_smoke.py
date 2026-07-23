@@ -136,9 +136,13 @@ def test_via_ownership_is_reversible_and_tracks_collisions(routed):
 
     pf._mark_via_barrel_ownership_for_path("OTHER_NET", path)
     assert all(pf.node_owner[node] == -2 for node in via_nodes)
+    _, conflicts = pf._detect_barrel_conflicts()
+    assert conflicts > 0
+    assert {"TEST_NET", "OTHER_NET"} <= pf._barrel_conflict_nets
 
     pf._clear_via_barrel_ownership_for_path("OTHER_NET", path)
     assert all(pf.node_owner[node] == original_id for node in via_nodes)
+    assert pf._detect_barrel_conflicts()[1] == 0
     assert all(
         pf._node_owner_members[node] == {original_id}
         for node in via_nodes
