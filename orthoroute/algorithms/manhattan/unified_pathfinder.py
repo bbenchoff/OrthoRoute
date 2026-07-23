@@ -860,12 +860,32 @@ class EdgeAccountant:
         self.capacity = self.xp.ones(num_edges, dtype=self.xp.float32)
         self.total_cost = None
 
+    @property
+    def edge_usage(self):
+        """Compatibility view of canonical sparse edge occupancy."""
+        return self.canonical
+
     def refresh_from_canonical(self):
         """Rebuild present"""
         self.present.fill(0)
-        for idx, count in self.canonical.items():
-            if 0 <= idx < self.E:
-                self.present[idx] = float(count)
+        if not self.canonical:
+            return
+        indices = np.fromiter(
+            self.canonical.keys(),
+            dtype=np.int64,
+            count=len(self.canonical),
+        )
+        counts = np.fromiter(
+            self.canonical.values(),
+            dtype=np.float32,
+            count=len(self.canonical),
+        )
+        valid = (indices >= 0) & (indices < self.E)
+        if not valid.all():
+            indices = indices[valid]
+            counts = counts[valid]
+        device_indices = self.xp.asarray(indices)
+        self.present[device_indices] = self.xp.asarray(counts)
 
     def commit_path(self, edge_indices: List[int]):
         """Add path and keep present in sync.
@@ -948,9 +968,23 @@ class EdgeAccountant:
     def verify_present_matches_canonical(self) -> bool:
         """Sanity check: verify present usage matches canonical store"""
         recomputed = self.xp.zeros(self.E, dtype=self.xp.float32)
-        for idx, count in self.canonical.items():
-            if 0 <= idx < self.E:
-                recomputed[idx] = float(count)
+        if self.canonical:
+            indices = np.fromiter(
+                self.canonical.keys(),
+                dtype=np.int64,
+                count=len(self.canonical),
+            )
+            counts = np.fromiter(
+                self.canonical.values(),
+                dtype=np.float32,
+                count=len(self.canonical),
+            )
+            valid = (indices >= 0) & (indices < self.E)
+            if not valid.all():
+                indices = indices[valid]
+                counts = counts[valid]
+            device_indices = self.xp.asarray(indices)
+            recomputed[device_indices] = self.xp.asarray(counts)
 
         if self.use_gpu:
             present_cpu = self.present.get()
@@ -4377,8 +4411,10 @@ class PathFinderRouter:
             if over_sum == 0:
                 unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
                 if not unrouted:
-                    logger.info("[CLEAN] All nets routed with zero overuse")
-                    break
+                    logger.info(
+                        "[CLEAN] All nets routed with zero edge overuse; "
+                        "continuing to the barrel audit"
+                    )
                 # Freeze placed nets and lower pressure for stragglers
                 placed = {nid for nid in tasks.keys() if self.net_paths.get(nid)}
                 pres_fac = min(pres_fac, 10.0)
@@ -5491,21 +5527,17 @@ class PathFinderRouter:
 
     def _rebuild_usage_from_committed_nets(self, keep_net_ids: Set[str]):
         """
-        Rebuild present usage from scratch based on committed nets.
-        Prevents ghost usage accumulation.
+        Refresh device usage from the canonical edge counts.
+
+        commit_path/clear_path maintain canonical synchronously with
+        net_paths. Rewalking every path here performed one GPU scalar update
+        per edge and dominated large-board iterations.
         """
-        # Clear accounting
-        self.accounting.canonical.clear()
-        self.accounting.present.fill(0)
-
-        # Rebuild from nets we're keeping
-        for net_id in keep_net_ids:
-            if net_id in self._net_to_edges:
-                for ei in self._net_to_edges[net_id]:
-                    self.accounting.canonical[ei] = self.accounting.canonical.get(ei, 0) + 1
-                    self.accounting.present[ei] += 1
-
-        logger.debug(f"[USAGE] Rebuilt from {len(keep_net_ids)} committed nets")
+        self.accounting.refresh_from_canonical()
+        logger.debug(
+            f"[USAGE] Refreshed {len(keep_net_ids)} committed nets "
+            "from canonical counts"
+        )
 
     def _update_net_edge_tracking(self, net_id: str, edge_indices: List[int]):
         """Update edge-to-nets tracking when a net is routed"""
