@@ -75,6 +75,9 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
     }
     total_lateral = sum(lateral_steps_per_layer.values())
     overuse_total, overuse_count = pf.accounting.compute_overuse(pf)
+    barrel_conflicts = int(
+        getattr(pf, "_last_barrel_conflict_count", 0)
+    )
 
     return {
         "board": {
@@ -100,12 +103,18 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             "excluded_nets": len(excluded_ids),
             "excluded_net_ids": sorted(excluded_ids),
             "unrouted_net_ids": unrouted_ids,
-            "complete": len(completed_ids) == len(routable_ids) and not excluded_ids,
+            "complete": (
+                len(completed_ids) == len(routable_ids)
+                and not excluded_ids
+                and int(overuse_total) == 0
+                and barrel_conflicts == 0
+            ),
         },
         "convergence": {
             "iterations": getattr(pf, "iteration", None),
             "overuse_total": int(overuse_total),
             "overuse_count": int(overuse_count),
+            "barrel_conflicts": barrel_conflicts,
         },
         "copper": {
             "wirelength_mm": round(total_lateral * pitch, 3),
