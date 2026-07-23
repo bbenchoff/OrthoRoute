@@ -6067,36 +6067,39 @@ class PathFinderRouter:
 
         logger.info(f"[BARREL-CONFLICT] Found {len(paths_dict)} committed paths")
 
-        # Collect all committed edges with their net IDs
-        all_edge_indices = []
-        all_net_ids = []
+        # Collect cached committed edges in vectorized chunks. Recomputing
+        # every path and extending Python lists one integer at a time made
+        # this audit dominate large-board iterations.
+        edge_chunks = []
+        net_id_chunks = []
 
         for net_name, path in paths_dict.items():
             if not path or len(path) < 2:
                 continue
 
             net_id = self._get_net_id(net_name)
-            edge_indices = self._path_to_edges(path)
+            net_edges = self._net_to_edges.get(net_name)
+            if net_edges is None:
+                net_edges = self._path_to_edges(path)
+            if not net_edges:
+                continue
+            edge_chunk = np.asarray(net_edges, dtype=np.int32)
+            edge_chunks.append(edge_chunk)
+            net_id_chunks.append(
+                np.full(edge_chunk.size, net_id, dtype=np.int32)
+            )
 
-            all_edge_indices.extend(edge_indices)
-            all_net_ids.extend([net_id] * len(edge_indices))
-
-        if len(all_edge_indices) == 0:
+        if not edge_chunks:
             logger.info("[BARREL-CONFLICT] No edges found in paths")
             return np.array([], dtype=np.int32), 0
 
-        logger.info(f"[BARREL-CONFLICT] Checking {len(all_edge_indices)} edges across {len(paths_dict)} nets")
+        edge_indices = np.concatenate(edge_chunks)
+        edge_net_ids = np.concatenate(net_id_chunks)
+        logger.info(f"[BARREL-CONFLICT] Checking {len(edge_indices)} edges across {len(paths_dict)} nets")
 
-        # Convert to arrays
-        edge_indices = np.array(all_edge_indices, dtype=np.int32)
-        edge_net_ids = np.array(all_net_ids, dtype=np.int32)
-
-        # Get graph data (handle CPU/GPU)
-        graph_indices = self.graph.indices
-        if hasattr(graph_indices, 'get'):
-            graph_indices_cpu = graph_indices.get()
-        else:
-            graph_indices_cpu = graph_indices
+        # SimpleDijkstra already owns the CPU CSR arrays. Reuse them instead
+        # of downloading the full destination array from the GPU per audit.
+        graph_indices_cpu = self.solver.indices
 
         # VECTORIZED CONFLICT DETECTION (GPU-accelerated!)
         # Get source and destination nodes for all edges at once
@@ -6124,14 +6127,14 @@ class PathFinderRouter:
             conflict_net_ids = set(
                 map(int, edge_net_ids[conflict_positions])
             )
-            for position in conflict_positions:
-                for node_idx in (
-                    int(src_nodes[position]),
-                    int(dst_nodes[position]),
-                ):
-                    conflict_net_ids.update(
-                        self._node_owner_members.get(node_idx, ())
-                    )
+            conflict_nodes = np.unique(np.concatenate([
+                src_nodes[conflict_positions],
+                dst_nodes[conflict_positions],
+            ]))
+            for node_idx in conflict_nodes:
+                conflict_net_ids.update(
+                    self._node_owner_members.get(int(node_idx), ())
+                )
             id_to_name = {
                 numeric_id: name
                 for name, numeric_id in self.net_id_map.items()
