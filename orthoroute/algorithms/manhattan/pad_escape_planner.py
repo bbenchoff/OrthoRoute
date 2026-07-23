@@ -726,8 +726,7 @@ class PadEscapePlanner:
                            pad_geometries: Dict, spatial_index: Dict = None,
                            claim_cell: bool = True,
                            allow_occupied_cell: Tuple[int, int] = None,
-                           axis: str = "y",
-                           cross_delta_steps: int = 0) -> Optional[Portal]:
+                           axis: str = "y") -> Optional[Portal]:
         """
         Try to create a portal with given parameters, return None if DRC fails.
 
@@ -758,9 +757,9 @@ class PadEscapePlanner:
         """
         if axis == "x":
             x_idx_portal = x_idx + direction * delta_steps
-            y_idx_portal = y_idx + cross_delta_steps
+            y_idx_portal = y_idx
         else:
-            x_idx_portal = x_idx + cross_delta_steps
+            x_idx_portal = x_idx
             y_idx_portal = y_idx + direction * delta_steps
         if not (
             0 <= x_idx_portal < self.lattice.x_steps
@@ -982,81 +981,28 @@ class PadEscapePlanner:
             choices = []
             for direction in (primary.direction, -primary.direction):
                 for delta in range(3, 13):
-                    for cross_delta in (0, -1, 1, -2, 2):
-                        x_portal = x_idx + cross_delta
-                        y_portal = y_idx + direction * delta
-                        if not (
-                            0 <= x_portal < self.lattice.x_steps
-                            and 0 <= y_portal < self.lattice.y_steps
-                        ):
-                            continue
-                        length_delta = abs(
-                            delta - primary.delta_steps
-                        )
-                        direction_penalty = (
-                            0
-                            if direction == primary.direction
-                            else 1
-                        )
-                        rank = (
-                            max(
-                                length_delta,
-                                abs(cross_delta),
-                                direction_penalty,
-                            ),
-                            length_delta
-                            + abs(cross_delta)
-                            + direction_penalty,
-                            0,
-                            delta,
-                            cross_delta,
-                        )
-                        choices.append((
-                            rank,
-                            "y",
-                            direction,
-                            delta,
-                            cross_delta,
-                        ))
+                    y_portal = y_idx + direction * delta
+                    if not (0 <= y_portal < self.lattice.y_steps):
+                        continue
+                    rank = (
+                        abs(delta - primary.delta_steps),
+                        0 if direction == primary.direction else 1,
+                        delta,
+                    )
+                    choices.append((rank, "y", direction, delta))
             for direction in (-1, 1):
                 for delta in range(3, 13):
-                    for cross_delta in (0, -1, 1, -2, 2):
-                        x_portal = x_idx + direction * delta
-                        y_portal = y_idx + cross_delta
-                        if not (
-                            0 <= x_portal < self.lattice.x_steps
-                            and 0 <= y_portal < self.lattice.y_steps
-                        ):
-                            continue
-                        length_delta = abs(
-                            delta - primary.delta_steps
-                        )
-                        rank = (
-                            max(
-                                length_delta,
-                                abs(cross_delta),
-                                1,
-                            ),
-                            length_delta + abs(cross_delta) + 1,
-                            1,
-                            delta,
-                            cross_delta,
-                        )
-                        choices.append((
-                            rank,
-                            "x",
-                            direction,
-                            delta,
-                            cross_delta,
-                        ))
+                    x_portal = x_idx + direction * delta
+                    if not (0 <= x_portal < self.lattice.x_steps):
+                        continue
+                    rank = (
+                        abs(delta - primary.delta_steps),
+                        2,
+                        delta,
+                    )
+                    choices.append((rank, "x", direction, delta))
 
-            for (
-                _,
-                axis,
-                direction,
-                delta,
-                cross_delta,
-            ) in sorted(choices):
+            for _, axis, direction, delta in sorted(choices):
                 if len(candidates) >= candidate_limit:
                     break
                 portal = self._try_create_portal(
@@ -1079,7 +1025,6 @@ class PadEscapePlanner:
                         primary.x_idx, primary.y_idx
                     ),
                     axis=axis,
-                    cross_delta_steps=cross_delta,
                 )
                 if portal is None:
                     continue
@@ -1090,9 +1035,6 @@ class PadEscapePlanner:
                 portal.score = (
                     abs(delta - primary.delta_steps)
                     * float(self.config.grid_pitch)
-                    + abs(cross_delta)
-                    * float(self.config.grid_pitch)
-                    * 0.25
                     + (
                         float(self.config.grid_pitch)
                         if (
