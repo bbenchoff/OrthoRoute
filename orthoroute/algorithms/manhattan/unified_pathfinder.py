@@ -1841,6 +1841,17 @@ class ROIExtractor:
         # Board is 244×227mm, so depth=800 would cover ENTIRE board!
         max_depth = min(int(initial_radius + stagnation_bonus * 2.0), 80)
         met = False
+        meeting_depth = None
+        # Stopping as soon as the two waves first touch produces a
+        # shortest-hop corridor, but negotiated congestion needs several
+        # alternate lanes around that corridor.  Keep a bounded halo beyond
+        # the first meeting instead of expanding all the way to max_depth.
+        # Grow the halo slightly after stagnation so a squeezed route gains
+        # alternatives without making every initial ROI board-sized.
+        post_meet_halo = min(
+            16,
+            2 + int(max(0.0, stagnation_bonus) / 0.6),
+        )
 
         # Limit ROI size for efficiency - smaller ROIs converge MUCH faster on GPU!
         # 50K nodes = ~60×60×12 region (24mm × 24mm × 12 layers @ 0.4mm pitch)
@@ -1848,7 +1859,7 @@ class ROIExtractor:
         # Target: <50 iterations instead of 500+ on full graph
         max_nodes = getattr(self, "max_roi_nodes", 50_000)
 
-        while depth < max_depth and (q_src or q_dst) and not met:
+        while depth < max_depth and (q_src or q_dst):
             def step(queue, mark):
                 next_q = []
                 met_flag = False
@@ -1870,11 +1881,18 @@ class ROIExtractor:
             q_src, met_src = step(q_src, 1)
             if met_src:
                 met = True
-            if not met:
-                q_dst, met_dst = step(q_dst, 2)
-                if met_dst:
-                    met = True
+            q_dst, met_dst = step(q_dst, 2)
+            if met_dst:
+                met = True
             depth += 1
+
+            if met and meeting_depth is None:
+                meeting_depth = depth
+            if (
+                meeting_depth is not None
+                and depth >= meeting_depth + post_meet_halo
+            ):
+                break
 
             # Early stop if ROI exceeds max size (will be truncated anyway)
             if (seen > 0).sum() > max_nodes * 1.5:

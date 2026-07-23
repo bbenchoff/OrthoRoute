@@ -65,11 +65,6 @@ def test_all_nets_still_route_around_keepout(routed_with_keepout):
     assert routed == len(board.nets), "keepout made board unroutable"
 
 
-@pytest.mark.xfail(reason="oscillation tail: the corridor squeeze leaves "
-                   "~7 overuse that negotiation never settles - same "
-                   "pathology as the bare 2x8 board needing 51 iterations. "
-                   "Flips green when the convergence tail is fixed.",
-                   strict=False)
 def test_zero_overuse_around_keepout(routed_with_keepout):
     pf, _ = routed_with_keepout
     total, _ = pf.accounting.compute_overuse(pf)
