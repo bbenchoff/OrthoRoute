@@ -4196,47 +4196,24 @@ class PathFinderRouter:
             if not self.accounting.verify_present_matches_canonical():
                 logger.warning(f"[ITER {it}] Accounting mismatch detected - potential bug")
 
-            # STEP 3.5: CRITICAL - Detect via barrel conflicts BEFORE computing overuse
-            # TWO-PHASE APPROACH:
-            #   Phase 1 (iters 1-50): Aggressively penalize barrel conflicts - check every iteration
-            #   Phase 2 (iters 51+): Disable penalties - only check every 10 iterations (for reporting)
-            BARREL_PHASE_1_ITERS = 50
-
-            # Detect barrel conflicts (expensive on large boards - skip in Phase 2 except every 10 iters)
-            if it <= BARREL_PHASE_1_ITERS or it % 10 == 0:
-                conflict_edge_indices, conflict_count = self._detect_barrel_conflicts()
-            else:
-                # Skip detection, use last known count
-                conflict_edge_indices = np.array([], dtype=np.int32)
-                conflict_count = getattr(self, '_last_barrel_conflict_count', 0)  # Aggressive barrel conflict reduction
+            # STEP 3.5: Detect via-barrel conflicts independently from edge
+            # capacity. Barrel collisions identify nets to reroute; they are
+            # not extra edge occupancy and must never be written into
+            # accounting.present (or learned permanently by edge history).
+            _, conflict_count = self._detect_barrel_conflicts()
 
             # Store barrel conflict count for iteration summary
             self._last_barrel_conflict_count = conflict_count
 
             if conflict_count > 0:
                 logger.debug(f"[BARREL-CONFLICT] Detected {conflict_count} barrel conflicts in iteration {it}")
+                self._last_ripped = (
+                    set(getattr(self, "_last_ripped", ()))
+                    | set(getattr(self, "_barrel_conflict_nets", ()))
+                )
 
-                if it <= BARREL_PHASE_1_ITERS:
-                    # PHASE 1: Apply penalty to reduce barrel conflicts
-                    pres = self.accounting.present
-                    conflict_penalty = min(10.0 * pres_fac, 100.0)  # Cap at 100
-
-                    if hasattr(pres, 'get'):
-                        # GPU array
-                        import cupy as cp
-                        conflict_indices_gpu = cp.asarray(conflict_edge_indices)
-                        pres[conflict_indices_gpu] += conflict_penalty
-                    else:
-                        # CPU array
-                        pres[conflict_edge_indices] += conflict_penalty
-
-                    logger.debug(f"[BARREL-CONFLICT] PHASE 1: Applied penalty {conflict_penalty:.1f} to {conflict_count} edges")
-                else:
-                    # PHASE 2: Detection only, no penalty - let PathFinder optimize
-                    if it == BARREL_PHASE_1_ITERS + 1:
-                        logger.info(f"[BARREL-CONFLICT] PHASE 2: Barrel penalties disabled (iter > {BARREL_PHASE_1_ITERS})")
-
-            # STEP 4: Overuse (now includes barrel conflicts as usage)
+            # STEP 4: Edge overuse. Barrel conflicts remain a separate
+            # convergence condition and hotset input.
             over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
 
             # Instrumentation: via overuse ratio
