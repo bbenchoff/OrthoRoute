@@ -19,6 +19,10 @@ boards).
 
 import pytest
 
+from orthoroute.algorithms.manhattan.unified_pathfinder import (
+    PathFinderConfig,
+    UnifiedPathFinder,
+)
 from orthoroute.infrastructure.kicad.file_parser import KiCadFileParser
 
 
@@ -134,3 +138,13 @@ class TestKiCad10Dialect:
         p1 = _by_ref(modern, "D1").pads[0]
         assert p1.position.x == pytest.approx(29.2, abs=1e-6)
         assert p1.position.y == pytest.approx(40.0, abs=1e-6)
+
+    def test_router_uses_string_names_from_parsed_stackup(self, modern):
+        router = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=False)
+
+        router.initialize_graph(modern)
+
+        assert router.config.layer_names == [
+            "F.Cu", "In1.Cu", "In2.Cu", "B.Cu",
+        ]
+        assert all(isinstance(name, str) for name in router.config.layer_names)
