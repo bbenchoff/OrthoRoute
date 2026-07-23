@@ -2913,6 +2913,14 @@ class PathFinderRouter:
         discount = float(getattr(
             self.config, "portal_via_discount", 0.15
         ))
+        if portal.dynamic_entry:
+            # A dynamic portal's explicit blind barrel occupies every layer
+            # from F.Cu to the chosen entry. Price those layers the same as
+            # the adjacent-span graph so deep punch-ins are available but
+            # no longer almost free.
+            discount = float(getattr(
+                self.config, "adjacent_via_step_scale", 4.0
+            ))
         for layer in routing_layers:
             node_idx = self.lattice.node_idx(
                 portal.x_idx, portal.y_idx, layer

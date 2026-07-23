@@ -235,6 +235,14 @@ def test_columnar_connectors_use_zero_conflict_dynamic_entries():
         pf.lattice.idx_to_coord(node)[2]
         for node, _ in portal_seeds
     } == {1, 3}
+    seed_costs = {
+        pf.lattice.idx_to_coord(node)[2]: cost
+        for node, cost in portal_seeds
+    }
+    assert seed_costs[1] == pytest.approx(
+        config.via_cost * config.adjacent_via_step_scale
+    )
+    assert seed_costs[3] == pytest.approx(3.0 * seed_costs[1])
     entry_layer = portal_seeds[0][0]
     entry_layer = pf.lattice.idx_to_coord(entry_layer)[2]
     geometry = pf.escape_planner._emit_portal_escape_geometry(
