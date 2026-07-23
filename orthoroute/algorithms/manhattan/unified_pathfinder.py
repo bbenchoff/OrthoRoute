@@ -2902,6 +2902,13 @@ class PathFinderRouter:
             if self.lattice.layers > 2
             else [1]
         )
+        if portal.dynamic_entry:
+            # The off-grid via reaches its lattice anchor with a short
+            # horizontal entry segment, so only horizontal layers are legal.
+            routing_layers = [
+                layer for layer in routing_layers
+                if self.lattice.get_legal_axis(layer) == "h"
+            ]
         via_base = float(getattr(self.config, "via_cost", 0.7))
         discount = float(getattr(
             self.config, "portal_via_discount", 0.15
@@ -2976,9 +2983,7 @@ class PathFinderRouter:
         )
 
     def _escape_record(self, net_id: str, pad_id: str, portal: Portal):
-        portal_xy = self.lattice.geom.lattice_to_world(
-            portal.x_idx, portal.y_idx
-        )
+        portal_xy = self.escape_planner._portal_world(portal)
         segments = tuple(self.escape_planner._escape_segments(
             portal.pad_x,
             portal.pad_y,
@@ -3187,6 +3192,38 @@ class PathFinderRouter:
         self._escape_spatial.clear()
         assignment = {}
 
+        # Preserve a geometry planner's known-feasible primary pattern. The
+        # remaining candidates are still available to each path search, but
+        # there is no reason to spend a global min-conflicts pass rediscovering
+        # a valid baseline.
+        for _, net_id, pad_id, candidates in entries:
+            assignment[pad_id] = candidates[0]
+            self._insert_escape_record(self._escape_record(
+                net_id, pad_id, candidates[0]
+            ))
+        primary_pairs, _, _ = self._detect_escape_conflicts()
+        if not primary_pairs:
+            self._escape_preferred_portals = assignment
+            self._escape_assignment_conflicts = set()
+            self._escape_reservations_strict = True
+            self._escape_reserved_records = dict(self._escape_records)
+            self._escape_reserved_spatial = defaultdict(set)
+            for key, record in self._escape_reserved_records.items():
+                for cell in record["cells"]:
+                    self._escape_reserved_spatial[cell].add(key)
+            self._escape_records.clear()
+            self._escape_spatial.clear()
+            logger.info(
+                "[ESCAPE-ASSIGN] Preserved zero-conflict primary "
+                "assignment for %d pads",
+                len(assignment),
+            )
+            return
+
+        self._escape_records.clear()
+        self._escape_spatial.clear()
+        assignment = {}
+
         # Constrained pads go first. Each later pad chooses the candidate
         # colliding with the fewest already assigned physical escapes.
         for _, net_id, pad_id, candidates in sorted(
@@ -3320,6 +3357,36 @@ class PathFinderRouter:
                     net_id, pad_id, assignment[pad_id]
                 ))
             pairs, _, _ = self._detect_escape_conflicts()
+
+        # Geometry-native planners may provide a known-feasible primary
+        # pattern plus flexible length alternatives. Never let heuristic
+        # candidate exploration discard that zero-conflict baseline.
+        if pairs:
+            primary_assignment = {
+                pad_id: candidates[0]
+                for _, _, pad_id, candidates in entries
+            }
+            self._escape_records.clear()
+            self._escape_spatial.clear()
+            for _, net_id, pad_id, _ in entries:
+                self._insert_escape_record(self._escape_record(
+                    net_id,
+                    pad_id,
+                    primary_assignment[pad_id],
+                ))
+            primary_pairs, _, _ = self._detect_escape_conflicts()
+            if len(primary_pairs) < len(pairs):
+                assignment = primary_assignment
+                pairs = primary_pairs
+            else:
+                self._escape_records.clear()
+                self._escape_spatial.clear()
+                for _, net_id, pad_id, _ in entries:
+                    self._insert_escape_record(self._escape_record(
+                        net_id,
+                        pad_id,
+                        assignment[pad_id],
+                    ))
 
         self._escape_preferred_portals = assignment
         self._escape_assignment_conflicts = set(pairs)
@@ -6263,6 +6330,8 @@ class PathFinderRouter:
         portal = self.portals.get(pad_id)
         if portal is None:
             return
+        if portal.dynamic_entry:
+            return
 
         if portal.retarget_count == 0:
             # Flip to the other side: y_pad - d*delta  ==  y_old + 2*(-d)*delta
@@ -7331,6 +7400,7 @@ class PathFinderRouter:
                         pad_id,
                         portal,
                         entry_layer,
+                        include_via=True,
                     )
                 )
                 for item in geometry:
@@ -7416,11 +7486,51 @@ class PathFinderRouter:
         self._geometry_payload = GeometryPayload(final_tracks, final_vias)
         return (len(final_tracks), len(final_vias))
 
+    def _path_without_dynamic_escape_chains(
+        self, net_id: str, path: List[int]
+    ) -> List[int]:
+        """Remove virtual anchor barrels supplied by explicit escape geometry."""
+        selected = self.net_selected_portals.get(net_id)
+        layers = self.net_portal_layers.get(net_id)
+        if not path or selected is None or layers is None:
+            return list(path)
+
+        start = 0
+        end = len(path)
+        src_portal, dst_portal = selected
+        src_layer, dst_layer = layers
+        if src_portal.dynamic_entry:
+            target = (
+                src_portal.x_idx,
+                src_portal.y_idx,
+                src_layer,
+            )
+            for index, node in enumerate(path):
+                if self.lattice.idx_to_coord(node) == target:
+                    start = index
+                    break
+        if dst_portal.dynamic_entry:
+            target = (
+                dst_portal.x_idx,
+                dst_portal.y_idx,
+                dst_layer,
+            )
+            for index in range(len(path) - 1, start - 1, -1):
+                if self.lattice.idx_to_coord(path[index]) == target:
+                    end = index + 1
+                    break
+        return list(path[start:end])
+
     def _generate_geometry_from_paths(self) -> Tuple[List, List]:
         """Generate tracks and vias from net_paths"""
         tracks, vias = [], []
 
         for net_id, path in self.net_paths.items():
+            if not path:
+                continue
+            path = self._path_without_dynamic_escape_chains(
+                net_id, path
+            )
             if not path:
                 continue
             path = self._coalesce_vertical_runs(path)

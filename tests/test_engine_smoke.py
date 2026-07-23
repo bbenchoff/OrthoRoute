@@ -15,6 +15,55 @@ from orthoroute.algorithms.manhattan.unified_pathfinder import (
 from conftest import make_two_pad_board
 
 
+def _make_columnar_connector_board():
+    """Two regular 8x4 SMD arrays joined pad-for-pad."""
+    from orthoroute.domain.models.board import (
+        Board, Component, Coordinate, Net, Pad,
+    )
+
+    board = Board(id="columnar", name="Columnar connectors")
+    board.layer_count = 6
+    components = []
+    pad_sets = []
+    row_offsets = (-1.7, 1.6, 3.2, 6.5)
+    for reference, base_y in (("J1", 10.0), ("J2", 30.0)):
+        component = Component(
+            id=reference,
+            reference=reference,
+            value="Dense",
+            footprint="Dense",
+            position=Coordinate(5.15, base_y),
+        )
+        pads = []
+        for column in range(8):
+            for row, y_offset in enumerate(row_offsets):
+                pad = Pad(
+                    id=f"{reference}_{column}_{row}",
+                    component_id=reference,
+                    net_id=None,
+                    position=Coordinate(
+                        5.15 + 0.4 * column,
+                        base_y + y_offset,
+                    ),
+                    size=(0.2, 1.15),
+                    layer="F.Cu",
+                    shape="rect",
+                )
+                component.pads.append(pad)
+                pads.append(pad)
+        board.add_component(component)
+        components.append(component)
+        pad_sets.append(pads)
+
+    for index, (first, second) in enumerate(zip(*pad_sets)):
+        board.add_net(Net(
+            id=f"N{index}",
+            name=f"N{index}",
+            pads=[first, second],
+        ))
+    return board
+
+
 @pytest.fixture(scope="module")
 def routed():
     """Route the synthetic board once; tests inspect the result."""
@@ -149,6 +198,77 @@ def test_escape_distance_detects_crossing_segments():
         ((0.0, 1.0), (1.0, 0.0)),
     )
     assert distance == 0.0
+
+
+def test_columnar_connectors_use_zero_conflict_dynamic_entries():
+    board = _make_columnar_connector_board()
+    config = PathFinderConfig()
+    config.track_width = 0.1016
+    config.clearance = 0.1016
+    config.via_diameter = 0.4
+    config.via_drill = 0.15
+    pf = UnifiedPathFinder(config=config, use_gpu=False)
+
+    pf.initialize_graph(board)
+    pf.precompute_all_pad_escapes(board)
+    tasks = pf._parse_requests(board.nets)
+    pf._plan_escape_assignment()
+
+    assert len(tasks) == 32
+    assert len(pf.portals) == 64
+    assert all(portal.dynamic_entry for portal in pf.portals.values())
+    assert all(
+        len(candidates) >= 2
+        for candidates in pf.portal_candidates.values()
+    )
+    assert pf._escape_reservations_strict
+    assert pf._escape_assignment_conflicts == set()
+
+    pad_id = pf.net_pad_ids["N0"][0]
+    portal = pf.portals[pad_id]
+    assert {
+        candidate.delta_steps
+        for candidate in pf.portal_candidates[pad_id]
+    } >= {3, 4}
+    portal_seeds = pf._get_portal_seeds(portal)
+    assert {
+        pf.lattice.idx_to_coord(node)[2]
+        for node, _ in portal_seeds
+    } == {1, 3}
+    entry_layer = portal_seeds[0][0]
+    entry_layer = pf.lattice.idx_to_coord(entry_layer)[2]
+    geometry = pf.escape_planner._emit_portal_escape_geometry(
+        "N0",
+        pad_id,
+        portal,
+        entry_layer,
+        include_via=True,
+    )
+    tracks = [item for item in geometry if "x1" in item]
+    vias = [item for item in geometry if "x" in item]
+
+    assert len(tracks) == 2
+    assert tracks[0]["layer"] == "F.Cu"
+    assert tracks[0]["x1"] == pytest.approx(tracks[0]["x2"])
+    assert tracks[1]["layer"] == pf.config.layer_names[entry_layer]
+    assert tracks[1]["y1"] == pytest.approx(tracks[1]["y2"])
+    assert len(vias) == 1
+    assert vias[0]["x"] == pytest.approx(portal.pad_x)
+    assert vias[0]["dynamic_entry"]
+
+    pf.route_multiple_nets([board.nets[0]])
+    pf.emit_geometry(board)
+    path = pf.net_paths["N0"]
+    assert pf.lattice.idx_to_coord(path[0])[2] == 0
+    assert pf.lattice.idx_to_coord(path[-1])[2] == 0
+    inner_path = pf._path_without_dynamic_escape_chains("N0", path)
+    assert pf.lattice.idx_to_coord(inner_path[0])[2] in {1, 3}
+    assert pf.lattice.idx_to_coord(inner_path[-1])[2] in {1, 3}
+    assert sum(
+        via.get("dynamic_entry", False)
+        for via in pf.get_geometry_payload().vias
+        if via["net"] == "N0"
+    ) == 2
 
 
 def test_horizontal_escape_uses_short_orthogonal_dogleg(routed):
