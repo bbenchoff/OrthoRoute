@@ -3005,15 +3005,20 @@ class PathFinderRouter:
         col_pool = hasattr(self, 'via_col_use')
         seg_pool = hasattr(self, 'via_seg_use')
 
+        previous_via_xy = None
         for u, v in zip(node_path, node_path[1:]):
             xu, yu, zu = idx_to_coord(u)
             xv, yv, zv = idx_to_coord(v)
 
             # Check if it's a vertical transition (same x,y, different z)
             if xu == xv and yu == yv and zu != zv:
-                # Column pooling: increment total vias at this (x,y)
-                if col_pool:
+                # Adjacent-span graphs encode one physical barrel as a chain
+                # of vertical hops. Count that contiguous chain once in the
+                # column pool, while retaining per-segment occupancy below.
+                via_xy = (xu, yu)
+                if col_pool and via_xy != previous_via_xy:
                     self.via_col_use[xu, yu] += 1
+                previous_via_xy = via_xy
 
                 # Segment pooling: increment each segment crossed
                 if seg_pool:
@@ -3036,6 +3041,8 @@ class PathFinderRouter:
                         # First owner wins
                         if key not in self._via_keepouts_map:
                             self._via_keepouts_map[key] = net_id
+            else:
+                previous_via_xy = None
 
     def _rebuild_via_usage_from_committed(self):
         """Rebuild via column/segment usage from all currently committed net paths"""
@@ -3064,8 +3071,15 @@ class PathFinderRouter:
             if node_path and len(node_path) > 1:
                 self._accumulate_via_usage_for_path(node_path, net_id=net_id)
 
-        # Also re-track escape vias (they're not in net_paths but occupy space)
-        self._track_escape_vias_in_via_usage()
+        # Escape barrels are attached to every committed routed path. Track
+        # only geometry belonging to nets without a path, otherwise the same
+        # physical barrel is counted twice.
+        committed_nets = {
+            net_id for net_id, path in self.net_paths.items() if path
+        }
+        self._track_escape_vias_in_via_usage(
+            exclude_nets=committed_nets
+        )
 
         # Log keepout statistics
         if hasattr(self, '_via_keepouts_map'):
@@ -3352,7 +3366,7 @@ class PathFinderRouter:
             penalty[cp.asarray(force_allow_nodes, dtype=cp.int32)] = 0.0
         return penalty
 
-    def _track_escape_vias_in_via_usage(self):
+    def _track_escape_vias_in_via_usage(self, exclude_nets=None):
         """
         Register escape vias in via spatial tracking arrays.
 
@@ -3367,8 +3381,11 @@ class PathFinderRouter:
             return
 
         tracked_count = 0
+        exclude_nets = set(exclude_nets or ())
 
         for via_dict in self._escape_vias:
+            if via_dict.get('net') in exclude_nets:
+                continue
             # Extract via information
             x_mm = via_dict.get('x')
             y_mm = via_dict.get('y')

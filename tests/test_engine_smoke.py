@@ -154,6 +154,42 @@ def test_via_ownership_is_reversible_and_tracks_collisions(routed):
     }
 
 
+def test_adjacent_via_chain_is_one_physical_column(routed):
+    """Adjacent graph hops in one barrel count as one physical via."""
+    pf, _, _, _ = routed
+    source_portal = pf.net_selected_portals["TEST_NET"][0]
+    x_idx, y_idx = source_portal.x_idx, source_portal.y_idx
+    via_chain = [
+        pf.lattice.node_idx(x_idx, y_idx, layer)
+        for layer in (0, 1, 2)
+    ]
+
+    pf.via_col_use.fill(0)
+    pf.via_seg_use.fill(0)
+    pf._accumulate_via_usage_for_path(via_chain)
+
+    assert pf.via_col_use[
+        source_portal.x_idx, source_portal.y_idx
+    ] == 1
+    assert pf.via_seg_use[x_idx, y_idx].sum() == 1
+
+    # Geometry for a committed net must not add the same barrel again.
+    x_mm, y_mm = pf.lattice.geom.lattice_to_world(x_idx, y_idx)
+    original_escape_vias = pf._escape_vias
+    pf._escape_vias = [{
+        "net": "TEST_NET",
+        "x": x_mm,
+        "y": y_mm,
+        "from_layer": "F.Cu",
+        "to_layer": "In1.Cu",
+    }]
+    pf._rebuild_via_usage_from_committed()
+    assert pf.via_col_use[x_idx, y_idx] == 1
+
+    # Restore the module-scoped fixture for the remaining assertions.
+    pf._escape_vias = original_escape_vias
+
+
 def test_path_respects_hv_discipline(routed):
     """Every lateral step must follow its layer's legal axis."""
     pf, _, _, _ = routed
