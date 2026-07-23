@@ -183,6 +183,33 @@ def test_escape_conflicts_identify_both_portals_for_history(routed):
     pf._rebuild_escape_occupancy()
 
 
+def test_committed_escape_conflicts_never_eliminate_all_seeds(routed):
+    pf, _, _, _ = routed
+    pad_id = pf.net_pad_ids["TEST_NET"][0]
+    candidates = pf.portal_candidates[pad_id]
+    old_strict = pf._escape_reservations_strict
+    pf._escape_records.clear()
+    pf._escape_spatial.clear()
+    for index, portal in enumerate(candidates):
+        pf._insert_escape_record(
+            pf._escape_record(
+                "BLOCKER",
+                f"BLOCKER_PAD_{index}",
+                portal,
+            )
+        )
+    pf._escape_reservations_strict = False
+
+    seeds, seed_portals = pf._get_pad_portal_seeds(
+        pad_id, "TEST_NET"
+    )
+
+    assert seeds
+    assert seed_portals
+    pf._escape_reservations_strict = old_strict
+    pf._rebuild_escape_occupancy()
+
+
 def test_stagnation_rip_clears_all_geometry_ownership():
     board = make_two_pad_board(layer_count=4)
     config = PathFinderConfig()
