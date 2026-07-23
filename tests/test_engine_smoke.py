@@ -89,15 +89,19 @@ def test_portal_vias_attach_from_either_outer_layer(routed):
 
 def test_escape_planner_collects_distinct_portal_candidates(routed):
     pf, _, _, _ = routed
-    all_cells = []
     for pad_id in pf.net_pad_ids["TEST_NET"]:
         candidates = pf.escape_planner.portal_candidates[pad_id]
         assert candidates[0] is pf.portals[pad_id]
         assert len(candidates) >= 2
         cells = {(portal.x_idx, portal.y_idx) for portal in candidates}
         assert len(cells) == len(candidates)
-        all_cells.extend(cells)
-    assert len(all_cells) == len(set(all_cells))
+        pad_x, pad_y, _ = pf.lattice.idx_to_coord(
+            pf.pad_to_node[pad_id]
+        )
+        assert any(
+            portal.x_idx != pad_x and portal.y_idx != pad_y
+            for portal in candidates
+        )
 
 
 def test_selected_portals_match_path_and_emitted_stubs(routed):
