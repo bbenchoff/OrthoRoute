@@ -27,12 +27,16 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
 
     lateral_steps_per_layer: Dict[int, int] = {}
     via_transitions = 0
-    routed_nets = 0
+    routed_path_ids = set()
+    trivial_path_ids = set()
 
-    for _, path in pf.net_paths.items():
+    for net_id, path in pf.net_paths.items():
+        if len(path) == 1:
+            trivial_path_ids.add(str(net_id))
+            continue
         if len(path) < 2:
             continue
-        routed_nets += 1
+        routed_path_ids.add(str(net_id))
         for a, b in zip(path, path[1:]):
             za, zb = a // plane, b // plane
             if za == zb:
@@ -40,7 +44,17 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             else:
                 via_transitions += 1
 
-    total_nets = len(board.nets)
+    raw_nets = list(board.nets)
+    routable_ids = {
+        str(getattr(net, "name", None) or getattr(net, "id", ""))
+        for net in raw_nets
+        if len(getattr(net, "pads", ())) >= 2
+    }
+    completed_ids = (routed_path_ids | trivial_path_ids) & routable_ids
+    unrouted_ids = sorted(routable_ids - completed_ids)
+    excluded_ids = {
+        str(net_id) for net_id in getattr(pf, "_excluded_nets", ())
+    }
     total_lateral = sum(lateral_steps_per_layer.values())
     overuse_total, overuse_count = pf.accounting.compute_overuse(pf)
 
@@ -48,8 +62,10 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
         "board": {
             "name": board.name,
             "layer_count": board.layer_count,
-            "nets": total_nets,
-            "pads": sum(len(getattr(n, "pads", [])) for n in board.nets),
+            "nets": len(raw_nets),
+            "routable_nets": len(routable_ids),
+            "singleton_nets": len(raw_nets) - len(routable_ids),
+            "pads": sum(len(getattr(n, "pads", [])) for n in raw_nets),
         },
         "lattice": {
             "x_steps": pf.lattice.x_steps,
@@ -59,10 +75,14 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             "pitch_mm": pitch,
         },
         "completion": {
-            "routed_nets": routed_nets,
-            "total_nets": total_nets,
-            "excluded_nets": len(getattr(pf, "_excluded_nets", ())),
-            "complete": routed_nets == total_nets,
+            "routed_nets": len(routed_path_ids & routable_ids),
+            "trivial_nets": len(trivial_path_ids & routable_ids),
+            "completed_nets": len(completed_ids),
+            "total_nets": len(routable_ids),
+            "excluded_nets": len(excluded_ids),
+            "excluded_net_ids": sorted(excluded_ids),
+            "unrouted_net_ids": unrouted_ids,
+            "complete": len(completed_ids) == len(routable_ids) and not excluded_ids,
         },
         "convergence": {
             "iterations": getattr(pf, "iteration", None),

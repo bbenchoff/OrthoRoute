@@ -1,8 +1,8 @@
-"""CPU-only routing benchmark on a synthetic backplane.
+"""CPU/GPU routing benchmark on a synthetic backplane.
 
 Usage:
-    python benchmarks/run_benchmark.py --connectors 2 --pins 16 --layers 4
-    python benchmarks/run_benchmark.py --connectors 4 --pins 40 --layers 8 --pattern pairs
+    python benchmarks/run_benchmark.py --cpu --connectors 2 --pins 16 --layers 4
+    python benchmarks/run_benchmark.py --gpu --connectors 4 --pins 40 --layers 8
 
 Writes a metrics JSON to benchmarks/results/ (gitignored) and prints a
 one-line summary. Compare layers_used across --layers values to measure
@@ -37,14 +37,40 @@ def run(args) -> dict:
 
     config = PathFinderConfig()
     config.portal_x_snap_max = 0.75  # pads sit half a pitch off-grid (see conftest)
-    pf = UnifiedPathFinder(config=config, use_gpu=False)
+    pf = UnifiedPathFinder(config=config, use_gpu=args.use_gpu)
+    # Explicit benchmark selection wins over the router's legacy USE_GPU
+    # environment override so CPU/GPU comparisons cannot silently swap backends.
+    pf.config.use_gpu = args.use_gpu
 
     timings = {}
+    memory = {}
+
+    def sync_gpu():
+        if pf.config.use_gpu:
+            import cupy as cp
+            cp.cuda.Stream.null.synchronize()
+
+    def snapshot_gpu():
+        if not pf.config.use_gpu:
+            return None
+        import cupy as cp
+        free, total = cp.cuda.runtime.memGetInfo()
+        pool = cp.get_default_memory_pool()
+        return {
+            "device_free_bytes": int(free),
+            "device_total_bytes": int(total),
+            "pool_used_bytes": int(pool.used_bytes()),
+            "pool_total_bytes": int(pool.total_bytes()),
+        }
 
     def phase(name, fn):
+        sync_gpu()
         t0 = time.perf_counter()
         result = fn()
+        sync_gpu()
         timings[name] = time.perf_counter() - t0
+        if pf.config.use_gpu:
+            memory[name] = snapshot_gpu()
         print(f"[BENCH] {name}: {timings[name]:.2f}s")
         return result
 
@@ -60,8 +86,16 @@ def run(args) -> dict:
     metrics["params"] = {
         "connectors": args.connectors, "pins": args.pins,
         "layers": args.layers, "pattern": args.pattern, "seed": args.seed,
+        "backend": "gpu" if pf.config.use_gpu else "cpu",
+        "effective_max_iterations": config.max_iterations,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
+    if memory:
+        metrics["memory"] = memory
+        metrics["memory"]["peak_observed_pool_total_bytes"] = max(
+            sample["pool_total_bytes"] for sample in memory.values()
+            if isinstance(sample, dict)
+        )
     return metrics
 
 
@@ -73,6 +107,12 @@ def main():
     parser.add_argument("--pattern", choices=["pairs", "neighbor", "bus"],
                         default="pairs")
     parser.add_argument("--seed", type=int, default=42)
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument("--gpu", dest="use_gpu", action="store_true",
+                         help="run the CUDA/CuPy path")
+    backend.add_argument("--cpu", dest="use_gpu", action="store_false",
+                         help="run the CPU path (default)")
+    parser.set_defaults(use_gpu=False)
     parser.add_argument("-o", "--output-dir", default=str(REPO_ROOT / "benchmarks" / "results"))
     args = parser.parse_args()
 
