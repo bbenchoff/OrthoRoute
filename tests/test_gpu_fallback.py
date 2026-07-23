@@ -69,6 +69,34 @@ def test_gpu_seed_failure_falls_back_to_cost_based_routing(monkeypatch, gpu_fail
     assert len(router.net_paths["TEST_NET"]) > 1
 
 
+def test_gpu_seed_failure_skips_cpu_fullgraph_on_huge_graph(monkeypatch):
+    """Large CUDA misses must remain negotiated failures, not CPU searches."""
+    board = make_two_pad_board(layer_count=4)
+    config = PathFinderConfig()
+    config.portal_x_snap_max = 0.75
+    config.gpu_fullgraph_fail_fast_nodes = 1
+    router = UnifiedPathFinder(config=config, use_gpu=False)
+
+    router.initialize_graph(board)
+    router.map_all_pads(board)
+    router.precompute_all_pad_escapes(board)
+    router.prepare_routing_runtime()
+    tasks = router._parse_requests(board.nets)
+
+    router.accounting.total_cost = np.asarray(
+        router.graph.base_costs
+    ).copy().view(_DeviceCosts)
+    gpu_solver = _FailingGpuSolver(None)
+    router.solver.gpu_solver = gpu_solver
+    monkeypatch.setitem(sys.modules, "cupy", types.ModuleType("cupy"))
+
+    routed, failed = router._route_all(tasks, all_tasks=tasks, iteration=1)
+
+    assert gpu_solver.calls == 1
+    assert (routed, failed) == (0, 1)
+    assert router.net_paths["TEST_NET"] == []
+
+
 def test_gpu_roi_csr_prices_the_destination_node():
     """ROI extraction must preserve the CPU ownership-as-cost semantics."""
     solver = object.__new__(CUDADijkstra)
