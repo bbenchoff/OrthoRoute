@@ -584,7 +584,7 @@ class PathFinderConfig:
     # A via inserted after a planar route cannot see that track in the
     # via-only ownership map. Price every occupied path node lightly so
     # track-via conflicts are symmetric within the same routing pass.
-    path_node_penalty_base: float = 0.05
+    path_node_penalty_base: float = 25.0
     # CONVERGENCE SCHEDULE (BALANCED BASED ON DIAGNOSTICS):
     pres_fac_init: float = 1.0   # Start gentle (iteration 1)
     pres_fac_mult: float = 1.10  # Gentler exponential to keep history competitive (was 1.15)
@@ -5759,12 +5759,14 @@ class PathFinderRouter:
                             dtype=np.float32,
                         )
 
-                        # Ownership is a negotiated node cost, not a hard wall.
-                        # Force source/destination seeds to zero penalty because
-                        # stale ownership bookkeeping must never hide terminals.
-                        force_allow = np.unique(np.concatenate([src_node_array, dst_node_array])).astype(np.int32)
+                        # Ownership is a negotiated node cost, not a hard
+                        # wall. Keep that cost on every candidate terminal:
+                        # clearing it for all source/destination alternatives
+                        # makes foreign via barrels free to enter precisely
+                        # where dense connector fields need the strongest
+                        # discrimination.
                         owner_penalty = self._build_owner_penalty_gpu(
-                            net_id, force_allow_nodes=force_allow
+                            net_id
                         )
 
                         if len(src_node_array) > 0 and len(dst_node_array) > 0:
