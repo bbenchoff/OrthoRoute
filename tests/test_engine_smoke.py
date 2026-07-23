@@ -147,6 +147,39 @@ def test_escape_distance_detects_crossing_segments():
     assert distance == 0.0
 
 
+def test_stagnation_rip_clears_all_geometry_ownership():
+    board = make_two_pad_board(layer_count=4)
+    config = PathFinderConfig()
+    config.portal_x_snap_max = 0.75
+    pf = UnifiedPathFinder(config=config, use_gpu=False)
+    pf.initialize_graph(board)
+    pf.precompute_all_pad_escapes(board)
+    pf.route_multiple_nets(board.nets)
+
+    path = list(pf.net_paths["TEST_NET"])
+    path_nodes = pf._unique_path_nodes(path)
+    via_nodes = pf._via_nodes_for_path(path)
+    net_id = pf._get_net_id("TEST_NET")
+    pf.locked_nets.clear()
+    edge = pf._net_to_edges["TEST_NET"][0]
+    pf.accounting.present[edge] = pf.accounting.capacity[edge] + 1
+
+    victims = pf._rip_top_k_offenders(k=1)
+
+    assert victims == {"TEST_NET"}
+    assert not pf.net_paths["TEST_NET"]
+    assert "TEST_NET" not in pf.net_selected_portals
+    assert np.all(pf.path_node_use[path_nodes] == 0)
+    assert all(
+        net_id not in pf._node_owner_members.get(node, ())
+        for node in via_nodes
+    )
+    assert all(
+        record["net"] != "TEST_NET"
+        for record in pf._escape_records.values()
+    )
+
+
 def test_via_ownership_is_reversible_and_tracks_collisions(routed):
     pf, _, _, _ = routed
     path = pf.net_paths["TEST_NET"]
