@@ -655,6 +655,32 @@ def test_portal_cleanup_makes_foreign_barrels_prohibitive(routed):
         pf._freeze_selected_portals = old_freeze
 
 
+def test_layer_depth_bias_is_monotonic_without_congestion():
+    config = PathFinderConfig()
+    config.layer_depth_bias = 0.1
+    router = UnifiedPathFinder(config=config, use_gpu=False)
+    accounting = type("Accounting", (), {
+        "xp": np,
+        "use_gpu": False,
+        "present": np.zeros(4, dtype=np.float32),
+        "present_ema": np.zeros(4, dtype=np.float32),
+        "capacity": np.ones(4, dtype=np.float32),
+    })()
+    graph = type("Graph", (), {
+        "edge_layer": np.arange(4, dtype=np.int32),
+    })()
+
+    bias = router._compute_layer_bias(
+        accounting,
+        graph,
+        num_layers=4,
+        alpha=0.0,
+        max_boost=1.8,
+    )
+
+    assert bias == pytest.approx([1.0, 1.1, 1.2, 1.3])
+
+
 def test_path_node_use_prices_tracks_for_later_vias(routed):
     """Planar copper must be visible before a later net chooses a via."""
     pf, _, _, _ = routed

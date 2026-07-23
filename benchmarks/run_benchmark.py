@@ -48,6 +48,7 @@ def run(args) -> dict:
             axis.strip().lower()
             for axis in args.layer_directions.split(",")
         ]
+    config.layer_depth_bias = args.layer_depth_bias
     pf = UnifiedPathFinder(config=config, use_gpu=args.use_gpu)
     # Explicit benchmark selection wins over the router's legacy USE_GPU
     # environment override so CPU/GPU comparisons cannot silently swap backends.
@@ -103,6 +104,7 @@ def run(args) -> dict:
         "preferred_layer_directions": (
             config.preferred_layer_directions
         ),
+        "layer_depth_bias": config.layer_depth_bias,
         "effective_max_iterations": config.max_iterations,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
@@ -138,6 +140,12 @@ def main():
     parser.add_argument(
         "--layer-directions",
         help="comma-separated preferred H/V axis for every copper layer",
+    )
+    parser.add_argument(
+        "--layer-depth-bias",
+        type=float,
+        default=0.0,
+        help="additive cost bias per higher layer (zero disables packing)",
     )
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--gpu", dest="use_gpu", action="store_true",

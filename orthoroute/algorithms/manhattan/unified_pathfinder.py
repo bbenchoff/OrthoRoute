@@ -607,6 +607,10 @@ class PathFinderConfig:
     # >1 is guided routing, 1 is fully bidirectional, and infinity is strict.
     preferred_layer_directions: Optional[List[str]] = None
     wrong_way_cost_multiplier: float = float("inf")
+    # Additive multiplicative-cost bias per layer index. Zero is neutral;
+    # positive values pack routes toward lower layers while leaving every
+    # layer available when congestion makes spilling upward worthwhile.
+    layer_depth_bias: float = 0.0
     # Physical output geometry. Parsed KiCad project rules replace these
     # defaults during initialize_graph().
     track_width: float = 0.24
@@ -7027,6 +7031,16 @@ class PathFinderRouter:
             # Baseline bias from document
             raw_bias = 1.0 + 0.75 * shortfall  # Bias = 1.0 to 1.75
 
+        depth_alpha = max(
+            0.0, float(getattr(self.config, "layer_depth_bias", 0.0))
+        )
+        if depth_alpha:
+            raw_bias = (
+                raw_bias
+                + depth_alpha
+                * xp.arange(num_layers, dtype=xp.float32)
+            )
+
         # EMA smoothing to prevent oscillation
         if not hasattr(self, "_layer_bias_ema"):
             self._layer_bias_ema = raw_bias.astype(xp.float32)
@@ -7034,7 +7048,12 @@ class PathFinderRouter:
             self._layer_bias_ema = (alpha * self._layer_bias_ema + (1.0 - alpha) * raw_bias).astype(xp.float32)
 
         # Clamp to prevent extreme penalties
-        self._layer_bias_ema = xp.clip(self._layer_bias_ema, 1.0, max_boost)
+        depth_ceiling = max_boost + depth_alpha * max(
+            0, num_layers - 1
+        )
+        self._layer_bias_ema = xp.clip(
+            self._layer_bias_ema, 1.0, depth_ceiling
+        )
 
         return self._layer_bias_ema
 
