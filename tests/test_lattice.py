@@ -9,7 +9,11 @@ layers.
 import numpy as np
 import pytest
 
-from orthoroute.algorithms.manhattan.unified_pathfinder import Lattice3D
+from orthoroute.algorithms.manhattan.unified_pathfinder import (
+    Lattice3D,
+    PathFinderConfig,
+    UnifiedPathFinder,
+)
 
 BOUNDS = (0.0, 0.0, 4.0, 4.0)  # 4x4 mm
 PITCH = 0.4
@@ -53,8 +57,13 @@ class TestLayerDiscipline:
 class TestViaPairs:
     def test_four_layer_pairs(self, lattice4):
         pairs = lattice4.get_legal_via_pairs(4)
-        # Canonical unordered pairs: build_graph emits both directions.
-        # Inner layers {1,2} full blind/buried + F.Cu transitions, no B.Cu.
+        # Adjacent pairs include F.Cu but exclude B.Cu.
+        assert pairs == {(0, 1), (1, 2)}
+
+    def test_four_layer_full_span_pairs(self, lattice4):
+        pairs = lattice4.get_legal_via_pairs(
+            4, allow_any_layer_via=True
+        )
         assert pairs == {(1, 2), (0, 1), (0, 2)}
 
     def test_two_layer_pairs_through_via(self, lattice4):
@@ -81,6 +90,7 @@ class TestGraphBuild:
         xs, ys = lattice4.x_steps, lattice4.y_steps
         expected_lateral = 2 * ys * (xs - 1) + 2 * xs * (ys - 1)  # z=1 (h) + z=2 (v)
         assert E - via_edges == expected_lateral
+        assert via_edges == 2 * xs * ys * 2
 
     def test_two_layer_graph_has_edges(self):
         # Regression for #18/#13: 2-layer boards used to produce an empty
@@ -104,3 +114,19 @@ class TestGraphBuild:
         graph = lattice4.build_graph(via_cost=0.7)
         costs = np.asarray(graph.base_costs)
         assert np.all(costs > 0)
+
+    def test_adjacent_via_hops_emit_as_one_span(self, lattice4):
+        router = UnifiedPathFinder(PathFinderConfig(), use_gpu=False)
+        router.lattice = lattice4
+        path = [
+            lattice4.node_idx(2, 3, 0),
+            lattice4.node_idx(2, 3, 1),
+            lattice4.node_idx(2, 3, 2),
+            lattice4.node_idx(3, 3, 2),
+        ]
+
+        assert router._coalesce_vertical_runs(path) == [
+            lattice4.node_idx(2, 3, 0),
+            lattice4.node_idx(2, 3, 2),
+            lattice4.node_idx(3, 3, 2),
+        ]

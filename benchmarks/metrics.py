@@ -27,6 +27,7 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
 
     lateral_steps_per_layer: Dict[int, int] = {}
     via_transitions = 0
+    via_layer_steps = 0
     routed_path_ids = set()
     trivial_path_ids = set()
 
@@ -37,12 +38,29 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
         if len(path) < 2:
             continue
         routed_path_ids.add(str(net_id))
+        in_vertical_run = False
+        vertical_xy = None
+        vertical_direction = 0
         for a, b in zip(path, path[1:]):
             za, zb = a // plane, b // plane
             if za == zb:
                 lateral_steps_per_layer[za] = lateral_steps_per_layer.get(za, 0) + 1
+                in_vertical_run = False
+                vertical_xy = None
+                vertical_direction = 0
             else:
-                via_transitions += 1
+                via_layer_steps += abs(zb - za)
+                xy = a % plane
+                direction = 1 if zb > za else -1
+                if (
+                    not in_vertical_run
+                    or xy != vertical_xy
+                    or direction != vertical_direction
+                ):
+                    via_transitions += 1
+                in_vertical_run = True
+                vertical_xy = xy
+                vertical_direction = direction
 
     raw_nets = list(board.nets)
     routable_ids = {
@@ -92,6 +110,7 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
         "copper": {
             "wirelength_mm": round(total_lateral * pitch, 3),
             "via_transitions": via_transitions,
+            "via_layer_steps": via_layer_steps,
             "lateral_steps_per_layer": {
                 str(z): n for z, n in sorted(lateral_steps_per_layer.items())
             },

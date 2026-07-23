@@ -596,6 +596,11 @@ class PathFinderConfig:
     via_cost: float = 0.7  # Cheaper vias to encourage layer hopping and redistribute load (was 1.0)
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
     span_alpha: float = 0.15  # Span penalty: cost *= (1 + alpha*(span-1))
+    # None selects full spans through 18 layers and adjacent spans on deeper
+    # stacks where the O(L²) graph is prohibitive.
+    allow_any_layer_via: Optional[bool] = None
+    # Adjacent graph hops represent segments of one physical multi-layer via.
+    adjacent_via_step_scale: float = 4.0
 
     # Iteration 1 policy: always-connect mode for maximum connectivity
     iter1_always_connect: bool = True  # Use soft costs in iteration 1 instead of hard blocks
@@ -1187,7 +1192,9 @@ class Lattice3D:
         else:
             return dx == 0 and dy == 1  # Vertical: only ±Y
 
-    def get_legal_via_pairs(self, layer_count: int) -> set:
+    def get_legal_via_pairs(
+        self, layer_count: int, allow_any_layer_via: bool = False
+    ) -> set:
         """
         Return canonical unordered legal via layer pairs.
 
@@ -1205,16 +1212,13 @@ class Lattice3D:
             logger.info("[VIA-PAIRS] 2-layer board: through vias only")
             return {(0, 1)}
 
-        # Check config for via policy (default to FULL blind/buried)
-        allow_any = True  # ALWAYS allow full blind/buried for convergence
-
         # Internal routing layers (exclude B.Cu which is layer_count-1)
         routing_layers = list(range(1, layer_count - 1))
 
         logger.info(f"[VIA-PAIRS] layer_count={layer_count}, routing_layers={len(routing_layers)}, "
-                   f"allow_any={allow_any}")
+                   f"allow_any={allow_any_layer_via}")
 
-        if allow_any:
+        if allow_any_layer_via:
             # FULL BLIND/BURIED: Any routing layer to any other routing layer
             legal_pairs = set()
             for z1 in routing_layers:
@@ -1233,12 +1237,14 @@ class Lattice3D:
             )
             return legal_pairs
 
-        # FALLBACK: Adjacent routing layers only
-        legal_pairs = set()
-        for i in range(len(routing_layers) - 1):
-            z1, z2 = routing_layers[i], routing_layers[i+1]
-            legal_pairs.add((z1, z2))
-        logger.info(f"[VIA-PAIRS] Generated {len(legal_pairs)} adjacent-only pairs (fallback mode)")
+        # O(L) representation: a physical long via is a chain of adjacent
+        # segments. Include F.Cu→In1.Cu, but never B.Cu.
+        legal_pairs = {
+            (z, z + 1) for z in range(0, layer_count - 2)
+        }
+        logger.info(
+            f"[VIA-PAIRS] Generated {len(legal_pairs)} adjacent-only pairs"
+        )
         return legal_pairs
 
     def node_idx(self, x: int, y: int, z: int) -> int:
@@ -1253,7 +1259,14 @@ class Lattice3D:
         """mm → lattice"""
         return self.geom.world_to_lattice(x_mm, y_mm)
 
-    def build_graph(self, via_cost: float, allowed_via_spans: Optional[Set[Tuple[int, int]]] = None, use_gpu=False) -> CSRGraph:
+    def build_graph(
+        self,
+        via_cost: float,
+        allowed_via_spans: Optional[Set[Tuple[int, int]]] = None,
+        use_gpu=False,
+        allow_any_layer_via: bool = False,
+        adjacent_via_step_scale: float = 4.0,
+    ) -> CSRGraph:
         """
         Build graph with H/V constraints and flexible via spans.
 
@@ -1282,8 +1295,24 @@ class Lattice3D:
             else:  # 'v'
                 edge_count += 2 * self.x_steps * (self.y_steps - 1)
 
-        # Count via edges using ACTUAL legal pairs (not parameter guess)
-        legal_via_pairs_set = self.get_legal_via_pairs(self.layers)
+        # Explicit spans win; canonicalize them because add_edge emits both
+        # directions for each physical pair.
+        if allowed_via_spans is not None:
+            legal_via_pairs_set = {
+                (min(int(a), int(b)), max(int(a), int(b)))
+                for a, b in allowed_via_spans
+                if a != b and 0 <= a < self.layers and 0 <= b < self.layers
+            }
+        else:
+            legal_via_pairs_set = self.get_legal_via_pairs(
+                self.layers,
+                allow_any_layer_via=allow_any_layer_via,
+            )
+        adjacent_only = (
+            self.layers > 2
+            and legal_via_pairs_set
+            and all(abs(b - a) == 1 for a, b in legal_via_pairs_set)
+        )
         via_edge_count = 2 * self.x_steps * self.y_steps * len(legal_via_pairs_set)
         edge_count += via_edge_count
 
@@ -1329,8 +1358,11 @@ class Lattice3D:
                 for (z_from, z_to) in legal_via_pairs_set:
                     # Only add if this specific pair is legal
                     span = abs(z_to - z_from)
-                    span_alpha = 0.15
-                    cost = via_cost * (1.0 + span_alpha * (span - 1))
+                    if adjacent_only:
+                        cost = via_cost * adjacent_via_step_scale
+                    else:
+                        span_alpha = 0.15
+                        cost = via_cost * (1.0 + span_alpha * (span - 1))
 
                     u = self.node_idx(x, y, z_from)
                     v = self.node_idx(x, y, z_to)
@@ -2226,10 +2258,25 @@ class PathFinderRouter:
 
         self.lattice = Lattice3D(bounds, self.config.grid_pitch, self.config.layer_count)
 
+        allow_any_layer_via = getattr(
+            self.config, "allow_any_layer_via", None
+        )
+        if allow_any_layer_via is None:
+            allow_any_layer_via = self.config.layer_count <= 18
+        logger.info(
+            "[VIA-TOPOLOGY] %s spans for %d layers",
+            "full" if allow_any_layer_via else "adjacent",
+            self.config.layer_count,
+        )
+
         self.graph = self.lattice.build_graph(
             self.config.via_cost,
             allowed_via_spans=self.config.allowed_via_spans,
-            use_gpu=self.config.use_gpu and GPU_AVAILABLE
+            use_gpu=self.config.use_gpu and GPU_AVAILABLE,
+            allow_any_layer_via=allow_any_layer_via,
+            adjacent_via_step_scale=getattr(
+                self.config, "adjacent_via_step_scale", 4.0
+            ),
         )
         # Note: graph.finalize() is now called inside build_graph() before validation
 
@@ -5948,6 +5995,7 @@ class PathFinderRouter:
         for net_id, path in self.net_paths.items():
             if not path:
                 continue
+            path = self._coalesce_vertical_runs(path)
 
             # NOTE: Escape geometry is pre-computed by PadEscapePlanner and cached.
             # It will be merged with routed geometry in emit_geometry().
@@ -6089,6 +6137,40 @@ class PathFinderRouter:
                     pass  # Skip if layer name doesn't match expected pattern
 
         return (tracks, vias)
+
+    def _coalesce_vertical_runs(self, path: List[int]) -> List[int]:
+        """Collapse adjacent z hops at one x/y into one physical via span."""
+        if len(path) < 3:
+            return list(path)
+
+        result = [path[0]]
+        via_xy = None
+        via_direction = 0
+
+        for previous, node in zip(path, path[1:]):
+            x0, y0, z0 = self.lattice.idx_to_coord(previous)
+            x1, y1, z1 = self.lattice.idx_to_coord(node)
+            dz = z1 - z0
+            is_vertical = x0 == x1 and y0 == y1 and dz != 0
+            direction = int(np.sign(dz)) if is_vertical else 0
+
+            if (
+                is_vertical
+                and via_xy == (x0, y0)
+                and direction == via_direction
+            ):
+                result[-1] = node
+            else:
+                result.append(node)
+
+            if is_vertical:
+                via_xy = (x0, y0)
+                via_direction = direction
+            else:
+                via_xy = None
+                via_direction = 0
+
+        return result
 
     def get_geometry_payload(self):
         """
