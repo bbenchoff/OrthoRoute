@@ -582,9 +582,13 @@ class PathFinderConfig:
     # barrel conflicts are negotiated like any other congestion.
     owner_penalty_base: float = 25.0
     # A via inserted after a planar route cannot see that track in the
-    # via-only ownership map. Price every occupied path node lightly so
+    # via-only ownership map. Price every occupied path node equally so
     # track-via conflicts are symmetric within the same routing pass.
     path_node_penalty_base: float = 25.0
+    # Coordinates that produced a physical node/barrel short retain a
+    # Pathfinder history cost after their present owner is ripped up.
+    node_history_penalty: float = 5.0
+    node_history_increment: float = 1.0
     # CONVERGENCE SCHEDULE (BALANCED BASED ON DIAGNOSTICS):
     pres_fac_init: float = 1.0   # Start gentle (iteration 1)
     pres_fac_mult: float = 1.10  # Gentler exponential to keep history competitive (was 1.15)
@@ -2462,6 +2466,10 @@ class PathFinderRouter:
             self.lattice.num_nodes, dtype=np.int16
         )
         self.path_node_use_gpu = None
+        self.node_conflict_history = np.zeros(
+            self.lattice.num_nodes, dtype=np.float32
+        )
+        self.node_conflict_history_gpu = None
         self.net_id_map = {}  # net_name -> integer ID
         self.next_net_id = 0
         logger.info(f"[NODE-OWNER] Initialized node ownership tracking for {self.lattice.num_nodes:,} nodes")
@@ -2480,6 +2488,9 @@ class PathFinderRouter:
                 self.solver.gpu_solver = CUDADijkstra(self.graph, self.lattice)
                 self.node_owner_gpu = cp.asarray(self.node_owner)
                 self.path_node_use_gpu = cp.asarray(self.path_node_use)
+                self.node_conflict_history_gpu = cp.asarray(
+                    self.node_conflict_history
+                )
                 logger.info("[GPU] CUDA Near-Far Dijkstra enabled (ROI > 5K nodes) with lattice dims")
                 # Log GPU details
                 device = cp.cuda.Device()
@@ -3983,21 +3994,34 @@ class PathFinderRouter:
             if roi_nodes is None else self.path_node_use[roi_nodes]
         )
         occupied = path_use > 0
+        node_history = (
+            self.node_conflict_history
+            if roi_nodes is None
+            else self.node_conflict_history[roi_nodes]
+        )
         if roi_nodes is None and force_allow_nodes is not None:
             foreign[force_allow_nodes] = False
             occupied[force_allow_nodes] = False
-        if not foreign.any() and not occupied.any():
+        if (
+            not foreign.any()
+            and not occupied.any()
+            and not node_history.any()
+        ):
             return None
 
         weight = (float(getattr(self.config, 'owner_penalty_base', 25.0))
                   * float(getattr(self, '_pres_fac_now', 1.0)))
         path_weight = (
-            float(getattr(self.config, 'path_node_penalty_base', 0.05))
+            float(getattr(self.config, 'path_node_penalty_base', 25.0))
             * float(getattr(self, '_pres_fac_now', 1.0))
         )
+        history_weight = float(getattr(
+            self.config, "node_history_penalty", 5.0
+        ))
         return (
             foreign.astype(np.float32) * weight
             + occupied.astype(np.float32) * path_weight
+            + node_history * history_weight
         )
 
     def _build_owner_penalty_gpu(self, current_net: str,
@@ -4020,7 +4044,7 @@ class PathFinderRouter:
             cp.float32(0.0),
         ).astype(cp.float32, copy=False)
         path_weight = np.float32(
-            float(getattr(self.config, 'path_node_penalty_base', 0.05))
+            float(getattr(self.config, 'path_node_penalty_base', 25.0))
             * float(getattr(self, '_pres_fac_now', 1.0))
         )
         if self.path_node_use_gpu is not None and path_weight > 0:
@@ -4028,6 +4052,16 @@ class PathFinderRouter:
                 self.path_node_use_gpu > 0,
                 path_weight,
                 cp.float32(0.0),
+            )
+        history_weight = np.float32(getattr(
+            self.config, "node_history_penalty", 5.0
+        ))
+        if (
+            self.node_conflict_history_gpu is not None
+            and history_weight > 0
+        ):
+            penalty += (
+                self.node_conflict_history_gpu * history_weight
             )
         if force_allow_nodes is not None and len(force_allow_nodes) > 0:
             penalty[cp.asarray(force_allow_nodes, dtype=cp.int32)] = 0.0
@@ -6921,6 +6955,30 @@ class PathFinderRouter:
         edge_column = matches.argmax(axis=1)
         return (row_start + edge_column).astype(np.int64).tolist()
 
+    def _accumulate_node_conflict_history(self, nodes) -> None:
+        """Learn each physically shorted node at most once per iteration."""
+        if not hasattr(self, "node_conflict_history"):
+            return
+        iteration = int(getattr(self, "iteration", -1))
+        if getattr(
+            self, "_node_history_iteration", None
+        ) == iteration:
+            return
+        nodes = np.unique(np.asarray(nodes, dtype=np.int64))
+        if nodes.size == 0:
+            return
+        increment = np.float32(getattr(
+            self.config, "node_history_increment", 1.0
+        ))
+        self.node_conflict_history[nodes] += increment
+        if self.node_conflict_history_gpu is not None:
+            nodes_gpu = cp.asarray(nodes, dtype=cp.int32)
+            self.node_conflict_history_gpu[nodes_gpu] = cp.asarray(
+                self.node_conflict_history[nodes],
+                dtype=cp.float32,
+            )
+        self._node_history_iteration = iteration
+
     def _detect_barrel_conflicts(self) -> Tuple[np.ndarray, int]:
         """
         Detect via barrel conflicts across all committed paths (GPU-accelerated).
@@ -7024,10 +7082,19 @@ class PathFinderRouter:
                 map(int, edge_net_ids[conflict_positions])
             )
             owner_net_ids = set()
-            conflict_nodes = np.unique(np.concatenate([
-                src_nodes[conflict_positions],
-                dst_nodes[conflict_positions],
-            ]))
+            conflict_node_chunks = []
+            if np.any(src_conflict):
+                conflict_node_chunks.append(
+                    src_nodes[np.flatnonzero(src_conflict)]
+                )
+            if np.any(dst_conflict):
+                conflict_node_chunks.append(
+                    dst_nodes[np.flatnonzero(dst_conflict)]
+                )
+            conflict_nodes = np.unique(np.concatenate(
+                conflict_node_chunks
+            ))
+            self._accumulate_node_conflict_history(conflict_nodes)
             for node_idx in conflict_nodes:
                 owner_net_ids.update(
                     self._node_owner_members.get(int(node_idx), ())

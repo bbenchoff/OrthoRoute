@@ -301,6 +301,44 @@ def test_path_node_use_prices_tracks_for_later_vias(routed):
     assert np.all(pf.path_node_use[path_nodes] == 1)
 
 
+def test_node_conflict_history_persists_once_per_iteration(routed):
+    pf, _, _, _ = routed
+    node = int(np.flatnonzero(
+        (pf.node_owner == -1) & (pf.path_node_use == 0)
+    )[0])
+    old_value = pf.node_conflict_history[node]
+    old_iteration = pf.iteration
+    had_marker = hasattr(pf, "_node_history_iteration")
+    old_marker = getattr(pf, "_node_history_iteration", None)
+    try:
+        pf.iteration = old_iteration + 1000
+        pf._accumulate_node_conflict_history([node, node])
+        pf._accumulate_node_conflict_history([node])
+        assert pf.node_conflict_history[node] == pytest.approx(
+            old_value + pf.config.node_history_increment
+        )
+
+        pf.iteration += 1
+        pf._accumulate_node_conflict_history([node])
+        expected_history = (
+            old_value + 2 * pf.config.node_history_increment
+        )
+        assert pf.node_conflict_history[node] == pytest.approx(
+            expected_history
+        )
+        penalty = pf._build_owner_penalty(None, "HISTORY_TEST")
+        assert penalty[node] == pytest.approx(
+            expected_history * pf.config.node_history_penalty
+        )
+    finally:
+        pf.node_conflict_history[node] = old_value
+        pf.iteration = old_iteration
+        if had_marker:
+            pf._node_history_iteration = old_marker
+        else:
+            del pf._node_history_iteration
+
+
 def test_barrel_owner_routes_before_crossing_track(routed):
     pf, _, _, _ = routed
     path = pf.net_paths["TEST_NET"]
