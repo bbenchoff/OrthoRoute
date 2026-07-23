@@ -5708,6 +5708,7 @@ class PathFinderRouter:
         over = np.maximum(0, present - cap)
         hot_edges = over + 0.1 * hist  # Gentle history influence (was 0.5 - too aggressive!)
         over_idx = set(map(int, np.where(hot_edges > 0.5)[0]))  # Higher threshold to be more selective
+        via_pool_offenders = self._find_via_pool_offenders()
 
         # Initialize clean iteration tracking
         if not hasattr(self, '_net_clean_iters'):
@@ -5715,11 +5716,15 @@ class PathFinderRouter:
 
         freeze_after_clean = int(getattr(self.config, 'freeze_after_clean', 3))
 
-        # NO OVERUSE CASE: only route unrouted nets
+        # No edge overuse can still leave an over-capacity via pool.
         if len(over_idx) == 0:
             unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
-            hotset = unrouted | ripped
-            logger.info(f"[HOTSET] no-overuse; unrouted={len(unrouted)} ripped={len(ripped)} → hotset={len(hotset)}")
+            hotset = unrouted | ripped | via_pool_offenders
+            logger.info(
+                f"[HOTSET] no-edge-overuse; unrouted={len(unrouted)} "
+                f"ripped={len(ripped)} via_pool={len(via_pool_offenders)} "
+                f"→ hotset={len(hotset)}"
+            )
             return hotset
 
         # OVERUSE EXISTS: collect nets touching overused edges using fast lookup
@@ -5745,6 +5750,7 @@ class PathFinderRouter:
 
         # Add ripped nets
         offenders |= ripped
+        offenders |= via_pool_offenders
 
         # Add unrouted nets (small priority, will be at end after sorting)
         unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
@@ -5823,6 +5829,60 @@ class PathFinderRouter:
                     f"(60% top + 40% random, unique={unique_frac:.1%})")
 
         return hotset
+
+    def _find_via_pool_offenders(self) -> Set[str]:
+        """Return nets using an over-capacity via column or segment."""
+        if not hasattr(self, "via_col_use") and not hasattr(
+            self, "via_seg_use"
+        ):
+            return set()
+
+        def over_mask(use, capacity):
+            mask = use > capacity
+            if hasattr(mask, "get"):
+                if not bool(cp.any(mask)):
+                    return None
+                return mask.get()
+            return mask if np.any(mask) else None
+
+        col_over = None
+        if hasattr(self, "via_col_use") and hasattr(self, "via_col_cap"):
+            col_over = over_mask(self.via_col_use, self.via_col_cap)
+
+        seg_over = None
+        if hasattr(self, "via_seg_use") and hasattr(self, "via_seg_cap"):
+            seg_over = over_mask(self.via_seg_use, self.via_seg_cap)
+
+        if col_over is None and seg_over is None:
+            self._via_pool_conflict_nets = set()
+            return set()
+
+        offenders = set()
+        for net_id, path in self.net_paths.items():
+            if not path or len(path) < 2:
+                continue
+            for u, v in zip(path, path[1:]):
+                xu, yu, zu = self.lattice.idx_to_coord(u)
+                xv, yv, zv = self.lattice.idx_to_coord(v)
+                if xu != xv or yu != yv or zu == zv:
+                    continue
+                if col_over is not None and col_over[xu, yu]:
+                    offenders.add(net_id)
+                    break
+                if seg_over is not None:
+                    z_lo, z_hi = sorted((zu, zv))
+                    z_lo = max(1, min(z_lo, self._Nz - 2))
+                    z_hi = max(1, min(z_hi, self._Nz - 2))
+                    if any(
+                        0 <= z - 1 < self._segZ
+                        and seg_over[xu, yu, z - 1]
+                        for z in range(z_lo, z_hi)
+                    ):
+                        offenders.add(net_id)
+                        break
+
+        self._via_pool_conflict_nets = offenders
+        return offenders
 
     def _log_top_overused_channels(self, over: np.ndarray, top_k: int = 10):
         """Log top-K overused channels with spatial info"""
