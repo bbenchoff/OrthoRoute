@@ -2278,6 +2278,10 @@ class PathFinderRouter:
                 self.config, "adjacent_via_step_scale", 4.0
             ),
         )
+        # Lazily populated by _path_to_edges. Invalidate if this router is
+        # reinitialized with a different board.
+        self._indptr_cpu = None
+        self._indices_cpu = None
         # Note: graph.finalize() is now called inside build_graph() before validation
 
         # Set N for ROI checks (number of nodes in full graph)
@@ -5703,19 +5707,55 @@ class PathFinderRouter:
         logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on CPU in {time.perf_counter() - t0:.3f}s")
 
     def _path_to_edges(self, node_path: List[int]) -> List[int]:
-        """Nodes → edge indices via on-the-fly CSR scan (no dict needed)"""
-        out = []
-        indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
-        indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
+        """Map path hops to CSR edge ids with one cached graph download."""
+        if len(node_path) < 2:
+            return []
 
-        for u, v in zip(node_path, node_path[1:]):
-            s, e = int(indptr[u]), int(indptr[u+1])
-            # Linear scan over neighbors (small degree in Manhattan lattice, so fast)
-            for ei in range(s, e):
-                if int(indices[ei]) == v:
-                    out.append(ei)
-                    break
-        return out
+        if self._indptr_cpu is None:
+            self._indptr_cpu = (
+                self.graph.indptr.get()
+                if hasattr(self.graph.indptr, "get")
+                else np.asarray(self.graph.indptr)
+            )
+            self._indices_cpu = (
+                self.graph.indices.get()
+                if hasattr(self.graph.indices, "get")
+                else np.asarray(self.graph.indices)
+            )
+
+        indptr = self._indptr_cpu
+        indices = self._indices_cpu
+        nodes = np.asarray(node_path, dtype=np.int64)
+        sources = nodes[:-1]
+        targets = nodes[1:]
+        row_start = indptr[sources]
+        row_end = indptr[sources + 1]
+        row_len = row_end - row_start
+        max_row = int(row_len.max(initial=0))
+
+        if max_row == 0:
+            raise ValueError(
+                f"Path starts with a node that has no graph edges: "
+                f"{int(sources[0])}→{int(targets[0])}"
+            )
+
+        offsets = np.arange(max_row, dtype=np.int64)
+        edge_candidates = row_start[:, None] + offsets[None, :]
+        valid = offsets[None, :] < row_len[:, None]
+        safe_candidates = np.minimum(edge_candidates, len(indices) - 1)
+        neighbors = np.where(valid, indices[safe_candidates], -1)
+        matches = neighbors == targets[:, None]
+        has_match = matches.any(axis=1)
+
+        if not np.all(has_match):
+            hop = int(np.flatnonzero(~has_match)[0])
+            raise ValueError(
+                f"Path hop is not a graph edge at offset {hop}: "
+                f"{int(sources[hop])}→{int(targets[hop])}"
+            )
+
+        edge_column = matches.argmax(axis=1)
+        return (row_start + edge_column).astype(np.int64).tolist()
 
     def _detect_barrel_conflicts(self) -> Tuple[np.ndarray, int]:
         """
