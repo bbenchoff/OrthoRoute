@@ -2262,6 +2262,8 @@ class PathFinderRouter:
         self.net_portal_layers: Dict[str, Tuple[int, int]] = {}  # net_id -> (entry_layer, exit_layer)
         self._escape_records = {}
         self._escape_spatial = defaultdict(set)
+        self._escape_reserved_records = {}
+        self._escape_reserved_spatial = defaultdict(set)
         self._escape_bucket_mm = 1.0
         self._portal_barrel_history = defaultdict(float)
 
@@ -3048,20 +3050,23 @@ class PathFinderRouter:
         )
 
     def _escape_candidate_conflicts(
-        self, net_id: str, pad_id: str, portal: Portal
+        self, net_id: str, pad_id: str, portal: Portal,
+        records=None, spatial=None,
     ) -> int:
-        if not self._escape_records:
+        records = self._escape_records if records is None else records
+        spatial = self._escape_spatial if spatial is None else spatial
+        if not records:
             return 0
         candidate = self._escape_record(net_id, pad_id, portal)
         nearby = set()
         for cell in self._escape_cells(candidate):
-            nearby.update(self._escape_spatial.get(cell, ()))
+            nearby.update(spatial.get(cell, ()))
         return sum(
             1
             for key in nearby
-            if self._escape_records[key]["net"] != net_id
+            if records[key]["net"] != net_id
             and self._escape_records_conflict(
-                candidate, self._escape_records[key]
+                candidate, records[key]
             )
         )
 
@@ -3231,6 +3236,11 @@ class PathFinderRouter:
             len(assignment),
             len(pairs),
         )
+        self._escape_reserved_records = dict(self._escape_records)
+        self._escape_reserved_spatial = defaultdict(set)
+        for key, record in self._escape_reserved_records.items():
+            for cell in record["cells"]:
+                self._escape_reserved_spatial[cell].add(key)
         self._escape_records.clear()
         self._escape_spatial.clear()
 
@@ -3266,8 +3276,18 @@ class PathFinderRouter:
                     self.config, "escape_preference_penalty", 1.0
                 ))
             if current_net is not None:
-                conflicts = self._escape_candidate_conflicts(
+                committed_conflicts = self._escape_candidate_conflicts(
                     current_net, pad_id, portal
+                )
+                reserved_conflicts = self._escape_candidate_conflicts(
+                    current_net,
+                    pad_id,
+                    portal,
+                    records=self._escape_reserved_records,
+                    spatial=self._escape_reserved_spatial,
+                )
+                conflicts = max(
+                    committed_conflicts, reserved_conflicts
                 )
                 candidate_penalty += (
                     conflicts
