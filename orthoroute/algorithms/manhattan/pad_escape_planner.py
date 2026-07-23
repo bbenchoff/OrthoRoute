@@ -82,6 +82,7 @@ class Portal:
     entry_layer: int = 1  # Which horizontal layer this escape via connects to
     score: float = 0.0
     retarget_count: int = 0
+    axis: str = "y"
 
 
 class PadEscapePlanner:
@@ -724,7 +725,8 @@ class PadEscapePlanner:
                            pad_id: str, pad_x: float, pad_y: float, pad_layer: int, entry_layer: int,
                            pad_geometries: Dict, spatial_index: Dict = None,
                            claim_cell: bool = True,
-                           allow_occupied_cell: Tuple[int, int] = None) -> Optional[Portal]:
+                           allow_occupied_cell: Tuple[int, int] = None,
+                           axis: str = "y") -> Optional[Portal]:
         """
         Try to create a portal with given parameters, return None if DRC fails.
 
@@ -753,14 +755,24 @@ class PadEscapePlanner:
         Returns:
             Portal object if DRC passes, None if any violation detected
         """
-        y_idx_portal = y_idx + direction * delta_steps
+        if axis == "x":
+            x_idx_portal = x_idx + direction * delta_steps
+            y_idx_portal = y_idx
+        else:
+            x_idx_portal = x_idx
+            y_idx_portal = y_idx + direction * delta_steps
+        if not (
+            0 <= x_idx_portal < self.lattice.x_steps
+            and 0 <= y_idx_portal < self.lattice.y_steps
+        ):
+            return None
 
         # HARD GUARANTEE: one portal via per lattice cell. Two portals on the
         # same cell share a via barrel - permanent overuse no amount of
         # negotiation can resolve (and a DRC violation in the output).
         if not hasattr(self, '_occupied_portal_cells'):
             self._occupied_portal_cells = set()
-        portal_cell = (x_idx, y_idx_portal)
+        portal_cell = (x_idx_portal, y_idx_portal)
         if (
             portal_cell in self._occupied_portal_cells
             and portal_cell != allow_occupied_cell
@@ -768,7 +780,9 @@ class PadEscapePlanner:
             return None
 
         # Convert portal to world coordinates
-        portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(x_idx, y_idx_portal)
+        portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(
+            x_idx_portal, y_idx_portal
+        )
 
         clearance = float(
             getattr(self.config, "clearance", PAD_CLEARANCE_MM)
@@ -811,7 +825,7 @@ class PadEscapePlanner:
         if claim_cell:
             self._occupied_portal_cells.add(portal_cell)
         return Portal(
-            x_idx=x_idx,
+            x_idx=x_idx_portal,
             y_idx=y_idx_portal,
             pad_layer=pad_layer,
             delta_steps=delta_steps,
@@ -820,7 +834,8 @@ class PadEscapePlanner:
             pad_y=pad_y,
             entry_layer=entry_layer,
             score=0.0,
-            retarget_count=0
+            retarget_count=0,
+            axis=axis,
         )
 
     @staticmethod
@@ -830,19 +845,29 @@ class PadEscapePlanner:
         portal_x: float,
         portal_y: float,
     ):
-        """Return the exact vertical/45-degree stub centerlines."""
+        """Return the shortest orthogonal/45-degree stub centerlines."""
         dx = portal_x - pad_x
         dy = portal_y - pad_y
-        if abs(dx) <= 0.01:
+        if abs(dx) <= 0.01 or abs(dy) <= 0.01:
             return [((pad_x, pad_y), (portal_x, portal_y))]
 
-        sign_y = 1 if dy > 0 else -1
-        intermediate = (
-            pad_x,
-            pad_y + dy - sign_y * abs(dx),
-        )
+        if abs(dx) <= abs(dy):
+            sign_y = 1 if dy > 0 else -1
+            intermediate = (
+                pad_x,
+                pad_y + dy - sign_y * abs(dx),
+            )
+        else:
+            sign_x = 1 if dx > 0 else -1
+            intermediate = (
+                pad_x + dx - sign_x * abs(dy),
+                pad_y,
+            )
         segments = []
-        if abs(intermediate[1] - pad_y) > 0.01:
+        if (
+            abs(intermediate[0] - pad_x) > 0.01
+            or abs(intermediate[1] - pad_y) > 0.01
+        ):
             segments.append(((pad_x, pad_y), intermediate))
         segments.append((intermediate, (portal_x, portal_y)))
         return segments
@@ -960,13 +985,24 @@ class PadEscapePlanner:
                     if not (0 <= y_portal < self.lattice.y_steps):
                         continue
                     rank = (
-                        0 if direction == primary.direction else 1,
                         abs(delta - primary.delta_steps),
+                        0 if direction == primary.direction else 1,
                         delta,
                     )
-                    choices.append((rank, direction, delta))
+                    choices.append((rank, "y", direction, delta))
+            for direction in (-1, 1):
+                for delta in range(3, 13):
+                    x_portal = x_idx + direction * delta
+                    if not (0 <= x_portal < self.lattice.x_steps):
+                        continue
+                    rank = (
+                        abs(delta - primary.delta_steps),
+                        2,
+                        delta,
+                    )
+                    choices.append((rank, "x", direction, delta))
 
-            for _, direction, delta in sorted(choices):
+            for _, axis, direction, delta in sorted(choices):
                 if len(candidates) >= candidate_limit:
                     break
                 portal = self._try_create_portal(
@@ -981,14 +1017,14 @@ class PadEscapePlanner:
                     primary.entry_layer,
                     pad_geometries,
                     spatial_index,
-                    # Candidate terminals are force-allowed by the path
-                    # search, so two pads must never be offered the same
-                    # cell. Reserve every accepted alternative globally just
-                    # like the primary portal.
-                    claim_cell=True,
+                    # Alternatives are not copper until selected. Global
+                    # assignment and negotiated physical history choose a
+                    # mutually clear set.
+                    claim_cell=False,
                     allow_occupied_cell=(
                         primary.x_idx, primary.y_idx
                     ),
+                    axis=axis,
                 )
                 if portal is None:
                     continue
@@ -1001,7 +1037,10 @@ class PadEscapePlanner:
                     * float(self.config.grid_pitch)
                     + (
                         float(self.config.grid_pitch)
-                        if direction != primary.direction
+                        if (
+                            axis != primary.axis
+                            or direction != primary.direction
+                        )
                         else 0.0
                     )
                 )

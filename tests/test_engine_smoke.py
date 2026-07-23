@@ -151,6 +151,38 @@ def test_escape_distance_detects_crossing_segments():
     assert distance == 0.0
 
 
+def test_horizontal_escape_uses_short_orthogonal_dogleg(routed):
+    pf, _, _, _ = routed
+    segments = pf.escape_planner._escape_segments(
+        0.0, 0.0, 4.0, 0.2
+    )
+
+    assert segments == [
+        ((0.0, 0.0), (3.8, 0.0)),
+        ((3.8, 0.0), (4.0, 0.2)),
+    ]
+
+
+def test_escape_conflicts_identify_both_portals_for_history(routed):
+    pf, _, _, _ = routed
+    portal = pf.net_selected_portals["TEST_NET"][0]
+    pf._escape_records.clear()
+    pf._escape_spatial.clear()
+    for net_id, pad_id in (("FIRST", "PAD_A"), ("SECOND", "PAD_B")):
+        pf._insert_escape_record(
+            pf._escape_record(net_id, pad_id, portal)
+        )
+
+    conflicts, _, _ = pf._detect_escape_conflicts()
+
+    assert len(conflicts) == 1
+    assert pf._escape_conflict_portal_keys(conflicts) == {
+        ("PAD_A", portal.x_idx, portal.y_idx),
+        ("PAD_B", portal.x_idx, portal.y_idx),
+    }
+    pf._rebuild_escape_occupancy()
+
+
 def test_stagnation_rip_clears_all_geometry_ownership():
     board = make_two_pad_board(layer_count=4)
     config = PathFinderConfig()

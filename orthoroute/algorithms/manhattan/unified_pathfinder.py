@@ -623,7 +623,9 @@ class PathFinderConfig:
     portal_x_snap_max: float = 0.5  # Max x-snap in steps (½ pitch)
     portal_via_discount: float = 0.15  # Escape via multiplier (85% discount)
     portal_retarget_patience: int = 3  # Iters before retargeting
-    portal_candidate_count: int = 6
+    portal_candidate_count: int = 20
+    escape_assignment_steps: int = 5000
+    escape_reservation_penalty: float = 1000.0
     escape_preference_penalty: float = 10.0
     escape_replan_patience: int = 2
     escape_replan_limit: int = 3
@@ -3045,26 +3047,38 @@ class PathFinderRouter:
             for second_segment in second["segments"]
         )
 
-    def _escape_candidate_conflicts(
+    def _escape_candidate_conflict_keys(
         self, net_id: str, pad_id: str, portal: Portal,
         records=None, spatial=None,
-    ) -> int:
+    ):
         records = self._escape_records if records is None else records
         spatial = self._escape_spatial if spatial is None else spatial
         if not records:
-            return 0
+            return set()
         candidate = self._escape_record(net_id, pad_id, portal)
         nearby = set()
         for cell in self._escape_cells(candidate):
             nearby.update(spatial.get(cell, ()))
-        return sum(
-            1
+        return {
+            key
             for key in nearby
             if records[key]["net"] != net_id
             and self._escape_records_conflict(
                 candidate, records[key]
             )
-        )
+        }
+
+    def _escape_candidate_conflicts(
+        self, net_id: str, pad_id: str, portal: Portal,
+        records=None, spatial=None,
+    ) -> int:
+        return len(self._escape_candidate_conflict_keys(
+            net_id,
+            pad_id,
+            portal,
+            records=records,
+            spatial=spatial,
+        ))
 
     def _mark_escape_occupancy(
         self, net_id: str, selected_portals: Tuple[Portal, Portal]
@@ -3132,6 +3146,20 @@ class PathFinderRouter:
         victims = {pair[1][0] for pair in pairs}
         return pairs, owners, victims
 
+    def _escape_conflict_portal_keys(self, pairs):
+        """Return the selected portal-history keys involved in conflicts."""
+        keys = set()
+        for pair in pairs:
+            for record_key in pair:
+                record = self._escape_records[record_key]
+                portal = record["portal"]
+                keys.add((
+                    record["pad"],
+                    portal.x_idx,
+                    portal.y_idx,
+                ))
+        return keys
+
     def _plan_escape_assignment(self) -> None:
         """Choose a globally clearance-aware portal candidate for every pad."""
         entries = []
@@ -3173,60 +3201,118 @@ class PathFinderRouter:
                 self._escape_record(net_id, pad_id, selected)
             )
 
-        # Greedy insertion can paint a later pad into a corner. Repair the
-        # remaining sparse conflict graph with deterministic min-conflicts.
-        for _ in range(20):
-            pairs, _, _ = self._detect_escape_conflicts()
-            if not pairs:
-                break
-            degree = defaultdict(int)
-            for first, second in pairs:
-                degree[first] += 1
-                degree[second] += 1
-            improved = False
-            for key in sorted(
-                degree, key=lambda item: (-degree[item], item)
-            ):
-                old = self._remove_escape_record(key)
-                if old is None:
-                    continue
-                candidates = self.portal_candidates.get(
-                    old["pad"], [old["portal"]]
-                )
-                ranked = []
-                for portal in candidates:
-                    conflicts = self._escape_candidate_conflicts(
-                        old["net"], old["pad"], portal
-                    )
-                    ranked.append((
-                        conflicts,
-                        self._portal_barrel_history.get(
-                            (
-                                old["pad"],
-                                portal.x_idx,
-                                portal.y_idx,
-                            ),
-                            0.0,
-                        ),
-                        float(getattr(portal, "score", 0.0)),
-                        portal.y_idx,
-                        portal,
-                    ))
-                best = min(ranked, key=lambda item: item[:4])
-                selected = best[4]
-                assignment[old["pad"]] = selected
-                self._insert_escape_record(
-                    self._escape_record(
-                        old["net"], old["pad"], selected
-                    )
-                )
-                if best[0] < degree[key]:
-                    improved = True
-            if not improved:
-                break
+        # Greedy insertion can paint a later pad into a corner. Standard
+        # min-conflicts with sideways moves escapes the deterministic
+        # two-variable swaps that occur in dense connector fields.
+        import random
 
         pairs, _, _ = self._detect_escape_conflicts()
+        adjacency = defaultdict(set)
+        for first, second in pairs:
+            adjacency[first].add(second)
+            adjacency[second].add(first)
+        conflict_keys = set(adjacency)
+        best_pair_count = len(pairs)
+        best_assignment = dict(assignment)
+        rng = random.Random(42)
+        key_cache = []
+        max_steps = int(getattr(
+            self.config, "escape_assignment_steps", 5000
+        ))
+
+        for step in range(max_steps):
+            if not pairs:
+                break
+            if step % 128 == 0 or not key_cache:
+                key_cache = list(conflict_keys)
+            if not key_cache:
+                break
+            key = rng.choice(key_cache)
+            if key not in conflict_keys:
+                continue
+
+            old_neighbors = tuple(adjacency.pop(key, ()))
+            old = self._remove_escape_record(key)
+            if old is None:
+                conflict_keys.discard(key)
+                continue
+            for other in old_neighbors:
+                adjacency[other].discard(key)
+                pairs.discard(tuple(sorted((key, other))))
+                if not adjacency[other]:
+                    adjacency.pop(other, None)
+                    conflict_keys.discard(other)
+            conflict_keys.discard(key)
+
+            candidates = self.portal_candidates.get(
+                old["pad"], [old["portal"]]
+            )
+            ranked = []
+            for portal in candidates:
+                neighbors = self._escape_candidate_conflict_keys(
+                    old["net"], old["pad"], portal
+                )
+                ranked.append((
+                    len(neighbors),
+                    self._portal_barrel_history.get(
+                        (
+                            old["pad"],
+                            portal.x_idx,
+                            portal.y_idx,
+                        ),
+                        0.0,
+                    ),
+                    float(getattr(portal, "score", 0.0)),
+                    portal.y_idx,
+                    portal,
+                    neighbors,
+                ))
+            min_conflicts = min(item[0] for item in ranked)
+            choices = [
+                item for item in ranked if item[0] == min_conflicts
+            ]
+            if len(choices) > 1:
+                alternatives = [
+                    item for item in choices
+                    if item[4] is not old["portal"]
+                ]
+                if alternatives:
+                    choices = alternatives
+            selected_item = rng.choice(choices)
+
+            selected = selected_item[4]
+            assignment[old["pad"]] = selected
+            self._insert_escape_record(
+                self._escape_record(
+                    old["net"], old["pad"], selected
+                )
+            )
+            for other in selected_item[5]:
+                pair = tuple(sorted((key, other)))
+                pairs.add(pair)
+                adjacency[key].add(other)
+                adjacency[other].add(key)
+                conflict_keys.add(other)
+            if adjacency.get(key):
+                conflict_keys.add(key)
+
+            if len(pairs) < best_pair_count:
+                best_pair_count = len(pairs)
+                best_assignment = dict(assignment)
+
+        if len(pairs) > best_pair_count:
+            assignment = best_assignment
+            self._escape_records.clear()
+            self._escape_spatial.clear()
+            for _, net_id, pad_id, _ in entries:
+                self._insert_escape_record(self._escape_record(
+                    net_id, pad_id, assignment[pad_id]
+                ))
+            pairs, _, _ = self._detect_escape_conflicts()
+
         self._escape_preferred_portals = assignment
+        self._escape_assignment_conflicts = set(pairs)
+        self._escape_reservations_strict = not pairs
         logger.info(
             "[ESCAPE-ASSIGN] Assigned %d pads with %d physical conflicts",
             len(assignment),
@@ -3255,6 +3341,7 @@ class PathFinderRouter:
         best_by_node = {}
         portal_by_node = {}
         for portal in candidates:
+            reserved_conflicts = 0
             if current_net is not None:
                 committed_conflicts = self._escape_candidate_conflicts(
                     current_net, pad_id, portal
@@ -3270,9 +3357,23 @@ class PathFinderRouter:
                 # Candidate escape geometry that violates either that
                 # reservation or committed copper is physically illegal;
                 # on-grid ownership remains a negotiated cost below.
-                if committed_conflicts or reserved_conflicts:
+                if committed_conflicts:
+                    continue
+                if (
+                    getattr(self, "_escape_reservations_strict", False)
+                    and reserved_conflicts
+                ):
                     continue
             candidate_penalty = float(getattr(portal, "score", 0.0))
+            if current_net is not None and reserved_conflicts:
+                candidate_penalty += (
+                    reserved_conflicts
+                    * float(getattr(
+                        self.config,
+                        "escape_reservation_penalty",
+                        1000.0,
+                    ))
+                )
             candidate_penalty += (
                 self._portal_barrel_history[
                     (pad_id, portal.x_idx, portal.y_idx)
@@ -6992,6 +7093,13 @@ class PathFinderRouter:
         )
         self._last_escape_conflict_count = len(escape_pairs)
         if escape_pairs:
+            # Escape stubs live outside edge accounting, so their selected
+            # candidates need their own Pathfinder history. Penalize both
+            # ends of every physical conflict; otherwise these conflicts can
+            # reroute forever without making either alternative more costly.
+            self._barrel_owner_portal_keys.update(
+                self._escape_conflict_portal_keys(escape_pairs)
+            )
             self._barrel_owner_nets.update(escape_owners)
             self._barrel_victim_nets.update(escape_victims)
             self._barrel_conflict_nets.update(
