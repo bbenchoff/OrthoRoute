@@ -648,6 +648,36 @@ LAYER_COUNT = 6
 # CSR GRAPH
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _points_in_polygon(px: np.ndarray, py: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Ray-casting point-in-polygon test, vectorised over N points.
+
+    (From PR #17 by RolandWa.)
+
+    Args:
+        px, py: 1-D float arrays of query point coordinates (mm), shape (N,)
+        poly:   polygon vertices, shape (M, 2) in (x, y) order
+
+    Returns:
+        Boolean array of shape (N,), True if the point is inside the polygon.
+    """
+    n = len(poly)
+    inside = np.zeros(len(px), dtype=bool)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i, 0], poly[i, 1]
+        xj, yj = poly[j, 0], poly[j, 1]
+        cond1 = (yi > py) != (yj > py)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            x_intersect = np.where(
+                cond1,
+                (xj - xi) * (py - yi) / (yj - yi + 1e-15) + xi,
+                np.inf
+            )
+        inside ^= cond1 & (px < x_intersect)
+        j = i
+    return inside
+
+
 class CSRGraph:
     """Compressed Sparse Row graph"""
 
@@ -829,21 +859,42 @@ class EdgeAccountant:
                 self.present[idx] = float(count)
 
     def commit_path(self, edge_indices: List[int]):
-        """Add path and keep present in sync"""
+        """Add path and keep present in sync.
+
+        Vectorized scatter-add on present (from PR #17 by RolandWa): the old
+        per-element loop was one host<->device round-trip per edge on GPU.
+        The canonical dict stays a CPU loop - fast for typical path lengths.
+        """
+        if not edge_indices:
+            return
         for idx in edge_indices:
             self.canonical[idx] = self.canonical.get(idx, 0) + 1
-            # Keep present in sync during iteration
-            self.present[idx] = self.present[idx] + 1
+        arr = self.xp.asarray(edge_indices, dtype=np.int64)
+        if self.use_gpu:
+            import cupyx
+            cupyx.scatter_add(self.present, arr,
+                              self.xp.ones(len(edge_indices), dtype=self.present.dtype))
+        else:
+            np.add.at(self.present, arr, 1.0)
 
     def clear_path(self, edge_indices: List[int]):
-        """Remove path and keep present in sync"""
+        """Remove path and keep present in sync (vectorized, floored at 0)."""
+        if not edge_indices:
+            return
         for idx in edge_indices:
             if idx in self.canonical:
                 self.canonical[idx] -= 1
                 if self.canonical[idx] <= 0:
                     del self.canonical[idx]
-            # Reflect in present
-            self.present[idx] = self.xp.maximum(0, self.present[idx] - 1)
+        arr = self.xp.asarray(edge_indices, dtype=np.int64)
+        if self.use_gpu:
+            import cupyx
+            cupyx.scatter_add(self.present, arr,
+                              -self.xp.ones(len(edge_indices), dtype=self.present.dtype))
+            self.xp.maximum(self.present, 0, out=self.present)
+        else:
+            np.add.at(self.present, arr, -1.0)
+            np.maximum(self.present, 0, out=self.present)
 
     def compute_overuse(self, router_instance=None) -> Tuple[int, int]:
         """
@@ -1650,6 +1701,15 @@ class ROIExtractor:
         indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
         indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
 
+        # Hard-blocked edges (keepouts) must be INVISIBLE to ROI growth: the
+        # bidirectional BFS stops when the waves meet, and a cost-blind BFS
+        # meets straight through a keepout - the resulting corridor then
+        # contains no legal detour and Dijkstra is forced to pay the block
+        # cost. Skipping blocked edges makes the waves grow around the
+        # keepout so the ROI includes a legal route. The mask is precomputed
+        # by _apply_keepout_obstacles (None when the board has no keepouts).
+        blocked = getattr(self.graph, 'blocked_edges', None)
+
         N = self.N
         seen = np.zeros(N, dtype=np.uint8)   # 0=unseen, 1=src-wave, 2=dst-wave, 3=both
         q_src = [src]
@@ -1678,6 +1738,8 @@ class ROIExtractor:
                 for u in queue:
                     s, e = int(indptr[u]), int(indptr[u+1])
                     for ei in range(s, e):
+                        if blocked is not None and blocked[ei]:
+                            continue
                         v = int(indices[ei])
                         if seen[v] == 0:
                             seen[v] = mark
@@ -2267,8 +2329,115 @@ class PathFinderRouter:
         # Note: Portal discounts are applied at seed level in _get_portal_seeds()
         # No need for graph-level discount modification
 
+        # Block edges inside keepout rule areas (from PR #17 by RolandWa)
+        self._apply_keepout_obstacles(board)
+
         logger.info("=== Init complete ===")
         return True
+
+    def _apply_keepout_obstacles(self, board) -> None:
+        """Block lattice edges inside keepout rule area polygons.
+
+        Respects per-keepout constraint flags:
+            keepout_tracks -> block planar (same-layer) edges
+            keepout_vias   -> block via (inter-layer) edges
+
+        Called from initialize_graph() after the graph is built.
+        (From PR #17 by RolandWa, with dst-layer lookup vectorised.)
+        """
+        keepouts = getattr(board, 'keepouts', [])
+        if not keepouts:
+            return
+
+        if getattr(self, 'graph', None) is None or self.graph.base_costs is None:
+            logger.warning("[KEEPOUT] Graph not initialized, skipping keepout obstacles")
+            return
+
+        base_cost = self.graph.base_costs
+        is_gpu = hasattr(base_cost, 'get')
+        base_cost_cpu = base_cost.get() if is_gpu else base_cost
+
+        indptr = self.graph.indptr
+        indices = self.graph.indices
+        if hasattr(indptr, 'get'):
+            indptr = indptr.get()
+        if hasattr(indices, 'get'):
+            indices = indices.get()
+
+        BLOCK_COST = 1e9
+        Nx, Ny, Nz = self._Nx, self._Ny, self._Nz
+        plane = Nx * Ny
+        bounds = self.lattice.bounds
+        pitch = self.lattice.pitch
+
+        # Pre-build vectorised mm grids for PIP tests (shape Nx*Ny)
+        xs = bounds[0] + np.arange(Nx, dtype=np.float64) * pitch
+        ys = bounds[1] + np.arange(Ny, dtype=np.float64) * pitch
+        grid_x, grid_y = np.meshgrid(xs, ys, indexing='ij')
+        grid_x_flat = grid_x.ravel()
+        grid_y_flat = grid_y.ravel()
+
+        layer_names = list(getattr(self.config, 'layer_names', []))
+        total_blocked_tracks = 0
+        total_blocked_vias = 0
+
+        for keepout in keepouts:
+            outline = keepout.get('outline', [])
+            if len(outline) < 3:
+                continue
+
+            block_tracks = keepout.get('keepout_tracks', False)
+            block_vias = keepout.get('keepout_vias', False)
+            if not block_tracks and not block_vias:
+                continue
+
+            # Determine affected z-indices (all layers if unmapped)
+            ko_layers = keepout.get('layers', [])
+            if ko_layers and layer_names:
+                z_indices = [layer_names.index(ln) for ln in ko_layers if ln in layer_names]
+            else:
+                z_indices = list(range(Nz))
+            if not z_indices:
+                continue
+
+            # Vectorised point-in-polygon over the whole (Nx, Ny) plane
+            poly = np.array(outline, dtype=np.float64)
+            inside_2d = _points_in_polygon(grid_x_flat, grid_y_flat, poly).reshape(Nx, Ny)
+            xis, yis = np.nonzero(inside_2d)
+            if len(xis) == 0:
+                continue
+
+            for zi in z_indices:
+                node_idxs = zi * plane + yis * Nx + xis
+                for node_idx in node_idxs.tolist():
+                    start, end = int(indptr[node_idx]), int(indptr[node_idx + 1])
+                    if start == end:
+                        continue
+                    dst_z = indices[start:end] // plane
+                    is_via = dst_z != zi
+                    if block_tracks:
+                        planar_eids = np.arange(start, end)[~is_via]
+                        base_cost_cpu[planar_eids] = BLOCK_COST
+                        total_blocked_tracks += len(planar_eids)
+                    if block_vias:
+                        via_eids = np.arange(start, end)[is_via]
+                        base_cost_cpu[via_eids] = BLOCK_COST
+                        total_blocked_vias += len(via_eids)
+
+        # Sync back to GPU if needed
+        if is_gpu:
+            self.graph.base_costs = cp.asarray(base_cost_cpu)
+        else:
+            self.graph.base_costs = base_cost_cpu
+
+        # Precomputed mask for the ROI extractor (BFS must not grow through
+        # blocked edges - see extract_roi_bfs)
+        self.graph.blocked_edges = base_cost_cpu >= 1e8
+
+        logger.info(
+            f"[KEEPOUT] Applied {len(keepouts)} keepout area(s): "
+            f"blocked {total_blocked_tracks} track edges, {total_blocked_vias} via edges"
+        )
 
     def _calc_bounds(self, board: Board) -> Tuple[float, float, float, float]:
         """
