@@ -83,6 +83,9 @@ class Portal:
     score: float = 0.0
     retarget_count: int = 0
     axis: str = "y"
+    via_x: Optional[float] = None
+    via_y: Optional[float] = None
+    dynamic_entry: bool = False
 
 
 class PadEscapePlanner:
@@ -314,15 +317,27 @@ class PadEscapePlanner:
         spatial_time = time.time() - spatial_start
         logger.info(f"Built spatial index in {spatial_time:.2f}s ({len(pad_geometries)} pads → {len(spatial_index)} grid cells)")
 
-        # STEP 2: Group by column (x_idx)
+        # Dense columnar SMD connectors have a stronger geometric structure
+        # than the generic column heuristic can infer from snapped cells.
+        # Preserve their exact pad X coordinate and connect the resulting via
+        # to the nearby lattice node on the negotiated entry layer.
+        dynamic_pad_ids = self._plan_dynamic_columnar_escapes(
+            pad_list,
+            pad_geometries,
+            spatial_index,
+        )
+
+        # STEP 2: Group remaining pads by snapped lattice column.
         columns = {}  # x_idx -> [(pad_obj, pad_id, y_idx, pad_x, pad_y, pad_layer), ...]
         for pad, pad_id, x_idx, y_idx, pad_x, pad_y, pad_layer in pad_list:
+            if pad_id in dynamic_pad_ids:
+                continue
             if x_idx not in columns:
                 columns[x_idx] = []
             columns[x_idx].append((pad, pad_id, y_idx, pad_x, pad_y, pad_layer))
 
         # STEP 3: Process each column (already sorted from Step 1)
-        portal_count = 0
+        portal_count = len(dynamic_pad_ids)
 
         # REVERTED: Back to simple random (no env var complexity)
         # Both portal layers and Y-offsets use random assignment
@@ -505,6 +520,142 @@ class PadEscapePlanner:
 
         logger.info(f"Final: {len(tracks)} escape stubs and {len(vias)} portal vias")
         return (tracks, vias)
+
+    def _plan_dynamic_columnar_escapes(
+        self,
+        pad_list: List,
+        pad_geometries: Dict,
+        spatial_index: Dict,
+    ) -> set:
+        """Plan straight, staggered escapes for regular dense connectors.
+
+        A connector qualifies only when it has many equally populated
+        physical X columns of tall SMD pads at the routing pitch. Each column
+        is sent away from its centreline and adjacent columns alternate
+        between the minimum escape length and one additional grid step.
+        The physical via remains at the pad X coordinate; ``x_idx`` is only
+        the nearby lattice anchor on the negotiated horizontal entry layer.
+        """
+        from collections import defaultdict
+
+        by_component = defaultdict(list)
+        for entry in pad_list:
+            pad = entry[0]
+            component_id = getattr(pad, "component_id", None)
+            if component_id:
+                by_component[component_id].append(entry)
+
+        planned_ids = set()
+        pitch = float(self.config.grid_pitch)
+        min_steps = int(getattr(
+            self.config, "portal_delta_min", 3
+        ))
+
+        for component_id, entries in sorted(by_component.items()):
+            physical_columns = defaultdict(list)
+            for entry in entries:
+                physical_columns[round(float(entry[4]), 5)].append(entry)
+
+            ordered_columns = sorted(physical_columns.items())
+            if len(ordered_columns) < 8:
+                continue
+
+            row_counts = {len(column) for _, column in ordered_columns}
+            if len(row_counts) != 1:
+                continue
+            row_count = next(iter(row_counts))
+            if row_count < 2 or row_count % 2:
+                continue
+
+            regular_gaps = sum(
+                abs((right - left) - pitch) <= pitch * 0.05
+                for (left, _), (right, _)
+                in zip(ordered_columns, ordered_columns[1:])
+            )
+            if regular_gaps < 0.75 * (len(ordered_columns) - 1):
+                continue
+
+            if any(
+                pad_geometries[entry[1]]["height"]
+                < 2.0 * pad_geometries[entry[1]]["width"]
+                or pad_geometries[entry[1]]["width"] > 0.75 * pitch
+                for entry in entries
+            ):
+                continue
+
+            component_portals = {}
+            component_cells = set()
+            valid = True
+            for column_rank, (_, column) in enumerate(ordered_columns):
+                ordered_rows = sorted(column, key=lambda entry: entry[5])
+                delta_steps = min_steps + (column_rank % 2)
+                for row_rank, entry in enumerate(ordered_rows):
+                    (
+                        _pad,
+                        pad_id,
+                        x_idx,
+                        y_idx,
+                        pad_x,
+                        pad_y,
+                        pad_layer,
+                    ) = entry
+                    direction = (
+                        -1 if row_rank < row_count // 2 else 1
+                    )
+                    portal = self._try_create_portal(
+                        x_idx,
+                        y_idx,
+                        direction,
+                        delta_steps,
+                        pad_id,
+                        pad_x,
+                        pad_y,
+                        pad_layer,
+                        1,
+                        pad_geometries,
+                        spatial_index,
+                        claim_cell=False,
+                        dynamic_entry=True,
+                    )
+                    if portal is None:
+                        valid = False
+                        break
+                    cell = (portal.x_idx, portal.y_idx)
+                    if (
+                        cell in component_cells
+                        or cell in self._occupied_portal_cells
+                    ):
+                        valid = False
+                        break
+                    component_cells.add(cell)
+                    component_portals[pad_id] = portal
+                if not valid:
+                    break
+
+            if not valid:
+                logger.info(
+                    "[DYNAMIC-ESCAPE] %s did not admit a complete "
+                    "straight staggered assignment; using generic planning",
+                    component_id,
+                )
+                continue
+
+            self.portals.update(component_portals)
+            self._occupied_portal_cells.update(component_cells)
+            planned_ids.update(component_portals)
+            logger.info(
+                "[DYNAMIC-ESCAPE] %s: %d pads in %d physical columns",
+                component_id,
+                len(component_portals),
+                len(ordered_columns),
+            )
+
+        if planned_ids:
+            logger.info(
+                "[DYNAMIC-ESCAPE] Planned %d straight off-grid punch-ins",
+                len(planned_ids),
+            )
+        return planned_ids
 
     def _plan_column_escapes(self, x_idx: int, column_pads: List, pad_geometries: Dict, spatial_index: Dict = None) -> int:
         """
@@ -726,7 +877,8 @@ class PadEscapePlanner:
                            pad_geometries: Dict, spatial_index: Dict = None,
                            claim_cell: bool = True,
                            allow_occupied_cell: Tuple[int, int] = None,
-                           axis: str = "y") -> Optional[Portal]:
+                           axis: str = "y",
+                           dynamic_entry: bool = False) -> Optional[Portal]:
         """
         Try to create a portal with given parameters, return None if DRC fails.
 
@@ -780,9 +932,13 @@ class PadEscapePlanner:
             return None
 
         # Convert portal to world coordinates
-        portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(
+        anchor_x_mm, anchor_y_mm = self.lattice.geom.lattice_to_world(
             x_idx_portal, y_idx_portal
         )
+        portal_x_mm = (
+            pad_x if dynamic_entry and axis == "y" else anchor_x_mm
+        )
+        portal_y_mm = anchor_y_mm
 
         clearance = float(
             getattr(self.config, "clearance", PAD_CLEARANCE_MM)
@@ -836,6 +992,17 @@ class PadEscapePlanner:
             score=0.0,
             retarget_count=0,
             axis=axis,
+            via_x=portal_x_mm if dynamic_entry else None,
+            via_y=portal_y_mm if dynamic_entry else None,
+            dynamic_entry=dynamic_entry,
+        )
+
+    def _portal_world(self, portal: Portal) -> Tuple[float, float]:
+        """Return the physical via location for a portal."""
+        if portal.via_x is not None and portal.via_y is not None:
+            return float(portal.via_x), float(portal.via_y)
+        return self.lattice.geom.lattice_to_world(
+            portal.x_idx, portal.y_idx
         )
 
     @staticmethod
@@ -978,6 +1145,59 @@ class PadEscapePlanner:
 
             candidates = [primary]
             seen_cells = {(primary.x_idx, primary.y_idx)}
+            if primary.dynamic_entry:
+                # Vary the straight trace length while preserving the
+                # connector's physical escape direction and exact pad X.
+                # Entry-layer depth is expanded later by PathFinder.
+                for delta in sorted(
+                    range(
+                        int(getattr(
+                            self.config, "portal_delta_min", 3
+                        )),
+                        int(getattr(
+                            self.config, "portal_delta_max", 12
+                        )) + 1,
+                    ),
+                    key=lambda value: (
+                        abs(value - primary.delta_steps),
+                        value,
+                    ),
+                ):
+                    if len(candidates) >= candidate_limit:
+                        break
+                    if delta == primary.delta_steps:
+                        continue
+                    portal = self._try_create_portal(
+                        x_idx,
+                        y_idx,
+                        primary.direction,
+                        delta,
+                        pad_id,
+                        pad_x,
+                        pad_y,
+                        pad_layer,
+                        primary.entry_layer,
+                        pad_geometries,
+                        spatial_index,
+                        claim_cell=False,
+                        allow_occupied_cell=(
+                            primary.x_idx, primary.y_idx
+                        ),
+                        dynamic_entry=True,
+                    )
+                    if portal is None:
+                        continue
+                    cell = (portal.x_idx, portal.y_idx)
+                    if cell in seen_cells:
+                        continue
+                    seen_cells.add(cell)
+                    portal.score = (
+                        abs(delta - primary.delta_steps)
+                        * float(self.config.grid_pitch)
+                    )
+                    candidates.append(portal)
+                self.portal_candidates[pad_id] = candidates
+                continue
             choices = []
             for direction in (primary.direction, -primary.direction):
                 for delta in range(3, 13):
@@ -1271,8 +1491,15 @@ class PadEscapePlanner:
 
         return len(violations) == 0
 
-    def _emit_portal_escape_geometry(self, net_id: str, pad_id: str, portal: Portal, entry_layer: int):
-        """Emit vertical + 45-degree escape stub and portal via for a pad"""
+    def _emit_portal_escape_geometry(
+        self,
+        net_id: str,
+        pad_id: str,
+        portal: Portal,
+        entry_layer: int,
+        include_via: bool = False,
+    ):
+        """Emit a pad stub and, after routing, its dynamic grid entry."""
         geometry = []
 
         # 1. Escape routing: vertical segment + 45-degree segment to portal via
@@ -1284,7 +1511,7 @@ class PadEscapePlanner:
             logger.error(f"[ESCAPE-LAYER-BUG] This will create escape stubs on {pad_layer_name} instead of F.Cu!")
 
         # Get portal mm coordinates
-        portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(portal.x_idx, portal.y_idx)
+        portal_x_mm, portal_y_mm = self._portal_world(portal)
 
         for start, end in self._escape_segments(
             portal.pad_x,
@@ -1303,10 +1530,40 @@ class PadEscapePlanner:
                 'escape': True,
             })
 
-        # 2. Portal via is NOT created here!
-        # The escape planner only creates the F.Cu stub to the portal location.
-        # PathFinder will decide which layer to transition to and create the via
-        # from F.Cu to that layer based on routing needs.
-        # This ensures vias are only created where tracks actually connect.
+        if include_via and portal.dynamic_entry:
+            entry_layer_name = (
+                self.config.layer_names[entry_layer]
+                if entry_layer < len(self.config.layer_names)
+                else f"L{entry_layer}"
+            )
+            geometry.append({
+                "net": net_id,
+                "x": portal_x_mm,
+                "y": portal_y_mm,
+                "from_layer": pad_layer_name,
+                "to_layer": entry_layer_name,
+                "diameter": self.config.via_diameter,
+                "drill": self.config.via_drill,
+                "escape": True,
+                "dynamic_entry": True,
+            })
+
+            anchor_x, anchor_y = self.lattice.geom.lattice_to_world(
+                portal.x_idx, portal.y_idx
+            )
+            if (
+                abs(anchor_x - portal_x_mm) > 1e-9
+                or abs(anchor_y - portal_y_mm) > 1e-9
+            ):
+                geometry.append({
+                    "net": net_id,
+                    "layer": entry_layer_name,
+                    "x1": portal_x_mm,
+                    "y1": portal_y_mm,
+                    "x2": anchor_x,
+                    "y2": anchor_y,
+                    "width": self.config.track_width,
+                    "escape": True,
+                })
 
         return geometry
