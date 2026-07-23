@@ -48,6 +48,45 @@ def test_path_uses_via(routed):
     assert layer_changes >= 1
 
 
+def test_portal_entry_is_negotiated_without_outer_layer_routing(routed):
+    """Portal stubs must via in place before any lateral routing."""
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    coords = [pf.lattice.idx_to_coord(node) for node in path]
+
+    assert coords[0][2] == 0
+    assert coords[-1][2] == 0
+    entry_layer, exit_layer = pf.net_portal_layers["TEST_NET"]
+    assert 0 < entry_layer < pf.lattice.layers - 1
+    assert 0 < exit_layer < pf.lattice.layers - 1
+
+    for (ax, ay, az), (bx, by, bz) in zip(coords, coords[1:]):
+        if az == bz:
+            assert az not in (0, pf.lattice.layers - 1), (
+                "path moved laterally on an outer copper layer"
+            )
+
+
+def test_portal_vias_attach_from_either_outer_layer(routed):
+    """Back-side pads need the same in-place via chain as front-side pads."""
+    from dataclasses import replace
+
+    pf, _, _, _ = routed
+    src_pad, dst_pad = pf.net_pad_ids["TEST_NET"]
+    src = replace(pf.portals[src_pad], pad_layer=pf.lattice.layers - 1)
+    dst = replace(pf.portals[dst_pad], pad_layer=pf.lattice.layers - 1)
+    inner_path = [
+        pf.lattice.node_idx(src.x_idx, src.y_idx, 1),
+        pf.lattice.node_idx(src.x_idx, src.y_idx, 2),
+        pf.lattice.node_idx(dst.x_idx, dst.y_idx, 2),
+    ]
+
+    attached = pf._attach_portal_vias(inner_path, src, dst)
+    layers = [pf.lattice.idx_to_coord(node)[2] for node in attached]
+    assert layers[:3] == [3, 2, 1]
+    assert layers[-2:] == [2, 3]
+
+
 def test_path_respects_hv_discipline(routed):
     """Every lateral step must follow its layer's legal axis."""
     pf, _, _, _ = routed

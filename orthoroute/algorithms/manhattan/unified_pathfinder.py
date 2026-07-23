@@ -2757,23 +2757,66 @@ class PathFinderRouter:
 
     def _get_portal_seeds(self, portal: Portal) -> List[Tuple[int, float]]:
         """
-        Get portal entry point seeds for routing.
+        Get every legal internal entry layer at a fixed portal cell.
 
-        NEW ARCHITECTURE: Escape planner creates F.Cu stubs only (no portal vias).
-        PathFinder MUST route from F.Cu where stub ends.
+        The escape planner creates an F.Cu stub to this cell.  The winning
+        internal seed is connected back to that stub before path commit.
         PathFinder will create the escape via (F.Cu → internal layer) based on routing needs.
 
-        CRITICAL: Only seed on F.Cu (layer 0)! Multi-layer seeding would bypass F.Cu.
+        The path cost chooses the winner.  Starting on F.Cu would let a route
+        move laterally away from the portal before taking its via.
         """
         seeds = []
-
-        # ONLY seed on F.Cu (layer 0) where the escape stub ends
-        # PathFinder will create via from F.Cu to whatever internal layer it needs
-        node_idx = self.lattice.node_idx(portal.x_idx, portal.y_idx, 0)
-        cost = 0.0  # F.Cu portal - where escape stub ends
-
-        seeds.append((node_idx, cost))
+        routing_layers = (
+            range(1, self.lattice.layers - 1)
+            if self.lattice.layers > 2
+            else [1]
+        )
+        via_base = float(getattr(self.config, "via_cost", 0.7))
+        discount = float(getattr(
+            self.config, "portal_via_discount", 0.15
+        ))
+        for layer in routing_layers:
+            node_idx = self.lattice.node_idx(
+                portal.x_idx, portal.y_idx, layer
+            )
+            depth = abs(layer - portal.pad_layer)
+            seeds.append((node_idx, via_base * discount * depth))
         return seeds
+
+    def _attach_portal_vias(
+        self,
+        path: List[int],
+        src_portal: Portal,
+        dst_portal: Portal,
+    ) -> List[int]:
+        """Connect chosen internal portal seeds back to their F.Cu stubs."""
+        if not path:
+            return path
+
+        _, _, src_layer = self.lattice.idx_to_coord(path[0])
+        _, _, dst_layer = self.lattice.idx_to_coord(path[-1])
+        src_step = 1 if src_layer > src_portal.pad_layer else -1
+        dst_step = 1 if dst_portal.pad_layer > dst_layer else -1
+        prefix = [
+            self.lattice.node_idx(
+                src_portal.x_idx, src_portal.y_idx, layer
+            )
+            for layer in range(
+                src_portal.pad_layer, src_layer, src_step
+            )
+        ]
+        suffix = [
+            self.lattice.node_idx(
+                dst_portal.x_idx, dst_portal.y_idx, layer
+            )
+            for layer in range(
+                dst_layer + dst_step,
+                dst_portal.pad_layer + dst_step,
+                dst_step,
+            )
+        ]
+        return prefix + path + suffix
 
     def _build_routing_seeds(self, portal_seeds_list):
         """
@@ -4824,6 +4867,10 @@ class PathFinderRouter:
                                     exit_layer = path[-1] // self.solver.plane_size
                                 else:
                                     entry_layer = exit_layer = 0
+
+                                path = self._attach_portal_vias(
+                                    path, src_portal, dst_portal
+                                )
                                 
                                 # Commit path and continue to next net
                                 edge_indices = self._path_to_edges(path)
@@ -5043,6 +5090,10 @@ class PathFinderRouter:
                 self.full_graph_fallback_count += 1
 
             if path and len(path) > 1:
+                if use_portals and src_portal and dst_portal:
+                    path = self._attach_portal_vias(
+                        path, src_portal, dst_portal
+                    )
                 edge_indices = self._path_to_edges(path)
                 self.accounting.commit_path(edge_indices)  # bumps present for next iteration
                 # NOTE: Do NOT update costs here! PathFinder requires fixed costs per iteration.
