@@ -185,12 +185,24 @@ def test_project_netclass_drives_drc_valid_router_geometry(tmp_path):
     rules = board._design_rules
     assert rules["default_track_width"] == pytest.approx(0.1016)
     assert rules["default_clearance"] == pytest.approx(0.1016)
-    assert rules["default_via_drill"] == pytest.approx(0.30)
-    assert rules["default_via_diameter"] == pytest.approx(0.4524)
+    assert rules["min_through_hole_drill"] == pytest.approx(0.30)
+    assert rules["default_via_drill"] == pytest.approx(0.15)
+    assert rules["default_via_diameter"] == pytest.approx(0.3024)
 
     router = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=False)
     router.initialize_graph(board)
     assert router.config.track_width == pytest.approx(0.1016)
     assert router.config.clearance == pytest.approx(0.1016)
-    assert router.config.via_drill == pytest.approx(0.30)
-    assert router.config.via_diameter == pytest.approx(0.4524)
+    assert router.config.via_drill == pytest.approx(0.15)
+    assert router.config.via_diameter == pytest.approx(0.3024)
+
+
+def test_file_parser_pad_geometry_remains_in_millimetres(modern):
+    router = UnifiedPathFinder(config=PathFinderConfig(), use_gpu=False)
+    router.initialize_graph(modern)
+
+    geometries = router.escape_planner._extract_pad_geometries(modern)
+    r1_pad1 = geometries["R1_R1_1"]
+
+    assert r1_pad1["width"] == pytest.approx(1.0)
+    assert r1_pad1["height"] == pytest.approx(1.3)

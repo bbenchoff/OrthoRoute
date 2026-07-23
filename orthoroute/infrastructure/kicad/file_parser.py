@@ -319,6 +319,7 @@ class KiCadFileParser:
             "min_track_spacing": 0.1,
             "min_via_diameter": 0.2,
             "min_via_drill": 0.1,
+            "min_through_hole_drill": 0.3,
             "min_via_annular_width": 0.05,
             "default_track_width": 0.2,
             "default_clearance": 0.2,
@@ -347,7 +348,10 @@ class KiCadFileParser:
                     for src_key, dst_key in (
                             ("min_track_width", "min_track_width"),
                             ("min_via_diameter", "min_via_diameter"),
-                            ("min_through_hole_diameter", "min_via_drill"),
+                            (
+                                "min_through_hole_diameter",
+                                "min_through_hole_drill",
+                            ),
                             ("min_via_annular_width", "min_via_annular_width"),
                             ("min_clearance", "min_track_spacing")):
                         if src_key in pro_rules:
