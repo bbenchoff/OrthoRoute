@@ -118,6 +118,7 @@ class PadEscapePlanner:
         self.config = config
         self.pad_to_node = pad_to_node
         self.portals: Dict[str, Portal] = {}  # pad_id -> Portal
+        self.portal_candidates: Dict[str, List[Portal]] = {}
         self.random_seed = random_seed
 
         # Initialize seeded RNG for deterministic escape planning
@@ -229,6 +230,8 @@ class PadEscapePlanner:
 
         # Clear existing portals
         self.portals.clear()
+        self.portal_candidates.clear()
+        self._occupied_portal_cells = set()
 
         # STEP 1: Collect all routable pads with grid positions
         # IMPORTANT: Build deterministically sorted list for reproducible results
@@ -332,6 +335,14 @@ class PadEscapePlanner:
             portal_count += portals_created
 
         logger.info(f"Planned {portal_count} portals using column-based approach")
+
+        # Preserve the collision-free primary assignment, then collect nearby
+        # DRC-valid alternatives for negotiated routing. Alternatives may
+        # overlap one another, but never an already assigned primary portal;
+        # PathFinder ownership/congestion chooses the final combination.
+        self._collect_portal_candidates(
+            pad_list, pad_geometries, spatial_index
+        )
 
         # STEP 3.5: Fill gaps in portal distribution (DISABLED)
         # Gap-filling portals didn't solve blank bands and just add visual clutter
@@ -711,7 +722,9 @@ class PadEscapePlanner:
 
     def _try_create_portal(self, x_idx: int, y_idx: int, direction: int, delta_steps: int,
                            pad_id: str, pad_x: float, pad_y: float, pad_layer: int, entry_layer: int,
-                           pad_geometries: Dict, spatial_index: Dict = None) -> Optional[Portal]:
+                           pad_geometries: Dict, spatial_index: Dict = None,
+                           claim_cell: bool = True,
+                           allow_occupied_cell: Tuple[int, int] = None) -> Optional[Portal]:
         """
         Try to create a portal with given parameters, return None if DRC fails.
 
@@ -747,7 +760,11 @@ class PadEscapePlanner:
         # negotiation can resolve (and a DRC violation in the output).
         if not hasattr(self, '_occupied_portal_cells'):
             self._occupied_portal_cells = set()
-        if (x_idx, y_idx_portal) in self._occupied_portal_cells:
+        portal_cell = (x_idx, y_idx_portal)
+        if (
+            portal_cell in self._occupied_portal_cells
+            and portal_cell != allow_occupied_cell
+        ):
             return None
 
         # Convert portal to world coordinates
@@ -769,7 +786,8 @@ class PadEscapePlanner:
                 return None
 
         # DRC passed! Claim the cell and create the portal
-        self._occupied_portal_cells.add((x_idx, y_idx_portal))
+        if claim_cell:
+            self._occupied_portal_cells.add(portal_cell)
         return Portal(
             x_idx=x_idx,
             y_idx=y_idx_portal,
@@ -782,6 +800,99 @@ class PadEscapePlanner:
             score=0.0,
             retarget_count=0
         )
+
+    def _collect_portal_candidates(
+        self,
+        pad_list: List,
+        pad_geometries: Dict,
+        spatial_index: Dict,
+    ) -> None:
+        """Collect a small deterministic set of valid escapes per pad."""
+        candidate_limit = max(
+            1, int(getattr(self.config, "portal_candidate_count", 6))
+        )
+        seen_pads = set()
+
+        for (
+            _pad,
+            pad_id,
+            x_idx,
+            y_idx,
+            pad_x,
+            pad_y,
+            pad_layer,
+        ) in pad_list:
+            if pad_id in seen_pads:
+                continue
+            seen_pads.add(pad_id)
+            primary = self.portals.get(pad_id)
+            if primary is None:
+                continue
+
+            candidates = [primary]
+            seen_cells = {(primary.x_idx, primary.y_idx)}
+            choices = []
+            for direction in (primary.direction, -primary.direction):
+                for delta in range(3, 13):
+                    y_portal = y_idx + direction * delta
+                    if not (0 <= y_portal < self.lattice.y_steps):
+                        continue
+                    rank = (
+                        0 if direction == primary.direction else 1,
+                        abs(delta - primary.delta_steps),
+                        delta,
+                    )
+                    choices.append((rank, direction, delta))
+
+            for _, direction, delta in sorted(choices):
+                if len(candidates) >= candidate_limit:
+                    break
+                portal = self._try_create_portal(
+                    x_idx,
+                    y_idx,
+                    direction,
+                    delta,
+                    pad_id,
+                    pad_x,
+                    pad_y,
+                    pad_layer,
+                    primary.entry_layer,
+                    pad_geometries,
+                    spatial_index,
+                    claim_cell=False,
+                    allow_occupied_cell=(
+                        primary.x_idx, primary.y_idx
+                    ),
+                )
+                if portal is None:
+                    continue
+                cell = (portal.x_idx, portal.y_idx)
+                if cell in seen_cells:
+                    continue
+                seen_cells.add(cell)
+                portal.score = (
+                    abs(delta - primary.delta_steps)
+                    * float(self.config.grid_pitch)
+                    + (
+                        float(self.config.grid_pitch)
+                        if direction != primary.direction
+                        else 0.0
+                    )
+                )
+                candidates.append(portal)
+
+            self.portal_candidates[pad_id] = candidates
+
+        counts = [len(v) for v in self.portal_candidates.values()]
+        if counts:
+            logger.info(
+                "[PORTAL-CANDIDATES] %d pads, %.2f candidates/pad "
+                "(min=%d, max=%d)",
+                len(counts),
+                sum(counts) / len(counts),
+                min(counts),
+                max(counts),
+            )
 
     def _pad_key(self, pad, comp=None):
         """Generate unique pad key with coordinates for orphaned pads"""

@@ -87,6 +87,16 @@ def test_portal_vias_attach_from_either_outer_layer(routed):
     assert layers[-2:] == [2, 3]
 
 
+def test_escape_planner_collects_distinct_portal_candidates(routed):
+    pf, _, _, _ = routed
+    for pad_id in pf.net_pad_ids["TEST_NET"]:
+        candidates = pf.escape_planner.portal_candidates[pad_id]
+        assert candidates[0] is pf.portals[pad_id]
+        assert len(candidates) >= 2
+        cells = {(portal.x_idx, portal.y_idx) for portal in candidates}
+        assert len(cells) == len(candidates)
+
+
 def test_path_respects_hv_discipline(routed):
     """Every lateral step must follow its layer's legal axis."""
     pf, _, _, _ = routed
