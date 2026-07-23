@@ -127,6 +127,26 @@ def test_selected_portals_match_path_and_emitted_stubs(routed):
     assert portal_points <= stub_points
 
 
+def test_selected_escape_geometry_is_physically_conflict_free(routed):
+    pf, _, _, _ = routed
+    pf._rebuild_escape_occupancy()
+    conflicts, _, _ = pf._detect_escape_conflicts()
+    assert conflicts == set()
+    assert set(pf._escape_preferred_portals) == {
+        pad_id
+        for pad_ids in pf.net_pad_ids.values()
+        for pad_id in pad_ids
+    }
+
+
+def test_escape_distance_detects_crossing_segments():
+    distance = UnifiedPathFinder._segment_distance(
+        ((0.0, 0.0), (1.0, 1.0)),
+        ((0.0, 1.0), (1.0, 0.0)),
+    )
+    assert distance == 0.0
+
+
 def test_via_ownership_is_reversible_and_tracks_collisions(routed):
     pf, _, _, _ = routed
     path = pf.net_paths["TEST_NET"]
