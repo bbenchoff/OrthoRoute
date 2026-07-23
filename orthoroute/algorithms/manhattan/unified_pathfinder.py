@@ -1886,7 +1886,10 @@ class SimpleDijkstra:
         if use_gpu:
             logger.info(f"[GPU] Using GPU pathfinding for ROI size={roi_size} (threshold={gpu_threshold})")
             try:
-                path = self.gpu_solver.find_path_roi_gpu(src, dst, costs, roi_nodes, global_to_roi)
+                path = self.gpu_solver.find_path_roi_gpu(
+                    src, dst, costs, roi_nodes, global_to_roi,
+                    node_penalty=node_penalty,
+                )
                 if path:
                     self._gpu_path_count += 1
                     return path
@@ -2189,18 +2192,29 @@ class PathFinderRouter:
         layers_from_board = getattr(board, "layer_count", None) or len(getattr(board, "layers", [])) or self.config.layer_count
         self.config.layer_count = int(layers_from_board)
 
-        # Ensure we have enough layer names
+        # Domain boards store Layer objects, while geometry and keepout code
+        # require string names. Prefer the board's exact copper stackup; the
+        # config default may have the wrong length or omit B.Cu after slicing.
+        board_layer_names = [
+            layer.name if hasattr(layer, "name") else str(layer)
+            for layer in (getattr(board, "layers", None) or [])
+            if (layer.name if hasattr(layer, "name") else str(layer)).endswith(".Cu")
+        ]
         existing_names = getattr(self.config, "layer_names", None)
-        # Handle dataclass Field objects
-        if hasattr(existing_names, '__len__'):
-            has_enough_layers = len(existing_names) >= self.config.layer_count
-        else:
-            has_enough_layers = False
+        existing_names = [
+            layer.name if hasattr(layer, "name") else str(layer)
+            for layer in existing_names
+        ] if isinstance(existing_names, (list, tuple)) else []
 
-        if not existing_names or not has_enough_layers:
+        if len(board_layer_names) == self.config.layer_count:
+            self.config.layer_names = board_layer_names
+        elif len(existing_names) == self.config.layer_count:
+            self.config.layer_names = existing_names
+        else:
             self.config.layer_names = (
-                getattr(board, "layers", None)
-                or (["F.Cu"] + [f"In{i}.Cu" for i in range(1, self.config.layer_count-1)] + ["B.Cu"])
+                ["F.Cu"]
+                + [f"In{i}.Cu" for i in range(1, self.config.layer_count - 1)]
+                + (["B.Cu"] if self.config.layer_count > 1 else [])
             )
 
         logger.info(f"Using {self.config.layer_count} layers from board")
@@ -3097,7 +3111,9 @@ class PathFinderRouter:
 
         return bitmap
 
-    def _build_owner_penalty(self, roi_nodes: np.ndarray, current_net: str) -> Optional[np.ndarray]:
+    def _build_owner_penalty(self, roi_nodes: Optional[np.ndarray],
+                             current_net: str,
+                             force_allow_nodes=None) -> Optional[np.ndarray]:
         """
         Build a ROI-local node penalty pricing nodes owned by OTHER nets.
 
@@ -3116,8 +3132,10 @@ class PathFinderRouter:
             return None
 
         current_net_id = self._get_net_id(current_net)
-        owners = self.node_owner[roi_nodes]
+        owners = self.node_owner if roi_nodes is None else self.node_owner[roi_nodes]
         foreign = (owners != -1) & (owners != current_net_id)
+        if roi_nodes is None and force_allow_nodes is not None:
+            foreign[force_allow_nodes] = False
         if not foreign.any():
             return None
 
@@ -4680,20 +4698,25 @@ class PathFinderRouter:
                         src_node_array = self._build_routing_seeds(src_seeds)
                         dst_node_array = self._build_routing_seeds(dst_targets)
 
-                        # Build owner-aware bitmap - FORCE-ALLOW source/dest seeds!
+                        # Ownership is a negotiated node cost, not a hard wall.
+                        # Force source/destination seeds to zero penalty because
+                        # stale ownership bookkeeping must never hide terminals.
                         force_allow = np.unique(np.concatenate([src_node_array, dst_node_array])).astype(np.int32)
-                        owner_bitmap = self._build_owner_bitmap_for_fullgraph(net_id, force_allow_nodes=force_allow)
+                        owner_penalty = self._build_owner_penalty(
+                            None, net_id, force_allow_nodes=force_allow
+                        )
 
                         if len(src_node_array) > 0 and len(dst_node_array) > 0:
-                            # Call GPU supersource pathfinding with owner-aware bitmap
+                            # Call GPU supersource pathfinding with owner-aware cost.
                             gpu_start = time.time()
                             path = self.solver.gpu_solver.find_path_fullgraph_gpu_seeds(
                                 costs=costs,
                                 src_seeds=src_node_array,
                                 dst_targets=dst_node_array,
                                 ub_hint=None,
-                                allowed_bitmap=owner_bitmap,
-                                use_bitmap=True
+                                node_penalty=owner_penalty,
+                                allowed_bitmap=None,
+                                use_bitmap=False
                             )
                             gpu_time = time.time() - gpu_start
 
@@ -4724,15 +4747,17 @@ class PathFinderRouter:
                                 routed_this_pass += 1
                                 continue  # Skip ROI extraction and CPU routing
                             else:
-                                logger.info(f"[GPU-SEEDS] No path found, skipping net (will be marked as failed)")
-                                failed_this_pass += 1
-                                continue  # Skip CPU fallback, let exclusion handle it
+                                logger.info(
+                                    "[GPU-SEEDS] No full-graph path found; "
+                                    "falling back to cost-based ROI routing"
+                                )
                         else:
                             logger.warning(f"[GPU-SEEDS] Empty seed arrays, skipping GPU fast path")
                 except Exception as e:
-                    logger.warning(f"[GPU-SEEDS] GPU fast path failed: {e}, skipping net (will be marked as failed)")
-                    failed_this_pass += 1
-                    continue  # Skip CPU fallback, let exclusion handle it
+                    logger.warning(
+                        f"[GPU-SEEDS] GPU fast path failed: {e}; "
+                        "falling back to cost-based ROI routing"
+                    )
             
             # If GPU fast path succeeded, we already continued to next net above
             # Otherwise, proceed with standard ROI routing below

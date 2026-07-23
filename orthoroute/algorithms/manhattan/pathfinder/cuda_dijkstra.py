@@ -146,6 +146,7 @@ class CUDADijkstra:
         self._persistent_kernel_version = 2  # Increment to recompile after bug fixes
         # NOTE: Multi-launch wavefront_expand_all kernel HAS IN_BITMAP check, persistent doesn't
         # TODO: Add bitmap support to persistent kernel for maximum performance
+        self._zero_node_penalty = cp.zeros(1, dtype=cp.float32)
 
         # Compile CUDA kernel for parallel edge relaxation
         self.relax_kernel = cp.RawKernel(r'''
@@ -253,6 +254,9 @@ class CUDADijkstra:
             const int weights_stride,       // Stride between ROI rows (0 for shared CSR!)
             const float* total_cost,            // CSR negotiated costs
             const int total_cost_stride,        // Stride for total_cost
+            const float* node_penalty,           // Optional cost for entering a node
+            const int node_penalty_stride,       // Stride between ROI penalty rows
+            const int use_node_penalty,          // 1 = add node penalty, 0 = ignore
             const int* goal_nodes,          // (K,) goal node index for each ROI (for A* heuristic)
             const int Nx,                   // P0-3: Lattice X dimension
             const int Ny,                   // P0-3: Lattice Y dimension
@@ -324,7 +328,13 @@ class CUDADijkstra:
                     // Bounds check to prevent corruption
                     if (neighbor < 0 || neighbor >= max_roi_size) continue;
 
-                    const float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
+                    float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
+                    if (use_node_penalty) {
+                        edge_cost += node_penalty[
+                            (size_t)roi_idx * (size_t)node_penalty_stride
+                            + (size_t)neighbor
+                        ];
+                    }
                     const float g_new = node_dist + edge_cost;  // g(n) = distance from start
 
                     // FIX-7: BITMAP CHECK - conditional based on use_bitmap flag
@@ -498,6 +508,9 @@ class CUDADijkstra:
             const int weights_stride,
             const float* total_cost,            // CSR negotiated costs
             const int total_cost_stride,        // Stride for total_cost
+            const float* node_penalty,           // Optional cost for entering a node
+            const int node_penalty_stride,       // Stride between ROI penalty rows
+            const int use_node_penalty,          // 1 = add node penalty, 0 = ignore
             const int* goal_nodes,              // (K,) goal indices for A*
             const int Nx,                       // P0-3: Lattice X dimension (procedural coords)
             const int Ny,                       // P0-3: Lattice Y dimension
@@ -561,6 +574,12 @@ class CUDADijkstra:
                 if (neighbor < 0 || neighbor >= max_roi_size) continue;
 
                 float edge_cost = total_cost[total_cost_off + e];  // Use negotiated cost (PathFinder)
+                if (use_node_penalty) {
+                    edge_cost += node_penalty[
+                        (size_t)roi_idx * (size_t)node_penalty_stride
+                        + (size_t)neighbor
+                    ];
+                }
 
                 // Phase 4: Decode neighbor coordinates (always needed for ROI check)
                 const int plane_size = Nx * Ny;
@@ -3246,6 +3265,9 @@ class CUDADijkstra:
 
         # Get use_bitmap flag from data dict
         use_bitmap_flag = 1 if data.get('use_bitmap', False) else 0  # Default FALSE for iter-1 compatibility
+        node_penalty_arr = data.get('node_penalty', self._zero_node_penalty)
+        node_penalty_stride = int(data.get('node_penalty_stride', 0))
+        use_node_penalty_flag = 1 if data.get('use_node_penalty', False) else 0
 
         # INSTRUMENTATION: Allocate counter for blocked neighbors
         blocked_counter = cp.zeros(1, dtype=cp.int32)
@@ -3264,6 +3286,9 @@ class CUDADijkstra:
             weights_stride,
             weights_arr,           # total_cost = same as weights (already negotiated)
             weights_stride,        # total_cost_stride
+            node_penalty_arr,
+            node_penalty_stride,
+            use_node_penalty_flag,
             data['goal_nodes'],
             data['Nx'],            # P0-3: Lattice dimensions for procedural coords
             data['Ny'],
@@ -3431,6 +3456,9 @@ class CUDADijkstra:
 
         # Get use_bitmap flag from data dict
         use_bitmap_flag = 1 if data.get('use_bitmap', False) else 0  # Default FALSE for iter-1 compatibility
+        node_penalty_arr = data.get('node_penalty', self._zero_node_penalty)
+        node_penalty_stride = int(data.get('node_penalty_stride', 0))
+        use_node_penalty_flag = 1 if data.get('use_node_penalty', False) else 0
 
         # Get iter1_relax_hv flag from config and current iteration
         current_iteration = getattr(self, 'current_iteration', 1)
@@ -3453,6 +3481,9 @@ class CUDADijkstra:
             weights_stride,        # When stride>0, each ROI has own row
             weights_arr,           # total_cost = same as weights (already negotiated)
             weights_stride,        # total_cost_stride
+            node_penalty_arr,
+            node_penalty_stride,
+            use_node_penalty_flag,
             data['goal_nodes'],    # NEW: A* goal nodes
             data['Nx'],            # P0-3: Lattice dimensions
             data['Ny'],
@@ -4911,7 +4942,8 @@ class CUDADijkstra:
                          dst: int,
                          costs,
                          roi_nodes,
-                         global_to_roi) -> Optional[List[int]]:
+                         global_to_roi,
+                         node_penalty=None) -> Optional[List[int]]:
         """
         GPU pathfinding on single ROI (SimpleDijkstra-compatible interface).
 
@@ -4950,7 +4982,8 @@ class CUDADijkstra:
         # Build ROI CSR subgraph
         roi_size = len(roi_nodes_cpu)
         roi_indptr, roi_indices, roi_weights = self._extract_roi_csr(
-            roi_nodes_cpu, global_to_roi_cpu, costs
+            roi_nodes_cpu, global_to_roi_cpu, costs,
+            node_penalty=node_penalty,
         )
 
         # VALIDATION: Verify src/dst are in valid range
@@ -4995,7 +5028,8 @@ class CUDADijkstra:
 
         return global_path if len(global_path) > 1 else None
 
-    def _extract_roi_csr(self, roi_nodes, global_to_roi, global_costs):
+    def _extract_roi_csr(self, roi_nodes, global_to_roi, global_costs,
+                         node_penalty=None):
         """
         Extract CSR subgraph for ROI.
 
@@ -5030,6 +5064,8 @@ class CUDADijkstra:
                 # Only include edges within ROI
                 if local_v >= 0:
                     cost = float(global_costs[ei])
+                    if node_penalty is not None:
+                        cost += float(node_penalty[local_v])
                     local_edges.append((local_u, local_v, cost))
 
         # Convert to CSR format
@@ -5465,6 +5501,7 @@ class CUDADijkstra:
         return paths
 
     def find_path_fullgraph_gpu_seeds(self, costs, src_seeds, dst_targets, ub_hint=None, *,
+                                      node_penalty=None,
                                       allowed_bitmap=None, use_bitmap=False):
         """
         Multi-source/multi-sink SSSP using supersource seeding on full graph.
@@ -5474,6 +5511,7 @@ class CUDADijkstra:
             src_seeds: np.int32 array of source node IDs
             dst_targets: np.int32 array of destination node IDs
             ub_hint: Optional upper bound for early termination
+            node_penalty: Optional float32 cost for entering each graph node
             allowed_bitmap: Optional uint32 bitmap for owner-aware node filtering
             use_bitmap: Whether to enable bitmap filtering
 
@@ -5483,6 +5521,7 @@ class CUDADijkstra:
         """
         import numpy as np
         import cupy as cp
+        import cupyx
 
         logger.info(f"[GPU-SEEDS] Starting full-graph SSSP: {len(src_seeds)} sources -> {len(dst_targets)} targets")
 
@@ -5501,28 +5540,26 @@ class CUDADijkstra:
         parent = cp.full(num_nodes, -1, dtype=cp.int32)
 
         # Convert seeds to GPU
-        src_seeds_gpu = cp.asarray(src_seeds, dtype=cp.int32)
-        dst_targets_gpu = cp.asarray(dst_targets, dtype=cp.int32)
+        # Dedupe before scatter-add: repeated seeds would add the same bit
+        # twice and carry into a neighboring frontier bit.
+        src_seeds_gpu = cp.unique(cp.asarray(src_seeds, dtype=cp.int32))
+        dst_targets_gpu = cp.unique(cp.asarray(dst_targets, dtype=cp.int32))
 
         # Initialize source seeds (supersource via seeding)
         logger.info(f"[GPU-SEEDS] Initialized {len(src_seeds)} source seeds with dist=0")
-        for seed in src_seeds_gpu:
-            dist[int(seed)] = 0.0
+        dist[src_seeds_gpu] = 0.0
 
         # Create destination bitmap for fast termination check
         dst_bitmap = cp.zeros(num_nodes, dtype=cp.bool_)
-        for target in dst_targets_gpu:
-            dst_bitmap[int(target)] = True
+        dst_bitmap[dst_targets_gpu] = True
         logger.info(f"[GPU-SEEDS] Created destination bitmap for {len(dst_targets)} targets")
 
         # Initialize bit-packed frontier (K=1, frontier_words)
         frontier_words = (num_nodes + 31) // 32
         frontier = cp.zeros((1, frontier_words), dtype=cp.uint32)  # 2D array for K=1
-        for seed in src_seeds_gpu:
-            seed_val = int(seed)
-            word_idx = seed_val // 32
-            bit_pos = seed_val % 32
-            frontier[0, word_idx] |= (1 << bit_pos)  # Access with [0, word_idx]
+        src_words = (src_seeds_gpu >> 5).astype(cp.int32)
+        src_bits = (src_seeds_gpu & 31).astype(cp.uint32)
+        cupyx.scatter_add(frontier[0], src_words, cp.uint32(1) << src_bits)
         logger.info(f"[GPU-SEEDS] Initialized frontier with {len(src_seeds)} seeds")
 
         # Allocate stamp pools if needed (device-resident optimization)
@@ -5545,8 +5582,7 @@ class CUDADijkstra:
         # Reset all keys to INF_KEY first
         self.best_key_pool[0, :num_nodes] = INF_KEY
         # Initialize source seeds with SRC_KEY
-        for seed in src_seeds_gpu:
-            self.best_key_pool[0, int(seed)] = SRC_KEY
+        self.best_key_pool[0, src_seeds_gpu] = SRC_KEY
 
         # Determine lattice dimensions for coordinate encoding
         # For full-graph routing: use linear layout
@@ -5571,15 +5607,14 @@ class CUDADijkstra:
 
             # CRITICAL: Force-allow source/dest seeds (prevents frontier empty!)
             # This happens IN THE GPU CODE to guarantee seeds are always reachable
-            seed_nodes = cp.concatenate([cp.asarray(src_seeds, dtype=cp.int32),
-                                        cp.asarray(dst_targets, dtype=cp.int32)])
-
-            # Proper GPU array operations with correct dtypes
-            for seed in seed_nodes:
-                seed_int = int(seed)
-                word_idx = seed_int // 32
-                bit_idx = seed_int & 31
-                roi_bitmaps[0, word_idx] = roi_bitmaps[0, word_idx] | (cp.uint32(1) << bit_idx)
+            seed_nodes = cp.unique(cp.concatenate([src_seeds_gpu, dst_targets_gpu]))
+            seed_words = (seed_nodes >> 5).astype(cp.int32)
+            seed_bits = (seed_nodes & 31).astype(cp.uint32)
+            force_mask = cp.zeros(bitmap_words, dtype=cp.uint32)
+            cupyx.scatter_add(
+                force_mask, seed_words, cp.uint32(1) << seed_bits
+            )
+            roi_bitmaps[0] |= force_mask
 
             # Count allowed nodes for sanity
             total_bits_set = int(cp.count_nonzero(roi_bitmaps))
@@ -5593,6 +5628,19 @@ class CUDADijkstra:
         indptr_gpu = cp.asarray(self.indptr) if not isinstance(self.indptr, cp.ndarray) else self.indptr
         indices_gpu = cp.asarray(self.indices) if not isinstance(self.indices, cp.ndarray) else self.indices
         costs_gpu = cp.asarray(costs) if not isinstance(costs, cp.ndarray) else costs
+        if node_penalty is not None:
+            node_penalty_gpu = cp.asarray(node_penalty, dtype=cp.float32).reshape(1, -1)
+            if node_penalty_gpu.shape[1] != num_nodes:
+                raise ValueError(
+                    f"node_penalty has {node_penalty_gpu.shape[1]} nodes, "
+                    f"expected {num_nodes}"
+                )
+            use_node_penalty = True
+            node_penalty_stride = num_nodes
+        else:
+            node_penalty_gpu = self._zero_node_penalty
+            use_node_penalty = False
+            node_penalty_stride = 0
 
         data = {
             'K': 1,
@@ -5620,6 +5668,9 @@ class CUDADijkstra:
             'bitmap_words': bitmap_words,
             'use_astar': 0,
             'use_bitmap': bool(use_bitmap),  # Owner-aware filtering if bitmap provided
+            'node_penalty': node_penalty_gpu,
+            'node_penalty_stride': node_penalty_stride,
+            'use_node_penalty': use_node_penalty,
             'iter1_relax_hv': True,
             'use_atomic_parent_keys': True,  # ENABLED: Eliminates parent pointer race condition cycles
         }
