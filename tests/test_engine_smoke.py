@@ -289,6 +289,10 @@ def test_path_node_use_prices_tracks_for_later_vias(routed):
     penalty = pf._build_owner_penalty(None, "OTHER_NET")
     expected = pf.config.path_node_penalty_base * pf._pres_fac_now
     assert penalty[planar_node] == pytest.approx(expected)
+    assert (
+        pf.config.path_node_penalty_base
+        == pf.config.owner_penalty_base
+    )
     pf._pres_fac_now = old_pres_fac
 
     pf._clear_path_node_use(path)
