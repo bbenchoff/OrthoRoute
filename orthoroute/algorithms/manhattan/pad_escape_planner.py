@@ -1092,10 +1092,7 @@ class PadEscapePlanner:
                 y = pad.position.y
 
                 if hasattr(pad, 'size'):
-                    size_x_iu = pad.size.x if hasattr(pad.size, 'x') else pad.size[0]
-                    size_y_iu = pad.size.y if hasattr(pad.size, 'y') else pad.size[1]
-                    width = size_x_iu / 1_000_000.0
-                    height = size_y_iu / 1_000_000.0
+                    width, height = self._pad_size_mm(pad.size)
                 else:
                     width = 0.5
                     height = 0.5
@@ -1110,10 +1107,7 @@ class PadEscapePlanner:
                 y = pad.position.y
 
                 if hasattr(pad, 'size'):
-                    size_x_iu = pad.size.x if hasattr(pad.size, 'x') else pad.size[0]
-                    size_y_iu = pad.size.y if hasattr(pad.size, 'y') else pad.size[1]
-                    width = size_x_iu / 1_000_000.0
-                    height = size_y_iu / 1_000_000.0
+                    width, height = self._pad_size_mm(pad.size)
                 else:
                     width = 0.5
                     height = 0.5
@@ -1121,6 +1115,18 @@ class PadEscapePlanner:
                 geometries[pad_id] = {'x': x, 'y': y, 'width': width, 'height': height}
 
         return geometries
+
+    @staticmethod
+    def _pad_size_mm(size) -> Tuple[float, float]:
+        """Return a pad size in mm for both domain and pcbnew objects."""
+        if hasattr(size, "x") and hasattr(size, "y"):
+            # pcbnew VECTOR2I values use integer nanometres.
+            return (
+                float(size.x) / 1_000_000.0,
+                float(size.y) / 1_000_000.0,
+            )
+        # File-parser domain Pads already store floating-point millimetres.
+        return float(size[0]), float(size[1])
 
     def _build_spatial_index(self, pad_geometries: Dict):
         """
