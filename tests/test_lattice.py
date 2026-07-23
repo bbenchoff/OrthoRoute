@@ -53,6 +53,41 @@ class TestLayerDiscipline:
         assert lattice4.is_legal_planar_edge(0, 0, 2, 0, 1, 2)
         assert not lattice4.is_legal_planar_edge(0, 0, 2, 1, 0, 2)
 
+    def test_custom_preferred_directions(self):
+        lattice = Lattice3D(
+            BOUNDS,
+            PITCH,
+            layers=4,
+            preferred_layer_directions=["v", "v", "h", "h"],
+        )
+        assert lattice.layer_dir == ["v", "v", "h", "h"]
+        assert lattice.get_allowed_axes(1) == ("v",)
+        assert lattice.is_legal_planar_edge(0, 0, 1, 0, 1, 1)
+        assert not lattice.is_legal_planar_edge(0, 0, 1, 1, 0, 1)
+
+    def test_guided_layers_allow_both_axes(self):
+        lattice = Lattice3D(
+            BOUNDS,
+            PITCH,
+            layers=4,
+            wrong_way_cost_multiplier=2.5,
+        )
+        assert lattice.get_allowed_axes(1) == ("h", "v")
+        assert lattice.is_legal_planar_edge(0, 0, 1, 1, 0, 1)
+        assert lattice.is_legal_planar_edge(0, 0, 1, 0, 1, 1)
+        assert lattice.planar_cost_multiplier(1, "h") == 1.0
+        assert lattice.planar_cost_multiplier(1, "v") == 2.5
+
+    @pytest.mark.parametrize("multiplier", [0.5, float("nan")])
+    def test_invalid_wrong_way_multiplier(self, multiplier):
+        with pytest.raises(ValueError, match="wrong_way_cost_multiplier"):
+            Lattice3D(
+                BOUNDS,
+                PITCH,
+                layers=4,
+                wrong_way_cost_multiplier=multiplier,
+            )
+
 
 class TestViaPairs:
     def test_four_layer_pairs(self, lattice4):
@@ -109,6 +144,38 @@ class TestGraphBuild:
         assert E - via_edges == expected_lateral
         # One physical pair, materialized as its two directed graph edges.
         assert via_edges == 2 * xs * ys
+
+    def test_guided_graph_prices_wrong_way_edges(self):
+        lattice = Lattice3D(
+            BOUNDS,
+            PITCH,
+            layers=4,
+            wrong_way_cost_multiplier=2.5,
+        )
+        graph = lattice.build_graph(via_cost=0.7)
+        xs, ys = lattice.x_steps, lattice.y_steps
+        via_edges = int(np.sum(graph.edge_kind))
+        expected_lateral = 2 * (
+            ys * (xs - 1) + xs * (ys - 1)
+        ) * 2
+        assert len(graph.indices) - via_edges == expected_lateral
+
+        source = lattice.node_idx(2, 2, 1)
+        targets = {
+            lattice.node_idx(3, 2, 1): PITCH,
+            lattice.node_idx(2, 3, 1): PITCH * 2.5,
+        }
+        start = int(graph.indptr[source])
+        end = int(graph.indptr[source + 1])
+        costs = {
+            int(target): float(cost)
+            for target, cost in zip(
+                graph.indices[start:end],
+                graph.base_costs[start:end],
+            )
+        }
+        for target, expected in targets.items():
+            assert costs[target] == pytest.approx(expected)
 
     def test_edge_costs_positive(self, lattice4):
         graph = lattice4.build_graph(via_cost=0.7)
