@@ -112,8 +112,9 @@ class PathFinderConfig:
     # Centralized via policy (used everywhere; avoid module-level lookups)
     via_cost: float = VIA_COST
     via_capacity_per_net: int = VIA_CAPACITY_PER_NET
-    # Blind/buried via policy (FULL FLEXIBILITY FOR CONVERGENCE TEST)
-    allow_any_layer_via: bool = True  # TRUE: Allow any-to-any layer vias (full blind/buried)
+    # Auto: full spans through 18 layers, adjacent spans on deeper stacks.
+    allow_any_layer_via: Optional[bool] = None
+    adjacent_via_step_scale: float = 4.0
     enable_buried_via_keepouts: bool = False  # DISABLED: Hard-blocking intermediate layers causes convergence oscillation
     keepout_weight: float = 1e9                # effectively "INF" for track edges touching a blocked node
     via_span_alpha: float = 0.08               # Small penalty for long via spans (reduces shaft congestion)
