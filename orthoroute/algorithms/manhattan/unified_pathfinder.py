@@ -638,6 +638,9 @@ class PathFinderConfig:
     phase_block_after: int = 2
     congestion_multiplier: float = 1.0
     max_search_nodes: int = 2000000
+    # Avoid heap Dijkstra over an entire multi-million-node graph after CUDA
+    # has already failed for the current negotiated cost state.
+    gpu_fullgraph_fail_fast_nodes: int = 1_000_000
     layer_names: List[str] = field(default_factory=lambda: ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'B.Cu'])
     hotset_cap: int = 512  # Allow all nets to be rerouted if needed (was 150, bottleneck!)
     allowed_via_spans: Optional[Set[Tuple[int, int]]] = None  # None = all layer pairs allowed (blind/buried)
@@ -4772,6 +4775,7 @@ class PathFinderRouter:
             # If it fails or GPU not available, fall back to standard ROI routing
             
             gpu_fast_path_used = False
+            gpu_fullgraph_failed = False
             # Full-graph routing with owner-aware bitmap filtering
             if use_portals and hasattr(self.solver, 'gpu_solver') and self.solver.gpu_solver:
                 try:
@@ -4837,6 +4841,7 @@ class PathFinderRouter:
                                 routed_this_pass += 1
                                 continue  # Skip ROI extraction and CPU routing
                             else:
+                                gpu_fullgraph_failed = True
                                 logger.info(
                                     "[GPU-SEEDS] No full-graph path found; "
                                     "falling back to cost-based ROI routing"
@@ -4844,10 +4849,39 @@ class PathFinderRouter:
                         else:
                             logger.warning(f"[GPU-SEEDS] Empty seed arrays, skipping GPU fast path")
                 except Exception as e:
+                    gpu_fullgraph_failed = True
                     logger.warning(
                         f"[GPU-SEEDS] GPU fast path failed: {e}; "
                         "falling back to cost-based ROI routing"
                     )
+
+            # For a long net on a huge board, the "ROI" below is the entire
+            # graph.  Falling through to CPU multisource Dijkstra can take
+            # many minutes per miss.  Record a normal negotiated failure and
+            # retry after costs/portals change.  Small graphs retain the CPU
+            # correctness fallback.
+            if (
+                gpu_fullgraph_failed
+                and self.N >= int(getattr(
+                    cfg, "gpu_fullgraph_fail_fast_nodes", 1_000_000
+                ))
+            ):
+                logger.warning(
+                    f"[GPU-SEEDS] Net {net_id}: skipping CPU full-graph "
+                    f"fallback for {self.N:,} nodes"
+                )
+                failed_this_pass += 1
+                self.net_paths[net_id] = []
+                self._clear_net_edge_tracking(net_id)
+                if cfg.portal_enabled and net_id in self.net_pad_ids:
+                    self.net_portal_failures[net_id] += 1
+                    if (
+                        self.net_portal_failures[net_id]
+                        >= cfg.portal_retarget_patience
+                    ):
+                        self._retarget_portals_for_net(net_id)
+                        self.net_portal_failures[net_id] = 0
+                continue
             
             # If GPU fast path succeeded, we already continued to next net above
             # Otherwise, proceed with standard ROI routing below
