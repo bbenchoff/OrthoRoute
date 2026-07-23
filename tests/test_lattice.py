@@ -124,9 +124,27 @@ class TestGraphBuild:
             lattice4.node_idx(2, 3, 2),
             lattice4.node_idx(3, 3, 2),
         ]
-
         assert router._coalesce_vertical_runs(path) == [
             lattice4.node_idx(2, 3, 0),
             lattice4.node_idx(2, 3, 2),
             lattice4.node_idx(3, 3, 2),
         ]
+
+    def test_path_to_edges_rejects_non_edge_hop(self, lattice4):
+        router = UnifiedPathFinder(PathFinderConfig(), use_gpu=False)
+        router.lattice = lattice4
+        router.graph = lattice4.build_graph(via_cost=0.7)
+        router._indptr_cpu = None
+        router._indices_cpu = None
+        valid_path = [
+            lattice4.node_idx(2, 3, 1),
+            lattice4.node_idx(3, 3, 1),
+        ]
+        invalid_path = [
+            lattice4.node_idx(2, 3, 1),
+            lattice4.node_idx(4, 3, 1),
+        ]
+
+        assert len(router._path_to_edges(valid_path)) == 1
+        with pytest.raises(ValueError, match="not a graph edge"):
+            router._path_to_edges(invalid_path)
