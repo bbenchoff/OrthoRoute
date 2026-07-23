@@ -137,6 +137,10 @@ def test_selected_escape_geometry_is_physically_conflict_free(routed):
         for pad_ids in pf.net_pad_ids.values()
         for pad_id in pad_ids
     }
+    assert {
+        record["pad"]
+        for record in pf._escape_reserved_records.values()
+    } == set(pf._escape_preferred_portals)
 
 
 def test_escape_distance_detects_crossing_segments():
