@@ -103,3 +103,27 @@ def test_metrics_report_excluded_and_unrouted_ids():
     assert completion["complete"] is False
     assert completion["excluded_net_ids"] == ["DROPPED"]
     assert completion["unrouted_net_ids"] == ["DROPPED"]
+
+
+def test_metrics_reject_barrel_conflicts():
+    board = SimpleNamespace(
+        name="shorted",
+        layer_count=2,
+        nets=[_net("ROUTED", 2)],
+    )
+    router = SimpleNamespace(
+        lattice=SimpleNamespace(
+            x_steps=2, y_steps=2, layers=2,
+            num_nodes=8, pitch=0.4,
+        ),
+        net_paths={"ROUTED": [0, 1]},
+        accounting=_Accounting(),
+        iteration=2,
+        _excluded_nets=set(),
+        _last_barrel_conflict_count=3,
+    )
+
+    metrics = collect_route_metrics(router, board)
+
+    assert metrics["completion"]["complete"] is False
+    assert metrics["convergence"]["barrel_conflicts"] == 3
