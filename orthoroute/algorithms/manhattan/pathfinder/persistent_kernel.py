@@ -290,8 +290,10 @@ void persistent_queue_sssp_kernel(
     const float* weights,
     const int num_nodes,
     const int* src_seeds,
+    const float* src_seed_costs,
     const int num_srcs,
     const int* dst_targets,
+    const float* dst_target_costs,
     const int num_dsts,
     float* dist,
     int* parent,
@@ -341,9 +343,10 @@ void persistent_queue_sssp_kernel(
         int seed = src_seeds[s];
         if (seed < 0 || seed >= num_nodes) continue;
 
-        dist[seed] = 0.0f;
+        float seed_cost = src_seed_costs[s];
+        dist[seed] = seed_cost;
         parent[seed] = -1;
-        best_key[seed] = pack_key(0.0f, -1);
+        best_key[seed] = pack_key(seed_cost, -1);
 
         int word_idx = seed >> 5;
         unsigned int mask = 1u << (seed & 31);
@@ -443,7 +446,9 @@ void persistent_queue_sssp_kernel(
                 (unsigned int)(dst_key >> 32)
             );
             if (!isinf(dst_dist)) {
-                atomicMinFloat(best_dist, dst_dist);
+                atomicMinFloat(
+                    best_dist, dst_dist + dst_target_costs[d]
+                );
             }
         }
         grid.sync();
@@ -462,7 +467,9 @@ void persistent_queue_sssp_kernel(
                 (unsigned int)(dst_key >> 32)
             );
             if (!isinf(dst_dist)
-                && fabsf(dst_dist - *best_dist) < 1e-6f) {
+                && fabsf(
+                    dst_dist + dst_target_costs[d] - *best_dist
+                ) < 1e-6f) {
                 atomicCAS(best_dst, -1, dst);
                 atomicExch(settled_flag, 1);
             }
@@ -522,6 +529,8 @@ def launch_persistent_kernel(
     use_bitmap=False,
     node_penalty_gpu=None,
     use_node_penalty=False,
+    src_seed_costs_gpu=None,
+    dst_target_costs_gpu=None,
     max_iterations=2000
 ):
     """
@@ -534,7 +543,9 @@ def launch_persistent_kernel(
         weights_gpu: CSR weights array (CuPy)
         num_nodes: Total number of nodes
         src_seeds_gpu: Source seed array (CuPy int32)
+        src_seed_costs_gpu: Initial cost aligned with each source seed
         dst_targets_gpu: Destination targets array (CuPy int32)
+        dst_target_costs_gpu: Terminal cost aligned with each destination
         dist_gpu: Distance array (CuPy float32), pre-initialized to inf
         parent_gpu: Parent array (CuPy int32), pre-initialized to -1
         best_key_gpu: 64-bit atomic key array (CuPy uint64), packed dist+parent
@@ -596,6 +607,28 @@ def launch_persistent_kernel(
 
     num_srcs = len(src_seeds_gpu)
     num_dsts = len(dst_targets_gpu)
+    if src_seed_costs_gpu is None:
+        source_costs_gpu = cp.zeros(num_srcs, dtype=cp.float32)
+    else:
+        source_costs_gpu = cp.asarray(
+            src_seed_costs_gpu, dtype=cp.float32
+        ).ravel()
+        if len(source_costs_gpu) != num_srcs:
+            raise ValueError(
+                f"src_seed_costs has {len(source_costs_gpu)} entries, "
+                f"expected {num_srcs}"
+            )
+    if dst_target_costs_gpu is None:
+        target_costs_gpu = cp.zeros(num_dsts, dtype=cp.float32)
+    else:
+        target_costs_gpu = cp.asarray(
+            dst_target_costs_gpu, dtype=cp.float32
+        ).ravel()
+        if len(target_costs_gpu) != num_dsts:
+            raise ValueError(
+                f"dst_target_costs has {len(target_costs_gpu)} entries, "
+                f"expected {num_dsts}"
+            )
 
     # Kernel launch config
     # Use many blocks for persistent execution
@@ -612,8 +645,10 @@ def launch_persistent_kernel(
             weights_gpu,
             num_nodes,
             src_seeds_gpu,
+            source_costs_gpu,
             num_srcs,
             dst_targets_gpu,
+            target_costs_gpu,
             num_dsts,
             dist_gpu,
             parent_gpu,

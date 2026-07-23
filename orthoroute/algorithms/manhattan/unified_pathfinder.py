@@ -4834,6 +4834,14 @@ class PathFinderRouter:
                         # Convert portal seeds to plain node arrays
                         src_node_array = self._build_routing_seeds(src_seeds)
                         dst_node_array = self._build_routing_seeds(dst_targets)
+                        src_seed_costs = np.asarray(
+                            [cost for _, cost in src_seeds],
+                            dtype=np.float32,
+                        )
+                        dst_target_costs = np.asarray(
+                            [cost for _, cost in dst_targets],
+                            dtype=np.float32,
+                        )
 
                         # Ownership is a negotiated node cost, not a hard wall.
                         # Force source/destination seeds to zero penalty because
@@ -4851,6 +4859,8 @@ class PathFinderRouter:
                                 src_seeds=src_node_array,
                                 dst_targets=dst_node_array,
                                 ub_hint=None,
+                                src_seed_costs=src_seed_costs,
+                                dst_target_costs=dst_target_costs,
                                 node_penalty=owner_penalty,
                                 allowed_bitmap=None,
                                 use_bitmap=False
