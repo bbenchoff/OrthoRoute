@@ -5508,6 +5508,8 @@ class CUDADijkstra:
         return paths
 
     def find_path_fullgraph_gpu_seeds(self, costs, src_seeds, dst_targets, ub_hint=None, *,
+                                      src_seed_costs=None,
+                                      dst_target_costs=None,
                                       node_penalty=None,
                                       allowed_bitmap=None, use_bitmap=False):
         """
@@ -5518,6 +5520,8 @@ class CUDADijkstra:
             src_seeds: np.int32 array of source node IDs
             dst_targets: np.int32 array of destination node IDs
             ub_hint: Optional upper bound for early termination
+            src_seed_costs: Initial cost aligned with each source seed
+            dst_target_costs: Terminal cost aligned with each destination
             node_penalty: Optional float32 cost for entering each graph node
             allowed_bitmap: Optional uint32 bitmap for owner-aware node filtering
             use_bitmap: Whether to enable bitmap filtering
@@ -5542,11 +5546,40 @@ class CUDADijkstra:
         num_edges = len(self.indices)
         logger.info(f"[GPU-SEEDS] Full graph: {num_nodes} nodes, {num_edges} edges")
 
-        # Convert seeds to GPU
         # Dedupe before scatter-add: repeated seeds would add the same bit
-        # twice and carry into a neighboring frontier bit.
-        src_seeds_gpu = cp.unique(cp.asarray(src_seeds, dtype=cp.int32))
-        dst_targets_gpu = cp.unique(cp.asarray(dst_targets, dtype=cp.int32))
+        # twice and carry into a neighboring frontier bit. Retain the
+        # cheapest cost for duplicate nodes and keep costs aligned after sort.
+        def _prepare_terminals(nodes, terminal_costs, label):
+            nodes_cpu = np.asarray(nodes, dtype=np.int32).ravel()
+            if terminal_costs is None:
+                costs_cpu = np.zeros(len(nodes_cpu), dtype=np.float32)
+            else:
+                costs_cpu = np.asarray(
+                    terminal_costs, dtype=np.float32
+                ).ravel()
+                if len(costs_cpu) != len(nodes_cpu):
+                    raise ValueError(
+                        f"{label} costs has {len(costs_cpu)} entries, "
+                        f"expected {len(nodes_cpu)}"
+                    )
+            order = np.argsort(nodes_cpu, kind="stable")
+            sorted_nodes = nodes_cpu[order]
+            sorted_costs = costs_cpu[order]
+            unique_nodes, first = np.unique(
+                sorted_nodes, return_index=True
+            )
+            unique_costs = np.minimum.reduceat(sorted_costs, first)
+            return (
+                cp.asarray(unique_nodes, dtype=cp.int32),
+                cp.asarray(unique_costs, dtype=cp.float32),
+            )
+
+        src_seeds_gpu, src_seed_costs_gpu = _prepare_terminals(
+            src_seeds, src_seed_costs, "source seed"
+        )
+        dst_targets_gpu, dst_target_costs_gpu = _prepare_terminals(
+            dst_targets, dst_target_costs, "destination target"
+        )
 
         # Initialize bit-packed frontier (K=1, frontier_words)
         frontier_words = (num_nodes + 31) // 32
@@ -5573,16 +5606,20 @@ class CUDADijkstra:
         parent_view = self.parent_val_pool[0, :num_nodes]
         dist_view.fill(cp.inf)
         parent_view.fill(-1)
-        dist_view[src_seeds_gpu] = 0.0
-        logger.info(f"[GPU-SEEDS] Initialized {len(src_seeds)} source seeds with dist=0")
+        dist_view[src_seeds_gpu] = src_seed_costs_gpu
+        logger.info(
+            f"[GPU-SEEDS] Initialized {len(src_seeds_gpu)} source seeds"
+        )
 
-        # Initialize best_key_pool for source seeds with SRC_KEY (cost=0, parent=-1)
-        SRC_KEY = 0x00000000FFFFFFFF  # cost=0 (upper 32 bits) | parent=-1 (lower 32 bits)
+        # Initialize best_key_pool for source seeds with their entry costs.
         INF_KEY = 0x7F800000FFFFFFFF  # +inf (upper 32 bits) | parent=-1 (lower 32 bits)
         # Reset all keys to INF_KEY first
         self.best_key_pool[0, :num_nodes] = INF_KEY
-        # Initialize source seeds with SRC_KEY
-        self.best_key_pool[0, src_seeds_gpu] = SRC_KEY
+        seed_cost_bits = src_seed_costs_gpu.view(cp.uint32).astype(cp.uint64)
+        seed_keys = (
+            seed_cost_bits << cp.uint64(32)
+        ) | cp.uint64(0xFFFFFFFF)
+        self.best_key_pool[0, src_seeds_gpu] = seed_keys
 
         # Determine lattice dimensions for coordinate encoding
         # For full-graph routing: use linear layout
@@ -5712,6 +5749,8 @@ class CUDADijkstra:
                 use_bitmap=bool(data['use_bitmap']),
                 node_penalty_gpu=data['node_penalty'],
                 use_node_penalty=bool(data['use_node_penalty']),
+                src_seed_costs_gpu=src_seed_costs_gpu,
+                dst_target_costs_gpu=dst_target_costs_gpu,
                 max_iterations=max_iterations
             )
 

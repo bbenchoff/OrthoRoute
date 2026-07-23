@@ -26,9 +26,11 @@ class _FailingGpuSolver:
     def __init__(self, failure):
         self.failure = failure
         self.calls = 0
+        self.last_kwargs = None
 
-    def find_path_fullgraph_gpu_seeds(self, **_kwargs):
+    def find_path_fullgraph_gpu_seeds(self, **kwargs):
         self.calls += 1
+        self.last_kwargs = kwargs
         if isinstance(self.failure, Exception):
             raise self.failure
         return self.failure
@@ -65,6 +67,8 @@ def test_gpu_seed_failure_falls_back_to_cost_based_routing(monkeypatch, gpu_fail
     routed, failed = router._route_all(tasks, all_tasks=tasks, iteration=1)
 
     assert gpu_solver.calls == 1
+    assert np.count_nonzero(gpu_solver.last_kwargs["src_seed_costs"]) > 0
+    assert np.count_nonzero(gpu_solver.last_kwargs["dst_target_costs"]) > 0
     assert (routed, failed) == (1, 0)
     assert len(router.net_paths["TEST_NET"]) > 1
 
