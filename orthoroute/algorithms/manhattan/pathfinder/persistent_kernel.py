@@ -35,13 +35,22 @@ __device__ float atomicMinFloat(float* addr, float value) {
     return __int_as_float(old);
 }
 
-// Atomic min for 64-bit keys (cycle-proof relaxation)
-__device__ unsigned long long atomicMin64(unsigned long long* address, unsigned long long val) {
+// Atomically replace a packed (distance, parent) key only when distance
+// strictly improves.  Comparing the whole key lets an equal float32 distance
+// replace its parent based on node ID; after large penalties, sub-ULP edges
+// then create flat-distance parent cycles.
+__device__ unsigned long long atomicMinDistanceKey(
+    unsigned long long* address,
+    unsigned long long val
+) {
     unsigned long long old = *address;
     unsigned long long assumed;
     do {
         assumed = old;
-        old = atomicCAS(address, assumed, (val < assumed) ? val : assumed);
+        unsigned int old_dist = (unsigned int)(assumed >> 32);
+        unsigned int new_dist = (unsigned int)(val >> 32);
+        if (new_dist >= old_dist) break;
+        old = atomicCAS(address, assumed, val);
     } while (assumed != old);
     return old;
 }
@@ -172,10 +181,13 @@ void persistent_sssp_kernel(
                     unsigned long long new_key = pack_key(g_new, node);
 
                     // Single atomic operation on 64-bit key - eliminates race condition!
-                    unsigned long long old_key = atomicMin64(&best_key[neighbor], new_key);
+                    unsigned long long old_key = atomicMinDistanceKey(
+                        &best_key[neighbor], new_key
+                    );
 
                     // Only the winning thread proceeds
-                    if (new_key < old_key) {
+                    if ((unsigned int)(new_key >> 32)
+                            < (unsigned int)(old_key >> 32)) {
                         // We won! Update dist and parent arrays (for compatibility)
                         dist[neighbor] = g_new;
                         atomicExch(&parent[neighbor], node);
@@ -262,7 +274,7 @@ __device__ float atomicMinFloat(float* addr, float value) {
     return __int_as_float(old);
 }
 
-__device__ unsigned long long atomicMin64(
+__device__ unsigned long long atomicMinDistanceKey(
     unsigned long long* address,
     unsigned long long value
 ) {
@@ -270,7 +282,10 @@ __device__ unsigned long long atomicMin64(
     unsigned long long assumed;
     do {
         assumed = old;
-        old = atomicCAS(address, assumed, (value < assumed) ? value : assumed);
+        unsigned int old_dist = (unsigned int)(assumed >> 32);
+        unsigned int new_dist = (unsigned int)(value >> 32);
+        if (new_dist >= old_dist) break;
+        old = atomicCAS(address, assumed, value);
     } while (assumed != old);
     return old;
 }
@@ -410,11 +425,12 @@ void persistent_queue_sssp_kernel(
                 float candidate = node_dist + edge_cost;
                 if (candidate >= *best_dist) continue;
                 unsigned long long new_key = pack_key(candidate, node);
-                unsigned long long old_key = atomicMin64(
+                unsigned long long old_key = atomicMinDistanceKey(
                     &best_key[neighbor], new_key
                 );
 
-                if (new_key < old_key) {
+                if ((unsigned int)(new_key >> 32)
+                        < (unsigned int)(old_key >> 32)) {
                     int word_idx = neighbor >> 5;
                     unsigned int mask = 1u << (neighbor & 31);
                     unsigned int old_bits = atomicOr(

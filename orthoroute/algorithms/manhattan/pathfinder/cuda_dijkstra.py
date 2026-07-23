@@ -225,12 +225,15 @@ class CUDADijkstra:
             return ((unsigned long long)f2u(g) << 32) | (unsigned long long)(unsigned int)p;
         }
 
-        __device__ __forceinline__ unsigned long long atomicMin64(unsigned long long* address, unsigned long long val) {
+        __device__ __forceinline__ unsigned long long atomicMinDistanceKey(unsigned long long* address, unsigned long long val) {
             unsigned long long old = *address;
             unsigned long long assumed;
             do {
                 assumed = old;
-                old = atomicCAS(address, assumed, (val < assumed) ? val : assumed);
+                const unsigned int old_dist = (unsigned int)(assumed >> 32);
+                const unsigned int new_dist = (unsigned int)(val >> 32);
+                if (new_dist >= old_dist) break;
+                old = atomicCAS(address, assumed, val);
             } while (assumed != old);
             return old;
         }
@@ -383,10 +386,11 @@ class CUDADijkstra:
                         // Pack cost+parent into 64-bit key
                         const unsigned long long new_key = pack_key(g_new, node);
                         unsigned long long* key_ptr = &best_key[(size_t)roi_idx * (size_t)key_stride + (size_t)neighbor];
-                        const unsigned long long old_key = atomicMin64(key_ptr, new_key);
+                        const unsigned long long old_key = atomicMinDistanceKey(key_ptr, new_key);
 
                         // Only the winning thread proceeds
-                        if (new_key < old_key) {
+                        if ((unsigned int)(new_key >> 32)
+                                < (unsigned int)(old_key >> 32)) {
                             // We won! Always update dist (enables early exit & valid backtrace)
                             dist[nidx] = g_new;
                             // Mirror parent to legacy array for tooling/accounting compatibility

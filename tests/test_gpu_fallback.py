@@ -143,3 +143,31 @@ def test_gpu_fullgraph_prices_source_seed_node():
     )
 
     assert path == [1, 3]
+
+
+def test_gpu_fullgraph_high_cost_rounding_does_not_cycle_parents():
+    """Equal float32 distances must not replace parents by lower node ID."""
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CUDA device unavailable")
+    except Exception:
+        pytest.skip("CUDA runtime unavailable")
+
+    # At this magnitude, adding a 0.4 mm edge does not change a float32.
+    # Whole-key (distance, parent) minimization used to rewrite the source
+    # parent and create a cycle while walking this bidirectional chain.
+    graph = types.SimpleNamespace(
+        indptr=cp.asarray([0, 1, 3, 5, 6], dtype=cp.int32),
+        indices=cp.asarray([1, 0, 2, 1, 3, 2], dtype=cp.int32),
+    )
+    solver = CUDADijkstra(graph=graph)
+    path = solver.find_path_fullgraph_gpu_seeds(
+        costs=cp.full(6, 0.4, dtype=cp.float32),
+        src_seeds=np.asarray([3], dtype=np.int32),
+        dst_targets=np.asarray([0], dtype=np.int32),
+        src_seed_costs=np.asarray([16_000_000.0], dtype=np.float32),
+        dst_target_costs=np.zeros(1, dtype=np.float32),
+    )
+
+    assert path == [3, 2, 1, 0]
