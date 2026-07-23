@@ -648,6 +648,9 @@ class PathFinderConfig:
     strict_capacity: bool = True
     live_present_costs: bool = True
     reroute_only_offenders: bool = True
+    # Complete production routes may not silently drop difficult nets.
+    # Retain the legacy quarantine only as an opt-in diagnostic.
+    allow_net_exclusion: bool = False
     layer_shortfall_percentile: float = 95.0
     layer_shortfall_cap: int = 16
     enable_profiling: bool = False
@@ -4673,23 +4676,27 @@ class PathFinderRouter:
             if it > 1:  # Allow greedy first pass without hard blocking
                 self._block_via_edges_with_collisions()
 
-            # STEP 2.9: Exclude persistently failing nets (CRITICAL for large boards)
-            # Track nets that fail repeatedly and exclude them to prevent thrashing
-            # ONLY ACTIVATE AFTER ITERATION 4 to allow greedy routing to complete
+            # STEP 2.9: Optionally quarantine persistently failing nets for
+            # diagnostics. Production routing keeps every net negotiable.
             if not hasattr(self, '_net_failure_count'):
                 self._net_failure_count = {}  # net_id -> consecutive failures
-                self._excluded_nets = set()   # nets we've given up on
+                self._excluded_nets = set()
 
-            # Every 10 iterations, give excluded nets another chance (conditions may have improved)
-            # This prevents permanent exclusion of temporarily unroutable nets
-            if it > 10 and it % 10 == 0 and self._excluded_nets:
+            allow_exclusion = bool(getattr(
+                cfg, "allow_net_exclusion", False
+            ))
+            if (
+                allow_exclusion
+                and it > 10
+                and it % 10 == 0
+                and self._excluded_nets
+            ):
                 num_to_retry = len(self._excluded_nets)
                 logger.warning(f"[EXCLUDE-RETRY] Iteration {it}: Giving {num_to_retry} excluded nets another chance")
                 self._excluded_nets.clear()
                 self._net_failure_count.clear()
 
-            # Only start tracking failures after iteration 4
-            if it > 4:
+            if allow_exclusion and it > 4:
                 # Update failure counts based on which nets have paths
                 for net_id in tasks.keys():
                     has_path = bool(self.net_paths.get(net_id))
@@ -4796,10 +4803,21 @@ class PathFinderRouter:
 
             # Check barrel conflicts
             barrel_conflicts = getattr(self, '_last_barrel_conflict_count', 0)
+            exact_barrel_conflicts = getattr(
+                self, "_last_exact_barrel_conflict_count", 0
+            )
+            escape_conflicts = getattr(
+                self, "_last_escape_conflict_count", 0
+            )
 
             # Clean consolidated iteration summary (WARNING level so it shows in console)
             status = "✓ CONVERGED" if over_sum == 0 else f"overuse={over_sum}"
-            barrel_info = f"  barrel={barrel_conflicts}" if barrel_conflicts > 0 else ""
+            barrel_info = (
+                f"  barrel={barrel_conflicts}"
+                f" (exact={exact_barrel_conflicts},"
+                f" escape={escape_conflicts})"
+                if barrel_conflicts > 0 else ""
+            )
             logger.warning(f"[ITER {it:3d}] nets={routed}/{routed+failed}  {status}  edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}")
 
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0) - only first 3 iterations
@@ -6496,9 +6514,16 @@ class PathFinderRouter:
 
         for net_id in victims:
             if self.net_paths.get(net_id) and net_id in self._net_to_edges:
+                old_path = self.net_paths[net_id]
                 # Use cached edges for efficiency
                 self.accounting.clear_path(self._net_to_edges[net_id])
+                self._clear_via_barrel_ownership_for_path(
+                    net_id, old_path
+                )
+                self._clear_path_node_use(old_path)
+                self._clear_escape_occupancy(net_id)
                 self.net_paths[net_id] = []
+                self.net_selected_portals.pop(net_id, None)
                 # Clear edge tracking for ripped nets
                 self._clear_net_edge_tracking(net_id)
                 # Reset clean streak so they can't immediately lock again
