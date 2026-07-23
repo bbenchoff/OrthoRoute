@@ -3023,7 +3023,14 @@ class PathFinderRouter:
 
         return tasks
 
-    def _accumulate_via_usage_for_path(self, node_path: List[int], net_id: str = None):
+    def _accumulate_via_usage_for_path(
+        self,
+        node_path: List[int],
+        net_id: str = None,
+        *,
+        col_use=None,
+        seg_use=None,
+    ):
         """
         Accumulate via column and segment usage for a committed path.
         Also registers via keepouts to prevent other nets from routing tracks through via locations.
@@ -3036,8 +3043,12 @@ class PathFinderRouter:
             self._via_keepouts_map = {}
 
         idx_to_coord = self.lattice.idx_to_coord
-        col_pool = hasattr(self, 'via_col_use')
-        seg_pool = hasattr(self, 'via_seg_use')
+        if col_use is None and hasattr(self, 'via_col_use'):
+            col_use = self.via_col_use
+        if seg_use is None and hasattr(self, 'via_seg_use'):
+            seg_use = self.via_seg_use
+        col_pool = col_use is not None
+        seg_pool = seg_use is not None
 
         previous_via_xy = None
         for u, v in zip(node_path, node_path[1:]):
@@ -3051,7 +3062,7 @@ class PathFinderRouter:
                 # column pool, while retaining per-segment occupancy below.
                 via_xy = (xu, yu)
                 if col_pool and via_xy != previous_via_xy:
-                    self.via_col_use[xu, yu] += 1
+                    col_use[xu, yu] += 1
                 previous_via_xy = via_xy
 
                 # Segment pooling: increment each segment crossed
@@ -3064,7 +3075,7 @@ class PathFinderRouter:
                     for z in range(z_lo, z_hi):
                         seg_idx = z - 1  # Segment z→z+1 stored at index z-1
                         if 0 <= seg_idx < self._segZ:
-                            self.via_seg_use[xu, yu, seg_idx] += 1
+                            seg_use[xu, yu, seg_idx] += 1
 
                 # Register via keepouts for ALL layers the via touches (including endpoints!)
                 # This prevents other nets from routing tracks through via locations
@@ -3083,11 +3094,16 @@ class PathFinderRouter:
         if not hasattr(self, 'via_col_use') and not hasattr(self, 'via_seg_use'):
             return
 
-        # Clear counters
-        if hasattr(self, 'via_col_use'):
-            self.via_col_use.fill(0)
-        if hasattr(self, 'via_seg_use'):
-            self.via_seg_use.fill(0)
+        # Accumulate on the host and upload once. Per-via writes into CuPy
+        # arrays serialize the CPU and GPU thousands of times on large boards.
+        col_use_cpu = (
+            np.zeros((self._Nx, self._Ny), dtype=np.int16)
+            if hasattr(self, 'via_col_use') else None
+        )
+        seg_use_cpu = (
+            np.zeros((self._Nx, self._Ny, self._segZ), dtype=np.int16)
+            if hasattr(self, 'via_seg_use') else None
+        )
 
         # Clear routing via keepouts but PRESERVE portal keepouts
         # Portal keepouts were pre-registered to protect escape via columns
@@ -3103,7 +3119,12 @@ class PathFinderRouter:
         # Rebuild from all committed paths (including keepout registration)
         for net_id, node_path in self.net_paths.items():
             if node_path and len(node_path) > 1:
-                self._accumulate_via_usage_for_path(node_path, net_id=net_id)
+                self._accumulate_via_usage_for_path(
+                    node_path,
+                    net_id=net_id,
+                    col_use=col_use_cpu,
+                    seg_use=seg_use_cpu,
+                )
 
         # Escape barrels are attached to every committed routed path. Track
         # only geometry belonging to nets without a path, otherwise the same
@@ -3112,8 +3133,15 @@ class PathFinderRouter:
             net_id for net_id, path in self.net_paths.items() if path
         }
         self._track_escape_vias_in_via_usage(
-            exclude_nets=committed_nets
+            exclude_nets=committed_nets,
+            col_use=col_use_cpu,
+            seg_use=seg_use_cpu,
         )
+
+        if col_use_cpu is not None:
+            self.via_col_use[:] = self.accounting.xp.asarray(col_use_cpu)
+        if seg_use_cpu is not None:
+            self.via_seg_use[:] = self.accounting.xp.asarray(seg_use_cpu)
 
         # Log keepout statistics
         if hasattr(self, '_via_keepouts_map'):
@@ -3400,7 +3428,13 @@ class PathFinderRouter:
             penalty[cp.asarray(force_allow_nodes, dtype=cp.int32)] = 0.0
         return penalty
 
-    def _track_escape_vias_in_via_usage(self, exclude_nets=None):
+    def _track_escape_vias_in_via_usage(
+        self,
+        exclude_nets=None,
+        *,
+        col_use=None,
+        seg_use=None,
+    ):
         """
         Register escape vias in via spatial tracking arrays.
 
@@ -3416,6 +3450,10 @@ class PathFinderRouter:
 
         tracked_count = 0
         exclude_nets = set(exclude_nets or ())
+        if col_use is None and hasattr(self, 'via_col_use'):
+            col_use = self.via_col_use
+        if seg_use is None and hasattr(self, 'via_seg_use'):
+            seg_use = self.via_seg_use
 
         for via_dict in self._escape_vias:
             if via_dict.get('net') in exclude_nets:
@@ -3446,15 +3484,15 @@ class PathFinderRouter:
                 z_lo, z_hi = z_hi, z_lo
 
             # Track in column usage
-            if hasattr(self, 'via_col_use'):
-                self.via_col_use[xu, yu] += 1
+            if col_use is not None:
+                col_use[xu, yu] += 1
 
             # Track in segment usage
-            if hasattr(self, 'via_seg_use'):
+            if seg_use is not None:
                 for z in range(z_lo, z_hi):
                     seg_idx = z - 1  # Segments indexed from 0
                     if 0 <= seg_idx < self._segZ:
-                        self.via_seg_use[xu, yu, seg_idx] += 1
+                        seg_use[xu, yu, seg_idx] += 1
 
             # Register via keepouts for ALL layers (including endpoints) to block tracks
             if not hasattr(self, '_via_keepouts_map'):
