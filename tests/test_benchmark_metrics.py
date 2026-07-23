@@ -121,9 +121,11 @@ def test_metrics_reject_barrel_conflicts():
         iteration=2,
         _excluded_nets=set(),
         _last_barrel_conflict_count=3,
+        _last_portal_grid_conflict_count=2,
     )
 
     metrics = collect_route_metrics(router, board)
 
     assert metrics["completion"]["complete"] is False
     assert metrics["convergence"]["barrel_conflicts"] == 3
+    assert metrics["convergence"]["portal_grid_conflicts"] == 2

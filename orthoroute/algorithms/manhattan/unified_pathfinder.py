@@ -608,6 +608,7 @@ class PathFinderConfig:
     via_diameter: float = 0.25
     via_drill: float = 0.15
     min_hole_to_hole: float = 0.25
+    hole_clearance: float = 0.1
     via_cost: float = 0.7  # Cheaper vias to encourage layer hopping and redistribute load (was 1.0)
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
     span_alpha: float = 0.15  # Span penalty: cost *= (1 + alpha*(span-1))
@@ -638,6 +639,8 @@ class PathFinderConfig:
     # Accumulated history prevents the owner from returning to the same
     # locally attractive but globally impossible escape column.
     portal_barrel_history_penalty: float = 25.0
+    portal_cleanup_edge_penalty: float = 1_000_000.0
+    portal_cleanup_node_penalty: float = 1_000_000.0
 
     stagnation_patience: int = 5
     use_gpu: bool = True  # GPU algorithm fixed, validation will catch ROI construction issues
@@ -2407,6 +2410,12 @@ class PathFinderRouter:
                     self.config.min_hole_to_hole,
                 )
             )
+            self.config.hole_clearance = float(
+                design_rules.get(
+                    "min_hole_clearance",
+                    self.config.hole_clearance,
+                )
+            )
         logger.info("=" * 80)
         logger.info("PATHFINDER NEGOTIATED CONGESTION ROUTER - RUNTIME CONFIGURATION")
         logger.info("=" * 80)
@@ -2555,6 +2564,18 @@ class PathFinderRouter:
         self.node_owner = np.full(self.lattice.num_nodes, -1, dtype=np.int32)
         self._node_owner_members: Dict[int, Set[int]] = {}
         self.node_owner_gpu = None
+        # Explicit terminal vias are physically off-grid. Their clearance
+        # footprints therefore cannot be represented by graph via edges, but
+        # later graph searches still need to price tracks and vias entering
+        # those footprints.
+        self.portal_clearance_owner = np.full(
+            self.lattice.num_nodes, -1, dtype=np.int32
+        )
+        self._portal_clearance_owner_members: Dict[int, Set[int]] = {}
+        self.portal_clearance_owner_gpu = None
+        self._portal_clearance_nodes_cache = {}
+        self._portal_clearance_halo_cache = {}
+        self._portal_clearance_xy_cache = {}
         self.path_node_use = np.zeros(
             self.lattice.num_nodes, dtype=np.int16
         )
@@ -2580,6 +2601,9 @@ class PathFinderRouter:
             try:
                 self.solver.gpu_solver = CUDADijkstra(self.graph, self.lattice)
                 self.node_owner_gpu = cp.asarray(self.node_owner)
+                self.portal_clearance_owner_gpu = cp.asarray(
+                    self.portal_clearance_owner
+                )
                 self.path_node_use_gpu = cp.asarray(self.path_node_use)
                 self.node_conflict_history_gpu = cp.asarray(
                     self.node_conflict_history
@@ -3505,6 +3529,28 @@ class PathFinderRouter:
         candidates = self.portal_candidates.get(pad_id)
         if not candidates:
             candidates = [primary] if primary is not None else []
+        fixed_layer = None
+        if (
+            current_net is not None
+            and getattr(self, "_freeze_selected_portals", False)
+            and current_net not in getattr(
+                self, "_portal_cleanup_movable_nets", ()
+            )
+        ):
+            pad_ids = self.net_pad_ids.get(current_net, ())
+            selected = self.net_selected_portals.get(current_net, ())
+            selected_layers = self.net_portal_layers.get(
+                current_net, ()
+            )
+            if pad_id in pad_ids:
+                position = pad_ids.index(pad_id)
+                if (
+                    position < len(selected)
+                    and position < len(selected_layers)
+                    and selected[position] is not None
+                ):
+                    candidates = [selected[position]]
+                    fixed_layer = int(selected_layers[position])
         preferred = getattr(
             self, "_escape_preferred_portals", {}
         ).get(pad_id)
@@ -3562,9 +3608,33 @@ class PathFinderRouter:
                 ))
             for node, layer_cost in self._get_portal_seeds(portal):
                 entry_layer = self.lattice.idx_to_coord(node)[2]
+                if (
+                    fixed_layer is not None
+                    and entry_layer != fixed_layer
+                ):
+                    continue
+                depth_history_penalty = (
+                    self._portal_barrel_history[
+                        (
+                            pad_id,
+                            portal.x_idx,
+                            portal.y_idx,
+                            entry_layer,
+                        )
+                    ]
+                    * float(getattr(
+                        self.config,
+                        "portal_barrel_history_penalty",
+                        25.0,
+                    ))
+                    * float(getattr(
+                        self, "_pres_fac_now", 1.0
+                    ))
+                )
                 total_cost = (
                     layer_cost
                     + candidate_penalty
+                    + depth_history_penalty
                     + self._portal_chain_node_penalty(
                         portal,
                         entry_layer,
@@ -3620,6 +3690,19 @@ class PathFinderRouter:
         current_net_id = self._get_net_id(current_net)
         owners = self.node_owner[nodes]
         foreign = (owners != -1) & (owners != current_net_id)
+        clearance_nodes = self._portal_clearance_halo_nodes(
+            portal, entry_layer
+        )
+        clearance_owners = self.node_owner[clearance_nodes]
+        clearance_portal_owners = self.portal_clearance_owner[
+            clearance_nodes
+        ]
+        clearance_foreign = (
+            ((clearance_owners != -1)
+             & (clearance_owners != current_net_id))
+            | ((clearance_portal_owners != -1)
+               & (clearance_portal_owners != current_net_id))
+        )
 
         pres_fac = float(getattr(self, "_pres_fac_now", 1.0))
         owner_weight = (
@@ -3637,6 +3720,13 @@ class PathFinderRouter:
             foreign.sum() * owner_weight
             + (self.path_node_use[nodes] > 0).sum() * path_weight
             + self.node_conflict_history[nodes].sum() * history_weight
+            + clearance_foreign.sum() * owner_weight
+            + (
+                self.path_node_use[clearance_nodes] > 0
+            ).sum() * path_weight
+            + self.node_conflict_history[
+                clearance_nodes
+            ].sum() * history_weight
         )
 
     def _attach_portal_vias(
@@ -3987,6 +4077,8 @@ class PathFinderRouter:
         # Reset to all free
         self.node_owner.fill(-1)
         self._node_owner_members = {}
+        self.portal_clearance_owner.fill(-1)
+        self._portal_clearance_owner_members = {}
 
         owned_count = 0
 
@@ -4008,10 +4100,13 @@ class PathFinderRouter:
                 continue
 
             net_id = self._get_net_id(net_name)
+            graph_path = self._path_without_dynamic_escape_chains(
+                net_name, path
+            )
 
             # Walk path and find layer transitions (vias)
-            for i in range(len(path) - 1):
-                u, v = path[i], path[i+1]
+            for i in range(len(graph_path) - 1):
+                u, v = graph_path[i], graph_path[i+1]
                 xu, yu, zu = self.lattice.idx_to_coord(u)
                 xv, yv, zv = self.lattice.idx_to_coord(v)
 
@@ -4023,15 +4118,37 @@ class PathFinderRouter:
                             node_idx, set()
                         ).add(net_id)
 
+            for node_idx in self._selected_portal_clearance_nodes(
+                net_name
+            ):
+                self._portal_clearance_owner_members.setdefault(
+                    node_idx, set()
+                ).add(net_id)
+
         for node_idx, members in self._node_owner_members.items():
             self.node_owner[node_idx] = (
                 next(iter(members)) if len(members) == 1 else -2
             )
         owned_count = len(self._node_owner_members)
+        for node_idx, members in (
+            self._portal_clearance_owner_members.items()
+        ):
+            self.portal_clearance_owner[node_idx] = (
+                next(iter(members)) if len(members) == 1 else -2
+            )
 
-        logger.info(f"[NODE-OWNER] Marked {owned_count:,} nodes as owned ({owned_count*100//self.lattice.num_nodes}% of graph)")
+        logger.info(
+            "[NODE-OWNER] Marked %s graph-barrel and %s terminal-via "
+            "clearance nodes as owned",
+            f"{owned_count:,}",
+            f"{len(self._portal_clearance_owner_members):,}",
+        )
         if self.node_owner_gpu is not None:
             self.node_owner_gpu[:] = cp.asarray(self.node_owner)
+        if self.portal_clearance_owner_gpu is not None:
+            self.portal_clearance_owner_gpu[:] = cp.asarray(
+                self.portal_clearance_owner
+            )
 
     def _get_net_id(self, net_name: str) -> int:
         """Map net name to integer ID for node ownership"""
@@ -4085,13 +4202,25 @@ class PathFinderRouter:
             return
 
         net_id = self._get_net_id(net_name)
-        owned_nodes = self._via_nodes_for_path(path)
+        graph_path = self._path_without_dynamic_escape_chains(
+            net_name, path
+        )
+        owned_nodes = self._via_nodes_for_path(graph_path)
         for node_idx in owned_nodes:
             members = self._node_owner_members.setdefault(
                 node_idx, set()
             )
             members.add(net_id)
             self.node_owner[node_idx] = (
+                net_id if len(members) == 1 else -2
+            )
+        portal_nodes = self._selected_portal_clearance_nodes(net_name)
+        for node_idx in portal_nodes:
+            members = self._portal_clearance_owner_members.setdefault(
+                node_idx, set()
+            )
+            members.add(net_id)
+            self.portal_clearance_owner[node_idx] = (
                 net_id if len(members) == 1 else -2
             )
 
@@ -4102,6 +4231,16 @@ class PathFinderRouter:
             self.node_owner_gpu[owned_nodes_gpu] = cp.asarray(
                 self.node_owner[owned_nodes], dtype=cp.int32
             )
+        if portal_nodes and self.portal_clearance_owner_gpu is not None:
+            portal_nodes_gpu = cp.asarray(
+                portal_nodes, dtype=cp.int32
+            )
+            self.portal_clearance_owner_gpu[
+                portal_nodes_gpu
+            ] = cp.asarray(
+                self.portal_clearance_owner[portal_nodes],
+                dtype=cp.int32,
+            )
 
     def _clear_via_barrel_ownership_for_path(
         self, net_name: str, path: List[int]
@@ -4110,7 +4249,10 @@ class PathFinderRouter:
         if not path or len(path) < 2:
             return
         net_id = self._get_net_id(net_name)
-        changed_nodes = self._via_nodes_for_path(path)
+        graph_path = self._path_without_dynamic_escape_chains(
+            net_name, path
+        )
+        changed_nodes = self._via_nodes_for_path(graph_path)
         for node_idx in changed_nodes:
             members = self._node_owner_members.get(node_idx)
             if not members:
@@ -4124,12 +4266,201 @@ class PathFinderRouter:
                 self.node_owner[node_idx] = next(iter(members))
             else:
                 self.node_owner[node_idx] = -2
+        portal_nodes = self._selected_portal_clearance_nodes(net_name)
+        for node_idx in portal_nodes:
+            members = self._portal_clearance_owner_members.get(node_idx)
+            if not members:
+                self.portal_clearance_owner[node_idx] = -1
+                continue
+            members.discard(net_id)
+            if not members:
+                self._portal_clearance_owner_members.pop(node_idx, None)
+                self.portal_clearance_owner[node_idx] = -1
+            elif len(members) == 1:
+                self.portal_clearance_owner[node_idx] = next(iter(members))
+            else:
+                self.portal_clearance_owner[node_idx] = -2
 
         if changed_nodes and self.node_owner_gpu is not None:
             nodes_gpu = cp.asarray(changed_nodes, dtype=cp.int32)
             self.node_owner_gpu[nodes_gpu] = cp.asarray(
                 self.node_owner[changed_nodes], dtype=cp.int32
             )
+        if portal_nodes and self.portal_clearance_owner_gpu is not None:
+            nodes_gpu = cp.asarray(portal_nodes, dtype=cp.int32)
+            self.portal_clearance_owner_gpu[nodes_gpu] = cp.asarray(
+                self.portal_clearance_owner[portal_nodes],
+                dtype=cp.int32,
+            )
+
+    def _selected_portal_clearance_nodes(
+        self, net_name: str
+    ) -> List[int]:
+        """Return graph nodes whose copper would hit a net's terminal vias."""
+        selected = self.net_selected_portals.get(net_name, ())
+        layers = self.net_portal_layers.get(net_name, ())
+        nodes = set()
+        for portal, entry_layer in zip(selected, layers):
+            if portal is not None:
+                nodes.update(self._portal_clearance_nodes(
+                    portal, int(entry_layer)
+                ))
+        return sorted(nodes)
+
+    def _portal_clearance_nodes(
+        self, portal: Portal, entry_layer: int
+    ) -> np.ndarray:
+        """Map one off-grid terminal-via envelope onto affected graph nodes."""
+        cache_key = (id(portal), int(entry_layer))
+        cached = self._portal_clearance_nodes_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        xy_by_axis = self._portal_clearance_xy_nodes(portal)
+        plane = self.lattice.x_steps * self.lattice.y_steps
+        z_lo, z_hi = sorted((
+            int(portal.pad_layer), int(entry_layer)
+        ))
+        chunks = []
+        for layer in range(z_lo, z_hi + 1):
+            xy_nodes = xy_by_axis["via"]
+            if not (
+                self.lattice.layers > 2
+                and layer in (0, self.lattice.layers - 1)
+            ):
+                xy_nodes = np.union1d(
+                    xy_nodes,
+                    xy_by_axis[
+                        self.lattice.get_legal_axis(layer)
+                    ],
+                )
+            if xy_nodes.size:
+                chunks.append(xy_nodes + layer * plane)
+
+        result = (
+            np.unique(np.concatenate(chunks)).astype(
+                np.int32, copy=False
+            )
+            if chunks else np.empty(0, dtype=np.int32)
+        )
+        self._portal_clearance_nodes_cache[cache_key] = result
+        return result
+
+    def _portal_clearance_halo_nodes(
+        self, portal: Portal, entry_layer: int
+    ) -> np.ndarray:
+        """Clearance footprint excluding the contracted centerline chain."""
+        cache_key = (id(portal), int(entry_layer))
+        cached = self._portal_clearance_halo_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        nodes = self._portal_clearance_nodes(portal, entry_layer)
+        pad_layer = int(portal.pad_layer)
+        step = 1 if entry_layer > pad_layer else -1
+        plane = self.lattice.x_steps * self.lattice.y_steps
+        xy = portal.y_idx * self.lattice.x_steps + portal.x_idx
+        chain = (
+            np.arange(
+                pad_layer, entry_layer, step, dtype=np.int64
+            ) * plane + xy
+        )
+        result = np.setdiff1d(
+            nodes, chain, assume_unique=False
+        ).astype(np.int32, copy=False)
+        self._portal_clearance_halo_cache[cache_key] = result
+        return result
+
+    def _portal_clearance_xy_nodes(self, portal: Portal):
+        """Compute reusable XY clearance templates for one portal."""
+        cache_key = id(portal)
+        cached = self._portal_clearance_xy_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        center = self.escape_planner._portal_world(portal)
+        pitch = float(self.lattice.geom.pitch)
+        via_track_limit = max(
+            0.5 * float(self.config.via_diameter)
+            + 0.5 * float(self.config.track_width)
+            + float(self.config.clearance),
+            0.5 * float(self.config.via_drill)
+            + 0.5 * float(self.config.track_width)
+            + float(getattr(self.config, "hole_clearance", 0.0)),
+        )
+        via_via_limit = max(
+            float(self.config.via_diameter)
+            + float(self.config.clearance),
+            float(self.config.via_drill)
+            + float(getattr(
+                self.config, "min_hole_to_hole", 0.0
+            )),
+        )
+        search_steps = int(np.ceil(
+            max(via_track_limit, via_via_limit) / pitch
+        )) + 1
+        x_lo = max(0, portal.x_idx - search_steps)
+        x_hi = min(
+            self.lattice.x_steps - 1,
+            portal.x_idx + search_steps,
+        )
+        y_lo = max(0, portal.y_idx - search_steps)
+        y_hi = min(
+            self.lattice.y_steps - 1,
+            portal.y_idx + search_steps,
+        )
+        via_xy = set()
+        for x_idx in range(x_lo, x_hi + 1):
+            for y_idx in range(y_lo, y_hi + 1):
+                world = self.lattice.geom.lattice_to_world(
+                    x_idx, y_idx
+                )
+                if (
+                    float(np.hypot(
+                        world[0] - center[0],
+                        world[1] - center[1],
+                    ))
+                    < via_via_limit - 1e-9
+                ):
+                    via_xy.add(
+                        y_idx * self.lattice.x_steps + x_idx
+                    )
+
+        axis_xy = {}
+        for axis in ("h", "v"):
+            track_xy = set()
+            if axis == "h":
+                segments = (
+                    (x_idx, y_idx, x_idx + 1, y_idx)
+                    for y_idx in range(y_lo, y_hi + 1)
+                    for x_idx in range(x_lo, x_hi)
+                )
+            else:
+                segments = (
+                    (x_idx, y_idx, x_idx, y_idx + 1)
+                    for x_idx in range(x_lo, x_hi + 1)
+                    for y_idx in range(y_lo, y_hi)
+                )
+            for x0, y0, x1, y1 in segments:
+                start = self.lattice.geom.lattice_to_world(x0, y0)
+                end = self.lattice.geom.lattice_to_world(x1, y1)
+                if (
+                    self._point_segment_distance(center, start, end)
+                    < via_track_limit - 1e-9
+                ):
+                    track_xy.update((
+                        y0 * self.lattice.x_steps + x0,
+                        y1 * self.lattice.x_steps + x1,
+                    ))
+            axis_xy[axis] = np.asarray(
+                sorted(track_xy), dtype=np.int32
+            )
+
+        result = {
+            "via": np.asarray(sorted(via_xy), dtype=np.int32),
+            **axis_xy,
+        }
+        self._portal_clearance_xy_cache[cache_key] = result
+        return result
 
     def _via_nodes_for_hop(self, u: int, v: int) -> List[int]:
         xu, yu, zu = self.lattice.idx_to_coord(u)
@@ -4216,6 +4547,15 @@ class PathFinderRouter:
         current_net_id = self._get_net_id(current_net)
         owners = self.node_owner if roi_nodes is None else self.node_owner[roi_nodes]
         foreign = (owners != -1) & (owners != current_net_id)
+        portal_owners = (
+            self.portal_clearance_owner
+            if roi_nodes is None
+            else self.portal_clearance_owner[roi_nodes]
+        )
+        foreign_portal = (
+            (portal_owners != -1)
+            & (portal_owners != current_net_id)
+        )
         path_use = (
             self.path_node_use
             if roi_nodes is None else self.path_node_use[roi_nodes]
@@ -4228,9 +4568,11 @@ class PathFinderRouter:
         )
         if roi_nodes is None and force_allow_nodes is not None:
             foreign[force_allow_nodes] = False
+            foreign_portal[force_allow_nodes] = False
             occupied[force_allow_nodes] = False
         if (
             not foreign.any()
+            and not foreign_portal.any()
             and not occupied.any()
             and not node_history.any()
         ):
@@ -4238,6 +4580,15 @@ class PathFinderRouter:
 
         weight = (float(getattr(self.config, 'owner_penalty_base', 25.0))
                   * float(getattr(self, '_pres_fac_now', 1.0)))
+        if getattr(self, "_freeze_selected_portals", False):
+            weight = max(
+                weight,
+                float(getattr(
+                    self.config,
+                    "portal_cleanup_node_penalty",
+                    1_000_000.0,
+                )),
+            )
         path_weight = (
             float(getattr(self.config, 'path_node_penalty_base', 25.0))
             * float(getattr(self, '_pres_fac_now', 1.0))
@@ -4246,7 +4597,7 @@ class PathFinderRouter:
             self.config, "node_history_penalty", 5.0
         ))
         return (
-            foreign.astype(np.float32) * weight
+            (foreign | foreign_portal).astype(np.float32) * weight
             + occupied.astype(np.float32) * path_weight
             + node_history * history_weight
         )
@@ -4264,12 +4615,32 @@ class PathFinderRouter:
             float(getattr(self.config, 'owner_penalty_base', 25.0))
             * float(getattr(self, '_pres_fac_now', 1.0))
         )
+        if getattr(self, "_freeze_selected_portals", False):
+            weight = np.float32(max(
+                float(weight),
+                float(getattr(
+                    self.config,
+                    "portal_cleanup_node_penalty",
+                    1_000_000.0,
+                )),
+            ))
         owners = self.node_owner_gpu
         penalty = cp.where(
             (owners != -1) & (owners != current_net_id),
             weight,
             cp.float32(0.0),
         ).astype(cp.float32, copy=False)
+        if self.portal_clearance_owner_gpu is not None:
+            portal_owners = self.portal_clearance_owner_gpu
+            penalty = cp.maximum(
+                penalty,
+                cp.where(
+                    (portal_owners != -1)
+                    & (portal_owners != current_net_id),
+                    weight,
+                    cp.float32(0.0),
+                ),
+            )
         path_weight = np.float32(
             float(getattr(self.config, 'path_node_penalty_base', 25.0))
             * float(getattr(self, '_pres_fac_now', 1.0))
@@ -5182,6 +5553,13 @@ class PathFinderRouter:
                     )
                 replans = getattr(self, "_escape_replan_count", 0)
                 if (
+                    int(getattr(
+                        self, "_last_escape_conflict_count", 0
+                    )) > 0
+                    and not getattr(
+                        self, "_freeze_selected_portals", False
+                    )
+                    and
                     self._escape_replan_stagnant
                     >= int(getattr(
                         cfg, "escape_replan_patience", 2
@@ -5229,6 +5607,96 @@ class PathFinderRouter:
             escape_conflicts = getattr(
                 self, "_last_escape_conflict_count", 0
             )
+            portal_grid_conflicts = getattr(
+                self, "_last_portal_grid_conflict_count", 0
+            )
+
+            # Once graph overuse is gone and escape geometry is internally
+            # legal, repair physical conflicts one side at a time. Holding
+            # one deterministic net fixed in each connected component keeps
+            # shared graph barrels and terminal-via conflicts from migrating
+            # between two simultaneously rerouted paths.
+            if (
+                barrel_conflicts > 0
+                and (
+                    getattr(self, "_freeze_selected_portals", False)
+                    or (
+                        over_sum == 0
+                        and escape_conflicts == 0
+                    )
+                )
+            ):
+                entering_cleanup = not getattr(
+                    self, "_freeze_selected_portals", False
+                )
+                if entering_cleanup:
+                    logger.info(
+                        "[PORTAL-CLEANUP] Freezing %d selected terminal "
+                        "vias; rerouting %d grid victims",
+                        sum(
+                            len(portals)
+                            for portals in
+                            self.net_selected_portals.values()
+                        ),
+                        len(getattr(
+                            self, "_portal_grid_victim_nets", ()
+                        )),
+                    )
+                self._freeze_selected_portals = True
+                self._portal_cleanup_movable_nets = (
+                    self._portal_cleanup_movable_components(
+                        getattr(self, "_portal_grid_pairs", ()),
+                        getattr(self, "_escape_conflict_pairs", ()),
+                        getattr(self, "_exact_barrel_pairs", ()),
+                    )
+                )
+                cleanup_involved_nets = (
+                    set(getattr(
+                        self, "_portal_grid_owner_nets", ()
+                    ))
+                    | set(getattr(
+                        self, "_portal_grid_victim_nets", ()
+                    ))
+                    | {
+                        key[0]
+                        for pair in getattr(
+                            self, "_escape_conflict_pairs", ()
+                        )
+                        for key in pair
+                    }
+                )
+                logger.info(
+                    "[PORTAL-CLEANUP] Holding %d involved nets fixed; "
+                    "allowing %d conflict peers to renegotiate punch-ins",
+                    len(
+                        cleanup_involved_nets
+                        - self._portal_cleanup_movable_nets
+                    ),
+                    len(self._portal_cleanup_movable_nets),
+                )
+                # Movable terminals may have changed during the preceding
+                # iteration. Re-index the current exact envelopes before the
+                # next hotset routes; live node ownership covers changes made
+                # later within that iteration.
+                self._rebuild_portal_cleanup_edge_owners()
+                if self._portal_cleanup_movable_nets:
+                    self._barrel_conflict_nets = set(
+                        self._portal_cleanup_movable_nets
+                    )
+                    self._last_ripped = set(
+                        self._portal_cleanup_movable_nets
+                    )
+            elif barrel_conflicts == 0:
+                self._freeze_selected_portals = False
+                self._portal_cleanup_movable_nets = set()
+            elif (
+                escape_conflicts > 0
+                and not getattr(
+                    self, "_freeze_selected_portals", False
+                )
+            ):
+                self._freeze_selected_portals = False
+                self._portal_cleanup_movable_nets = set()
 
             # Clean consolidated iteration summary (WARNING level so it shows in console)
             status = "✓ CONVERGED" if over_sum == 0 else f"overuse={over_sum}"
@@ -5516,7 +5984,10 @@ class PathFinderRouter:
                 pres_fac = min(pres_fac * 1.5, pres_fac_max)
                 logger.info(f"[PLATEAU-KICK] Stagnant for 2 iters, boosting pres_fac: {old_pres_fac:.2f} → {pres_fac:.2f}")
 
-            if stagnant >= cfg.stagnation_patience:
+            if (
+                stagnant >= cfg.stagnation_patience
+                and it < cfg.max_iterations
+            ):
                 self.stagnation_counter += 1  # Track cumulative stagnation events
                 victims = self._rip_top_k_offenders(k=20)  # Only rip 16-24 worst nets
                 self._last_ripped = victims  # Store for next hotset build (Fix 2)
@@ -5681,7 +6152,13 @@ class PathFinderRouter:
         # Collect nets that use any conflict edge
         conflict_nets = set()
         for net_id, path in self.net_paths.items():
-            if path and any(ei in conflict_edges for ei in self._path_to_edges(path)):
+            graph_path = self._path_without_dynamic_escape_chains(
+                net_id, path
+            )
+            if graph_path and any(
+                ei in conflict_edges
+                for ei in self._path_to_edges(graph_path)
+            ):
                 conflict_nets.add(net_id)
 
         logger.info(f"[DETAIL] Found {len(conflict_nets)} nets in conflict zone")
@@ -5807,10 +6284,16 @@ class PathFinderRouter:
         for net_id, path in self.net_paths.items():
             if not path or len(path) < 2:
                 continue
-            edge_indices = self._path_to_edges(path)
+            graph_path = self._path_without_dynamic_escape_chains(
+                net_id, path
+            )
+            edge_indices = self._path_to_edges(graph_path)
             self.accounting.commit_path(edge_indices)
             self._update_net_edge_tracking(net_id, edge_indices)
         self._rebuild_via_usage_from_committed()
+        self._rebuild_node_owner()
+        self._rebuild_path_node_use()
+        self._rebuild_escape_occupancy()
         return {'success': False, 'error_code': 'DETAIL-INCOMPLETE', 'overuse_sum': best_overuse}
 
     def _order_nets_by_difficulty(self, tasks: Dict[str, Tuple[int, int]]) -> List[str]:
@@ -6029,12 +6512,31 @@ class PathFinderRouter:
                         owner_penalty = self._build_owner_penalty_gpu(
                             net_id
                         )
+                        route_costs = costs
+                        if getattr(
+                            self, "_freeze_selected_portals", False
+                        ):
+                            forbidden_edges = (
+                                self._portal_cleanup_foreign_edges(
+                                    net_id
+                                )
+                            )
+                            if forbidden_edges.size:
+                                route_costs = costs.copy()
+                                route_costs[cp.asarray(
+                                    forbidden_edges,
+                                    dtype=cp.int32,
+                                )] += np.float32(getattr(
+                                    cfg,
+                                    "portal_cleanup_edge_penalty",
+                                    1_000_000.0,
+                                ))
 
                         if len(src_node_array) > 0 and len(dst_node_array) > 0:
                             # Call GPU supersource pathfinding with owner-aware cost.
                             gpu_start = time.time()
                             path = self.solver.gpu_solver.find_path_fullgraph_gpu_seeds(
-                                costs=costs,
+                                costs=route_costs,
                                 src_seeds=src_node_array,
                                 dst_targets=dst_node_array,
                                 ub_hint=None,
@@ -6042,7 +6544,7 @@ class PathFinderRouter:
                                 dst_target_costs=dst_target_costs,
                                 node_penalty=owner_penalty,
                                 allowed_bitmap=None,
-                                use_bitmap=False
+                                use_bitmap=False,
                             )
                             gpu_time = time.time() - gpu_start
 
@@ -6611,10 +7113,19 @@ class PathFinderRouter:
         # No edge overuse can still leave an over-capacity via pool.
         if len(over_idx) == 0:
             unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
-            hotset = unrouted | ripped | via_pool_offenders
+            physical_offenders = set(getattr(
+                self, "_barrel_conflict_nets", ()
+            ))
+            hotset = (
+                unrouted
+                | ripped
+                | via_pool_offenders
+                | physical_offenders
+            )
             logger.info(
                 f"[HOTSET] no-edge-overuse; unrouted={len(unrouted)} "
                 f"ripped={len(ripped)} via_pool={len(via_pool_offenders)} "
+                f"physical={len(physical_offenders)} "
                 f"→ hotset={len(hotset)}"
             )
             return hotset
@@ -7211,11 +7722,21 @@ class PathFinderRouter:
         if not hasattr(self, "node_conflict_history"):
             return
         iteration = int(getattr(self, "iteration", -1))
+        if isinstance(nodes, set):
+            nodes = tuple(nodes)
+        nodes = np.unique(np.asarray(nodes, dtype=np.int64))
+        if nodes.size == 0:
+            return
         if getattr(
             self, "_node_history_iteration", None
-        ) == iteration:
-            return
-        nodes = np.unique(np.asarray(nodes, dtype=np.int64))
+        ) != iteration:
+            self._node_history_iteration = iteration
+            self._node_history_nodes = set()
+        learned = getattr(self, "_node_history_nodes", set())
+        nodes = np.asarray(
+            [node for node in nodes if int(node) not in learned],
+            dtype=np.int64,
+        )
         if nodes.size == 0:
             return
         increment = np.float32(getattr(
@@ -7228,7 +7749,451 @@ class PathFinderRouter:
                 self.node_conflict_history[nodes],
                 dtype=cp.float32,
             )
-        self._node_history_iteration = iteration
+        learned.update(map(int, nodes))
+        self._node_history_nodes = learned
+
+    def _edge_index_for_hop(
+        self, source: int, target: int
+    ) -> Optional[int]:
+        """Return one directed CSR edge index, or None for a non-edge."""
+        if self._indptr_cpu is None:
+            self._indptr_cpu = (
+                self.graph.indptr.get()
+                if hasattr(self.graph.indptr, "get")
+                else np.asarray(self.graph.indptr)
+            )
+            self._indices_cpu = (
+                self.graph.indices.get()
+                if hasattr(self.graph.indices, "get")
+                else np.asarray(self.graph.indices)
+            )
+        start = int(self._indptr_cpu[source])
+        end = int(self._indptr_cpu[source + 1])
+        row = self._indices_cpu[start:end]
+        matches = np.flatnonzero(row == target)
+        if matches.size == 0:
+            return None
+        return start + int(matches[0])
+
+    def _portal_conflicting_graph_edges(
+        self, portal: Portal, entry_layer: int
+    ) -> np.ndarray:
+        """Return exact graph edges violating one terminal-via envelope."""
+        cache = getattr(
+            self, "_portal_conflicting_edges_cache", None
+        )
+        if cache is None:
+            cache = {}
+            self._portal_conflicting_edges_cache = cache
+        cache_key = (id(portal), int(entry_layer))
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        self._ensure_edge_src_map()
+        center = self.escape_planner._portal_world(portal)
+        pitch = float(self.lattice.geom.pitch)
+        via_track_limit = max(
+            0.5 * float(self.config.via_diameter)
+            + 0.5 * float(self.config.track_width)
+            + float(self.config.clearance),
+            0.5 * float(self.config.via_drill)
+            + 0.5 * float(self.config.track_width)
+            + float(getattr(self.config, "hole_clearance", 0.0)),
+        )
+        via_via_limit = max(
+            float(self.config.via_diameter)
+            + float(self.config.clearance),
+            float(self.config.via_drill)
+            + float(getattr(
+                self.config, "min_hole_to_hole", 0.0
+            )),
+        )
+        search_steps = int(np.ceil(
+            max(via_track_limit, via_via_limit) / pitch
+        )) + 1
+        x_lo = max(0, portal.x_idx - search_steps)
+        x_hi = min(
+            self.lattice.x_steps - 1,
+            portal.x_idx + search_steps,
+        )
+        y_lo = max(0, portal.y_idx - search_steps)
+        y_hi = min(
+            self.lattice.y_steps - 1,
+            portal.y_idx + search_steps,
+        )
+        z_lo, z_hi = sorted((
+            int(portal.pad_layer), int(entry_layer)
+        ))
+        edges = set()
+
+        for layer in range(z_lo, z_hi + 1):
+            if not (
+                self.lattice.layers > 2
+                and layer in (0, self.lattice.layers - 1)
+            ):
+                axis = self.lattice.get_legal_axis(layer)
+                if axis == "h":
+                    segments = (
+                        (x_idx, y_idx, x_idx + 1, y_idx)
+                        for y_idx in range(y_lo, y_hi + 1)
+                        for x_idx in range(x_lo, x_hi)
+                    )
+                else:
+                    segments = (
+                        (x_idx, y_idx, x_idx, y_idx + 1)
+                        for x_idx in range(x_lo, x_hi + 1)
+                        for y_idx in range(y_lo, y_hi)
+                    )
+                for x0, y0, x1, y1 in segments:
+                    start = self.lattice.geom.lattice_to_world(
+                        x0, y0
+                    )
+                    end = self.lattice.geom.lattice_to_world(x1, y1)
+                    if (
+                        self._point_segment_distance(
+                            center, start, end
+                        )
+                        >= via_track_limit - 1e-9
+                    ):
+                        continue
+                    source = self.lattice.node_idx(
+                        x0, y0, layer
+                    )
+                    target = self.lattice.node_idx(
+                        x1, y1, layer
+                    )
+                    for u, v in (
+                        (source, target), (target, source)
+                    ):
+                        edge = self._edge_index_for_hop(u, v)
+                        if edge is not None:
+                            edges.add(edge)
+
+            for x_idx in range(x_lo, x_hi + 1):
+                for y_idx in range(y_lo, y_hi + 1):
+                    world = self.lattice.geom.lattice_to_world(
+                        x_idx, y_idx
+                    )
+                    if (
+                        float(np.hypot(
+                            world[0] - center[0],
+                            world[1] - center[1],
+                        ))
+                        >= via_via_limit - 1e-9
+                    ):
+                        continue
+                    node = self.lattice.node_idx(
+                        x_idx, y_idx, layer
+                    )
+                    start = int(self._indptr_cpu[node])
+                    end = int(self._indptr_cpu[node + 1])
+                    for edge in range(start, end):
+                        target = int(self._indices_cpu[edge])
+                        target_layer = (
+                            target
+                            // (
+                                self.lattice.x_steps
+                                * self.lattice.y_steps
+                            )
+                        )
+                        if target_layer == layer:
+                            continue
+                        edge_lo, edge_hi = sorted((
+                            layer, target_layer
+                        ))
+                        if edge_lo <= z_hi and edge_hi >= z_lo:
+                            edges.add(edge)
+                            reverse = self._edge_index_for_hop(
+                                target, node
+                            )
+                            if reverse is not None:
+                                edges.add(reverse)
+
+        result = np.asarray(sorted(edges), dtype=np.int32)
+        cache[cache_key] = result
+        return result
+
+    def _rebuild_portal_cleanup_edge_owners(self) -> None:
+        """Index fixed terminal envelopes by their exact graph edges."""
+        members = defaultdict(set)
+        for net_name, selected in self.net_selected_portals.items():
+            if not self.net_paths.get(net_name):
+                continue
+            net_id = self._get_net_id(net_name)
+            layers = self.net_portal_layers.get(net_name, ())
+            for portal, entry_layer in zip(selected, layers):
+                if portal is None:
+                    continue
+                for edge in self._portal_conflicting_graph_edges(
+                    portal, int(entry_layer)
+                ):
+                    members[int(edge)].add(net_id)
+        self._portal_cleanup_edge_members = members
+        self._portal_cleanup_foreign_cache = {}
+        logger.info(
+            "[PORTAL-CLEANUP] Indexed %d exact graph edges around "
+            "fixed terminal vias",
+            len(members),
+        )
+
+    @staticmethod
+    def _portal_cleanup_movable_components(
+        portal_grid_pairs, escape_pairs=(), exact_pairs=()
+    ) -> Set[str]:
+        """Choose deterministic movable peers for physical conflicts.
+
+        Freezing every selected portal makes conflicts near another net's
+        source anchor impossible to repair: its graph path may have no legal
+        first via while its punch-in is pinned. For each connected conflict
+        component, hold one deterministic net fixed and let every peer
+        renegotiate its terminal position and depth. Every conflict therefore
+        retains at least one movable endpoint without allowing both ends of an
+        isolated pair to chase each other.
+        """
+        adjacency = defaultdict(set)
+        for identity, victim, _kind in portal_grid_pairs:
+            owner = identity[0]
+            if owner == victim:
+                continue
+            adjacency[owner].add(victim)
+            adjacency[victim].add(owner)
+        for first, second in escape_pairs:
+            first_net = first[0]
+            second_net = second[0]
+            if first_net == second_net:
+                continue
+            adjacency[first_net].add(second_net)
+            adjacency[second_net].add(first_net)
+        for first_net, second_net in exact_pairs:
+            if first_net == second_net:
+                continue
+            adjacency[first_net].add(second_net)
+            adjacency[second_net].add(first_net)
+
+        movable = set()
+        unseen = set(adjacency)
+        while unseen:
+            root = min(unseen)
+            component = set()
+            stack = [root]
+            while stack:
+                net_name = stack.pop()
+                if net_name in component:
+                    continue
+                component.add(net_name)
+                unseen.discard(net_name)
+                stack.extend(adjacency[net_name] - component)
+            movable.update(component - {min(component)})
+        return movable
+
+    def _portal_cleanup_foreign_edges(
+        self, current_net: str
+    ) -> np.ndarray:
+        """Return exact terminal-clearance edges owned by other nets."""
+        cache = getattr(
+            self, "_portal_cleanup_foreign_cache", {}
+        )
+        cached = cache.get(current_net)
+        if cached is not None:
+            return cached
+        current_id = self._get_net_id(current_net)
+        result = np.fromiter(
+            (
+                edge
+                for edge, members in getattr(
+                    self, "_portal_cleanup_edge_members", {}
+                ).items()
+                if any(owner != current_id for owner in members)
+            ),
+            dtype=np.int32,
+        )
+        cache[current_net] = result
+        self._portal_cleanup_foreign_cache = cache
+        return result
+
+    def _detect_portal_grid_conflicts(self):
+        """Audit explicit terminal vias against committed lattice copper.
+
+        Terminal vias may be off-grid and are intentionally contracted out
+        of the routing graph. Check their real emitted center, diameter,
+        drill, and layer span against graph tracks and graph-via barrels.
+        """
+        if self.escape_planner is None:
+            return set(), set(), set(), set(), set()
+
+        self._ensure_edge_src_map()
+        edge_owners = defaultdict(set)
+        node_owners = defaultdict(set)
+        portal_keys = {}
+        pitch = float(self.lattice.geom.pitch)
+        via_track_limit = max(
+            0.5 * float(self.config.via_diameter)
+            + 0.5 * float(self.config.track_width)
+            + float(self.config.clearance),
+            0.5 * float(self.config.via_drill)
+            + 0.5 * float(self.config.track_width)
+            + float(getattr(self.config, "hole_clearance", 0.0)),
+        )
+        via_via_limit = max(
+            float(self.config.via_diameter)
+            + float(self.config.clearance),
+            float(self.config.via_drill)
+            + float(getattr(
+                self.config, "min_hole_to_hole", 0.0
+            )),
+        )
+        search_steps = int(np.ceil(
+            max(via_track_limit, via_via_limit) / pitch
+        )) + 1
+
+        for net_name, selected in self.net_selected_portals.items():
+            if not self.net_paths.get(net_name):
+                continue
+            pad_ids = self.net_pad_ids.get(net_name, ())
+            layers = self.net_portal_layers.get(net_name, ())
+            for pad_id, portal, entry_layer in zip(
+                pad_ids, selected, layers
+            ):
+                if portal is None:
+                    continue
+                identity = (
+                    net_name,
+                    pad_id,
+                    portal.x_idx,
+                    portal.y_idx,
+                )
+                portal_keys[identity] = (
+                    pad_id,
+                    portal.x_idx,
+                    portal.y_idx,
+                    int(entry_layer),
+                )
+                center = self.escape_planner._portal_world(portal)
+                z_lo, z_hi = sorted((
+                    int(portal.pad_layer), int(entry_layer)
+                ))
+                x_lo = max(0, portal.x_idx - search_steps)
+                x_hi = min(
+                    self.lattice.x_steps - 1,
+                    portal.x_idx + search_steps,
+                )
+                y_lo = max(0, portal.y_idx - search_steps)
+                y_hi = min(
+                    self.lattice.y_steps - 1,
+                    portal.y_idx + search_steps,
+                )
+
+                for layer in range(z_lo, z_hi + 1):
+                    for x_idx in range(x_lo, x_hi + 1):
+                        for y_idx in range(y_lo, y_hi + 1):
+                            world = self.lattice.geom.lattice_to_world(
+                                x_idx, y_idx
+                            )
+                            if (
+                                float(np.hypot(
+                                    world[0] - center[0],
+                                    world[1] - center[1],
+                                ))
+                                < via_via_limit - 1e-9
+                            ):
+                                node_owners[
+                                    self.lattice.node_idx(
+                                        x_idx, y_idx, layer
+                                    )
+                                ].add(identity)
+
+                    if (
+                        self.lattice.layers > 2
+                        and layer in (0, self.lattice.layers - 1)
+                    ):
+                        continue
+                    axis = self.lattice.get_legal_axis(layer)
+                    if axis == "h":
+                        candidates = (
+                            (x_idx, y_idx, x_idx + 1, y_idx)
+                            for y_idx in range(y_lo, y_hi + 1)
+                            for x_idx in range(x_lo, x_hi)
+                        )
+                    else:
+                        candidates = (
+                            (x_idx, y_idx, x_idx, y_idx + 1)
+                            for x_idx in range(x_lo, x_hi + 1)
+                            for y_idx in range(y_lo, y_hi)
+                        )
+                    for x0, y0, x1, y1 in candidates:
+                        start_world = (
+                            self.lattice.geom.lattice_to_world(x0, y0)
+                        )
+                        end_world = (
+                            self.lattice.geom.lattice_to_world(x1, y1)
+                        )
+                        if (
+                            self._point_segment_distance(
+                                center, start_world, end_world
+                            )
+                            >= via_track_limit - 1e-9
+                        ):
+                            continue
+                        source = self.lattice.node_idx(x0, y0, layer)
+                        target = self.lattice.node_idx(x1, y1, layer)
+                        for u, v in (
+                            (source, target), (target, source)
+                        ):
+                            edge = self._edge_index_for_hop(u, v)
+                            if edge is not None:
+                                edge_owners[edge].add(identity)
+
+        pairs = set()
+        owner_nets = set()
+        victim_nets = set()
+        history_nodes = set()
+        involved_portals = set()
+
+        for edge, identities in edge_owners.items():
+            victims = self._edge_to_nets.get(edge, ())
+            if not victims:
+                continue
+            source = int(self._edge_src[edge])
+            target = int(self.solver.indices[edge])
+            for identity in identities:
+                owner = identity[0]
+                for victim in victims:
+                    if victim == owner:
+                        continue
+                    pairs.add((identity, victim, "track"))
+                    owner_nets.add(owner)
+                    victim_nets.add(victim)
+                    involved_portals.add(portal_keys[identity])
+                    history_nodes.update((source, target))
+
+        id_to_name = {
+            numeric_id: name
+            for name, numeric_id in self.net_id_map.items()
+        }
+        for node, identities in node_owners.items():
+            victim_ids = self._node_owner_members.get(node, ())
+            if not victim_ids:
+                continue
+            for identity in identities:
+                owner = identity[0]
+                for victim_id in victim_ids:
+                    victim = id_to_name.get(victim_id)
+                    if victim is None or victim == owner:
+                        continue
+                    pairs.add((identity, victim, "via"))
+                    owner_nets.add(owner)
+                    victim_nets.add(victim)
+                    involved_portals.add(portal_keys[identity])
+                    history_nodes.add(node)
+
+        return (
+            pairs,
+            owner_nets,
+            victim_nets,
+            involved_portals,
+            history_nodes,
+        )
 
     def _detect_barrel_conflicts(self) -> Tuple[np.ndarray, int]:
         """
@@ -7249,6 +8214,12 @@ class PathFinderRouter:
         self._barrel_owner_portal_keys = set()
         self._last_exact_barrel_conflict_count = 0
         self._last_escape_conflict_count = 0
+        self._last_portal_grid_conflict_count = 0
+        self._portal_grid_owner_nets = set()
+        self._portal_grid_victim_nets = set()
+        self._portal_grid_pairs = set()
+        self._escape_conflict_pairs = set()
+        self._exact_barrel_pairs = set()
         self._last_exact_barrel_details = []
 
         # Bail out if node_owner not initialized
@@ -7284,7 +8255,10 @@ class PathFinderRouter:
             net_id = self._get_net_id(net_name)
             net_edges = self._net_to_edges.get(net_name)
             if net_edges is None:
-                net_edges = self._path_to_edges(path)
+                graph_path = self._path_without_dynamic_escape_chains(
+                    net_name, path
+                )
+                net_edges = self._path_to_edges(graph_path)
             if not net_edges:
                 continue
             edge_chunk = np.asarray(net_edges, dtype=np.int32)
@@ -7354,6 +8328,30 @@ class PathFinderRouter:
                 numeric_id: name
                 for name, numeric_id in self.net_id_map.items()
             }
+            exact_pairs = set()
+            for position in conflict_positions:
+                victim_id = int(edge_net_ids[position])
+                conflicting_nodes = []
+                if src_conflict[position]:
+                    conflicting_nodes.append(int(src_nodes[position]))
+                if dst_conflict[position]:
+                    conflicting_nodes.append(int(dst_nodes[position]))
+                for node_idx in conflicting_nodes:
+                    for owner_id in self._node_owner_members.get(
+                        node_idx, ()
+                    ):
+                        if owner_id == victim_id:
+                            continue
+                        victim_name = id_to_name.get(victim_id)
+                        owner_name = id_to_name.get(owner_id)
+                        if (
+                            victim_name is not None
+                            and owner_name is not None
+                        ):
+                            exact_pairs.add(tuple(sorted((
+                                victim_name, owner_name
+                            ))))
+            self._exact_barrel_pairs = exact_pairs
             for position in conflict_positions[:20]:
                 src_node = int(src_nodes[position])
                 dst_node = int(dst_nodes[position])
@@ -7395,13 +8393,19 @@ class PathFinderRouter:
             for owner_net in self._barrel_owner_nets:
                 selected = self.net_selected_portals.get(owner_net, ())
                 pad_ids = self.net_pad_ids.get(owner_net, ())
-                for pad_id, portal in zip(pad_ids, selected):
+                layers = self.net_portal_layers.get(owner_net, ())
+                for pad_id, portal, entry_layer in zip(
+                    pad_ids, selected, layers
+                ):
                     if (
                         portal is not None
                         and (portal.x_idx, portal.y_idx) in conflict_xy
                     ):
                         self._barrel_owner_portal_keys.add((
-                            pad_id, portal.x_idx, portal.y_idx
+                            pad_id,
+                            portal.x_idx,
+                            portal.y_idx,
+                            int(entry_layer),
                         ))
             self._barrel_conflict_nets = {
                 id_to_name[numeric_id]
@@ -7421,6 +8425,7 @@ class PathFinderRouter:
             self._detect_escape_conflicts()
         )
         self._last_escape_conflict_count = len(escape_pairs)
+        self._escape_conflict_pairs = set(escape_pairs)
         if escape_pairs:
             # Escape stubs live outside edge accounting, so their selected
             # candidates need their own Pathfinder history. Penalize both
@@ -7439,7 +8444,43 @@ class PathFinderRouter:
                 len(escape_pairs),
             )
 
-        return conflict_edge_indices, conflict_count + len(escape_pairs)
+        (
+            portal_grid_pairs,
+            portal_grid_owners,
+            portal_grid_victims,
+            portal_grid_keys,
+            portal_grid_nodes,
+        ) = self._detect_portal_grid_conflicts()
+        self._last_portal_grid_conflict_count = len(
+            portal_grid_pairs
+        )
+        self._portal_grid_pairs = set(portal_grid_pairs)
+        self._portal_grid_owner_nets = set(portal_grid_owners)
+        self._portal_grid_victim_nets = set(portal_grid_victims)
+        if portal_grid_pairs:
+            self._barrel_owner_portal_keys.update(portal_grid_keys)
+            self._barrel_owner_nets.update(portal_grid_owners)
+            self._barrel_victim_nets.update(portal_grid_victims)
+            self._barrel_conflict_nets.update(
+                portal_grid_owners | portal_grid_victims
+            )
+            self._accumulate_node_conflict_history(
+                portal_grid_nodes
+            )
+            logger.info(
+                "[PORTAL-GRID-CONFLICT] Detected %d terminal-via "
+                "conflicts (%d owners, %d victims)",
+                len(portal_grid_pairs),
+                len(portal_grid_owners),
+                len(portal_grid_victims),
+            )
+
+        return (
+            conflict_edge_indices,
+            conflict_count
+            + len(escape_pairs)
+            + len(portal_grid_pairs),
+        )
 
     def _path_is_manhattan(self, path: List[int]) -> bool:
         """Validate that path obeys Manhattan routing discipline"""

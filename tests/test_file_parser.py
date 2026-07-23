@@ -165,6 +165,7 @@ def test_project_netclass_drives_drc_valid_router_geometry(tmp_path):
                     "min_through_hole_diameter": 0.30,
                     "min_via_annular_width": 0.0762,
                     "min_hole_to_hole": 0.25,
+                    "min_hole_clearance": 0.10,
                 }
             }
         },
@@ -188,6 +189,7 @@ def test_project_netclass_drives_drc_valid_router_geometry(tmp_path):
     assert rules["default_clearance"] == pytest.approx(0.1016)
     assert rules["min_through_hole_drill"] == pytest.approx(0.30)
     assert rules["min_hole_to_hole"] == pytest.approx(0.25)
+    assert rules["min_hole_clearance"] == pytest.approx(0.10)
     assert rules["default_via_drill"] == pytest.approx(0.15)
     assert rules["default_via_diameter"] == pytest.approx(0.3024)
 
@@ -198,6 +200,7 @@ def test_project_netclass_drives_drc_valid_router_geometry(tmp_path):
     assert router.config.via_drill == pytest.approx(0.15)
     assert router.config.via_diameter == pytest.approx(0.3024)
     assert router.config.min_hole_to_hole == pytest.approx(0.25)
+    assert router.config.hole_clearance == pytest.approx(0.10)
 
 
 def test_file_parser_pad_geometry_remains_in_millimetres(modern):
