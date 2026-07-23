@@ -5018,8 +5018,14 @@ class PathFinderRouter:
             reverse=True,
         )
 
-        # Apply slight shuffle: rotate order by small random amount
-        rotation = random.randint(0, min(5, len(scores) // 10))
+        # Never rotate across barrel-role boundaries: moving even one forced
+        # barrel owner behind its crossing track recreates the same short.
+        # Ordinary congestion-only passes retain the tie-breaking rotation.
+        rotation = (
+            0
+            if owner_nets or victim_nets
+            else random.randint(0, min(5, len(scores) // 10))
+        )
         ordered = [nid for _, nid in scores]
         if rotation > 0:
             ordered = ordered[rotation:] + ordered[:rotation]
