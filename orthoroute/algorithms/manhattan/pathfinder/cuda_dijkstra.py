@@ -115,10 +115,12 @@ class CUDADijkstra:
         if not CUDA_AVAILABLE:
             raise RuntimeError("CuPy not available - cannot use CUDA Dijkstra")
 
-        # Store graph arrays for CSR extraction
+        # Keep an existing device graph on the device.  Downloading the full
+        # CSR here duplicates multi-gigabyte graphs and is unnecessary for
+        # full-graph CUDA searches.  ROI extraction takes a CPU copy lazily.
         if graph:
-            self.indptr = graph.indptr.get() if hasattr(graph.indptr, "get") else graph.indptr
-            self.indices = graph.indices.get() if hasattr(graph.indices, "get") else graph.indices
+            self.indptr = graph.indptr
+            self.indices = graph.indices
         else:
             self.indptr = None
             self.indices = None
@@ -142,10 +144,10 @@ class CUDADijkstra:
 
         # PERFORMANCE: Persistent kernel (compiled on-demand)
         self._persistent_kernel = None
-        self._enable_persistent_kernel = False  # Disabled - persistent kernel doesn't support owner-aware bitmap
-        self._persistent_kernel_version = 2  # Increment to recompile after bug fixes
-        # NOTE: Multi-launch wavefront_expand_all kernel HAS IN_BITMAP check, persistent doesn't
-        # TODO: Add bitmap support to persistent kernel for maximum performance
+        self._enable_persistent_kernel = True
+        self._persistent_kernel_version = 4
+        # Version 4 supports both the legacy hard bitmap and negotiated
+        # per-node ownership costs.
         self._zero_node_penalty = cp.zeros(1, dtype=cp.float32)
 
         # Compile CUDA kernel for parallel edge relaxation
@@ -5048,17 +5050,19 @@ class CUDADijkstra:
 
         roi_size = len(roi_nodes)
         max_edges_estimate = roi_size * 10  # Conservative estimate
+        indptr = self.indptr.get() if hasattr(self.indptr, "get") else self.indptr
+        indices = self.indices.get() if hasattr(self.indices, "get") else self.indices
 
         # Build local CSR from global graph
         local_edges = []
 
         for local_u, global_u in enumerate(roi_nodes):
             # Get global edges for this node
-            start = int(self.indptr[global_u])
-            end = int(self.indptr[global_u + 1])
+            start = int(indptr[global_u])
+            end = int(indptr[global_u + 1])
 
             for ei in range(start, end):
-                global_v = int(self.indices[ei])
+                global_v = int(indices[ei])
                 local_v = global_to_roi[global_v]
 
                 # Only include edges within ROI
@@ -5708,6 +5712,10 @@ class CUDADijkstra:
                 self.parent_val_pool[0, :num_nodes],  # Use stamp pool slice
                 self.best_key_pool[0, :num_nodes],  # Use best_key pool slice for atomic keys
                 frontier_words,
+                allowed_bitmap_gpu=data['roi_bitmaps'][0],
+                use_bitmap=bool(data['use_bitmap']),
+                node_penalty_gpu=data['node_penalty'],
+                use_node_penalty=bool(data['use_node_penalty']),
                 max_iterations=max_iterations
             )
 

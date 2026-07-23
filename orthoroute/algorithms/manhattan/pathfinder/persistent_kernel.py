@@ -68,6 +68,11 @@ void persistent_sssp_kernel(
     unsigned int* frontier_curr,        // Current frontier (bit-packed)
     unsigned int* frontier_next,        // Next frontier (bit-packed)
     const int frontier_words,           // Number of uint32 words for frontier
+    const unsigned int* allowed_bitmap, // Optional hard node filter
+    const int bitmap_words,             // Words in allowed_bitmap
+    const int use_bitmap,               // 1 = enforce bitmap
+    const float* node_penalty,           // Optional cost for entering each node
+    const int use_node_penalty,          // 1 = add node_penalty[neighbor]
     int* settled_flag,                  // Flag: 1 when path found
     int* best_dst,                      // Output: best destination found
     float* best_dist,                   // Output: best distance found
@@ -148,7 +153,19 @@ void persistent_sssp_kernel(
                     int neighbor = indices[e];
                     if (neighbor < 0 || neighbor >= num_nodes) continue;
 
+                    if (use_bitmap) {
+                        int nbr_word = neighbor >> 5;
+                        int nbr_bit = neighbor & 31;
+                        if (nbr_word >= bitmap_words ||
+                            ((allowed_bitmap[nbr_word] >> nbr_bit) & 1u) == 0) {
+                            continue;
+                        }
+                    }
+
                     float edge_cost = weights[e];
+                    if (use_node_penalty) {
+                        edge_cost += node_penalty[neighbor];
+                    }
                     float g_new = node_dist + edge_cost;
 
                     // Pack new key with distance and parent
@@ -249,6 +266,10 @@ def launch_persistent_kernel(
     parent_gpu,
     best_key_gpu,
     frontier_words,
+    allowed_bitmap_gpu=None,
+    use_bitmap=False,
+    node_penalty_gpu=None,
+    use_node_penalty=False,
     max_iterations=2000
 ):
     """
@@ -266,6 +287,10 @@ def launch_persistent_kernel(
         parent_gpu: Parent array (CuPy int32), pre-initialized to -1
         best_key_gpu: 64-bit atomic key array (CuPy uint64), packed dist+parent
         frontier_words: Number of uint32 words for frontier
+        allowed_bitmap_gpu: Optional hard node-filter bitmap (CuPy uint32)
+        use_bitmap: Whether to enforce allowed_bitmap_gpu
+        node_penalty_gpu: Optional per-node entry cost (CuPy float32)
+        use_node_penalty: Whether to add node_penalty_gpu during relaxation
         max_iterations: Maximum iterations before timeout
 
     Returns:
@@ -275,6 +300,31 @@ def launch_persistent_kernel(
         iterations: Number of iterations performed
     """
     import cupy as cp
+
+    if allowed_bitmap_gpu is None or not use_bitmap:
+        bitmap_words = frontier_words
+        bitmap_gpu = cp.full(bitmap_words, 0xFFFFFFFF, dtype=cp.uint32)
+        use_bitmap_flag = 0
+    else:
+        bitmap_gpu = cp.asarray(
+            allowed_bitmap_gpu, dtype=cp.uint32
+        ).ravel()
+        bitmap_words = int(len(bitmap_gpu))
+        use_bitmap_flag = 1
+
+    if node_penalty_gpu is None or not use_node_penalty:
+        penalty_gpu = cp.zeros(1, dtype=cp.float32)
+        use_node_penalty_flag = 0
+    else:
+        penalty_gpu = cp.asarray(
+            node_penalty_gpu, dtype=cp.float32
+        ).ravel()
+        if len(penalty_gpu) != num_nodes:
+            raise ValueError(
+                f"node_penalty has {len(penalty_gpu)} nodes, "
+                f"expected {num_nodes}"
+            )
+        use_node_penalty_flag = 1
 
     # Allocate frontier buffers
     frontier_curr = cp.zeros(frontier_words, dtype=cp.uint32)
@@ -314,6 +364,11 @@ def launch_persistent_kernel(
             frontier_curr,
             frontier_next,
             frontier_words,
+            bitmap_gpu,
+            bitmap_words,
+            use_bitmap_flag,
+            penalty_gpu,
+            use_node_penalty_flag,
             settled_flag,
             best_dst,
             best_dist,

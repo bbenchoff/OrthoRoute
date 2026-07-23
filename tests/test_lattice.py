@@ -53,13 +53,14 @@ class TestLayerDiscipline:
 class TestViaPairs:
     def test_four_layer_pairs(self, lattice4):
         pairs = lattice4.get_legal_via_pairs(4)
+        # Canonical unordered pairs: build_graph emits both directions.
         # Inner layers {1,2} full blind/buried + F.Cu transitions, no B.Cu.
-        assert pairs == {(1, 2), (2, 1), (0, 1), (1, 0), (0, 2), (2, 0)}
+        assert pairs == {(1, 2), (0, 1), (0, 2)}
 
     def test_two_layer_pairs_through_via(self, lattice4):
         # 2-layer boards have no inner layers: F.Cu/B.Cu route directly and
         # the only legal via is the (0,1) through-hole (regression: #18).
-        assert lattice4.get_legal_via_pairs(2) == {(0, 1), (1, 0)}
+        assert lattice4.get_legal_via_pairs(2) == {(0, 1)}
 
 
 class TestGraphBuild:
@@ -96,10 +97,8 @@ class TestGraphBuild:
         xs, ys = lattice.x_steps, lattice.y_steps
         expected_lateral = 2 * xs * (ys - 1) + 2 * ys * (xs - 1)  # z=0 (v) + z=1 (h)
         assert E - via_edges == expected_lateral
-        # 4 directed via edges per grid point: build_graph emits both
-        # directions for each ORDERED pair, so every via is materialized
-        # twice. Redundant-but-harmless; halving it is a planned memory win.
-        assert via_edges == 4 * xs * ys
+        # One physical pair, materialized as its two directed graph edges.
+        assert via_edges == 2 * xs * ys
 
     def test_edge_costs_positive(self, lattice4):
         graph = lattice4.build_graph(via_cost=0.7)

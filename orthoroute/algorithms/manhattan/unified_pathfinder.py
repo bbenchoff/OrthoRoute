@@ -1189,7 +1189,11 @@ class Lattice3D:
 
     def get_legal_via_pairs(self, layer_count: int) -> set:
         """
-        Return set of legal (from_layer, to_layer) via pairs.
+        Return canonical unordered legal via layer pairs.
+
+        ``build_graph`` materializes both directed edges for every pair, so
+        returning both ``(a, b)`` and ``(b, a)`` would duplicate each graph
+        edge. Keep the lower layer first to make that invariant explicit.
 
         CRITICAL: Must include F.Cu (layer 0) → internal layer transitions!
         The escape planner creates stubs on F.Cu, and PathFinder must be able
@@ -1199,7 +1203,7 @@ class Lattice3D:
             # 2-layer board: there are no inner layers, so F.Cu/B.Cu are the
             # routing layers and the only via is the (0,1) through-hole.
             logger.info("[VIA-PAIRS] 2-layer board: through vias only")
-            return {(0, 1), (1, 0)}
+            return {(0, 1)}
 
         # Check config for via policy (default to FULL blind/buried)
         allow_any = True  # ALWAYS allow full blind/buried for convergence
@@ -1215,16 +1219,18 @@ class Lattice3D:
             legal_pairs = set()
             for z1 in routing_layers:
                 for z2 in routing_layers:
-                    if z1 != z2:
+                    if z1 < z2:
                         legal_pairs.add((z1, z2))
 
             # CRITICAL: Add F.Cu (layer 0) → internal layer transitions
             # This allows PathFinder to create escape vias from F.Cu to any internal layer
             for z in routing_layers:
-                legal_pairs.add((0, z))  # F.Cu → internal layer
-                legal_pairs.add((z, 0))  # internal layer → F.Cu (bidirectional)
+                legal_pairs.add((0, z))
 
-            logger.info(f"[VIA-PAIRS] Generated {len(legal_pairs)} pairs: {len(routing_layers)}×{len(routing_layers)} internal + {len(routing_layers)}×2 F.Cu transitions")
+            logger.info(
+                f"[VIA-PAIRS] Generated {len(legal_pairs)} unordered pairs; "
+                "build_graph emits both directions"
+            )
             return legal_pairs
 
         # FALLBACK: Adjacent routing layers only
@@ -1232,7 +1238,6 @@ class Lattice3D:
         for i in range(len(routing_layers) - 1):
             z1, z2 = routing_layers[i], routing_layers[i+1]
             legal_pairs.add((z1, z2))
-            legal_pairs.add((z2, z1))
         logger.info(f"[VIA-PAIRS] Generated {len(legal_pairs)} adjacent-only pairs (fallback mode)")
         return legal_pairs
 
@@ -5513,6 +5518,16 @@ class PathFinderRouter:
 
     def _identify_via_edges(self):
         """Mark which edges are vias (vertical transitions between layers)"""
+        if getattr(self.graph, "edge_kind", None) is not None:
+            # CSR finalization has already computed this classification.  Do
+            # not download and rescan the multi-gigabyte CSR on GPU builds.
+            self._via_edges = self.graph.edge_kind.astype(np.bool_, copy=True)
+            logger.info(
+                f"Identified {int(self._via_edges.sum())} via edges "
+                "from cached edge metadata"
+            )
+            return
+
         indptr = self.graph.indptr.get() if hasattr(self.graph.indptr, 'get') else self.graph.indptr
         indices = self.graph.indices.get() if hasattr(self.graph.indices, 'get') else self.graph.indices
 
@@ -5542,6 +5557,52 @@ class PathFinderRouter:
         """
         import time
         t0 = time.perf_counter()
+        use_via_gpu = self.config.use_gpu and GPU_AVAILABLE
+
+        if use_via_gpu:
+            # Build directly from the device-resident CSR.  Pulling indices
+            # back to host and uploading four derived arrays temporarily
+            # duplicates several gigabytes on large backplanes.
+            via_edge_indices = cp.flatnonzero(
+                self.graph.edge_kind_gpu
+            ).astype(cp.int32)
+            num_via_edges = int(via_edge_indices.size)
+            if num_via_edges == 0:
+                self._via_edge_metadata = None
+                return
+
+            u_indices = (
+                cp.searchsorted(
+                    self.graph.indptr, via_edge_indices, side='right'
+                ) - 1
+            ).astype(cp.int32)
+            v_indices = self.graph.indices[via_edge_indices]
+            plane_size = self.lattice.x_steps * self.lattice.y_steps
+
+            xu = (u_indices % plane_size) % self.lattice.x_steps
+            yu = (u_indices % plane_size) // self.lattice.x_steps
+            zu = u_indices // plane_size
+            zv = v_indices // plane_size
+
+            via_xy_coords = cp.stack([xu, yu], axis=1).astype(cp.int32)
+            z_lo = cp.clip(
+                cp.minimum(zu, zv), 1, self.lattice.layers - 2
+            ).astype(cp.int32)
+            z_hi = cp.clip(
+                cp.maximum(zu, zv), 1, self.lattice.layers - 2
+            ).astype(cp.int32)
+
+            self._via_edge_metadata = {
+                'indices': via_edge_indices,
+                'xy_coords': via_xy_coords,
+                'z_lo': z_lo,
+                'z_hi': z_hi,
+            }
+            logger.info(
+                f"[VIA-METADATA] Built metadata for {num_via_edges} "
+                f"via edges on GPU in {time.perf_counter() - t0:.3f}s"
+            )
+            return
 
         # Get via edge indices
         via_edge_indices = np.where(self._via_edges)[0]
@@ -5586,27 +5647,13 @@ class PathFinderRouter:
         z_lo = np.clip(z_lo, 1, self.lattice.layers - 2)
         z_hi = np.clip(z_hi, 1, self.lattice.layers - 2)
 
-        # Store metadata - on GPU if kernels available, CPU otherwise
-        use_via_gpu = self.config.use_gpu and GPU_AVAILABLE
-
-        if use_via_gpu:
-            # Keep on GPU for zero-copy kernel execution
-            self._via_edge_metadata = {
-                'indices': cp.asarray(via_edge_indices.astype(np.int32)),
-                'xy_coords': cp.asarray(via_xy_coords),
-                'z_lo': cp.asarray(z_lo.astype(np.int32)),
-                'z_hi': cp.asarray(z_hi.astype(np.int32)),
-            }
-            logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on GPU in {time.perf_counter() - t0:.3f}s")
-        else:
-            # Keep on CPU
-            self._via_edge_metadata = {
-                'indices': via_edge_indices.astype(np.int32),
-                'xy_coords': via_xy_coords,
-                'z_lo': z_lo.astype(np.int32),
-                'z_hi': z_hi.astype(np.int32),
-            }
-            logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on CPU in {time.perf_counter() - t0:.3f}s")
+        self._via_edge_metadata = {
+            'indices': via_edge_indices.astype(np.int32),
+            'xy_coords': via_xy_coords,
+            'z_lo': z_lo.astype(np.int32),
+            'z_hi': z_hi.astype(np.int32),
+        }
+        logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on CPU in {time.perf_counter() - t0:.3f}s")
 
     def _path_to_edges(self, node_path: List[int]) -> List[int]:
         """Nodes → edge indices via on-the-fly CSR scan (no dict needed)"""
