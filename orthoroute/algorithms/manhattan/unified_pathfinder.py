@@ -2178,6 +2178,10 @@ class PathFinderRouter:
 
         # Portal escape tracking
         self.portals: Dict[str, Portal] = {}  # pad_id -> Portal
+        self.portal_candidates: Dict[str, List[Portal]] = {}
+        self.net_selected_portals: Dict[
+            str, Tuple[Portal, Portal]
+        ] = {}
         self.net_portal_failures: Dict[str, int] = defaultdict(int)  # net_id -> failure count
         self.net_pad_ids: Dict[str, Tuple[str, str]] = {}  # net_id -> (src_pad_id, dst_pad_id)
         self.net_portal_layers: Dict[str, Tuple[int, int]] = {}  # net_id -> (entry_layer, exit_layer)
@@ -2783,6 +2787,31 @@ class PathFinderRouter:
             depth = abs(layer - portal.pad_layer)
             seeds.append((node_idx, via_base * discount * depth))
         return seeds
+
+    def _get_pad_portal_seeds(
+        self, pad_id: str
+    ) -> Tuple[List[Tuple[int, float]], Dict[int, Portal]]:
+        """Expand every XY escape candidate across legal entry layers."""
+        primary = self.portals.get(pad_id)
+        candidates = self.portal_candidates.get(pad_id)
+        if not candidates:
+            candidates = [primary] if primary is not None else []
+
+        best_by_node = {}
+        portal_by_node = {}
+        for portal in candidates:
+            candidate_penalty = float(getattr(portal, "score", 0.0))
+            for node, layer_cost in self._get_portal_seeds(portal):
+                total_cost = layer_cost + candidate_penalty
+                if (
+                    node not in best_by_node
+                    or total_cost < best_by_node[node]
+                ):
+                    best_by_node[node] = total_cost
+                    portal_by_node[node] = portal
+
+        seeds = sorted(best_by_node.items())
+        return seeds, portal_by_node
 
     def _attach_portal_vias(
         self,
@@ -4796,6 +4825,8 @@ class PathFinderRouter:
             use_portals = cfg.portal_enabled and net_id in self.net_pad_ids
             src_seeds = []
             dst_targets = []
+            src_seed_portals = {}
+            dst_target_portals = {}
 
             if use_portals:
                 src_pad_id, dst_pad_id = self.net_pad_ids[net_id]
@@ -4803,9 +4834,13 @@ class PathFinderRouter:
                 dst_portal = self.portals.get(dst_pad_id)
 
                 if src_portal and dst_portal:
-                    # Get multi-layer seeds at both portals
-                    src_seeds = self._get_portal_seeds(src_portal)
-                    dst_targets = self._get_portal_seeds(dst_portal)
+                    # Negotiate both escape position and entry layer.
+                    src_seeds, src_seed_portals = (
+                        self._get_pad_portal_seeds(src_pad_id)
+                    )
+                    dst_targets, dst_target_portals = (
+                        self._get_pad_portal_seeds(dst_pad_id)
+                    )
                 else:
                     use_portals = False
 
@@ -4878,8 +4913,20 @@ class PathFinderRouter:
                                 else:
                                     entry_layer = exit_layer = 0
 
+                                selected_src_portal = (
+                                    src_seed_portals.get(
+                                        path[0], src_portal
+                                    )
+                                )
+                                selected_dst_portal = (
+                                    dst_target_portals.get(
+                                        path[-1], dst_portal
+                                    )
+                                )
                                 path = self._attach_portal_vias(
-                                    path, src_portal, dst_portal
+                                    path,
+                                    selected_src_portal,
+                                    selected_dst_portal,
                                 )
                                 
                                 # Commit path and continue to next net
@@ -4894,6 +4941,10 @@ class PathFinderRouter:
 
                                 if entry_layer is not None and exit_layer is not None:
                                     self.net_portal_layers[net_id] = (entry_layer, exit_layer)
+                                self.net_selected_portals[net_id] = (
+                                    selected_src_portal,
+                                    selected_dst_portal,
+                                )
                                 self._update_net_edge_tracking(net_id, edge_indices)
                                 routed_this_pass += 1
                                 continue  # Skip ROI extraction and CPU routing
@@ -4929,6 +4980,7 @@ class PathFinderRouter:
                 )
                 failed_this_pass += 1
                 self.net_paths[net_id] = []
+                self.net_selected_portals.pop(net_id, None)
                 self._clear_net_edge_tracking(net_id)
                 if cfg.portal_enabled and net_id in self.net_pad_ids:
                     self.net_portal_failures[net_id] += 1
@@ -4972,9 +5024,9 @@ class PathFinderRouter:
                 # Gather portal seeds if available
                 portal_seeds = None
                 if use_portals and src_portal and dst_portal:
-                    s_seeds = self._get_portal_seeds(src_portal)
-                    d_seeds = self._get_portal_seeds(dst_portal)
-                    portal_seeds = (s_seeds or []) + (d_seeds or [])
+                    portal_seeds = (
+                        (src_seeds or []) + (dst_targets or [])
+                    )
 
                 # Extract ROI
                 roi_nodes, global_to_roi = self.roi_extractor.extract_roi(
@@ -5101,8 +5153,20 @@ class PathFinderRouter:
 
             if path and len(path) > 1:
                 if use_portals and src_portal and dst_portal:
+                    selected_src_portal = src_seed_portals.get(
+                        path[0], src_portal
+                    )
+                    selected_dst_portal = dst_target_portals.get(
+                        path[-1], dst_portal
+                    )
                     path = self._attach_portal_vias(
-                        path, src_portal, dst_portal
+                        path,
+                        selected_src_portal,
+                        selected_dst_portal,
+                    )
+                    self.net_selected_portals[net_id] = (
+                        selected_src_portal,
+                        selected_dst_portal,
                     )
                 edge_indices = self._path_to_edges(path)
                 self.accounting.commit_path(edge_indices)  # bumps present for next iteration
@@ -5123,6 +5187,7 @@ class PathFinderRouter:
             else:
                 failed_this_pass += 1
                 self.net_paths[net_id] = []
+                self.net_selected_portals.pop(net_id, None)
                 # Clear tracking for failed nets
                 self._clear_net_edge_tracking(net_id)
 
@@ -6045,6 +6110,11 @@ class PathFinderRouter:
         # CRITICAL: Copy portals from escape_planner to self.portals
         # The pathfinder needs these to route from portal positions, not pad positions
         self.portals = self.escape_planner.portals.copy()
+        self.portal_candidates = {
+            pad_id: list(candidates)
+            for pad_id, candidates
+            in self.escape_planner.portal_candidates.items()
+        }
         logger.info(f"Copied {len(self.portals)} portals from escape planner to pathfinder")
 
         # Cache escape geometry for merging into final payload
@@ -6085,6 +6155,47 @@ class PathFinderRouter:
             'drill': 0.15,     # hole diameter
         }
 
+    def _refresh_selected_escape_geometry(self) -> None:
+        """Emit stubs only for the portal candidates selected by routing."""
+        if self.escape_planner is None:
+            return
+
+        tracks = []
+        vias = []
+        emitted_pads = set()
+        for net_id, pad_ids in self.net_pad_ids.items():
+            if not self.net_paths.get(net_id):
+                continue
+            selected = self.net_selected_portals.get(net_id)
+            if selected is None:
+                selected = tuple(
+                    self.portals.get(pad_id) for pad_id in pad_ids
+                )
+            layers = self.net_portal_layers.get(net_id, (1, 1))
+
+            for pad_id, portal, entry_layer in zip(
+                pad_ids, selected, layers
+            ):
+                if portal is None or pad_id in emitted_pads:
+                    continue
+                emitted_pads.add(pad_id)
+                geometry = (
+                    self.escape_planner._emit_portal_escape_geometry(
+                        net_id,
+                        pad_id,
+                        portal,
+                        entry_layer,
+                    )
+                )
+                for item in geometry:
+                    if "x1" in item and "y1" in item:
+                        tracks.append(item)
+                    elif "x" in item and "y" in item:
+                        vias.append(item)
+
+        self._escape_tracks = tracks
+        self._escape_vias = vias
+
     def emit_geometry(self, board: Board) -> Tuple[int, int]:
         """
         Convert routed node paths into drawable segments and vias.
@@ -6094,6 +6205,8 @@ class PathFinderRouter:
         CRITICAL: Escape geometry is ALWAYS merged, even with overuse.
         Escapes are the connection from pads to the routing grid and must be exported.
         """
+        self._refresh_selected_escape_geometry()
+
         # Generate provisional geometry from routing paths
         provisional_tracks, provisional_vias = self._generate_geometry_from_paths()
 

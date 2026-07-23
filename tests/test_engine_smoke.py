@@ -97,6 +97,33 @@ def test_escape_planner_collects_distinct_portal_candidates(routed):
         assert len(cells) == len(candidates)
 
 
+def test_selected_portals_match_path_and_emitted_stubs(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    selected = pf.net_selected_portals["TEST_NET"]
+    first = pf.lattice.idx_to_coord(path[0])
+    last = pf.lattice.idx_to_coord(path[-1])
+
+    assert first[:2] == (selected[0].x_idx, selected[0].y_idx)
+    assert last[:2] == (selected[1].x_idx, selected[1].y_idx)
+
+    portal_points = {
+        tuple(
+            round(value, 6)
+            for value in pf.lattice.geom.lattice_to_world(
+                portal.x_idx, portal.y_idx
+            )
+        )
+        for portal in selected
+    }
+    stub_points = {
+        (round(track["x2"], 6), round(track["y2"], 6))
+        for track in pf._escape_tracks
+        if track["net"] == "TEST_NET"
+    }
+    assert portal_points <= stub_points
+
+
 def test_path_respects_hv_discipline(routed):
     """Every lateral step must follow its layer's legal axis."""
     pf, _, _, _ = routed
