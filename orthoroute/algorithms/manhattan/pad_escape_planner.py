@@ -731,9 +731,9 @@ class PadEscapePlanner:
         This is the DRC validation function with LOCAL checking for performance.
 
         DRC Checks:
-        1. Portal via position: Must maintain PAD_CLEARANCE_MM from all pads within 3mm
-        2. Stub path: Sample 3 points (25%, 50%, 75%) along escape trace
-        3. Each sample point must maintain clearance from nearby pads
+        1. The complete portal via disk clears every nearby pad.
+        2. The complete stub centerline, expanded by half the trace width,
+           clears every nearby pad.
 
         Performance: O(k) where k = pads within 3mm radius (typically 5-20 pads)
         NOT O(n) where n = all pads on board (could be 10,000+)
@@ -770,19 +770,41 @@ class PadEscapePlanner:
         # Convert portal to world coordinates
         portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(x_idx, y_idx_portal)
 
-        # DRC check: portal via clearance (LOCAL only - within 3mm radius)
-        # OPTIMIZED: Pass spatial_index for 10-20× speedup!
-        if not self._check_clearance_to_pads(portal_x_mm, portal_y_mm, pad_id, pad_geometries,
-                                              check_radius=3.0, spatial_index=spatial_index):
+        clearance = float(
+            getattr(self.config, "clearance", PAD_CLEARANCE_MM)
+        )
+        via_radius = 0.5 * float(
+            getattr(self.config, "via_diameter", 0.25)
+        )
+        track_radius = 0.5 * float(
+            getattr(self.config, "track_width", 0.24)
+        )
+
+        # Check the complete portal via disk, not only its center.
+        if not self._check_clearance_to_pads(
+            portal_x_mm,
+            portal_y_mm,
+            pad_id,
+            pad_geometries,
+            clearance_mm=clearance + via_radius,
+            check_radius=3.0,
+            spatial_index=spatial_index,
+        ):
             return None
 
-        # DRC check: stub path (LOCAL only)
-        # Check 3 sample points along the escape trace
-        for t in [0.25, 0.5, 0.75]:
-            stub_x = pad_x + t * (portal_x_mm - pad_x)
-            stub_y = pad_y + t * (portal_y_mm - pad_y)
-            if not self._check_clearance_to_pads(stub_x, stub_y, pad_id, pad_geometries,
-                                                   check_radius=3.0, spatial_index=spatial_index):
+        # Check every point on the exact emitted segments. Sampling allowed
+        # short pad crossings to fall between the samples.
+        for start, end in self._escape_segments(
+            pad_x, pad_y, portal_x_mm, portal_y_mm
+        ):
+            if not self._check_segment_clearance_to_pads(
+                start,
+                end,
+                pad_id,
+                pad_geometries,
+                clearance + track_radius,
+                spatial_index,
+            ):
                 return None
 
         # DRC passed! Claim the cell and create the portal
@@ -800,6 +822,106 @@ class PadEscapePlanner:
             score=0.0,
             retarget_count=0
         )
+
+    @staticmethod
+    def _escape_segments(
+        pad_x: float,
+        pad_y: float,
+        portal_x: float,
+        portal_y: float,
+    ):
+        """Return the exact vertical/45-degree stub centerlines."""
+        dx = portal_x - pad_x
+        dy = portal_y - pad_y
+        if abs(dx) <= 0.01:
+            return [((pad_x, pad_y), (portal_x, portal_y))]
+
+        sign_y = 1 if dy > 0 else -1
+        intermediate = (
+            pad_x,
+            pad_y + dy - sign_y * abs(dx),
+        )
+        segments = []
+        if abs(intermediate[1] - pad_y) > 0.01:
+            segments.append(((pad_x, pad_y), intermediate))
+        segments.append((intermediate, (portal_x, portal_y)))
+        return segments
+
+    @staticmethod
+    def _segment_intersects_aabb(start, end, bounds) -> bool:
+        """Liang-Barsky intersection, including boundary contact."""
+        x0, y0 = start
+        x1, y1 = end
+        xmin, ymin, xmax, ymax = bounds
+        dx = x1 - x0
+        dy = y1 - y0
+        t0, t1 = 0.0, 1.0
+        for p, q in (
+            (-dx, x0 - xmin),
+            (dx, xmax - x0),
+            (-dy, y0 - ymin),
+            (dy, ymax - y0),
+        ):
+            if abs(p) < 1e-15:
+                if q < 0:
+                    return False
+                continue
+            ratio = q / p
+            if p < 0:
+                if ratio > t1:
+                    return False
+                t0 = max(t0, ratio)
+            else:
+                if ratio < t0:
+                    return False
+                t1 = min(t1, ratio)
+        return True
+
+    def _check_segment_clearance_to_pads(
+        self,
+        start,
+        end,
+        current_pad_id: str,
+        pad_geometries: Dict,
+        centerline_clearance: float,
+        spatial_index: Dict = None,
+    ) -> bool:
+        """Check an entire trace centerline against expanded pad rectangles."""
+        x0, y0 = start
+        x1, y1 = end
+        midpoint_x = 0.5 * (x0 + x1)
+        midpoint_y = 0.5 * (y0 + y1)
+        radius = (
+            max(abs(x1 - x0), abs(y1 - y0)) * 0.5
+            + centerline_clearance
+            + 1.0
+        )
+        if spatial_index is not None:
+            pads_to_check = self._get_nearby_pads(
+                midpoint_x,
+                midpoint_y,
+                radius,
+                spatial_index,
+                pad_geometries,
+            )
+        else:
+            pads_to_check = pad_geometries.keys()
+
+        for other_pad_id in pads_to_check:
+            if other_pad_id == current_pad_id:
+                continue
+            geom = pad_geometries[other_pad_id]
+            half_width = geom["width"] * 0.5 + centerline_clearance
+            half_height = geom["height"] * 0.5 + centerline_clearance
+            bounds = (
+                geom["x"] - half_width,
+                geom["y"] - half_height,
+                geom["x"] + half_width,
+                geom["y"] + half_height,
+            )
+            if self._segment_intersects_aabb(start, end, bounds):
+                return False
+        return True
 
     def _collect_portal_candidates(
         self,
@@ -1119,58 +1241,21 @@ class PadEscapePlanner:
         # Get portal mm coordinates
         portal_x_mm, portal_y_mm = self.lattice.geom.lattice_to_world(portal.x_idx, portal.y_idx)
 
-        # Calculate escape geometry: mostly vertical, then 45-degree to via
-        dx = portal_x_mm - portal.pad_x
-        dy = portal_y_mm - portal.pad_y
-
-        # For 45-degree segment, we need dx == dy_45
-        # If there's any horizontal offset, we'll use a 45-degree segment at the end
-        if abs(dx) > 0.01:  # More than 0.01mm horizontal offset
-            # Intermediate point: vertical from pad, then 45-degree to via
-            # The 45-degree segment covers |dx| in both X and Y
-            sign_y = 1 if dy > 0 else -1
-            dy_45 = sign_y * abs(dx)  # 45-degree segment Y component (same magnitude as dx)
-            dy_vertical = dy - dy_45   # Remaining Y distance covered by vertical segment
-
-            # Intermediate point at end of vertical segment
-            intermediate_x = portal.pad_x
-            intermediate_y = portal.pad_y + dy_vertical
-
-            # Vertical segment from pad to intermediate point
-            if abs(dy_vertical) > 0.01:  # Only create segment if length > 0.01mm
-                geometry.append({
-                    'net': net_id,
-                    'layer': pad_layer_name,
-                    'x1': portal.pad_x,
-                    'y1': portal.pad_y,
-                    'x2': intermediate_x,
-                    'y2': intermediate_y,
-                    'width': self.config.grid_pitch * 0.6,
-                    'escape': True,  # Tag for easy identification
-                })
-
-            # 45-degree segment from intermediate point to portal via
+        for start, end in self._escape_segments(
+            portal.pad_x,
+            portal.pad_y,
+            portal_x_mm,
+            portal_y_mm,
+        ):
             geometry.append({
                 'net': net_id,
                 'layer': pad_layer_name,
-                'x1': intermediate_x,
-                'y1': intermediate_y,
-                'x2': portal_x_mm,
-                'y2': portal_y_mm,
-                'width': self.config.grid_pitch * 0.6,
-                'escape': True,  # Tag for easy identification
-            })
-        else:
-            # Pure vertical escape (no horizontal offset)
-            geometry.append({
-                'net': net_id,
-                'layer': pad_layer_name,
-                'x1': portal.pad_x,
-                'y1': portal.pad_y,
-                'x2': portal_x_mm,
-                'y2': portal_y_mm,
-                'width': self.config.grid_pitch * 0.6,
-                'escape': True,  # Tag for easy identification
+                'x1': start[0],
+                'y1': start[1],
+                'x2': end[0],
+                'y2': end[1],
+                'width': self.config.track_width,
+                'escape': True,
             })
 
         # 2. Portal via is NOT created here!

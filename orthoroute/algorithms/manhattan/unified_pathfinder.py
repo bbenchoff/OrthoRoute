@@ -597,6 +597,12 @@ class PathFinderConfig:
     # enabling use of empty vertical channels. Lower values = more detours, higher completion.
 
     grid_pitch: float = 0.4
+    # Physical output geometry. Parsed KiCad project rules replace these
+    # defaults during initialize_graph().
+    track_width: float = 0.24
+    clearance: float = 0.15
+    via_diameter: float = 0.25
+    via_drill: float = 0.15
     via_cost: float = 0.7  # Cheaper vias to encourage layer hopping and redistribute load (was 1.0)
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
     span_alpha: float = 0.15  # Span penalty: cost *= (1 + alpha*(span-1))
@@ -2271,6 +2277,28 @@ class PathFinderRouter:
 
     def initialize_graph(self, board: Board) -> bool:
         """Build routing graph"""
+        design_rules = getattr(board, "_design_rules", None) or {}
+        if design_rules:
+            self.config.track_width = float(
+                design_rules.get(
+                    "default_track_width", self.config.track_width
+                )
+            )
+            self.config.clearance = float(
+                design_rules.get(
+                    "default_clearance", self.config.clearance
+                )
+            )
+            self.config.via_diameter = float(
+                design_rules.get(
+                    "default_via_diameter", self.config.via_diameter
+                )
+            )
+            self.config.via_drill = float(
+                design_rules.get(
+                    "default_via_drill", self.config.via_drill
+                )
+            )
         logger.info("=" * 80)
         logger.info("PATHFINDER NEGOTIATED CONGESTION ROUTER - RUNTIME CONFIGURATION")
         logger.info("=" * 80)
@@ -2280,6 +2308,14 @@ class PathFinderRouter:
         logger.info(f"[CONFIG] hist_gain        = {self.config.hist_gain}")
         logger.info(f"[CONFIG] via_cost         = {self.config.via_cost}")
         logger.info(f"[CONFIG] grid_pitch       = {self.config.grid_pitch} mm")
+        logger.info(
+            "[CONFIG] geometry         = %.4fmm track / %.4fmm "
+            "clearance / %.4fmm via / %.4fmm drill",
+            self.config.track_width,
+            self.config.clearance,
+            self.config.via_diameter,
+            self.config.via_drill,
+        )
         logger.info(f"[CONFIG] max_iterations   = {self.config.max_iterations}")
         logger.info(f"[CONFIG] stagnation_patience = {self.config.stagnation_patience}")
         logger.info("=" * 80)
@@ -6480,7 +6516,7 @@ class PathFinderRouter:
             'net': net,
             'layer': self.config.layer_names[layer] if layer < len(self.config.layer_names) else f"L{layer}",
             'x1': ax_mm, 'y1': ay_mm, 'x2': bx_mm, 'y2': by_mm,
-            'width': self.config.grid_pitch * 0.6,
+            'width': self.config.track_width,
         }
 
     def precompute_all_pad_escapes(self, board: Board, nets_to_route: List = None) -> Tuple[List, List]:
@@ -6542,8 +6578,8 @@ class PathFinderRouter:
             'x': x_mm, 'y': y_mm,
             'from_layer': self.config.layer_names[from_layer] if from_layer < len(self.config.layer_names) else f"L{from_layer}",
             'to_layer': self.config.layer_names[to_layer] if to_layer < len(self.config.layer_names) else f"L{to_layer}",
-            'diameter': 0.25,  # hole (0.15) + 2×annular (0.05) = 0.25mm
-            'drill': 0.15,     # hole diameter
+            'diameter': self.config.via_diameter,
+            'drill': self.config.via_drill,
         }
 
     def _refresh_selected_escape_geometry(self) -> None:
