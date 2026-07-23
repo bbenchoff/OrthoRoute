@@ -2340,6 +2340,7 @@ class PathFinderRouter:
         # -1 = free, otherwise net_id (mapped to integer)
         # This is THE solution to via barrel conflicts - enforce at node level, not edge level!
         self.node_owner = np.full(self.lattice.num_nodes, -1, dtype=np.int32)
+        self.node_owner_gpu = None
         self.net_id_map = {}  # net_name -> integer ID
         self.next_net_id = 0
         logger.info(f"[NODE-OWNER] Initialized node ownership tracking for {self.lattice.num_nodes:,} nodes")
@@ -2356,6 +2357,7 @@ class PathFinderRouter:
         if use_gpu_solver:
             try:
                 self.solver.gpu_solver = CUDADijkstra(self.graph, self.lattice)
+                self.node_owner_gpu = cp.asarray(self.node_owner)
                 logger.info("[GPU] CUDA Near-Far Dijkstra enabled (ROI > 5K nodes) with lattice dims")
                 # Log GPU details
                 device = cp.cuda.Device()
@@ -3053,7 +3055,8 @@ class PathFinderRouter:
                 logger.info(f"[NODE-OWNER] Escape via columns marked: {escape_owned:,} internal layer nodes")
 
         logger.info(f"[NODE-OWNER] Marked {owned_count:,} nodes as owned ({owned_count*100//self.lattice.num_nodes}% of graph)")
-        # NOTE: Node ownership enforced via bitmap filtering in GPU kernels, not cost penalties!
+        if self.node_owner_gpu is not None:
+            self.node_owner_gpu[:] = cp.asarray(self.node_owner)
 
     def _get_net_id(self, net_name: str) -> int:
         """Map net name to integer ID for node ownership"""
@@ -3107,6 +3110,7 @@ class PathFinderRouter:
             return
 
         net_id = self._get_net_id(net_name)
+        owned_nodes = []
 
         # Walk path and find via transitions
         for i in range(len(path) - 1):
@@ -3121,6 +3125,13 @@ class PathFinderRouter:
                 for z in range(z_lo, z_hi + 1):
                     node_idx = self.lattice.node_idx(xu, yu, z)
                     self.node_owner[node_idx] = net_id
+                    owned_nodes.append(node_idx)
+
+        if owned_nodes and self.node_owner_gpu is not None:
+            owned_nodes_gpu = cp.asarray(
+                np.unique(owned_nodes), dtype=cp.int32
+            )
+            self.node_owner_gpu[owned_nodes_gpu] = np.int32(net_id)
 
     def _build_owner_bitmap_for_fullgraph(self, current_net: str, force_allow_nodes=None) -> np.ndarray:
         """
@@ -3198,6 +3209,29 @@ class PathFinderRouter:
         weight = (float(getattr(self.config, 'owner_penalty_base', 25.0))
                   * float(getattr(self, '_pres_fac_now', 1.0)))
         return foreign.astype(np.float32) * weight
+
+    def _build_owner_penalty_gpu(self, current_net: str,
+                                 force_allow_nodes=None):
+        """Build the full-graph ownership cost without a host transfer."""
+        if self.node_owner_gpu is None:
+            return self._build_owner_penalty(
+                None, current_net, force_allow_nodes=force_allow_nodes
+            )
+
+        current_net_id = self._get_net_id(current_net)
+        weight = np.float32(
+            float(getattr(self.config, 'owner_penalty_base', 25.0))
+            * float(getattr(self, '_pres_fac_now', 1.0))
+        )
+        owners = self.node_owner_gpu
+        penalty = cp.where(
+            (owners != -1) & (owners != current_net_id),
+            weight,
+            cp.float32(0.0),
+        ).astype(cp.float32, copy=False)
+        if force_allow_nodes is not None and len(force_allow_nodes) > 0:
+            penalty[cp.asarray(force_allow_nodes, dtype=cp.int32)] = 0.0
+        return penalty
 
     def _track_escape_vias_in_via_usage(self):
         """
@@ -4758,8 +4792,8 @@ class PathFinderRouter:
                         # Force source/destination seeds to zero penalty because
                         # stale ownership bookkeeping must never hide terminals.
                         force_allow = np.unique(np.concatenate([src_node_array, dst_node_array])).astype(np.int32)
-                        owner_penalty = self._build_owner_penalty(
-                            None, net_id, force_allow_nodes=force_allow
+                        owner_penalty = self._build_owner_penalty_gpu(
+                            net_id, force_allow_nodes=force_allow
                         )
 
                         if len(src_node_array) > 0 and len(dst_node_array) > 0:
