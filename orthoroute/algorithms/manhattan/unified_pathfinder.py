@@ -2114,8 +2114,11 @@ class SimpleDijkstra:
         for global_node, initial_cost in src_seeds:
             roi_idx = int(global_to_roi[global_node])
             if roi_idx >= 0:
-                dist[roi_idx] = initial_cost
-                heapq.heappush(heap, (initial_cost, roi_idx))
+                source_cost = float(initial_cost)
+                if node_penalty is not None:
+                    source_cost += float(node_penalty[roi_idx])
+                dist[roi_idx] = source_cost
+                heapq.heappush(heap, (source_cost, roi_idx))
                 src_roi_nodes.add(roi_idx)
 
         # Build target set
@@ -2913,14 +2916,6 @@ class PathFinderRouter:
         discount = float(getattr(
             self.config, "portal_via_discount", 0.15
         ))
-        if portal.dynamic_entry:
-            # A dynamic portal's explicit blind barrel occupies every layer
-            # from F.Cu to the chosen entry. Price those layers the same as
-            # the adjacent-span graph so deep punch-ins are available but
-            # no longer almost free.
-            discount = float(getattr(
-                self.config, "adjacent_via_step_scale", 4.0
-            ))
         for layer in routing_layers:
             node_idx = self.lattice.node_idx(
                 portal.x_idx, portal.y_idx, layer
@@ -3476,7 +3471,16 @@ class PathFinderRouter:
                     self.config, "escape_preference_penalty", 1.0
                 ))
             for node, layer_cost in self._get_portal_seeds(portal):
-                total_cost = layer_cost + candidate_penalty
+                entry_layer = self.lattice.idx_to_coord(node)[2]
+                total_cost = (
+                    layer_cost
+                    + candidate_penalty
+                    + self._portal_chain_node_penalty(
+                        portal,
+                        entry_layer,
+                        current_net,
+                    )
+                )
                 if (
                     node not in best_by_node
                     or total_cost < best_by_node[node]
@@ -3486,6 +3490,64 @@ class PathFinderRouter:
 
         seeds = sorted(best_by_node.items())
         return seeds, portal_by_node
+
+    def _portal_chain_node_penalty(
+        self,
+        portal: Portal,
+        entry_layer: int,
+        current_net: Optional[str],
+    ) -> float:
+        """Price the local escape barrel hidden behind a terminal seed.
+
+        Multi-source routing contracts each pad's short F.Cu escape and blind
+        barrel into a terminal edge. The graph search sees the entry node, but
+        the intermediate barrel nodes are attached only after backtrace. Add
+        their ownership, occupancy, and learned-history costs to the terminal
+        edge so choosing an escape is equivalent to traversing that constrained
+        local graph.
+        """
+        if current_net is None or not hasattr(self, "node_owner"):
+            return 0.0
+
+        pad_layer = int(portal.pad_layer)
+        entry_layer = int(entry_layer)
+        if pad_layer == entry_layer:
+            return 0.0
+
+        step = 1 if entry_layer > pad_layer else -1
+        layers = np.arange(
+            pad_layer,
+            entry_layer,
+            step,
+            dtype=np.int32,
+        )
+        if layers.size == 0:
+            return 0.0
+
+        plane = self.lattice.x_steps * self.lattice.y_steps
+        xy = portal.y_idx * self.lattice.x_steps + portal.x_idx
+        nodes = layers.astype(np.int64) * plane + xy
+        current_net_id = self._get_net_id(current_net)
+        owners = self.node_owner[nodes]
+        foreign = (owners != -1) & (owners != current_net_id)
+
+        pres_fac = float(getattr(self, "_pres_fac_now", 1.0))
+        owner_weight = (
+            float(getattr(self.config, "owner_penalty_base", 25.0))
+            * pres_fac
+        )
+        path_weight = (
+            float(getattr(self.config, "path_node_penalty_base", 25.0))
+            * pres_fac
+        )
+        history_weight = float(getattr(
+            self.config, "node_history_penalty", 5.0
+        ))
+        return float(
+            foreign.sum() * owner_weight
+            + (self.path_node_use[nodes] > 0).sum() * path_weight
+            + self.node_conflict_history[nodes].sum() * history_weight
+        )
 
     def _attach_portal_vias(
         self,
