@@ -628,7 +628,9 @@ class PathFinderConfig:
     # already committed escape. It follows the negotiated-congestion
     # pressure schedule rather than making early choices into hard walls.
     escape_penalty_base: float = 1000.0
-    escape_preference_penalty: float = 1.0
+    escape_preference_penalty: float = 10.0
+    escape_replan_patience: int = 2
+    escape_replan_limit: int = 3
     # A portal barrel that repeatedly blocks another routed net must move.
     # Accumulated history prevents the owner from returning to the same
     # locally attractive but globally impossible escape column.
@@ -3157,11 +3159,14 @@ class PathFinderRouter:
                 )
                 ranked.append((
                     conflicts,
+                    self._portal_barrel_history.get(
+                        (pad_id, portal.x_idx, portal.y_idx), 0.0
+                    ),
                     float(getattr(portal, "score", 0.0)),
                     portal.y_idx,
                     portal,
                 ))
-            _, _, _, selected = min(ranked, key=lambda item: item[:3])
+            selected = min(ranked, key=lambda item: item[:4])[4]
             assignment[pad_id] = selected
             self._insert_escape_record(
                 self._escape_record(net_id, pad_id, selected)
@@ -3194,12 +3199,20 @@ class PathFinderRouter:
                     )
                     ranked.append((
                         conflicts,
+                        self._portal_barrel_history.get(
+                            (
+                                old["pad"],
+                                portal.x_idx,
+                                portal.y_idx,
+                            ),
+                            0.0,
+                        ),
                         float(getattr(portal, "score", 0.0)),
                         portal.y_idx,
                         portal,
                     ))
-                best = min(ranked, key=lambda item: item[:3])
-                selected = best[3]
+                best = min(ranked, key=lambda item: item[:4])
+                selected = best[4]
                 assignment[old["pad"]] = selected
                 self._insert_escape_record(
                     self._escape_record(
@@ -4780,6 +4793,44 @@ class PathFinderRouter:
                 self, "_barrel_owner_portal_keys", ()
             ):
                 self._portal_barrel_history[portal_key] += 1.0
+
+            exact_conflicts = int(getattr(
+                self, "_last_exact_barrel_conflict_count", 0
+            ))
+            escape_conflicts_now = int(getattr(
+                self, "_last_escape_conflict_count", 0
+            ))
+            if exact_conflicts == 0 and escape_conflicts_now > 0:
+                previous = getattr(
+                    self, "_escape_replan_best", float("inf")
+                )
+                if escape_conflicts_now < previous:
+                    self._escape_replan_best = escape_conflicts_now
+                    self._escape_replan_stagnant = 0
+                else:
+                    self._escape_replan_stagnant = (
+                        getattr(self, "_escape_replan_stagnant", 0) + 1
+                    )
+                replans = getattr(self, "_escape_replan_count", 0)
+                if (
+                    self._escape_replan_stagnant
+                    >= int(getattr(
+                        cfg, "escape_replan_patience", 2
+                    ))
+                    and replans
+                    < int(getattr(cfg, "escape_replan_limit", 3))
+                ):
+                    logger.warning(
+                        "[ESCAPE-REPLAN] Re-solving %d stalled "
+                        "physical escape conflicts",
+                        escape_conflicts_now,
+                    )
+                    self._plan_escape_assignment()
+                    self._escape_replan_count = replans + 1
+                    self._escape_replan_stagnant = 0
+            else:
+                self._escape_replan_best = float("inf")
+                self._escape_replan_stagnant = 0
 
             if conflict_count > 0:
                 logger.debug(f"[BARREL-CONFLICT] Detected {conflict_count} barrel conflicts in iteration {it}")
