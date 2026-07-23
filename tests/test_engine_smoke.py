@@ -232,6 +232,34 @@ def test_adjacent_via_chain_is_one_physical_column(routed):
     pf._escape_vias = original_escape_vias
 
 
+def test_via_pool_overuse_selects_its_nets(routed):
+    """A density-only violation must not produce an empty hotset."""
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    via_hop = next(
+        (u, v)
+        for u, v in zip(path, path[1:])
+        if pf.lattice.idx_to_coord(u)[:2]
+        == pf.lattice.idx_to_coord(v)[:2]
+        and pf.lattice.idx_to_coord(u)[2]
+        != pf.lattice.idx_to_coord(v)[2]
+    )
+    x_idx, y_idx, _ = pf.lattice.idx_to_coord(via_hop[0])
+
+    pf._rebuild_via_usage_from_committed()
+    old_capacity = int(pf.via_col_cap[x_idx, y_idx])
+    pf.via_col_cap[x_idx, y_idx] = 0
+    try:
+        assert "TEST_NET" in pf._find_via_pool_offenders()
+        pf.accounting.history.fill(0)
+        hotset = pf._build_hotset({
+            "TEST_NET": (path[0], path[-1]),
+        })
+        assert "TEST_NET" in hotset
+    finally:
+        pf.via_col_cap[x_idx, y_idx] = old_capacity
+
+
 def test_path_respects_hv_discipline(routed):
     """Every lateral step must follow its layer's legal axis."""
     pf, _, _, _ = routed
