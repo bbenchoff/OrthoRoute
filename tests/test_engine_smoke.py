@@ -595,6 +595,32 @@ def test_portal_cleanup_leaves_one_fixed_net_per_conflict_component():
     assert movable == {"B", "C", "D", "E", "Q", "S", "Y"}
 
 
+def test_physical_hotset_is_bounded_and_severity_ranked():
+    router = object.__new__(PathFinderRouter)
+    router.config = PathFinderConfig()
+    router.config.physical_hotset_cap = 3
+    router._barrel_conflict_nets = {"A", "B", "C", "D", "E"}
+    router._physical_conflict_scores = {
+        "A": 2,
+        "B": 9,
+        "C": 4,
+        "D": 9,
+        "E": 1,
+    }
+
+    assert router._select_physical_hotset() == {"B", "C", "D"}
+
+
+def test_spatial_via_overuse_counts_columns_and_segments():
+    router = object.__new__(PathFinderRouter)
+    router.via_col_use = np.array([[1, 5], [3, 2]])
+    router.via_col_cap = np.full((2, 2), 3)
+    router.via_seg_use = np.array([[[1, 4], [3, 2]]])
+    router.via_seg_cap = np.full((1, 2, 2), 2)
+
+    assert router._spatial_via_overuse_total() == 5
+
+
 def test_portal_cleanup_prices_exact_foreign_edges(routed):
     pf, _, _, _ = routed
     net_name = "TEST_NET"

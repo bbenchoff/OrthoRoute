@@ -620,6 +620,8 @@ class PathFinderConfig:
     min_hole_to_hole: float = 0.25
     hole_clearance: float = 0.1
     via_cost: float = 0.7  # Cheaper vias to encourage layer hopping and redistribute load (was 1.0)
+    via_pressure_threshold: int = 64
+    via_pressure_multiplier: float = 1.5
     portal_discount: float = 0.4  # 60% discount on first escape via from terminals
     span_alpha: float = 0.15  # Span penalty: cost *= (1 + alpha*(span-1))
     # None selects full spans through 18 layers and adjacent spans on deeper
@@ -685,6 +687,11 @@ class PathFinderConfig:
     gpu_fullgraph_fail_fast_nodes: int = 1_000_000
     layer_names: List[str] = field(default_factory=lambda: ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'B.Cu'])
     hotset_cap: int = 512  # Allow all nets to be rerouted if needed (was 150, bottleneck!)
+    # Physical conflicts may implicate nearly every net on a monster board.
+    # Rerouting that near-global set after graph congestion is already low
+    # destroys the best-known solution. Process the worst physical offenders
+    # in bounded waves; boards at or below this size remain unchanged.
+    physical_hotset_cap: int = 1024
     allowed_via_spans: Optional[Set[Tuple[int, int]]] = None  # None = all layer pairs allowed (blind/buried)
 
 
@@ -5238,6 +5245,28 @@ class PathFinderRouter:
         if penalties_applied > 0:
             logger.debug(f"[VIA-POOL] Sequential: Applied pooling penalties to {penalties_applied} via edges")
 
+    def _spatial_via_overuse_total(self) -> int:
+        """Return over-capacity via-column and via-segment occupancy."""
+        total = 0
+        for use_name, cap_name in (
+            ("via_col_use", "via_col_cap"),
+            ("via_seg_use", "via_seg_cap"),
+        ):
+            if not hasattr(self, use_name) or not hasattr(self, cap_name):
+                continue
+            use = getattr(self, use_name)
+            cap = getattr(self, cap_name)
+            xp = (
+                cp
+                if GPU_AVAILABLE and isinstance(use, cp.ndarray)
+                else np
+            )
+            subtotal = xp.maximum(0, use - cap).sum()
+            if hasattr(subtotal, "get"):
+                subtotal = subtotal.get()
+            total += int(subtotal)
+        return total
+
     def _block_via_edges_with_collisions(self):
         """
         Hard-block via edges with spatial collisions by setting costs to infinity.
@@ -5458,7 +5487,25 @@ class PathFinderRouter:
             # STEP 2: Update costs (with history weight and via annealing)
             # Via policy: anneal via cost when pres_fac >= 64 (lowered to trigger earlier)
             via_cost_mult = 1.0
-            if pres_fac >= 64:
+            spatial_via_overuse = self._spatial_via_overuse_total()
+            via_pressure_threshold = int(getattr(
+                cfg, "via_pressure_threshold", 64
+            ))
+            if (
+                it >= 3
+                and spatial_via_overuse >= via_pressure_threshold
+            ):
+                via_cost_mult = float(getattr(
+                    cfg, "via_pressure_multiplier", 1.5
+                ))
+                logger.info(
+                    "[VIA-PRESSURE] Spatial overuse=%d >= %d; "
+                    "via base cost *= %.2f",
+                    spatial_via_overuse,
+                    via_pressure_threshold,
+                    via_cost_mult,
+                )
+            elif pres_fac >= 64:
                 # Check if >70% of overuse is on vias
                 # OPTIMIZATION: Use cached GPU transfers
                 present = present_cpu_cache
@@ -7201,6 +7248,33 @@ class PathFinderRouter:
                 self._edge_to_nets[ei].discard(net_id)
             del self._net_to_edges[net_id]
 
+    def _select_physical_hotset(self) -> Set[str]:
+        """Return a bounded, severity-ranked physical-conflict wave."""
+        offenders = set(getattr(self, "_barrel_conflict_nets", ()))
+        cap = max(
+            1, int(getattr(self.config, "physical_hotset_cap", 1024))
+        )
+        if len(offenders) <= cap:
+            return offenders
+        scores = getattr(self, "_physical_conflict_scores", {})
+        ranked = sorted(
+            offenders,
+            key=lambda net_id: (
+                -int(scores.get(net_id, 0)),
+                str(net_id),
+            ),
+        )
+        selected = set(ranked[:cap])
+        logger.info(
+            "[PHYSICAL-HOTSET] Selected %d/%d offenders "
+            "(score range %d..%d)",
+            len(selected),
+            len(offenders),
+            int(scores.get(ranked[0], 0)),
+            int(scores.get(ranked[cap - 1], 0)),
+        )
+        return selected
+
     def _build_hotset(self, tasks: Dict[str, Tuple[int, int]], ripped: Optional[Set[str]] = None) -> Set[str]:
         """
         Build hotset: ONLY nets touching overused edges, with adaptive capping.
@@ -7229,9 +7303,7 @@ class PathFinderRouter:
         # No edge overuse can still leave an over-capacity via pool.
         if len(over_idx) == 0:
             unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
-            physical_offenders = set(getattr(
-                self, "_barrel_conflict_nets", ()
-            ))
+            physical_offenders = self._select_physical_hotset()
             hotset = (
                 unrouted
                 | ripped
@@ -7339,9 +7411,7 @@ class PathFinderRouter:
             self._last_reroute_iter[nid] = self.iteration
 
         hotset = set(hotset_with_cooldown)
-        physical_offenders = set(getattr(
-            self, "_barrel_conflict_nets", ()
-        ))
+        physical_offenders = self._select_physical_hotset()
         # The adaptive cap is for ordinary edge congestion. A physical
         # barrel or node collision is an electrical short and every net
         # participating in one must remain eligible immediately; limiting
@@ -8336,6 +8406,7 @@ class PathFinderRouter:
         self._portal_grid_pairs = set()
         self._escape_conflict_pairs = set()
         self._exact_barrel_pairs = set()
+        self._physical_conflict_scores = defaultdict(int)
         self._last_exact_barrel_details = []
 
         # Bail out if node_owner not initialized
@@ -8464,6 +8535,12 @@ class PathFinderRouter:
                             victim_name is not None
                             and owner_name is not None
                         ):
+                            self._physical_conflict_scores[
+                                victim_name
+                            ] += 1
+                            self._physical_conflict_scores[
+                                owner_name
+                            ] += 1
                             exact_pairs.add(tuple(sorted((
                                 victim_name, owner_name
                             ))))
@@ -8543,6 +8620,9 @@ class PathFinderRouter:
         self._last_escape_conflict_count = len(escape_pairs)
         self._escape_conflict_pairs = set(escape_pairs)
         if escape_pairs:
+            for first, second in escape_pairs:
+                self._physical_conflict_scores[first[0]] += 1
+                self._physical_conflict_scores[second[0]] += 1
             # Escape stubs live outside edge accounting, so their selected
             # candidates need their own Pathfinder history. Penalize both
             # ends of every physical conflict; otherwise these conflicts can
@@ -8574,6 +8654,9 @@ class PathFinderRouter:
         self._portal_grid_owner_nets = set(portal_grid_owners)
         self._portal_grid_victim_nets = set(portal_grid_victims)
         if portal_grid_pairs:
+            for identity, victim, _kind in portal_grid_pairs:
+                self._physical_conflict_scores[identity[0]] += 1
+                self._physical_conflict_scores[victim] += 1
             self._barrel_owner_portal_keys.update(portal_grid_keys)
             self._barrel_owner_nets.update(portal_grid_owners)
             self._barrel_victim_nets.update(portal_grid_victims)
