@@ -115,6 +115,34 @@ class TestGraphBuild:
         costs = np.asarray(graph.base_costs)
         assert np.all(costs > 0)
 
+    def test_checkerboard_via_sites_meet_sub_pitch_clearance(self, lattice4):
+        graph = lattice4.build_graph(
+            via_cost=0.7,
+            min_via_center_spacing=0.404,
+        )
+        plane = lattice4.x_steps * lattice4.y_steps
+        via_sources = []
+        for source in range(lattice4.num_nodes):
+            start = int(graph.indptr[source])
+            end = int(graph.indptr[source + 1])
+            if np.any(graph.edge_kind[start:end] == 1):
+                via_sources.append(source)
+
+        via_xy = {
+            (
+                source % plane % lattice4.x_steps,
+                source % plane // lattice4.x_steps,
+            )
+            for source in via_sources
+        }
+        assert via_xy
+        assert all((x + y) % 2 == 0 for x, y in via_xy)
+        assert len(via_xy) == sum(
+            (x + y) % 2 == 0
+            for x in range(lattice4.x_steps)
+            for y in range(lattice4.y_steps)
+        )
+
     def test_adjacent_via_hops_emit_as_one_span(self, lattice4):
         router = UnifiedPathFinder(PathFinderConfig(), use_gpu=False)
         router.lattice = lattice4
