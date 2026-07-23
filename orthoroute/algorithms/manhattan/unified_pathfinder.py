@@ -626,6 +626,7 @@ class PathFinderConfig:
     delta_multiplier: float = 4.0
     adaptive_delta: bool = True
     strict_capacity: bool = True
+    live_present_costs: bool = True
     reroute_only_offenders: bool = True
     layer_shortfall_percentile: float = 95.0
     layer_shortfall_cap: int = 16
@@ -1098,8 +1099,10 @@ class EdgeAccountant:
             inverted_bias = xp.where(per_edge_bias != 0, 1.0 / xp.maximum(per_edge_bias, 0.5), 1.0)
             inverted_bias = xp.where(edge_kind_arr == 0, inverted_bias, 1.0)  # Only H/V edges
             present_term = (pres_fac * inverted_bias) * over
+            self._present_cost_scale = pres_fac * inverted_bias
         else:
             present_term = pres_fac * over
+            self._present_cost_scale = float(pres_fac)
 
         self.total_cost = adjusted_base + present_term + hist_weight * self.history
 
@@ -1111,30 +1114,43 @@ class EdgeAccountant:
             jitter = jitter * 1e-6  # tiny epsilon
             self.total_cost += jitter
 
-    def update_present_cost_only(self, pres_fac: float, base_costs):
-        """
-        FAST per-net cost update: Only recomputes present cost term (not history).
-        Called after EACH net routes to update costs for the NEXT net.
-        History cost only updates at END of iteration.
+    def begin_live_present_costs(self):
+        """Switch from iteration EMA to prospective per-net occupancy costs."""
+        scale = getattr(self, "_present_cost_scale", 1.0)
+        iteration_over = self.xp.maximum(
+            0, self.present_ema - self.capacity
+        )
+        # Preserve base, history, jitter, pooling penalties, and hard blocks.
+        self._live_static_cost = (
+            self.total_cost - scale * iteration_over
+        )
+        prospective_over = self.xp.maximum(
+            0, self.present + 1.0 - self.capacity
+        )
+        self.total_cost[:] = (
+            self._live_static_cost + scale * prospective_over
+        )
 
-        This is critical for PathFinder convergence!
-
-        Formula: total_cost = base_cost + pres_fac * overuse + history
-        """
-        # Recompute overuse with current occupancy (using smoothed present_ema for consistency)
-        over = self.xp.maximum(0, self.present_ema - self.capacity)
-
-        # Update total_cost: base + present_penalty + history
-        # Don't modify history here - only update present penalty based on current occupancy
-        self.total_cost = base_costs + pres_fac * over + self.history
-
-        # Log first few updates for debugging
-        if not hasattr(self, '_pernet_update_count'):
-            self._pernet_update_count = 0
-        self._pernet_update_count += 1
-        if self._pernet_update_count <= 3:
-            overuse_count = int(self.xp.sum(over > 0))
-            logger.info(f"[PER-NET-UPDATE #{self._pernet_update_count}] Overuse edges: {overuse_count}, pres_fac={pres_fac:.2f}")
+    def refresh_live_present_costs(self, edge_indices: List[int]):
+        """Reprice touched edges after one net is ripped up or committed."""
+        if not edge_indices or not hasattr(self, "_live_static_cost"):
+            return
+        edge_array = self.xp.asarray(edge_indices, dtype=np.int64)
+        scale = getattr(self, "_present_cost_scale", 1.0)
+        prospective_over = self.xp.maximum(
+            0,
+            self.present[edge_array]
+            + 1.0
+            - self.capacity[edge_array],
+        )
+        if np.isscalar(scale):
+            edge_scale = scale
+        else:
+            edge_scale = scale[edge_array]
+        self.total_cost[edge_array] = (
+            self._live_static_cost[edge_array]
+            + edge_scale * prospective_over
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2347,6 +2363,7 @@ class PathFinderRouter:
         # -1 = free, otherwise net_id (mapped to integer)
         # This is THE solution to via barrel conflicts - enforce at node level, not edge level!
         self.node_owner = np.full(self.lattice.num_nodes, -1, dtype=np.int32)
+        self._node_owner_members: Dict[int, Set[int]] = {}
         self.node_owner_gpu = None
         self.net_id_map = {}  # net_name -> integer ID
         self.next_net_id = 0
@@ -3073,6 +3090,7 @@ class PathFinderRouter:
 
         # Reset to all free
         self.node_owner.fill(-1)
+        self._node_owner_members = {}
 
         owned_count = 0
 
@@ -3104,30 +3122,16 @@ class PathFinderRouter:
                 # Via: same (x,y), different z
                 if xu == xv and yu == yv and zu != zv:
                     # Mark ALL nodes in the via barrel span
-                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
-                    for z in range(z_lo, z_hi + 1):
-                        node_idx = self.lattice.node_idx(xu, yu, z)
-                        self.node_owner[node_idx] = net_id
-                        owned_count += 1
+                    for node_idx in self._via_nodes_for_hop(u, v):
+                        self._node_owner_members.setdefault(
+                            node_idx, set()
+                        ).add(net_id)
 
-        # 3. ESCAPE VIA COLUMNS: Mark internal-layer nodes from via keepouts (escape vias!)
-        # This is THE missing piece - escape vias in _via_keepouts_map weren't in node_owner!
-        if hasattr(self, '_via_keepouts_map') and self._via_keepouts_map:
-            escape_owned = 0
-            for (z, xu, yu), owner_net in self._via_keepouts_map.items():
-                # Skip F.Cu (z=0) so source seeds aren't blocked
-                if z <= 0:
-                    continue
-                node_idx = self.lattice.node_idx(xu, yu, z)
-                net_id_int = self._get_net_id(owner_net)
-                # First owner wins (don't thrash ownership)
-                if self.node_owner[node_idx] == -1:
-                    self.node_owner[node_idx] = net_id_int
-                    owned_count += 1
-                    escape_owned += 1
-
-            if escape_owned > 0:
-                logger.info(f"[NODE-OWNER] Escape via columns marked: {escape_owned:,} internal layer nodes")
+        for node_idx, members in self._node_owner_members.items():
+            self.node_owner[node_idx] = (
+                next(iter(members)) if len(members) == 1 else -2
+            )
+        owned_count = len(self._node_owner_members)
 
         logger.info(f"[NODE-OWNER] Marked {owned_count:,} nodes as owned ({owned_count*100//self.lattice.num_nodes}% of graph)")
         if self.node_owner_gpu is not None:
@@ -3185,28 +3189,68 @@ class PathFinderRouter:
             return
 
         net_id = self._get_net_id(net_name)
-        owned_nodes = []
-
-        # Walk path and find via transitions
-        for i in range(len(path) - 1):
-            u, v = path[i], path[i+1]
-            xu, yu, zu = self.lattice.idx_to_coord(u)
-            xv, yv, zv = self.lattice.idx_to_coord(v)
-
-            # Via: same (x,y), different z
-            if xu == xv and yu == yv and zu != zv:
-                # Mark ALL nodes in via barrel span
-                z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
-                for z in range(z_lo, z_hi + 1):
-                    node_idx = self.lattice.node_idx(xu, yu, z)
-                    self.node_owner[node_idx] = net_id
-                    owned_nodes.append(node_idx)
+        owned_nodes = self._via_nodes_for_path(path)
+        for node_idx in owned_nodes:
+            members = self._node_owner_members.setdefault(
+                node_idx, set()
+            )
+            members.add(net_id)
+            self.node_owner[node_idx] = (
+                net_id if len(members) == 1 else -2
+            )
 
         if owned_nodes and self.node_owner_gpu is not None:
             owned_nodes_gpu = cp.asarray(
-                np.unique(owned_nodes), dtype=cp.int32
+                owned_nodes, dtype=cp.int32
             )
-            self.node_owner_gpu[owned_nodes_gpu] = np.int32(net_id)
+            self.node_owner_gpu[owned_nodes_gpu] = cp.asarray(
+                self.node_owner[owned_nodes], dtype=cp.int32
+            )
+
+    def _clear_via_barrel_ownership_for_path(
+        self, net_name: str, path: List[int]
+    ) -> None:
+        """Remove a ripped-up path without leaving ghost barrel owners."""
+        if not path or len(path) < 2:
+            return
+        net_id = self._get_net_id(net_name)
+        changed_nodes = self._via_nodes_for_path(path)
+        for node_idx in changed_nodes:
+            members = self._node_owner_members.get(node_idx)
+            if not members:
+                self.node_owner[node_idx] = -1
+                continue
+            members.discard(net_id)
+            if not members:
+                self._node_owner_members.pop(node_idx, None)
+                self.node_owner[node_idx] = -1
+            elif len(members) == 1:
+                self.node_owner[node_idx] = next(iter(members))
+            else:
+                self.node_owner[node_idx] = -2
+
+        if changed_nodes and self.node_owner_gpu is not None:
+            nodes_gpu = cp.asarray(changed_nodes, dtype=cp.int32)
+            self.node_owner_gpu[nodes_gpu] = cp.asarray(
+                self.node_owner[changed_nodes], dtype=cp.int32
+            )
+
+    def _via_nodes_for_hop(self, u: int, v: int) -> List[int]:
+        xu, yu, zu = self.lattice.idx_to_coord(u)
+        xv, yv, zv = self.lattice.idx_to_coord(v)
+        if xu != xv or yu != yv or zu == zv:
+            return []
+        z_lo, z_hi = sorted((zu, zv))
+        return [
+            self.lattice.node_idx(xu, yu, z)
+            for z in range(z_lo, z_hi + 1)
+        ]
+
+    def _via_nodes_for_path(self, path: List[int]) -> List[int]:
+        nodes = set()
+        for u, v in zip(path, path[1:]):
+            nodes.update(self._via_nodes_for_hop(u, v))
+        return sorted(nodes)
 
     def _build_owner_bitmap_for_fullgraph(self, current_net: str, force_allow_nodes=None) -> np.ndarray:
         """
@@ -4777,9 +4821,14 @@ class PathFinderRouter:
         # Per-net updates will refresh this reference
         costs = self.accounting.total_cost  # Keep on GPU if use_gpu=True
 
-        # PathFinder design: Sequential routing with FIXED costs throughout iteration
-        # Costs are updated ONCE per iteration (in _pathfinder_negotiation), not per net
-        # This allows all nets to route with same congestion view, preventing unfair advantages
+        # History and base costs stay fixed for the iteration. Present costs
+        # track live occupancy so two nets do not select the same newly freed
+        # edge from an identical stale congestion view.
+        live_present_costs = bool(
+            getattr(cfg, "live_present_costs", True)
+        )
+        if live_present_costs:
+            self.accounting.begin_live_present_costs()
         
         # CRITICAL: Verify sequential mode (SEQUENTIAL_ALL env var check)
         force_sequential = os.getenv("SEQUENTIAL_ALL") == "1"
@@ -4806,7 +4855,12 @@ class PathFinderRouter:
                     old_edges = self._net_to_edges[net_id]
                 else:
                     old_edges = self._path_to_edges(self.net_paths[net_id])
+                self._clear_via_barrel_ownership_for_path(
+                    net_id, self.net_paths[net_id]
+                )
                 self.accounting.clear_path(old_edges)
+                if live_present_costs:
+                    self.accounting.refresh_live_present_costs(old_edges)
                 # Clear old tracking before re-routing
                 self._clear_net_edge_tracking(net_id)
 
@@ -4932,7 +4986,10 @@ class PathFinderRouter:
                                 # Commit path and continue to next net
                                 edge_indices = self._path_to_edges(path)
                                 self.accounting.commit_path(edge_indices)
-                                # NOTE: Do NOT update costs here! PathFinder requires fixed costs per iteration.
+                                if live_present_costs:
+                                    self.accounting.refresh_live_present_costs(
+                                        edge_indices
+                                    )
 
                                 self.net_paths[net_id] = path
 
@@ -5170,8 +5227,10 @@ class PathFinderRouter:
                     )
                 edge_indices = self._path_to_edges(path)
                 self.accounting.commit_path(edge_indices)  # bumps present for next iteration
-                # NOTE: Do NOT update costs here! PathFinder requires fixed costs per iteration.
-                # Costs are updated ONCE per iteration in _pathfinder_negotiation()
+                if live_present_costs:
+                    self.accounting.refresh_live_present_costs(
+                        edge_indices
+                    )
 
                 self.net_paths[net_id] = path
 
