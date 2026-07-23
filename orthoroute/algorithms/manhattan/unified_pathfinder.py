@@ -6427,6 +6427,15 @@ class PathFinderRouter:
             self._last_reroute_iter[nid] = self.iteration
 
         hotset = set(hotset_with_cooldown)
+        physical_offenders = set(getattr(
+            self, "_barrel_conflict_nets", ()
+        ))
+        # The adaptive cap is for ordinary edge congestion. A physical
+        # barrel or node collision is an electrical short and every net
+        # participating in one must remain eligible immediately; limiting
+        # these to 100 nets made large boards improve only a tiny fixed
+        # amount per iteration.
+        hotset.update(physical_offenders)
 
         unique_frac = len(hotset - getattr(self, '_prev_hotset', set())) / max(1, len(hotset))
         self._prev_hotset = hotset.copy()
