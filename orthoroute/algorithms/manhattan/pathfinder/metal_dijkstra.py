@@ -274,6 +274,8 @@ class MetalDijkstra:
         CAP = min(self.N, 4_000_000)
         params = mx.array(np.array([self.K, self.E, CAP], dtype=np.uint32))
         frontier = mx.array(np.unique(seed_nodes).astype(np.uint32))
+        target_mx = (mx.array(target_nodes.astype(np.int64))
+                     if target_nodes is not None and len(target_nodes) else None)
 
         for _ in range(self.N):
             F = frontier.shape[0]
@@ -294,6 +296,15 @@ class MetalDijkstra:
             takes = min(count, CAP)
             frontier = mx.array(
                 np.unique(np.array(next_f[:takes], dtype=np.uint32)))
+
+            # Dijkstra bound early-exit: uint32 dist encodings are monotonic,
+            # so once every target's encoding is <= the frontier's best,
+            # no future relaxation (costs >= 0) can improve any target.
+            if target_mx is not None:
+                t_best = int(mx.max(dist_enc[target_mx]))
+                f_best = int(mx.min(dist_enc[frontier.astype(mx.int64)]))
+                if t_best <= f_best and t_best != INF_ENC:
+                    break
 
         dist_np = np.array(dist_enc, dtype=np.uint32).view(np.float32)
 
