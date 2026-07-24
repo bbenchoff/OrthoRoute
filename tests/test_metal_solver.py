@@ -32,7 +32,8 @@ def solvers():
     costs = np.asarray(g.base_costs, dtype=np.float32)
     cpu = SimpleDijkstra(g, lattice=lat)
     gpu = MetalDijkstra(indptr, indices, lat.num_nodes,
-                        plane_size=lat.x_steps * lat.y_steps)
+                        plane_size=lat.x_steps * lat.y_steps,
+                        min_roi_nodes=0)  # force Metal on this tiny graph
     return lat, g, indptr, indices, costs, cpu, gpu
 
 
