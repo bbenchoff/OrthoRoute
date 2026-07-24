@@ -1035,6 +1035,16 @@ def test_history_hotset_cap_scales_with_live_overuse():
     assert cap(129) == 100
 
 
+def test_stagnation_rip_waits_for_spatial_via_tail():
+    should_rip = PathFinderRouter._should_rip_for_stagnation
+
+    assert should_rip(0)
+    assert should_rip(8)
+    assert not should_rip(9)
+    assert not should_rip(359)
+    assert should_rip(0, tail_threshold=-1)
+
+
 def test_physical_offenders_wait_for_via_pool_cleanup(routed):
     pf, _, _, _ = routed
     path = pf.net_paths["TEST_NET"]
