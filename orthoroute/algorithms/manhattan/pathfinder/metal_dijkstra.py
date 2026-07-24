@@ -141,6 +141,64 @@ class MetalDijkstra:
         self.in_eid = mx.array(in_eid)
         self.E = E
 
+        # OUT-neighbor padded tables (uint32, flat) for the frontier scatter
+        # kernel: threads relax the outgoing edges of frontier nodes only,
+        # so per-round work is O(frontier * K), not O(N * K) like the dense
+        # path. Padded slots: eid == E sentinel (skipped in-kernel).
+        out_nbr = np.zeros((self.N, self.K), dtype=np.uint32)
+        out_eid = np.full((self.N, self.K), E, dtype=np.uint32)
+        for k in range(self.K):
+            has_k = degrees > k
+            rows = np.nonzero(has_k)[0]
+            pos = indptr[:-1][has_k] + k
+            out_nbr[rows, k] = indices[pos]
+            out_eid[rows, k] = pos
+        self.out_nbr = mx.array(out_nbr.reshape(-1))
+        self.out_eid = mx.array(out_eid.reshape(-1))
+        self._zero_penalty = mx.zeros((self.N,), dtype=mx.float32)
+
+        # Frontier relax kernel. Distances are uint32-encoded float bits
+        # (monotonic for non-negative floats) and INVERTED (UINT_MAX - bits)
+        # so a single init_value=0 works for all atomic outputs: relaxation
+        # is atomic_fetch_max on inverted encodings == min on distances,
+        # and the frontier count naturally starts at 0.
+        self._relax_kernel = mx.fast.metal_kernel(
+            name="orthoroute_frontier_relax",
+            input_names=["dist", "frontier", "out_nbr", "out_eid",
+                         "costs", "penalty", "params"],
+            output_names=["new_dist_inv", "next_frontier", "next_count"],
+            source="""
+    uint tid = thread_position_in_grid.x;
+    uint K = params[0];
+    uint E_PAD = params[1];
+    uint CAP = params[2];
+    uint F = frontier_shape[0];
+    if (tid >= F * K) return;
+    uint f = frontier[tid / K];
+    uint slot = f * K + (tid % K);
+    uint eid = out_eid[slot];
+    if (eid == E_PAD) return;
+    uint v = out_nbr[slot];
+    float du = as_type<float>(dist[f]);
+    float cand = du + costs[eid] + penalty[v];
+    if (!(cand < INFINITY)) return;
+    uint enc = as_type<uint>(cand);
+    if (enc >= dist[v]) return;  // not an improvement on current state
+    uint inv = 0xFFFFFFFFu - enc;
+    uint old = atomic_fetch_max_explicit(&new_dist_inv[v], inv,
+                                         memory_order_relaxed);
+    if (inv > old) {
+        uint pos = atomic_fetch_add_explicit(&next_count[0], 1u,
+                                             memory_order_relaxed);
+        if (pos < CAP) {
+            atomic_store_explicit(&next_frontier[pos], v,
+                                  memory_order_relaxed);
+        }
+    }
+""",
+            atomic_outputs=True,
+        )
+
         # Cost cache: rebuilt only when the (in-place mutated) cost array's
         # cheap fingerprint changes.
         self._cost_fp = None
@@ -200,37 +258,63 @@ class MetalDijkstra:
             extra_np[~allowed_np] = np.inf
         extra = mx.array(extra_np)[:, None] if extra_np.any() else None
 
-        dist = mx.full((self.N,), np.float32(np.inf), dtype=mx.float32)
-        parent = mx.full((self.N,), -1, dtype=mx.int32)
-        seeds = mx.array(seed_nodes.astype(np.int64))
-        dist = dist.at[seeds].minimum(mx.array(seed_costs.astype(np.float32)))
-        mx.eval(dist)
+        # Penalty vector for the kernel: arrival penalty, +inf outside ROI
+        penalty_full = mx.array(extra_np) if extra is not None else self._zero_penalty
 
-        # Dense gather relaxation, fully GPU-resident. Host sync only every
-        # CHECK_EVERY rounds for the fixpoint test.
-        CHECK_EVERY = 8
-        checkpoint = dist
-        for rnd in range(1, self.N + 1):
-            gathered = dist[self.in_nbr] + cost_gpu[self.in_eid]  # (N, K)
-            if extra is not None:
-                gathered = gathered + extra  # arrival penalty / ROI wall
-            best = mx.min(gathered, axis=1)
-            best_k = mx.argmin(gathered, axis=1)
-            improved = best < dist
-            new_parent = mx.take_along_axis(
-                self.in_nbr, best_k[:, None].astype(mx.int64), axis=1
-            ).squeeze(1).astype(mx.int32)
-            parent = mx.where(improved, new_parent, parent)
-            dist = mx.where(improved, best, dist)
+        # Frontier scatter loop: per-round work is O(frontier * K). The
+        # kernel atomically maxes INVERTED uint32-encoded distances (== min
+        # on real distances) so init_value=0 serves all three outputs.
+        INF_ENC = int(np.float32(np.inf).view(np.uint32))
+        dist_np32 = np.full(self.N, INF_ENC, dtype=np.uint32)
+        dist_np32[seed_nodes] = np.minimum(
+            dist_np32[seed_nodes],
+            seed_costs.astype(np.float32).view(np.uint32))
+        dist_enc = mx.array(dist_np32)
 
-            if rnd % CHECK_EVERY == 0:
-                mx.eval(dist, parent)
-                if bool(mx.all(dist == checkpoint)):  # no change in window
-                    break
-                checkpoint = dist
+        CAP = min(self.N, 4_000_000)
+        params = mx.array(np.array([self.K, self.E, CAP], dtype=np.uint32))
+        frontier = mx.array(np.unique(seed_nodes).astype(np.uint32))
 
-        dist_np = np.array(dist, dtype=np.float32)
+        for _ in range(self.N):
+            F = frontier.shape[0]
+            new_inv, next_f, next_c = self._relax_kernel(
+                inputs=[dist_enc, frontier, self.out_nbr, self.out_eid,
+                        cost_gpu, penalty_full, params],
+                grid=(F * self.K, 1, 1),
+                threadgroup=(min(256, F * self.K), 1, 1),
+                output_shapes=[(self.N,), (CAP,), (1,)],
+                output_dtypes=[mx.uint32, mx.uint32, mx.uint32],
+                init_value=0,
+            )
+            dist_enc = mx.minimum(dist_enc,
+                                  mx.array(np.uint32(0xFFFFFFFF)) - new_inv)
+            count = int(next_c[0])  # the one host sync per round
+            if count == 0:
+                break
+            takes = min(count, CAP)
+            frontier = mx.array(
+                np.unique(np.array(next_f[:takes], dtype=np.uint32)))
+
+        dist_np = np.array(dist_enc, dtype=np.uint32).view(np.float32)
+
+        # Race-free parent resolution: ONE dense in-table pass against the
+        # final distances (same float op order as the kernel, so equality
+        # is bitwise-safe). Seeds keep parent -1.
+        dist = mx.array(dist_np)
+        gathered = dist[self.in_nbr] + cost_gpu[self.in_eid]
+        if extra is not None:
+            gathered = gathered + extra
+        best = mx.min(gathered, axis=1)
+        best_k = mx.argmin(gathered, axis=1)
+        cand_parent = mx.take_along_axis(
+            self.in_nbr, best_k[:, None].astype(mx.int64), axis=1
+        ).squeeze(1).astype(mx.int32)
+        parent = mx.where(best == dist, cand_parent,
+                          mx.full((self.N,), -1, dtype=mx.int32))
+        mx.eval(parent)
         parent_np = np.array(parent, dtype=np.int64)
+        parent_np[seed_nodes] = -1  # seeds are roots even on cost ties
+
         return dist_np, parent_np
 
     # ------------------------------------------------------------------ #
