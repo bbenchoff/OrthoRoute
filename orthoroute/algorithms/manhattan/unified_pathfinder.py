@@ -6988,8 +6988,13 @@ class PathFinderRouter:
                     logger.info(f"[HYBRID] Net {net_id}: SHORT ({manhattan_dist} steps) → ROI ({len(roi_nodes):,} nodes)")
             else:
                 # LONG NET: Use full graph (board-spanning)
-                roi_nodes = np.arange(self.N, dtype=np.int32)
-                global_to_roi = np.arange(self.N, dtype=np.int32)
+                # Cached identity arrays: rebuilding these per long net cost
+                # two 32MB allocations each on an 8M-node monster graph.
+                if getattr(self, '_full_roi_cache', None) is None or \
+                        len(self._full_roi_cache) != self.N:
+                    self._full_roi_cache = np.arange(self.N, dtype=np.int32)
+                roi_nodes = self._full_roi_cache
+                global_to_roi = self._full_roi_cache
 
                 if idx % 100 == 0:
                     logger.info(f"[HYBRID] Net {net_id}: LONG ({manhattan_dist} steps) → FULL GRAPH ({self.N:,} nodes)")
