@@ -664,7 +664,7 @@ def test_portal_cleanup_moves_nonconflicting_high_impact_peers():
         already_active=False,
         edge_threshold=3,
     )
-    assert PathFinderRouter._should_run_one_sided_cleanup(
+    assert not PathFinderRouter._should_run_one_sided_cleanup(
         physical_conflicts=5,
         overused_edges=3,
         already_active=True,
@@ -968,6 +968,107 @@ def test_physical_offenders_bypass_edge_hotset_cap(routed):
         pf._prev_hotset = old_hotset
 
 
+def test_physical_offenders_wait_for_graph_cleanup(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    physical = {f"PHYSICAL_{index}" for index in range(10)}
+    tasks = {
+        net_id: (path[0], path[-1])
+        for net_id in physical
+    }
+    edge = pf._net_to_edges["TEST_NET"][0]
+    old_present = pf.accounting.present[edge]
+    old_threshold = pf.config.portal_cleanup_edge_threshold
+    old_physical = getattr(pf, "_barrel_conflict_nets", set())
+    old_clean = dict(getattr(pf, "_net_clean_iters", {}))
+    old_reroute = dict(getattr(pf, "_last_reroute_iter", {}))
+    old_hotset = set(getattr(pf, "_prev_hotset", set()))
+    old_paths = {
+        net_id: pf.net_paths.get(net_id)
+        for net_id in physical
+    }
+    try:
+        pf.accounting.present[edge] = (
+            pf.accounting.capacity[edge] + 4
+        )
+        pf.config.portal_cleanup_edge_threshold = 3
+        pf._barrel_conflict_nets = physical
+        for net_id in physical:
+            pf.net_paths[net_id] = path
+
+        hotset = pf._build_hotset(tasks)
+
+        assert physical.isdisjoint(hotset)
+    finally:
+        pf.accounting.present[edge] = old_present
+        pf.config.portal_cleanup_edge_threshold = old_threshold
+        pf._barrel_conflict_nets = old_physical
+        pf._net_clean_iters = old_clean
+        pf._last_reroute_iter = old_reroute
+        pf._prev_hotset = old_hotset
+        for net_id, old_path in old_paths.items():
+            if old_path is None:
+                pf.net_paths.pop(net_id, None)
+            else:
+                pf.net_paths[net_id] = old_path
+
+
+def test_physical_cleanup_pauses_when_graph_reopens():
+    should_cleanup = PathFinderRouter._should_run_one_sided_cleanup
+
+    assert should_cleanup(1, 3, False, 3)
+    assert should_cleanup(1, 3, True, 3)
+    assert not should_cleanup(1, 1, False, 3, overuse_total=4)
+    assert not should_cleanup(1, 4, True, 3)
+    assert not should_cleanup(0, 0, True, 3)
+
+
+def test_history_hotset_cap_scales_with_live_overuse():
+    cap = PathFinderRouter._history_hotset_cap
+
+    assert cap(0) == 16
+    assert cap(8) == 16
+    assert cap(9) == 32
+    assert cap(32) == 32
+    assert cap(33) == 64
+    assert cap(128) == 64
+    assert cap(129) == 100
+
+
+def test_physical_offenders_wait_for_via_pool_cleanup(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    physical = {f"PHYSICAL_{index}" for index in range(4)}
+    tasks = {
+        net_id: (path[0], path[-1])
+        for net_id in physical
+    }
+    old_physical = getattr(pf, "_barrel_conflict_nets", set())
+    old_paths = {
+        net_id: pf.net_paths.get(net_id)
+        for net_id in physical
+    }
+    old_use = int(pf.via_col_use[0, 0])
+    old_capacity = int(pf.via_col_cap[0, 0])
+    try:
+        pf._barrel_conflict_nets = physical
+        for net_id in physical:
+            pf.net_paths[net_id] = [path[0], path[0]]
+        pf.via_col_use[0, 0] = old_capacity + 4
+
+        hotset = pf._build_hotset(tasks)
+
+        assert physical.isdisjoint(hotset)
+    finally:
+        pf.via_col_use[0, 0] = old_use
+        pf._barrel_conflict_nets = old_physical
+        for net_id, old_path in old_paths.items():
+            if old_path is None:
+                pf.net_paths.pop(net_id, None)
+            else:
+                pf.net_paths[net_id] = old_path
+
+
 def test_physical_offenders_stay_hot_when_edges_are_clean(routed):
     pf, _, _, _ = routed
     path = pf.net_paths["TEST_NET"]
@@ -1082,6 +1183,73 @@ def test_via_pool_overuse_selects_its_nets(routed):
         assert "TEST_NET" in hotset
     finally:
         pf.via_col_cap[x_idx, y_idx] = old_capacity
+
+
+def test_via_pool_reroutes_only_one_stable_peer(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    via_hop = next(
+        (u, v)
+        for u, v in zip(path, path[1:])
+        if pf.lattice.idx_to_coord(u)[:2]
+        == pf.lattice.idx_to_coord(v)[:2]
+        and pf.lattice.idx_to_coord(u)[2]
+        != pf.lattice.idx_to_coord(v)[2]
+    )
+    x_idx, y_idx, _ = pf.lattice.idx_to_coord(via_hop[0])
+    old_capacity = int(pf.via_col_cap[x_idx, y_idx])
+    old_peer_path = pf.net_paths.get("PEER_NET")
+    old_keepers = dict(getattr(pf, "_via_pool_keepers", {}))
+    old_member_state = dict(getattr(
+        pf, "_via_pool_member_state", {}
+    ))
+    old_stagnation = dict(getattr(
+        pf, "_via_pool_keeper_stagnation", {}
+    ))
+    had_rotation_threshold = hasattr(
+        pf.config, "via_keeper_rotation_overuse_threshold"
+    )
+    old_rotation_threshold = getattr(
+        pf.config, "via_keeper_rotation_overuse_threshold", 8
+    )
+    try:
+        pf.net_paths["PEER_NET"] = list(path)
+        pf.via_col_cap[x_idx, y_idx] = 1
+        pf._rebuild_via_usage_from_committed()
+
+        first = pf._find_via_pool_offenders()
+        second = pf._find_via_pool_offenders()
+        rotated = pf._find_via_pool_offenders()
+
+        peers = {"TEST_NET", "PEER_NET"}
+        assert len(first & peers) == 1
+        assert second & peers == first & peers
+        assert rotated & peers == peers - (first & peers)
+
+        pf._via_pool_keepers = {}
+        pf._via_pool_member_state = {}
+        pf._via_pool_keeper_stagnation = {}
+        pf.config.via_keeper_rotation_overuse_threshold = 0
+        broad_first = pf._find_via_pool_offenders()
+        pf._find_via_pool_offenders()
+        broad_third = pf._find_via_pool_offenders()
+        assert broad_third & peers == broad_first & peers
+    finally:
+        pf.via_col_cap[x_idx, y_idx] = old_capacity
+        if old_peer_path is None:
+            pf.net_paths.pop("PEER_NET", None)
+        else:
+            pf.net_paths["PEER_NET"] = old_peer_path
+        pf._via_pool_keepers = old_keepers
+        pf._via_pool_member_state = old_member_state
+        pf._via_pool_keeper_stagnation = old_stagnation
+        if had_rotation_threshold:
+            pf.config.via_keeper_rotation_overuse_threshold = (
+                old_rotation_threshold
+            )
+        else:
+            del pf.config.via_keeper_rotation_overuse_threshold
+        pf._rebuild_via_usage_from_committed()
 
 
 def test_path_respects_hv_discipline(routed):
