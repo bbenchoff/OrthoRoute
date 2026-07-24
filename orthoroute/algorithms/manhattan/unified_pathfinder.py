@@ -695,6 +695,8 @@ class PathFinderConfig:
     # destroys the best-known solution. Process the worst physical offenders
     # in bounded waves; boards at or below this size remain unchanged.
     physical_hotset_cap: int = 1024
+    physical_hotset_min: int = 64
+    physical_conflicts_per_hotset_net: float = 50.0
     allowed_via_spans: Optional[Set[Tuple[int, int]]] = None  # None = all layer pairs allowed (blind/buried)
 
 
@@ -7401,8 +7403,19 @@ class PathFinderRouter:
     def _select_physical_hotset(self) -> Set[str]:
         """Return a bounded, severity-ranked physical-conflict wave."""
         offenders = set(getattr(self, "_barrel_conflict_nets", ()))
-        cap = max(
-            1, int(getattr(self.config, "physical_hotset_cap", 1024))
+        cap = self._physical_hotset_limit(
+            int(getattr(self, "_last_barrel_conflict_count", 0)),
+            max_cap=int(getattr(
+                self.config, "physical_hotset_cap", 1024
+            )),
+            min_cap=int(getattr(
+                self.config, "physical_hotset_min", 64
+            )),
+            conflicts_per_net=float(getattr(
+                self.config,
+                "physical_conflicts_per_hotset_net",
+                50.0,
+            )),
         )
         if len(offenders) <= cap:
             return offenders
@@ -7424,6 +7437,20 @@ class PathFinderRouter:
             int(scores.get(ranked[cap - 1], 0)),
         )
         return selected
+
+    @staticmethod
+    def _physical_hotset_limit(
+        conflict_count: int,
+        max_cap: int = 1024,
+        min_cap: int = 64,
+        conflicts_per_net: float = 50.0,
+    ) -> int:
+        """Shrink physical waves with the remaining conflict severity."""
+        maximum = max(1, int(max_cap))
+        minimum = min(maximum, max(1, int(min_cap)))
+        scale = max(1.0, float(conflicts_per_net))
+        severity_cap = int(np.ceil(max(0, conflict_count) / scale))
+        return min(maximum, max(minimum, severity_cap))
 
     def _build_hotset(self, tasks: Dict[str, Tuple[int, int]], ripped: Optional[Set[str]] = None) -> Set[str]:
         """

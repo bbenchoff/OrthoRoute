@@ -1064,6 +1064,20 @@ def test_large_physical_drop_marks_cleanup_stage():
     assert not detected(100, 101)
 
 
+def test_physical_hotset_limit_scales_with_remaining_conflicts():
+    limit = PathFinderRouter._physical_hotset_limit
+
+    assert limit(0) == 64
+    assert limit(3200) == 64
+    assert limit(3201) == 65
+    assert limit(26844) == 537
+    assert limit(49566) == 992
+    assert limit(52696) == 1024
+    assert limit(100000) == 1024
+    assert limit(100000, max_cap=512) == 512
+    assert limit(0, max_cap=32, min_cap=64) == 32
+
+
 def test_physical_offenders_wait_for_via_pool_cleanup(routed):
     pf, _, _, _ = routed
     path = pf.net_paths["TEST_NET"]
