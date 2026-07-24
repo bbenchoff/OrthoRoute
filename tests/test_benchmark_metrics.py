@@ -151,6 +151,7 @@ def test_metrics_reject_barrel_conflicts():
         iteration=2,
         _excluded_nets=set(),
         _last_barrel_conflict_count=3,
+        _last_path_node_conflict_count=1,
         _last_portal_grid_conflict_count=2,
     )
 
@@ -158,4 +159,30 @@ def test_metrics_reject_barrel_conflicts():
 
     assert metrics["completion"]["complete"] is False
     assert metrics["convergence"]["barrel_conflicts"] == 3
+    assert metrics["convergence"]["path_node_conflicts"] == 1
     assert metrics["convergence"]["portal_grid_conflicts"] == 2
+
+
+def test_metrics_reject_shared_path_nodes_independently():
+    board = SimpleNamespace(
+        name="crossed",
+        layer_count=2,
+        nets=[_net("ROUTED", 2)],
+    )
+    router = SimpleNamespace(
+        lattice=SimpleNamespace(
+            x_steps=2, y_steps=2, layers=2,
+            num_nodes=8, pitch=0.4,
+        ),
+        net_paths={"ROUTED": [0, 1]},
+        accounting=_Accounting(),
+        iteration=2,
+        _excluded_nets=set(),
+        _last_barrel_conflict_count=0,
+        _last_path_node_conflict_count=1,
+    )
+
+    metrics = collect_route_metrics(router, board)
+
+    assert metrics["completion"]["complete"] is False
+    assert metrics["convergence"]["path_node_conflicts"] == 1
