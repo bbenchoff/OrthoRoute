@@ -594,8 +594,9 @@ def test_portal_cleanup_freezes_position_and_entry_depth(routed):
 def test_portal_cleanup_moves_nonconflicting_high_impact_peers():
     assert PathFinderRouter._should_run_one_sided_cleanup(
         physical_conflicts=5,
-        overused_edges=0,
+        overused_edges=3,
         already_active=False,
+        edge_threshold=3,
     )
     assert PathFinderRouter._should_run_one_sided_cleanup(
         physical_conflicts=5,
@@ -604,8 +605,9 @@ def test_portal_cleanup_moves_nonconflicting_high_impact_peers():
     )
     assert not PathFinderRouter._should_run_one_sided_cleanup(
         physical_conflicts=5,
-        overused_edges=3,
+        overused_edges=4,
         already_active=False,
+        edge_threshold=3,
     )
 
     pairs = {
@@ -614,7 +616,11 @@ def test_portal_cleanup_moves_nonconflicting_high_impact_peers():
         (("Y", "PAD-Y", 5, 6), "X", "via"),
     }
 
-    movable = PathFinderRouter._portal_cleanup_movable_components(
+    router = UnifiedPathFinder(
+        config=PathFinderConfig(),
+        use_gpu=False,
+    )
+    movable = router._portal_cleanup_movable_components(
         pairs,
         {
             (("C", "PAD-C"), ("D", "PAD-D")),
@@ -642,6 +648,23 @@ def test_portal_cleanup_moves_nonconflicting_high_impact_peers():
     all_pairs.update({("D", "E"), ("R", "S")})
     assert not any(
         first in movable and second in movable
+        for first, second in all_pairs
+    )
+
+    next_movable = router._portal_cleanup_movable_components(
+        pairs,
+        {
+            (("C", "PAD-C"), ("D", "PAD-D")),
+            (("Q", "PAD-Q"), ("P", "PAD-P")),
+        },
+        {
+            ("D", "E"),
+            ("R", "S"),
+        },
+    )
+    assert next_movable == {"A", "C", "E", "Q", "S", "Y"}
+    assert not any(
+        first in next_movable and second in next_movable
         for first, second in all_pairs
     )
 

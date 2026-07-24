@@ -654,6 +654,7 @@ class PathFinderConfig:
     portal_cleanup_edge_penalty: float = 1_000_000.0
     portal_cleanup_node_penalty: float = 1_000_000.0
     portal_cleanup_escape_penalty: float = 1_000_000.0
+    portal_cleanup_edge_threshold: int = 3
 
     stagnation_patience: int = 5
     use_gpu: bool = True  # GPU algorithm fixed, validation will catch ROI construction issues
@@ -2448,6 +2449,7 @@ class PathFinderRouter:
         self._escape_reserved_spatial = defaultdict(set)
         self._escape_bucket_mm = 1.0
         self._portal_barrel_history = defaultdict(float)
+        self._portal_cleanup_move_counts = defaultdict(int)
 
         # Pad escape planner (initialized after lattice is created)
         self.escape_planner: Optional[PadEscapePlanner] = None
@@ -5791,6 +5793,11 @@ class PathFinderRouter:
                 barrel_conflicts,
                 over_cnt,
                 getattr(self, "_freeze_selected_portals", False),
+                int(getattr(
+                    cfg,
+                    "portal_cleanup_edge_threshold",
+                    3,
+                )),
             ):
                 entering_cleanup = not getattr(
                     self, "_freeze_selected_portals", False
@@ -5855,6 +5862,7 @@ class PathFinderRouter:
             elif barrel_conflicts == 0:
                 self._freeze_selected_portals = False
                 self._portal_cleanup_movable_nets = set()
+                self._portal_cleanup_move_counts.clear()
             elif (
                 escape_conflicts > 0
                 and not getattr(
@@ -8156,16 +8164,19 @@ class PathFinderRouter:
         physical_conflicts: int,
         overused_edges: int,
         already_active: bool,
+        edge_threshold: int = 0,
     ) -> bool:
-        """Enter after ordinary edges settle; spatial pool tails may remain."""
+        """Enter after ordinary edges nearly settle; small tails run alongside."""
         return (
             physical_conflicts > 0
-            and (already_active or overused_edges == 0)
+            and (
+                already_active
+                or overused_edges <= max(0, int(edge_threshold))
+            )
         )
 
-    @staticmethod
     def _portal_cleanup_movable_components(
-        portal_grid_pairs, escape_pairs=(), exact_pairs=()
+        self, portal_grid_pairs, escape_pairs=(), exact_pairs=()
     ) -> Set[str]:
         """Choose a deterministic independent set of physical-conflict nets.
 
@@ -8173,8 +8184,9 @@ class PathFinderRouter:
         most shorts and simply migrates them. Rerouting only one peer makes a
         connector-sized component progress serially. A greedy maximal
         independent set gives a broad wave in which no two current conflict
-        peers can move together. Prefer high-degree nets to repair as many
-        reports as possible per wave.
+        peers can move together. Prefer the least-tried endpoint first, then
+        high-degree nets, so a stable pair alternates sides instead of starving
+        one endpoint forever.
         """
         adjacency = defaultdict(set)
         for identity, victim, _kind in portal_grid_pairs:
@@ -8202,6 +8214,7 @@ class PathFinderRouter:
             net_name = min(
                 eligible,
                 key=lambda candidate: (
+                    self._portal_cleanup_move_counts[candidate],
                     -len(adjacency[candidate]),
                     candidate,
                 ),
@@ -8209,6 +8222,8 @@ class PathFinderRouter:
             movable.add(net_name)
             eligible.discard(net_name)
             eligible.difference_update(adjacency[net_name])
+        for net_name in movable:
+            self._portal_cleanup_move_counts[net_name] += 1
         return movable
 
     def _portal_cleanup_foreign_edges(
