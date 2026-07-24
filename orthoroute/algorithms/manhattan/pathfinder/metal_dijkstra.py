@@ -97,9 +97,12 @@ class MetalDijkstra:
     """
 
     def __init__(self, indptr: np.ndarray, indices: np.ndarray, num_nodes: int,
-                 plane_size: Optional[int] = None):
+                 plane_size: Optional[int] = None,
+                 min_roi_nodes: Optional[int] = None):
         if not METAL_AVAILABLE:
             raise RuntimeError("MLX Metal GPU not available")
+        if min_roi_nodes is not None:
+            self.MIN_ROI_NODES = min_roi_nodes
 
         self.N = int(num_nodes)
         self.plane_size = plane_size
@@ -109,21 +112,33 @@ class MetalDijkstra:
         degrees = np.diff(indptr)
         self.K = int(degrees.max()) if len(degrees) else 0
 
-        # Dense padded tables: nbr[n, k] = neighbor node, eid[n, k] = CSR edge
-        # index (for cost lookup). Padded slots: nbr=self-loop 0, eid=E
-        # (one extra cost slot pinned to +inf).
+        # Dense padded INCOMING-neighbor tables: in_nbr[v, k] = source node u
+        # of the k-th edge ARRIVING at v, in_eid[v, k] = that edge's CSR
+        # index (for cost lookup). Relaxation is then pure gather:
+        #   dist'[v] = min(dist[v], min_k(dist[in_nbr[v,k]] + cost[in_eid[v,k]]))
+        # No scatter, no per-round host sync, and the winning parent is just
+        # in_nbr[v, argmin_k] - the Metal translation of the CUDA backend's
+        # GPU-resident frontier/backtrace design. Padded slots: nbr=0,
+        # eid=E (one extra cost slot pinned to +inf).
         E = len(indices)
-        nbr = np.zeros((self.N, self.K), dtype=np.int64)
-        eid = np.full((self.N, self.K), E, dtype=np.int64)
+        edge_src = np.repeat(np.arange(self.N, dtype=np.int64), degrees)
+        order = np.argsort(indices, kind="stable")
+        dst_sorted = indices[order]
+        in_degrees = np.bincount(dst_sorted, minlength=self.N)
+        self.K = int(max(self.K, in_degrees.max())) if len(in_degrees) else self.K
+        in_start = np.zeros(self.N + 1, dtype=np.int64)
+        np.cumsum(in_degrees, out=in_start[1:])
+        in_nbr = np.zeros((self.N, self.K), dtype=np.int64)
+        in_eid = np.full((self.N, self.K), E, dtype=np.int64)
         for k in range(self.K):
-            has_k = degrees > k
+            has_k = in_degrees > k
             rows = np.nonzero(has_k)[0]
-            pos = indptr[:-1][has_k] + k
-            nbr[rows, k] = indices[pos]
-            eid[rows, k] = pos
+            pos = in_start[:-1][has_k] + k
+            in_nbr[rows, k] = edge_src[order[pos]]
+            in_eid[rows, k] = order[pos]
 
-        self.nbr = mx.array(nbr)
-        self.eid = mx.array(eid)
+        self.in_nbr = mx.array(in_nbr)
+        self.in_eid = mx.array(in_eid)
         self.E = E
 
         # Cost cache: rebuilt only when the (in-place mutated) cost array's
@@ -145,10 +160,19 @@ class MetalDijkstra:
             self._cost_mx = mx.array(np.append(c, _INF))
         return self._cost_mx
 
+    # Below this ROI size the CPU heap Dijkstra wins: dense GPU relaxation
+    # does O(N*K) work per round regardless of wave width, which only pays
+    # off on big solves (same tradeoff as the CUDA backend's
+    # gpu_roi_min_nodes threshold).
+    MIN_ROI_NODES = 150_000
+
     def _run_sssp(self, seed_nodes: np.ndarray, seed_costs: np.ndarray,
                   costs, roi_nodes, node_penalty,
                   target_nodes: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Fixpoint frontier relaxation. Returns (dist_f32[N], parent_i64[N])."""
+        """Fixpoint dense relaxation. Returns (dist_f32[N], parent_i64[N])."""
+        roi_size = len(roi_nodes) if roi_nodes is not None else self.N
+        if roi_size < self.MIN_ROI_NODES:
+            return None  # CPU fallback handles small solves faster
         cost_gpu = self._costs_to_gpu(costs)
 
         # ROI mask over N (True = routable). None -> everything allowed.
@@ -166,64 +190,47 @@ class MetalDijkstra:
             if node_penalty is not None:
                 pen_np = np.asarray(node_penalty, dtype=np.float32)
 
-        allowed = mx.array(allowed_np) if allowed_np is not None else None
-        penalty = mx.array(pen_np) if pen_np is not None else None
+        INF = mx.array(np.float32(np.inf))
+        # Per-node arrival penalty and ROI restriction folded into a single
+        # additive vector: +inf outside the ROI kills those candidates.
+        extra_np = np.zeros(self.N, dtype=np.float32)
+        if pen_np is not None:
+            extra_np += pen_np
+        if allowed_np is not None:
+            extra_np[~allowed_np] = np.inf
+        extra = mx.array(extra_np)[:, None] if extra_np.any() else None
 
-        # Two-phase relaxation (MLX GPU scatter has no int64 support, so no
-        # packed dist|parent keys): phase 1 scatter-mins float32 distances,
-        # phase 2 scatters parents for candidates that achieved the new
-        # distance, resolving equal-cost ties to the MINIMUM source id -
-        # deterministic and always a valid shortest-path tree edge.
-        NO_PARENT = np.uint32(0xFFFFFFFF)
         dist = mx.full((self.N,), np.float32(np.inf), dtype=mx.float32)
-        parent = mx.full((self.N,), NO_PARENT, dtype=mx.uint32)
-
+        parent = mx.full((self.N,), -1, dtype=mx.int32)
         seeds = mx.array(seed_nodes.astype(np.int64))
         dist = dist.at[seeds].minimum(mx.array(seed_costs.astype(np.float32)))
         mx.eval(dist)
 
-        frontier = seeds
-        for _ in range(self.N):  # fixpoint exit fires far earlier
-            f_nbr = self.nbr[frontier]          # (F, K) neighbor node ids
-            f_eid = self.eid[frontier]          # (F, K) CSR edge ids
-            f_dist = dist[frontier]
+        # Dense gather relaxation, fully GPU-resident. Host sync only every
+        # CHECK_EVERY rounds for the fixpoint test.
+        CHECK_EVERY = 8
+        checkpoint = dist
+        for rnd in range(1, self.N + 1):
+            gathered = dist[self.in_nbr] + cost_gpu[self.in_eid]  # (N, K)
+            if extra is not None:
+                gathered = gathered + extra  # arrival penalty / ROI wall
+            best = mx.min(gathered, axis=1)
+            best_k = mx.argmin(gathered, axis=1)
+            improved = best < dist
+            new_parent = mx.take_along_axis(
+                self.in_nbr, best_k[:, None].astype(mx.int64), axis=1
+            ).squeeze(1).astype(mx.int32)
+            parent = mx.where(improved, new_parent, parent)
+            dist = mx.where(improved, best, dist)
 
-            w = cost_gpu[f_eid]                 # +inf on padded slots
-            if penalty is not None:
-                w = w + penalty[f_nbr]
-            cand = f_dist[:, None] + w
-            if allowed is not None:
-                cand = mx.where(allowed[f_nbr], cand, mx.array(np.float32(np.inf)))
-
-            flat_nbr = f_nbr.reshape(-1)
-            flat_cand = cand.reshape(-1)
-
-            new_dist = dist.at[flat_nbr].minimum(flat_cand)
-
-            # Parent phase: candidates that achieved the (bitwise-equal) new
-            # distance write their source id; min() resolves ties.
-            achieved = flat_cand == new_dist[flat_nbr]
-            src_ids = mx.broadcast_to(
-                frontier[:, None].astype(mx.uint32), f_nbr.shape).reshape(-1)
-            parent_cand = mx.where(achieved, src_ids, mx.array(NO_PARENT))
-            improved_nodes = new_dist < dist
-            # Only rewrite parents of nodes whose dist improved this round
-            keep_old = mx.where(improved_nodes, mx.array(NO_PARENT),
-                                parent)  # improved -> forget old parent
-            parent = mx.minimum(keep_old, mx.full((self.N,), NO_PARENT, dtype=mx.uint32))
-            parent = parent.at[flat_nbr].minimum(
-                mx.where(improved_nodes[flat_nbr], parent_cand, mx.array(NO_PARENT)))
-
-            changed = new_dist < dist
-            dist = new_dist
-            frontier = mx.array(np.nonzero(np.array(changed))[0].astype(np.int64))
-            mx.eval(dist, parent, frontier)
-            if frontier.size == 0:
-                break
+            if rnd % CHECK_EVERY == 0:
+                mx.eval(dist, parent)
+                if bool(mx.all(dist == checkpoint)):  # no change in window
+                    break
+                checkpoint = dist
 
         dist_np = np.array(dist, dtype=np.float32)
         parent_np = np.array(parent, dtype=np.int64)
-        parent_np[parent_np == int(NO_PARENT)] = -1
         return dist_np, parent_np
 
     # ------------------------------------------------------------------ #
