@@ -637,6 +637,7 @@ class PathFinderConfig:
     portal_enabled: bool = True
     portal_delta_min: int = 3      # Min vertical offset (1.2mm @ 0.4mm pitch)
     portal_delta_max: int = 12     # Max vertical offset (4.8mm)
+    portal_candidate_delta_min: int = 1
     portal_delta_pref: int = 6     # Preferred offset (2.4mm)
     portal_x_snap_max: float = 0.5  # Max x-snap in steps (½ pitch)
     portal_via_discount: float = 0.15  # Escape via multiplier (85% discount)

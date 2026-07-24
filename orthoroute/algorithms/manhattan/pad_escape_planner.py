@@ -984,6 +984,24 @@ class PadEscapePlanner:
             getattr(self.config, "track_width", 0.24)
         )
 
+        # Alternatives may be shorter than the primary three-grid-step
+        # escape. Keep the via body outside its own SMD copper so this never
+        # turns into an accidental via-in-pad construction.
+        own_pad = pad_geometries.get(pad_id)
+        if own_pad is not None:
+            dx = max(
+                0.0,
+                abs(portal_x_mm - float(own_pad["x"]))
+                - 0.5 * float(own_pad["width"]),
+            )
+            dy = max(
+                0.0,
+                abs(portal_y_mm - float(own_pad["y"]))
+                - 0.5 * float(own_pad["height"]),
+            )
+            if (dx * dx + dy * dy) ** 0.5 < via_radius - 1e-9:
+                return None
+
         # Check the complete portal via disk, not only its center.
         if not self._check_clearance_to_pads(
             portal_x_mm,
@@ -1186,7 +1204,9 @@ class PadEscapePlanner:
                 for delta in sorted(
                     range(
                         int(getattr(
-                            self.config, "portal_delta_min", 3
+                            self.config,
+                            "portal_candidate_delta_min",
+                            1,
                         )),
                         int(getattr(
                             self.config, "portal_delta_max", 12
@@ -1233,8 +1253,16 @@ class PadEscapePlanner:
                 self.portal_candidates[pad_id] = candidates
                 continue
             choices = []
+            candidate_delta_min = int(getattr(
+                self.config, "portal_candidate_delta_min", 1
+            ))
+            candidate_delta_max = int(getattr(
+                self.config, "portal_delta_max", 12
+            ))
             for direction in (primary.direction, -primary.direction):
-                for delta in range(3, 13):
+                for delta in range(
+                    candidate_delta_min, candidate_delta_max + 1
+                ):
                     y_portal = y_idx + direction * delta
                     if not (0 <= y_portal < self.lattice.y_steps):
                         continue
@@ -1245,7 +1273,9 @@ class PadEscapePlanner:
                     )
                     choices.append((rank, "y", direction, delta))
             for direction in (-1, 1):
-                for delta in range(3, 13):
+                for delta in range(
+                    candidate_delta_min, candidate_delta_max + 1
+                ):
                     x_portal = x_idx + direction * delta
                     if not (0 <= x_portal < self.lattice.x_steps):
                         continue
