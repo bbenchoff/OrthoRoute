@@ -985,6 +985,41 @@ def test_physical_offenders_stay_hot_when_edges_are_clean(routed):
         pf._barrel_conflict_nets = old_physical
 
 
+def test_unrouted_nets_bypass_hotset_cap_and_cooldown(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    tasks = {
+        f"UNROUTED_{index}": (path[0], path[-1])
+        for index in range(150)
+    }
+    edge = pf._net_to_edges["TEST_NET"][0]
+    old_present = pf.accounting.present[edge]
+    old_cap = pf.config.hotset_cap
+    old_physical = getattr(pf, "_barrel_conflict_nets", set())
+    old_clean = dict(getattr(pf, "_net_clean_iters", {}))
+    old_reroute = dict(getattr(pf, "_last_reroute_iter", {}))
+    old_hotset = set(getattr(pf, "_prev_hotset", set()))
+    try:
+        pf.accounting.present[edge] = (
+            pf.accounting.capacity[edge] + 1
+        )
+        pf.config.hotset_cap = 1
+        pf._barrel_conflict_nets = set()
+        pf._last_reroute_iter = {
+            net_id: pf.iteration
+            for net_id in tasks
+        }
+
+        assert set(tasks) <= pf._build_hotset(tasks)
+    finally:
+        pf.accounting.present[edge] = old_present
+        pf.config.hotset_cap = old_cap
+        pf._barrel_conflict_nets = old_physical
+        pf._net_clean_iters = old_clean
+        pf._last_reroute_iter = old_reroute
+        pf._prev_hotset = old_hotset
+
+
 def test_adjacent_via_chain_is_one_physical_column(routed):
     """Adjacent graph hops in one barrel count as one physical via."""
     pf, _, _, _ = routed

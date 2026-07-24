@@ -7446,6 +7446,10 @@ class PathFinderRouter:
         # these to 100 nets made large boards improve only a tiny fixed
         # amount per iteration.
         hotset.update(physical_offenders)
+        # A failed full-graph search has no committed edges and therefore no
+        # congestion score. It must bypass both caps and cooldowns or it can
+        # remain unrouted indefinitely.
+        hotset.update(unrouted)
 
         unique_frac = len(hotset - getattr(self, '_prev_hotset', set())) / max(1, len(hotset))
         self._prev_hotset = hotset.copy()
