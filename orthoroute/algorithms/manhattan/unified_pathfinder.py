@@ -2705,6 +2705,12 @@ class PathFinderRouter:
 
         self.solver = SimpleDijkstra(self.graph, self.lattice)
 
+        # Apple Silicon: graft the Metal/MLX solver over the CPU one
+        # (ORTHO_BACKEND=metal or config.use_metal; CPU fallback retained)
+        if os.getenv("ORTHO_BACKEND") == "metal" or getattr(self.config, "use_metal", False):
+            from .pathfinder.metal_dijkstra import try_attach_metal
+            try_attach_metal(self.solver, self.graph, self.lattice)
+
         # Add GPU solver if available
         use_gpu_solver = self.config.use_gpu and GPU_AVAILABLE and CUDA_DIJKSTRA_AVAILABLE
 
