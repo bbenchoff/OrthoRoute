@@ -3929,6 +3929,8 @@ class PathFinderRouter:
             Dict of routing results
         """
         logger.info(f"=== Route {len(requests)} nets ===")
+        self._physical_cleanup_started = False
+        self._previous_physical_conflict_count = None
         gpu_threshold = getattr(self.config, 'gpu_roi_min_nodes', 1000)
         logger.info(f"[GPU-THRESHOLD] GPU pathfinding enabled for ROIs with > {gpu_threshold} nodes")
 
@@ -5709,6 +5711,15 @@ class PathFinderRouter:
 
             # Store barrel conflict count for iteration summary
             self._last_barrel_conflict_count = conflict_count
+            previous_physical_conflicts = getattr(
+                self, "_previous_physical_conflict_count", None
+            )
+            if self._physical_cleanup_drop_detected(
+                previous_physical_conflicts,
+                conflict_count,
+            ):
+                self._physical_cleanup_started = True
+            self._previous_physical_conflict_count = conflict_count
             # Graph congestion and exact physical conflicts require different
             # cleanup schedules.  Measure graph overuse before deciding whether
             # physical offenders may enter the next hotset: mixing hundreds of
@@ -5822,6 +5833,7 @@ class PathFinderRouter:
                     self, "_freeze_selected_portals", False
                 )
                 if entering_cleanup:
+                    self._physical_cleanup_started = True
                     logger.info(
                         "[PORTAL-CLEANUP] Freezing %d selected terminal "
                         "vias; rerouting %d grid victims",
@@ -6216,6 +6228,9 @@ class PathFinderRouter:
                 if not self._should_rip_for_stagnation(
                     spatial_via_overuse,
                     via_tail_threshold,
+                    physical_cleanup_started=getattr(
+                        self, "_physical_cleanup_started", False
+                    ),
                 ):
                     # Via-pool offenders are already selected directly by
                     # _build_hotset. Ripping additional ordinary-edge nets
@@ -7355,9 +7370,25 @@ class PathFinderRouter:
     def _should_rip_for_stagnation(
         spatial_via_overuse: int,
         tail_threshold: int = 8,
+        physical_cleanup_started: bool = False,
     ) -> bool:
-        """Allow speculative rip-up only outside broad via recovery."""
-        return spatial_via_overuse <= max(0, int(tail_threshold))
+        """Allow speculative rip-up only before staged physical cleanup."""
+        return (
+            not physical_cleanup_started
+            and spatial_via_overuse <= max(0, int(tail_threshold))
+        )
+
+    @staticmethod
+    def _physical_cleanup_drop_detected(
+        previous_conflicts: Optional[int],
+        current_conflicts: int,
+        minimum_fraction: float = 0.25,
+    ) -> bool:
+        """Recognize the large one-pass drop made by physical cleanup."""
+        if previous_conflicts is None or previous_conflicts <= 0:
+            return False
+        fraction = min(1.0, max(0.0, float(minimum_fraction)))
+        return current_conflicts <= previous_conflicts * (1.0 - fraction)
 
     def _clear_net_edge_tracking(self, net_id: str):
         """Clear edge-to-nets tracking for a net"""
