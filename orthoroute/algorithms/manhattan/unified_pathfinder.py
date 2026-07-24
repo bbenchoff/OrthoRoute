@@ -5709,6 +5709,23 @@ class PathFinderRouter:
 
             # Store barrel conflict count for iteration summary
             self._last_barrel_conflict_count = conflict_count
+            # Graph congestion and exact physical conflicts require different
+            # cleanup schedules.  Measure graph overuse before deciding whether
+            # physical offenders may enter the next hotset: mixing hundreds of
+            # physical offenders into a still-congested graph pass can repair
+            # barrels by recreating ordinary edge collisions.
+            over_sum, over_cnt = self.accounting.compute_overuse(
+                router_instance=self
+            )
+            physical_cleanup_threshold = int(getattr(
+                cfg,
+                "portal_cleanup_edge_threshold",
+                3,
+            ))
+            physical_cleanup_ready = (
+                over_cnt <= physical_cleanup_threshold
+                and over_sum <= physical_cleanup_threshold
+            )
             for portal_key in getattr(
                 self, "_barrel_owner_portal_keys", ()
             ):
@@ -5731,6 +5748,7 @@ class PathFinderRouter:
                     int(getattr(
                         self, "_last_escape_conflict_count", 0
                     )) > 0
+                    and physical_cleanup_ready
                     and not getattr(
                         self, "_freeze_selected_portals", False
                     )
@@ -5754,7 +5772,7 @@ class PathFinderRouter:
                 self._escape_replan_best = float("inf")
                 self._escape_replan_stagnant = 0
 
-            if conflict_count > 0:
+            if conflict_count > 0 and physical_cleanup_ready:
                 logger.debug(f"[BARREL-CONFLICT] Detected {conflict_count} barrel conflicts in iteration {it}")
                 self._last_ripped = (
                     set(getattr(self, "_last_ripped", ()))
@@ -5763,7 +5781,6 @@ class PathFinderRouter:
 
             # STEP 4: Edge overuse. Barrel conflicts remain a separate
             # convergence condition and hotset input.
-            over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
 
             # Instrumentation: via overuse ratio
             # OPTIMIZATION: Use cached GPU transfers
@@ -5799,6 +5816,7 @@ class PathFinderRouter:
                     "portal_cleanup_edge_threshold",
                     3,
                 )),
+                overuse_total=over_sum,
             ):
                 entering_cleanup = not getattr(
                     self, "_freeze_selected_portals", False
@@ -5864,6 +5882,30 @@ class PathFinderRouter:
                 self._freeze_selected_portals = False
                 self._portal_cleanup_movable_nets = set()
                 self._portal_cleanup_move_counts.clear()
+            elif (
+                getattr(self, "_freeze_selected_portals", False)
+                and (
+                    over_cnt > int(getattr(
+                        cfg,
+                        "portal_cleanup_edge_threshold",
+                        3,
+                    ))
+                    or over_sum > int(getattr(
+                        cfg,
+                        "portal_cleanup_edge_threshold",
+                        3,
+                    ))
+                )
+            ):
+                logger.info(
+                    "[PORTAL-CLEANUP] Pausing physical cleanup after "
+                    "graph overuse reopened to %d edges",
+                    over_cnt,
+                )
+                self._freeze_selected_portals = False
+                self._portal_cleanup_movable_nets = set()
+                self._portal_cleanup_edge_members = {}
+                self._portal_cleanup_foreign_cache = {}
             elif (
                 escape_conflicts > 0
                 and not getattr(
@@ -7268,6 +7310,17 @@ class PathFinderRouter:
         for ei in edge_indices:
             self._edge_to_nets[ei].add(net_id)
 
+    @staticmethod
+    def _history_hotset_cap(total_overuse: float) -> int:
+        """Keep historical reroutes proportional to live congestion."""
+        if total_overuse <= 8:
+            return 16
+        if total_overuse <= 32:
+            return 32
+        if total_overuse <= 128:
+            return 64
+        return 100
+
     def _clear_net_edge_tracking(self, net_id: str):
         """Clear edge-to-nets tracking for a net"""
         if net_id in self._net_to_edges:
@@ -7321,6 +7374,14 @@ class PathFinderRouter:
         hot_edges = over + 0.1 * hist  # Gentle history influence (was 0.5 - too aggressive!)
         over_idx = set(map(int, np.where(hot_edges > 0.5)[0]))  # Higher threshold to be more selective
         via_pool_offenders = self._find_via_pool_offenders()
+        total_overuse_with_vias = self.accounting.compute_overuse(
+            router_instance=self
+        )[0]
+        cleanup_threshold = int(getattr(
+            self.config,
+            "portal_cleanup_edge_threshold",
+            3,
+        ))
 
         # Initialize clean iteration tracking
         if not hasattr(self, '_net_clean_iters'):
@@ -7331,7 +7392,11 @@ class PathFinderRouter:
         # No edge overuse can still leave an over-capacity via pool.
         if len(over_idx) == 0:
             unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
-            physical_offenders = self._select_physical_hotset()
+            physical_offenders = (
+                self._select_physical_hotset()
+                if total_overuse_with_vias <= cleanup_threshold
+                else set()
+            )
             hotset = (
                 unrouted
                 | ripped
@@ -7407,8 +7472,13 @@ class PathFinderRouter:
         #     base_target = max(64, int(base_target * 0.80))
         #     logger.debug(f"[HOTSET-TREND] Good progress ({delta*100:.1f}%) → shrinking hotset to {base_target}")
 
-        # Use FIXED hotset size for stable convergence
-        base_target = 100  # Fixed size (20% of nets) - smaller for smoother convergence
+        # Historical edges vastly outnumber live offenders in the final tail.
+        # A fixed 100-net wave can turn a handful of conflicts into hundreds
+        # of new via collisions. Scale only the ordinary/history wave; exact
+        # physical offenders and unrouted nets still bypass this cap below.
+        base_target = self._history_hotset_cap(
+            total_overuse_with_vias
+        )
 
         self._prev_overuse_for_hotset = total_overuse
 
@@ -7439,13 +7509,16 @@ class PathFinderRouter:
             self._last_reroute_iter[nid] = self.iteration
 
         hotset = set(hotset_with_cooldown)
-        physical_offenders = self._select_physical_hotset()
-        # The adaptive cap is for ordinary edge congestion. A physical
-        # barrel or node collision is an electrical short and every net
-        # participating in one must remain eligible immediately; limiting
-        # these to 100 nets made large boards improve only a tiny fixed
-        # amount per iteration.
-        hotset.update(physical_offenders)
+        raw_overuse_edges = int(np.count_nonzero(over > 0))
+        if (
+            raw_overuse_edges <= cleanup_threshold
+            and total_overuse_with_vias <= cleanup_threshold
+        ):
+            physical_offenders = self._select_physical_hotset()
+            # The adaptive cap is for ordinary edge congestion. Once the graph
+            # tail is clean enough for physical cleanup, exact shorts bypass
+            # that cap so one-sided repair can move every selected component.
+            hotset.update(physical_offenders)
         # A failed full-graph search has no committed edges and therefore no
         # congestion score. It must bypass both caps and cooldowns or it can
         # remain unrouted indefinitely.
@@ -7461,7 +7534,7 @@ class PathFinderRouter:
         return hotset
 
     def _find_via_pool_offenders(self) -> Set[str]:
-        """Return nets using an over-capacity via column or segment."""
+        """Return only excess peers on each over-capacity via resource."""
         if not hasattr(self, "via_col_use") and not hasattr(
             self, "via_seg_use"
         ):
@@ -7485,33 +7558,143 @@ class PathFinderRouter:
 
         if col_over is None and seg_over is None:
             self._via_pool_conflict_nets = set()
+            self._via_pool_keepers = {}
+            self._via_pool_member_state = {}
+            self._via_pool_keeper_stagnation = {}
             return set()
 
-        offenders = set()
+        members = defaultdict(set)
         for net_id, path in self.net_paths.items():
             if not path or len(path) < 2:
                 continue
+            net_resources = set()
             for u, v in zip(path, path[1:]):
                 xu, yu, zu = self.lattice.idx_to_coord(u)
                 xv, yv, zv = self.lattice.idx_to_coord(v)
                 if xu != xv or yu != yv or zu == zv:
                     continue
                 if col_over is not None and col_over[xu, yu]:
-                    offenders.add(net_id)
-                    break
+                    net_resources.add(("col", xu, yu))
                 if seg_over is not None:
                     z_lo, z_hi = sorted((zu, zv))
                     z_lo = max(1, min(z_lo, self._Nz - 2))
                     z_hi = max(1, min(z_hi, self._Nz - 2))
-                    if any(
-                        0 <= z - 1 < self._segZ
-                        and seg_over[xu, yu, z - 1]
-                        for z in range(z_lo, z_hi)
-                    ):
-                        offenders.add(net_id)
-                        break
+                    for z in range(z_lo, z_hi):
+                        seg_idx = z - 1
+                        if (
+                            0 <= seg_idx < self._segZ
+                            and seg_over[xu, yu, seg_idx]
+                        ):
+                            net_resources.add(
+                                ("seg", xu, yu, seg_idx)
+                            )
+            for resource in net_resources:
+                members[resource].add(net_id)
 
-        self._via_pool_conflict_nets = offenders
+        old_keepers = getattr(self, "_via_pool_keepers", {})
+        old_member_state = getattr(
+            self, "_via_pool_member_state", {}
+        )
+        old_stagnation = getattr(
+            self, "_via_pool_keeper_stagnation", {}
+        )
+        rotation_allowed = (
+            self._spatial_via_overuse_total()
+            <= int(getattr(
+                self.config,
+                "via_keeper_rotation_overuse_threshold",
+                8,
+            ))
+        )
+        new_keepers = {}
+        new_member_state = {}
+        new_stagnation = {}
+        offenders = set()
+
+        col_cap = getattr(self, "via_col_cap", None)
+        if hasattr(col_cap, "get"):
+            col_cap = col_cap.get()
+        seg_cap = getattr(self, "via_seg_cap", None)
+        if hasattr(seg_cap, "get"):
+            seg_cap = seg_cap.get()
+        col_use = getattr(self, "via_col_use", None)
+        if hasattr(col_use, "get"):
+            col_use = col_use.get()
+        seg_use = getattr(self, "via_seg_use", None)
+        if hasattr(seg_use, "get"):
+            seg_use = seg_use.get()
+
+        for resource, resource_members in sorted(members.items()):
+            kind, x_idx, y_idx, *tail = resource
+            if kind == "col":
+                capacity = int(col_cap[x_idx, y_idx])
+                observed = int(col_use[x_idx, y_idx])
+            else:
+                seg_idx = tail[0]
+                capacity = int(seg_cap[x_idx, y_idx, seg_idx])
+                observed = int(seg_use[x_idx, y_idx, seg_idx])
+
+            capacity = max(0, capacity)
+            member_state = frozenset(resource_members)
+            new_member_state[resource] = member_state
+            unchanged = (
+                old_member_state.get(resource) == member_state
+            )
+            stagnant = (
+                int(old_stagnation.get(resource, 0)) + 1
+                if unchanged else 0
+            )
+            previous = [
+                net_id
+                for net_id in old_keepers.get(resource, ())
+                if net_id in resource_members
+            ][:capacity]
+            remaining = sorted(resource_members - set(previous))
+            keepers = tuple(
+                previous + remaining[:max(0, capacity - len(previous))]
+            )
+
+            # A stable keeper prevents peers from exchanging ownership every
+            # pass, but it can starve the cleanup when the chosen excess net
+            # has no viable alternative. After two unchanged attempts, rotate
+            # the protected window so a former keeper gets a chance to move.
+            if (
+                rotation_allowed
+                and
+                stagnant >= 2
+                and 0 < capacity < len(resource_members)
+                and previous
+            ):
+                ordered = sorted(resource_members)
+                start = (ordered.index(previous[0]) + 1) % len(ordered)
+                keepers = tuple(
+                    ordered[(start + offset) % len(ordered)]
+                    for offset in range(capacity)
+                )
+                stagnant = 0
+                logger.info(
+                    "[VIA-POOL] Rotated %s keepers at (%d,%d)",
+                    kind,
+                    x_idx,
+                    y_idx,
+                )
+
+            new_stagnation[resource] = stagnant
+            new_keepers[resource] = keepers
+            offenders.update(resource_members - set(keepers))
+
+            # Repeated disconnected barrels from one net can make observed
+            # usage exceed the number of electrical owners. That net must move
+            # even if it would otherwise be the sole keeper.
+            if observed > len(resource_members):
+                offenders.update(resource_members)
+
+        self._via_pool_keepers = new_keepers
+        self._via_pool_member_state = new_member_state
+        self._via_pool_keeper_stagnation = new_stagnation
+        self._via_pool_conflict_nets = set().union(
+            *members.values()
+        ) if members else set()
         return offenders
 
     def _log_top_overused_channels(self, over: np.ndarray, top_k: int = 10):
@@ -8170,14 +8353,15 @@ class PathFinderRouter:
         overused_edges: int,
         already_active: bool,
         edge_threshold: int = 0,
+        overuse_total: Optional[float] = None,
     ) -> bool:
-        """Enter after ordinary edges nearly settle; small tails run alongside."""
+        """Run only while ordinary graph edges remain below the tail gate."""
+        if overuse_total is None:
+            overuse_total = overused_edges
         return (
             physical_conflicts > 0
-            and (
-                already_active
-                or overused_edges <= max(0, int(edge_threshold))
-            )
+            and overused_edges <= max(0, int(edge_threshold))
+            and overuse_total <= max(0, int(edge_threshold))
         )
 
     def _portal_cleanup_movable_components(
