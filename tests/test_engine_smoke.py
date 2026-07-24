@@ -1043,6 +1043,25 @@ def test_stagnation_rip_waits_for_spatial_via_tail():
     assert not should_rip(9)
     assert not should_rip(359)
     assert should_rip(0, tail_threshold=-1)
+    assert not should_rip(
+        0,
+        physical_cleanup_started=True,
+    )
+    assert not should_rip(
+        8,
+        physical_cleanup_started=True,
+    )
+
+
+def test_large_physical_drop_marks_cleanup_stage():
+    detected = PathFinderRouter._physical_cleanup_drop_detected
+
+    assert not detected(None, 75)
+    assert not detected(0, 0)
+    assert not detected(100, 76)
+    assert detected(100, 75)
+    assert detected(100, 25)
+    assert not detected(100, 101)
 
 
 def test_physical_offenders_wait_for_via_pool_cleanup(routed):
