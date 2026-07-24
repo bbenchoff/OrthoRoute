@@ -382,6 +382,24 @@ def test_committed_escape_conflicts_never_eliminate_all_seeds(routed):
     pf._rebuild_escape_occupancy()
 
 
+def test_cleanup_prices_live_escape_conflicts_above_reservations(routed):
+    pf, _, _, _ = routed
+    old_freeze = getattr(pf, "_freeze_selected_portals", False)
+    try:
+        pf._freeze_selected_portals = False
+        ordinary = pf._escape_candidate_congestion_penalty(1, 1)
+        assert ordinary == 2 * pf.config.escape_reservation_penalty
+
+        pf._freeze_selected_portals = True
+        cleanup = pf._escape_candidate_congestion_penalty(1, 1)
+        assert cleanup == (
+            pf.config.portal_cleanup_escape_penalty
+            + pf.config.escape_reservation_penalty
+        )
+    finally:
+        pf._freeze_selected_portals = old_freeze
+
+
 def test_stagnation_rip_clears_all_geometry_ownership():
     board = make_two_pad_board(layer_count=4)
     config = PathFinderConfig()
@@ -573,7 +591,23 @@ def test_portal_cleanup_freezes_position_and_entry_depth(routed):
         pf._portal_cleanup_movable_nets = old_movable
 
 
-def test_portal_cleanup_leaves_one_fixed_net_per_conflict_component():
+def test_portal_cleanup_moves_nonconflicting_high_impact_peers():
+    assert PathFinderRouter._should_run_one_sided_cleanup(
+        physical_conflicts=5,
+        overused_edges=0,
+        already_active=False,
+    )
+    assert PathFinderRouter._should_run_one_sided_cleanup(
+        physical_conflicts=5,
+        overused_edges=3,
+        already_active=True,
+    )
+    assert not PathFinderRouter._should_run_one_sided_cleanup(
+        physical_conflicts=5,
+        overused_edges=3,
+        already_active=False,
+    )
+
     pairs = {
         (("A", "PAD-A", 1, 2), "B", "via"),
         (("B", "PAD-B", 3, 4), "C", "track"),
@@ -592,7 +626,24 @@ def test_portal_cleanup_leaves_one_fixed_net_per_conflict_component():
         },
     )
 
-    assert movable == {"B", "C", "D", "E", "Q", "S", "Y"}
+    assert movable == {"B", "D", "P", "R", "X"}
+
+    all_pairs = {
+        (identity[0], victim)
+        for identity, victim, _kind in pairs
+    }
+    all_pairs.update(
+        (first[0], second[0])
+        for first, second in {
+            (("C", "PAD-C"), ("D", "PAD-D")),
+            (("Q", "PAD-Q"), ("P", "PAD-P")),
+        }
+    )
+    all_pairs.update({("D", "E"), ("R", "S")})
+    assert not any(
+        first in movable and second in movable
+        for first, second in all_pairs
+    )
 
 
 def test_physical_hotset_is_bounded_and_severity_ranked():

@@ -653,6 +653,7 @@ class PathFinderConfig:
     portal_barrel_history_penalty: float = 25.0
     portal_cleanup_edge_penalty: float = 1_000_000.0
     portal_cleanup_node_penalty: float = 1_000_000.0
+    portal_cleanup_escape_penalty: float = 1_000_000.0
 
     stagnation_patience: int = 5
     use_gpu: bool = True  # GPU algorithm fixed, validation will catch ROI construction issues
@@ -3693,12 +3694,10 @@ class PathFinderRouter:
             candidate_penalty = float(getattr(portal, "score", 0.0))
             if current_net is not None:
                 candidate_penalty += (
-                    (committed_conflicts + reserved_conflicts)
-                    * float(getattr(
-                        self.config,
-                        "escape_reservation_penalty",
-                        1000.0,
-                    ))
+                    self._escape_candidate_congestion_penalty(
+                        committed_conflicts,
+                        reserved_conflicts,
+                    )
                 )
             candidate_penalty += (
                 self._portal_barrel_history[
@@ -3759,6 +3758,32 @@ class PathFinderRouter:
 
         seeds = sorted(best_by_node.items())
         return seeds, portal_by_node
+
+    def _escape_candidate_congestion_penalty(
+        self,
+        committed_conflicts: int,
+        reserved_conflicts: int,
+    ) -> float:
+        """Price live escape copper more strongly during physical cleanup."""
+        reservation_weight = float(getattr(
+            self.config,
+            "escape_reservation_penalty",
+            1000.0,
+        ))
+        committed_weight = reservation_weight
+        if getattr(self, "_freeze_selected_portals", False):
+            committed_weight = max(
+                committed_weight,
+                float(getattr(
+                    self.config,
+                    "portal_cleanup_escape_penalty",
+                    1_000_000.0,
+                )),
+            )
+        return (
+            float(committed_conflicts) * committed_weight
+            + float(reserved_conflicts) * reservation_weight
+        )
 
     def _portal_chain_node_penalty(
         self,
@@ -5758,20 +5783,14 @@ class PathFinderRouter:
                 self, "_last_portal_grid_conflict_count", 0
             )
 
-            # Once graph overuse is gone and escape geometry is internally
-            # legal, repair physical conflicts one side at a time. Holding
-            # one deterministic net fixed in each connected component keeps
-            # shared graph barrels and terminal-via conflicts from migrating
-            # between two simultaneously rerouted paths.
-            if (
-                barrel_conflicts > 0
-                and (
-                    getattr(self, "_freeze_selected_portals", False)
-                    or (
-                        over_sum == 0
-                        and escape_conflicts == 0
-                    )
-                )
+            # Once ordinary graph edges are clean, repair physical conflicts
+            # one side at a time while any tiny spatial-via pool tail keeps
+            # negotiating. Waiting for both total overuse and escape conflicts
+            # to vanish lets the two ends of a physical short move together.
+            if self._should_run_one_sided_cleanup(
+                barrel_conflicts,
+                over_cnt,
+                getattr(self, "_freeze_selected_portals", False),
             ):
                 entering_cleanup = not getattr(
                     self, "_freeze_selected_portals", False
@@ -8133,18 +8152,29 @@ class PathFinderRouter:
         )
 
     @staticmethod
+    def _should_run_one_sided_cleanup(
+        physical_conflicts: int,
+        overused_edges: int,
+        already_active: bool,
+    ) -> bool:
+        """Enter after ordinary edges settle; spatial pool tails may remain."""
+        return (
+            physical_conflicts > 0
+            and (already_active or overused_edges == 0)
+        )
+
+    @staticmethod
     def _portal_cleanup_movable_components(
         portal_grid_pairs, escape_pairs=(), exact_pairs=()
     ) -> Set[str]:
-        """Choose deterministic movable peers for physical conflicts.
+        """Choose a deterministic independent set of physical-conflict nets.
 
-        Freezing every selected portal makes conflicts near another net's
-        source anchor impossible to repair: its graph path may have no legal
-        first via while its punch-in is pinned. For each connected conflict
-        component, hold one deterministic net fixed and let every peer
-        renegotiate its terminal position and depth. Every conflict therefore
-        retains at least one movable endpoint without allowing both ends of an
-        isolated pair to chase each other.
+        Rerouting every peer in a large connected component moves both ends of
+        most shorts and simply migrates them. Rerouting only one peer makes a
+        connector-sized component progress serially. A greedy maximal
+        independent set gives a broad wave in which no two current conflict
+        peers can move together. Prefer high-degree nets to repair as many
+        reports as possible per wave.
         """
         adjacency = defaultdict(set)
         for identity, victim, _kind in portal_grid_pairs:
@@ -8167,19 +8197,18 @@ class PathFinderRouter:
             adjacency[second_net].add(first_net)
 
         movable = set()
-        unseen = set(adjacency)
-        while unseen:
-            root = min(unseen)
-            component = set()
-            stack = [root]
-            while stack:
-                net_name = stack.pop()
-                if net_name in component:
-                    continue
-                component.add(net_name)
-                unseen.discard(net_name)
-                stack.extend(adjacency[net_name] - component)
-            movable.update(component - {min(component)})
+        eligible = set(adjacency)
+        while eligible:
+            net_name = min(
+                eligible,
+                key=lambda candidate: (
+                    -len(adjacency[candidate]),
+                    candidate,
+                ),
+            )
+            movable.add(net_name)
+            eligible.discard(net_name)
+            eligible.difference_update(adjacency[net_name])
         return movable
 
     def _portal_cleanup_foreign_edges(
