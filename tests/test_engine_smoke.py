@@ -356,6 +356,39 @@ def test_partial_connector_selection_preserves_regular_dynamic_run():
     )
 
 
+def test_dynamic_candidates_include_short_non_via_in_pad_escape():
+    board = _make_columnar_connector_board()
+    config = PathFinderConfig()
+    config.track_width = 0.1016
+    config.clearance = 0.1016
+    config.via_diameter = 0.3024
+    config.via_drill = 0.15
+    pf = UnifiedPathFinder(config=config, use_gpu=False)
+
+    pf.initialize_graph(board)
+    pf.precompute_all_pad_escapes(board)
+    pf._parse_requests(board.nets)
+    pad_id = pf.net_pad_ids["N1"][0]
+    short = next(
+        portal
+        for portal in pf.portal_candidates[pad_id]
+        if portal.delta_steps == 2
+    )
+    via_x, via_y = pf.escape_planner._portal_world(short)
+    dx = max(
+        0.0,
+        abs(via_x - short.pad_x) - 0.5 * 0.2,
+    )
+    dy = max(
+        0.0,
+        abs(via_y - short.pad_y) - 0.5 * 1.15,
+    )
+
+    assert (dx * dx + dy * dy) ** 0.5 >= (
+        0.5 * config.via_diameter
+    )
+
+
 def test_horizontal_escape_uses_short_orthogonal_dogleg(routed):
     pf, _, _, _ = routed
     segments = pf.escape_planner._escape_segments(
