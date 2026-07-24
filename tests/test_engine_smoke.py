@@ -16,8 +16,8 @@ from orthoroute.algorithms.manhattan.unified_pathfinder import (
 from conftest import make_two_pad_board
 
 
-def _make_columnar_connector_board():
-    """Two regular 8x4 SMD arrays joined pad-for-pad."""
+def _make_columnar_connector_board(columns=8):
+    """Two regular columnar SMD arrays joined pad-for-pad."""
     from orthoroute.domain.models.board import (
         Board, Component, Coordinate, Net, Pad,
     )
@@ -36,7 +36,7 @@ def _make_columnar_connector_board():
             position=Coordinate(5.15, base_y),
         )
         pads = []
-        for column in range(8):
+        for column in range(columns):
             for row, y_offset in enumerate(row_offsets):
                 pad = Pad(
                     id=f"{reference}_{column}_{row}",
@@ -321,6 +321,39 @@ def test_columnar_connectors_use_zero_conflict_dynamic_entries():
         for via in pf.get_geometry_payload().vias
         if via["net"] == "N0"
     ) == 2
+
+
+def test_partial_connector_selection_preserves_regular_dynamic_run():
+    board = _make_columnar_connector_board(columns=10)
+    selected_nets = board.nets[:32] + [board.nets[32], board.nets[36]]
+    config = PathFinderConfig()
+    config.track_width = 0.1016
+    config.clearance = 0.1016
+    config.via_diameter = 0.4
+    config.via_drill = 0.15
+    pf = UnifiedPathFinder(config=config, use_gpu=False)
+
+    pf.initialize_graph(board)
+    pf.precompute_all_pad_escapes(board, selected_nets)
+
+    regular_pad_ids = {
+        pf.escape_planner._pad_key(pad)
+        for net in board.nets[:32]
+        for pad in net.pads
+    }
+    partial_pad_ids = {
+        pf.escape_planner._pad_key(pad)
+        for net in selected_nets[32:]
+        for pad in net.pads
+    }
+    assert all(
+        pf.portals[pad_id].dynamic_entry
+        for pad_id in regular_pad_ids
+    )
+    assert all(
+        not pf.portals[pad_id].dynamic_entry
+        for pad_id in partial_pad_ids
+    )
 
 
 def test_horizontal_escape_uses_short_orthogonal_dogleg(routed):

@@ -557,98 +557,132 @@ class PadEscapePlanner:
                 physical_columns[round(float(entry[4]), 5)].append(entry)
 
             ordered_columns = sorted(physical_columns.items())
-            if len(ordered_columns) < 8:
-                continue
-
-            row_counts = {len(column) for _, column in ordered_columns}
-            if len(row_counts) != 1:
-                continue
-            row_count = next(iter(row_counts))
-            if row_count < 2 or row_count % 2:
-                continue
-
-            regular_gaps = sum(
-                abs((right - left) - pitch) <= pitch * 0.05
-                for (left, _), (right, _)
-                in zip(ordered_columns, ordered_columns[1:])
-            )
-            if regular_gaps < 0.75 * (len(ordered_columns) - 1):
-                continue
-
-            if any(
-                pad_geometries[entry[1]]["height"]
-                < 2.0 * pad_geometries[entry[1]]["width"]
-                or pad_geometries[entry[1]]["width"] > 0.75 * pitch
-                for entry in entries
-            ):
-                continue
-
-            component_portals = {}
-            component_cells = set()
-            valid = True
-            for column_rank, (_, column) in enumerate(ordered_columns):
-                ordered_rows = sorted(column, key=lambda entry: entry[5])
-                delta_steps = min_steps + (column_rank % 2)
-                for row_rank, entry in enumerate(ordered_rows):
-                    (
-                        _pad,
-                        pad_id,
-                        x_idx,
-                        y_idx,
-                        pad_x,
-                        pad_y,
-                        pad_layer,
-                    ) = entry
-                    direction = (
-                        -1 if row_rank < row_count // 2 else 1
+            # Route subsets need not contain every pad in a component. Split
+            # the selected columns into independently regular runs so a
+            # partially selected bank cannot disable exact-X punch-ins for a
+            # complete dense bank elsewhere in the same connector.
+            column_runs = []
+            current_run = []
+            for item in ordered_columns:
+                if current_run:
+                    previous_x, previous_column = current_run[-1]
+                    current_x, current_column = item
+                    previous_rows = sorted(
+                        float(entry[5]) for entry in previous_column
                     )
-                    portal = self._try_create_portal(
-                        x_idx,
-                        y_idx,
-                        direction,
-                        delta_steps,
-                        pad_id,
-                        pad_x,
-                        pad_y,
-                        pad_layer,
-                        1,
-                        pad_geometries,
-                        spatial_index,
-                        claim_cell=False,
-                        dynamic_entry=True,
+                    current_rows = sorted(
+                        float(entry[5]) for entry in current_column
                     )
-                    if portal is None:
-                        valid = False
-                        break
-                    cell = (portal.x_idx, portal.y_idx)
+                    compatible_rows = (
+                        len(previous_rows) == len(current_rows)
+                        and all(
+                            abs(left - right) <= pitch * 0.05
+                            for left, right
+                            in zip(previous_rows, current_rows)
+                        )
+                    )
                     if (
-                        cell in component_cells
-                        or cell in self._occupied_portal_cells
+                        abs((current_x - previous_x) - pitch)
+                        > pitch * 0.05
+                        or not compatible_rows
                     ):
-                        valid = False
+                        column_runs.append(current_run)
+                        current_run = []
+                current_run.append(item)
+            if current_run:
+                column_runs.append(current_run)
+
+            for run_index, column_run in enumerate(column_runs):
+                if len(column_run) < 8:
+                    continue
+                row_count = len(column_run[0][1])
+                if row_count < 2 or row_count % 2:
+                    continue
+                run_entries = [
+                    entry
+                    for _, column in column_run
+                    for entry in column
+                ]
+                if any(
+                    pad_geometries[entry[1]]["height"]
+                    < 2.0 * pad_geometries[entry[1]]["width"]
+                    or pad_geometries[entry[1]]["width"] > 0.75 * pitch
+                    for entry in run_entries
+                ):
+                    continue
+
+                run_portals = {}
+                run_cells = set()
+                valid = True
+                for column_rank, (_, column) in enumerate(column_run):
+                    ordered_rows = sorted(
+                        column, key=lambda entry: entry[5]
+                    )
+                    delta_steps = min_steps + (column_rank % 2)
+                    for row_rank, entry in enumerate(ordered_rows):
+                        (
+                            _pad,
+                            pad_id,
+                            x_idx,
+                            y_idx,
+                            pad_x,
+                            pad_y,
+                            pad_layer,
+                        ) = entry
+                        direction = (
+                            -1 if row_rank < row_count // 2 else 1
+                        )
+                        portal = self._try_create_portal(
+                            x_idx,
+                            y_idx,
+                            direction,
+                            delta_steps,
+                            pad_id,
+                            pad_x,
+                            pad_y,
+                            pad_layer,
+                            1,
+                            pad_geometries,
+                            spatial_index,
+                            claim_cell=False,
+                            dynamic_entry=True,
+                        )
+                        if portal is None:
+                            valid = False
+                            break
+                        cell = (portal.x_idx, portal.y_idx)
+                        if (
+                            cell in run_cells
+                            or cell in self._occupied_portal_cells
+                        ):
+                            valid = False
+                            break
+                        run_cells.add(cell)
+                        run_portals[pad_id] = portal
+                    if not valid:
                         break
-                    component_cells.add(cell)
-                    component_portals[pad_id] = portal
+
                 if not valid:
-                    break
+                    logger.info(
+                        "[DYNAMIC-ESCAPE] %s run %d did not admit a "
+                        "complete straight staggered assignment; using "
+                        "generic planning",
+                        component_id,
+                        run_index,
+                    )
+                    continue
 
-            if not valid:
+                self.portals.update(run_portals)
+                self._occupied_portal_cells.update(run_cells)
+                planned_ids.update(run_portals)
                 logger.info(
-                    "[DYNAMIC-ESCAPE] %s did not admit a complete "
-                    "straight staggered assignment; using generic planning",
+                    "[DYNAMIC-ESCAPE] %s run %d: %d pads in %d "
+                    "physical columns",
                     component_id,
+                    run_index,
+                    len(run_portals),
+                    len(column_run),
                 )
-                continue
-
-            self.portals.update(component_portals)
-            self._occupied_portal_cells.update(component_cells)
-            planned_ids.update(component_portals)
-            logger.info(
-                "[DYNAMIC-ESCAPE] %s: %d pads in %d physical columns",
-                component_id,
-                len(component_portals),
-                len(ordered_columns),
-            )
 
         if planned_ids:
             logger.info(
