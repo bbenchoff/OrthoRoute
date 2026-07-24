@@ -97,6 +97,9 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
     exact_barrel_conflicts = int(
         getattr(pf, "_last_exact_barrel_conflict_count", 0)
     )
+    path_node_conflicts = int(
+        getattr(pf, "_last_path_node_conflict_count", 0)
+    )
     escape_conflicts = int(
         getattr(pf, "_last_escape_conflict_count", 0)
     )
@@ -133,6 +136,7 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
                 and not excluded_ids
                 and int(overuse_total) == 0
                 and barrel_conflicts == 0
+                and path_node_conflicts == 0
             ),
         },
         "convergence": {
@@ -141,6 +145,7 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             "overuse_count": int(overuse_count),
             "barrel_conflicts": barrel_conflicts,
             "exact_barrel_conflicts": exact_barrel_conflicts,
+            "path_node_conflicts": path_node_conflicts,
             "escape_conflicts": escape_conflicts,
             "portal_grid_conflicts": portal_grid_conflicts,
         },

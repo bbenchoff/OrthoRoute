@@ -5809,6 +5809,9 @@ class PathFinderRouter:
             exact_barrel_conflicts = getattr(
                 self, "_last_exact_barrel_conflict_count", 0
             )
+            path_node_conflicts = getattr(
+                self, "_last_path_node_conflict_count", 0
+            )
             escape_conflicts = getattr(
                 self, "_last_escape_conflict_count", 0
             )
@@ -5853,7 +5856,16 @@ class PathFinderRouter:
                     self._portal_cleanup_movable_components(
                         getattr(self, "_portal_grid_pairs", ()),
                         getattr(self, "_escape_conflict_pairs", ()),
-                        getattr(self, "_exact_barrel_pairs", ()),
+                        (
+                            set(getattr(
+                                self, "_exact_barrel_pairs", ()
+                            ))
+                            | set(getattr(
+                                self,
+                                "_path_node_conflict_pairs",
+                                (),
+                            ))
+                        ),
                     )
                 )
                 cleanup_involved_nets = (
@@ -5934,6 +5946,7 @@ class PathFinderRouter:
             barrel_info = (
                 f"  barrel={barrel_conflicts}"
                 f" (exact={exact_barrel_conflicts},"
+                f" node={path_node_conflicts},"
                 f" escape={escape_conflicts})"
                 if barrel_conflicts > 0 else ""
             )
@@ -8710,6 +8723,50 @@ class PathFinderRouter:
             history_nodes,
         )
 
+    def _detect_path_node_conflicts(self):
+        """Find different nets touching the same routed lattice node.
+
+        Edge capacity is sufficient while each layer has only one planar
+        axis. Guided routing adds the other axis, so perpendicular tracks can
+        otherwise cross at a node without sharing an edge. The soft
+        path-node cost normally prevents that state; this audit makes zero
+        shared nodes an explicit convergence requirement.
+        """
+        if not hasattr(self, "path_node_use"):
+            return set(), set(), {}
+
+        shared_mask = self.path_node_use > 1
+        shared_nodes = set(map(int, np.flatnonzero(shared_mask)))
+        if not shared_nodes:
+            return set(), set(), {}
+
+        members = defaultdict(set)
+        scores = defaultdict(int)
+        for net_name, path in self.net_paths.items():
+            if not path:
+                continue
+            graph_path = self._path_without_dynamic_escape_chains(
+                net_name, path
+            )
+            nodes = self._unique_path_nodes(graph_path)
+            if not nodes.size:
+                continue
+            hits = nodes[shared_mask[nodes]]
+            for node in hits:
+                members[int(node)].add(net_name)
+                scores[net_name] += 1
+
+        pairs = set()
+        from itertools import combinations
+        for node_members in members.values():
+            pairs.update(combinations(sorted(node_members), 2))
+
+        # path_node_use can only exceed one when at least two committed paths
+        # contain the node. Keep the measured set aligned with the actual
+        # paths if state was refreshed during a diagnostic call.
+        measured_nodes = set(members)
+        return pairs, measured_nodes, dict(scores)
+
     def _detect_barrel_conflicts(self) -> Tuple[np.ndarray, int]:
         """
         Detect via barrel conflicts across all committed paths (GPU-accelerated).
@@ -8728,6 +8785,7 @@ class PathFinderRouter:
         self._barrel_victim_nets = set()
         self._barrel_owner_portal_keys = set()
         self._last_exact_barrel_conflict_count = 0
+        self._last_path_node_conflict_count = 0
         self._last_escape_conflict_count = 0
         self._last_portal_grid_conflict_count = 0
         self._portal_grid_owner_nets = set()
@@ -8735,6 +8793,7 @@ class PathFinderRouter:
         self._portal_grid_pairs = set()
         self._escape_conflict_pairs = set()
         self._exact_barrel_pairs = set()
+        self._path_node_conflict_pairs = set()
         self._physical_conflict_scores = defaultdict(int)
         self._last_exact_barrel_details = []
 
@@ -8938,6 +8997,30 @@ class PathFinderRouter:
         else:
             logger.info(f"[BARREL-CONFLICT] No conflicts found (checked {len(edge_indices)} edges)")
 
+        (
+            path_node_pairs,
+            shared_path_nodes,
+            path_node_scores,
+        ) = self._detect_path_node_conflicts()
+        self._path_node_conflict_pairs = set(path_node_pairs)
+        self._last_path_node_conflict_count = len(shared_path_nodes)
+        if shared_path_nodes:
+            for net_name, score in path_node_scores.items():
+                self._physical_conflict_scores[net_name] += int(score)
+            involved_nets = {
+                net_name
+                for pair in path_node_pairs
+                for net_name in pair
+            }
+            self._barrel_conflict_nets.update(involved_nets)
+            self._accumulate_node_conflict_history(shared_path_nodes)
+            logger.info(
+                "[PATH-NODE-CONFLICT] Detected %d shared nodes "
+                "across %d net pairs",
+                len(shared_path_nodes),
+                len(path_node_pairs),
+            )
+
         # Escape stubs and portal via bodies are off-lattice physical
         # geometry, so edge accounting cannot see their conflicts. Audit the
         # selected candidates with the same dimensions used for emission and
@@ -9006,6 +9089,7 @@ class PathFinderRouter:
         return (
             conflict_edge_indices,
             conflict_count
+            + len(shared_path_nodes)
             + len(escape_pairs)
             + len(portal_grid_pairs),
         )

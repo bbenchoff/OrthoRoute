@@ -875,6 +875,38 @@ def test_path_node_use_prices_tracks_for_later_vias(routed):
     assert np.all(pf.path_node_use[path_nodes] == 1)
 
 
+def test_shared_path_nodes_are_physical_conflicts(routed):
+    """Perpendicular guided tracks may not cross through one graph node."""
+    pf, _, _, _ = routed
+    original_paths = dict(pf.net_paths)
+    try:
+        shared = pf.lattice.node_idx(2, 2, 1)
+        pf.net_paths.clear()
+        pf.net_paths.update({
+            "H_NET": [
+                pf.lattice.node_idx(1, 2, 1),
+                shared,
+                pf.lattice.node_idx(3, 2, 1),
+            ],
+            "V_NET": [
+                pf.lattice.node_idx(2, 1, 1),
+                shared,
+                pf.lattice.node_idx(2, 3, 1),
+            ],
+        })
+        pf._rebuild_path_node_use()
+
+        pairs, nodes, scores = pf._detect_path_node_conflicts()
+
+        assert pairs == {("H_NET", "V_NET")}
+        assert nodes == {shared}
+        assert scores == {"H_NET": 1, "V_NET": 1}
+    finally:
+        pf.net_paths.clear()
+        pf.net_paths.update(original_paths)
+        pf._rebuild_path_node_use()
+
+
 def test_node_conflict_history_persists_once_per_iteration(routed):
     pf, _, _, _ = routed
     node = int(np.flatnonzero(
