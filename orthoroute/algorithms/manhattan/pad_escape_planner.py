@@ -536,7 +536,7 @@ class PadEscapePlanner:
         The physical via remains at the pad X coordinate; ``x_idx`` is only
         the nearby lattice anchor on the negotiated horizontal entry layer.
         """
-        from collections import defaultdict
+        from collections import Counter, defaultdict
 
         by_component = defaultdict(list)
         for entry in pad_list:
@@ -552,6 +552,55 @@ class PadEscapePlanner:
         ))
 
         for component_id, entries in sorted(by_component.items()):
+            full_columns = defaultdict(list)
+            for candidate_id, geometry in pad_geometries.items():
+                if (
+                    geometry.get("component_id") != component_id
+                    or float(geometry.get("drill", 0.0)) > 0.0
+                    or geometry["height"] < 2.0 * geometry["width"]
+                    or geometry["width"] > 0.75 * pitch
+                ):
+                    continue
+                full_columns[
+                    round(float(geometry["x"]), 5)
+                ].append((candidate_id, geometry))
+
+            full_column_ranks = {}
+            full_regular_columns = {}
+            if len(full_columns) >= 8:
+                count_frequency = Counter(
+                    len(column) for column in full_columns.values()
+                )
+                full_row_count, _ = max(
+                    count_frequency.items(),
+                    key=lambda item: (item[1], item[0]),
+                )
+                if full_row_count >= 2 and full_row_count % 2 == 0:
+                    full_regular_columns = {
+                        x: column
+                        for x, column in full_columns.items()
+                        if len(column) == full_row_count
+                    }
+                    full_ordered_x = sorted(full_regular_columns)
+                    regular_gaps = sum(
+                        abs((right - left) - pitch)
+                        <= pitch * 0.05
+                        for left, right in zip(
+                            full_ordered_x, full_ordered_x[1:]
+                        )
+                    )
+                    if (
+                        len(full_ordered_x) < 8
+                        or regular_gaps
+                        < 0.75 * (len(full_ordered_x) - 1)
+                    ):
+                        full_regular_columns = {}
+                    else:
+                        full_column_ranks = {
+                            x: rank
+                            for rank, x in enumerate(full_ordered_x)
+                        }
+
             physical_columns = defaultdict(list)
             for entry in entries:
                 physical_columns[round(float(entry[4]), 5)].append(entry)
@@ -618,7 +667,13 @@ class PadEscapePlanner:
                     ordered_rows = sorted(
                         column, key=lambda entry: entry[5]
                     )
-                    delta_steps = min_steps + (column_rank % 2)
+                    physical_x = round(
+                        float(ordered_rows[0][4]), 5
+                    )
+                    stagger_rank = full_column_ranks.get(
+                        physical_x, column_rank
+                    )
+                    delta_steps = min_steps + (stagger_rank % 2)
                     for row_rank, entry in enumerate(ordered_rows):
                         (
                             _pad,
@@ -682,6 +737,80 @@ class PadEscapePlanner:
                     run_index,
                     len(run_portals),
                     len(column_run),
+                )
+
+            recovered_portals = {}
+            recovered_cells = set()
+            for entry in entries:
+                (
+                    _pad,
+                    pad_id,
+                    x_idx,
+                    y_idx,
+                    pad_x,
+                    pad_y,
+                    pad_layer,
+                ) = entry
+                if pad_id in planned_ids:
+                    continue
+                physical_x = round(float(pad_x), 5)
+                full_column = full_regular_columns.get(physical_x)
+                if not full_column:
+                    continue
+                ordered_full_rows = sorted(
+                    full_column,
+                    key=lambda item: float(item[1]["y"]),
+                )
+                row_ids = [
+                    candidate_id
+                    for candidate_id, _geometry in ordered_full_rows
+                ]
+                if pad_id not in row_ids:
+                    continue
+                row_rank = row_ids.index(pad_id)
+                direction = (
+                    -1
+                    if row_rank < len(row_ids) // 2
+                    else 1
+                )
+                delta_steps = min_steps + (
+                    full_column_ranks[physical_x] % 2
+                )
+                portal = self._try_create_portal(
+                    x_idx,
+                    y_idx,
+                    direction,
+                    delta_steps,
+                    pad_id,
+                    pad_x,
+                    pad_y,
+                    pad_layer,
+                    1,
+                    pad_geometries,
+                    spatial_index,
+                    claim_cell=False,
+                    dynamic_entry=True,
+                )
+                if portal is None:
+                    continue
+                cell = (portal.x_idx, portal.y_idx)
+                if (
+                    cell in recovered_cells
+                    or cell in self._occupied_portal_cells
+                ):
+                    continue
+                recovered_cells.add(cell)
+                recovered_portals[pad_id] = portal
+
+            if recovered_portals:
+                self.portals.update(recovered_portals)
+                self._occupied_portal_cells.update(recovered_cells)
+                planned_ids.update(recovered_portals)
+                logger.info(
+                    "[DYNAMIC-ESCAPE] %s: recovered %d selected pads "
+                    "from full component geometry",
+                    component_id,
+                    len(recovered_portals),
                 )
 
         if planned_ids:
@@ -1383,6 +1512,16 @@ class PadEscapePlanner:
                     logger.warning(f"Pad {pad_id}: no size attribute, using default 0.5mm")
 
                 geometries[pad_id] = {'x': x, 'y': y, 'width': width, 'height': height}
+                geometries[pad_id].update({
+                    "component_id": getattr(
+                        pad, "component_id", None
+                    ) or getattr(comp, "id", None),
+                    "drill": float(
+                        getattr(pad, "drill", None)
+                        or getattr(pad, "drill_size", None)
+                        or 0.0
+                    ),
+                })
 
         for pad in getattr(board, "pads", []):
             pad_id = self._pad_key(pad, comp=None)
@@ -1396,7 +1535,20 @@ class PadEscapePlanner:
                     width = 0.5
                     height = 0.5
 
-                geometries[pad_id] = {'x': x, 'y': y, 'width': width, 'height': height}
+                geometries[pad_id] = {
+                    'x': x,
+                    'y': y,
+                    'width': width,
+                    'height': height,
+                    "component_id": getattr(
+                        pad, "component_id", None
+                    ),
+                    "drill": float(
+                        getattr(pad, "drill", None)
+                        or getattr(pad, "drill_size", None)
+                        or 0.0
+                    ),
+                }
 
         return geometries
 

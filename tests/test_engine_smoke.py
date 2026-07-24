@@ -323,7 +323,7 @@ def test_columnar_connectors_use_zero_conflict_dynamic_entries():
     ) == 2
 
 
-def test_partial_connector_selection_preserves_regular_dynamic_run():
+def test_full_component_geometry_recovers_partial_dynamic_columns():
     board = _make_columnar_connector_board(columns=10)
     selected_nets = board.nets[:32] + [board.nets[32], board.nets[36]]
     config = PathFinderConfig()
@@ -351,7 +351,7 @@ def test_partial_connector_selection_preserves_regular_dynamic_run():
         for pad_id in regular_pad_ids
     )
     assert all(
-        not pf.portals[pad_id].dynamic_entry
+        pf.portals[pad_id].dynamic_entry
         for pad_id in partial_pad_ids
     )
 
