@@ -6205,15 +6205,45 @@ class PathFinderRouter:
                 stagnant >= cfg.stagnation_patience
                 and it < cfg.max_iterations
             ):
-                self.stagnation_counter += 1  # Track cumulative stagnation events
-                victims = self._rip_top_k_offenders(k=20)  # Only rip 16-24 worst nets
-                self._last_ripped = victims  # Store for next hotset build (Fix 2)
-                # Freeze pres_fac for next 2 iterations to let smaller hotset settle (Fix 4)
-                self._freeze_pres_fac_until = it + 2
-                logger.warning(f"[STAGNATION {self.stagnation_counter}] Ripped {len(victims)} nets, "
-                              f"holding pres_fac for 2 iters, ROI margin now +{self.stagnation_counter*0.6:.1f}mm")
-                stagnant = 0
-                continue
+                spatial_via_overuse = (
+                    self._spatial_via_overuse_total()
+                )
+                via_tail_threshold = int(getattr(
+                    cfg,
+                    "via_keeper_rotation_overuse_threshold",
+                    8,
+                ))
+                if not self._should_rip_for_stagnation(
+                    spatial_via_overuse,
+                    via_tail_threshold,
+                ):
+                    # Via-pool offenders are already selected directly by
+                    # _build_hotset. Ripping additional ordinary-edge nets
+                    # during broad via recovery replaces otherwise-good full
+                    # paths and can recreate hundreds of spatial collisions.
+                    logger.info(
+                        "[STAGNATION] Suppressing speculative rip-up while "
+                        "spatial-via overuse=%d exceeds tail threshold=%d",
+                        spatial_via_overuse,
+                        via_tail_threshold,
+                    )
+                    stagnant = 0
+                else:
+                    self.stagnation_counter += 1
+                    victims = self._rip_top_k_offenders(k=20)
+                    self._last_ripped = victims
+                    # Freeze pres_fac for two iterations to let the smaller
+                    # hotset settle.
+                    self._freeze_pres_fac_until = it + 2
+                    logger.warning(
+                        "[STAGNATION %d] Ripped %d nets, holding pres_fac "
+                        "for 2 iters, ROI margin now +%.1fmm",
+                        self.stagnation_counter,
+                        len(victims),
+                        self.stagnation_counter * 0.6,
+                    )
+                    stagnant = 0
+                    continue
 
             # STEP 7: Escalate with anti-thrash damper
             if it <= getattr(self, "_freeze_pres_fac_until", 0):
@@ -7320,6 +7350,14 @@ class PathFinderRouter:
         if total_overuse <= 128:
             return 64
         return 100
+
+    @staticmethod
+    def _should_rip_for_stagnation(
+        spatial_via_overuse: int,
+        tail_threshold: int = 8,
+    ) -> bool:
+        """Allow speculative rip-up only outside broad via recovery."""
+        return spatial_via_overuse <= max(0, int(tail_threshold))
 
     def _clear_net_edge_tracking(self, net_id: str):
         """Clear edge-to-nets tracking for a net"""
