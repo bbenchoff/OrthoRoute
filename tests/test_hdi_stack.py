@@ -6,6 +6,7 @@ import pytest
 from orthoroute.algorithms.manhattan.hdi_stack import (
     pcbway_elic_stack,
     pcbway_mechanical_stack,
+    stack_for_profile,
 )
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
     Lattice3D,
@@ -73,6 +74,18 @@ def test_pcbway_mechanical_stack_uses_cnc_geometry_everywhere():
     assert stack.center_spacing_by_span()[(0, 1)] == pytest.approx(
         0.4294
     )
+
+
+def test_stack_profile_resolver():
+    assert stack_for_profile("board-default", 14) is None
+    assert stack_for_profile("pcbway-mechanical", 14).name == (
+        "pcbway_mechanical_adjacent_14L"
+    )
+    assert stack_for_profile("pcbway_elic", 14).name == (
+        "pcbway_elic_6+2+6"
+    )
+    with pytest.raises(ValueError, match="unknown fabrication profile"):
+        stack_for_profile("mystery", 14)
 
 
 def test_graph_applies_spacing_per_via_process():
