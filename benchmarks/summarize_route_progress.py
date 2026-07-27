@@ -17,7 +17,20 @@ COLORS = (
     "#9333ea",
     "#ea580c",
     "#0891b2",
+    "#be123c",
+    "#4d7c0f",
+    "#7c3aed",
+    "#0f766e",
 )
+
+
+def _is_candidate_name(name: str) -> bool:
+    """Include reduced-layer gates and every full-board layer candidate."""
+    if "HDI-pcbway_" not in name:
+        return False
+    return bool(
+        re.search(r"Backplane-(?:8L-1024N|14L-1024N|(\d+)L-\1L)", name)
+    )
 
 
 def _label(path: Path, journal: Dict[str, Any]) -> str:
@@ -222,8 +235,7 @@ def main() -> None:
     args = parser.parse_args()
     candidates = [
         path for path in args.results_dir.glob("*progress.json")
-        if "HDI-pcbway_" in path.name
-        and re.search(r"(8L-1024N|14L-1024N|14L-14L|16L-16L)", path.name)
+        if _is_candidate_name(path.name)
     ]
     runs = _load(candidates)
     if not runs:
