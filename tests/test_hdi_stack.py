@@ -3,7 +3,10 @@
 import numpy as np
 import pytest
 
-from orthoroute.algorithms.manhattan.hdi_stack import pcbway_elic_stack
+from orthoroute.algorithms.manhattan.hdi_stack import (
+    pcbway_elic_stack,
+    pcbway_mechanical_stack,
+)
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
     Lattice3D,
     PathFinderConfig,
@@ -47,6 +50,28 @@ def test_hdi_span_expands_to_adjacent_physical_vias():
         (4, 3),
         (3, 2),
         (2, 1),
+    )
+
+
+def test_pcbway_mechanical_stack_uses_cnc_geometry_everywhere():
+    stack = pcbway_mechanical_stack(14)
+
+    assert stack.name == "pcbway_mechanical_adjacent_14L"
+    assert stack.allowed_via_spans == frozenset(
+        (layer, layer + 1) for layer in range(13)
+    )
+    assert {
+        process.name for _, process in stack.via_processes
+    } == {"mechanical_blind_buried"}
+    assert {
+        process.kind for _, process in stack.via_processes
+    } == {"blind_buried"}
+    assert stack.process_for_span(0, 1).drill_mm == pytest.approx(0.15)
+    assert stack.process_for_span(6, 7).diameter_mm == pytest.approx(
+        0.3024
+    )
+    assert stack.center_spacing_by_span()[(0, 1)] == pytest.approx(
+        0.4294
     )
 
 

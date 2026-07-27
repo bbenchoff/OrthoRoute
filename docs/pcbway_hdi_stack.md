@@ -1,4 +1,4 @@
-# PCBWay HDI stack target
+# PCBWay reduced-layer stack targets
 
 OrthoRoute's reduced-layer fabrication target is an explicit ELIC
 (Every Layer Interconnect) family:
@@ -14,6 +14,16 @@ All build-up transitions are emitted as individual, copper-filled stacked
 laser microvias. The central core transition is emitted as a mechanical
 buried via. Consecutive graph transitions are not collapsed into an
 arbitrary deep blind/buried hole.
+
+For cost comparison, `pcbway_mechanical_stack()` preserves the same
+adjacent-only topology but assigns a 0.15 mm CNC drill and 0.3024 mm pad to
+every blind/buried transition. This is deliberately more restrictive on the
+0.4 mm grid: the published hole spacing requires about 0.4294 mm between
+centres, so adjacent grid sites cannot both carry vias on the same span.
+It is a routing-feasibility profile, not a claim that all thirteen
+transition types can be fabricated in one inexpensive lamination cycle.
+PCBWay must define the actual blind/buried drill spans and lamination
+sequence before that profile becomes an orderable stack.
 
 ## Routing rules
 

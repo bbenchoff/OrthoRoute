@@ -164,3 +164,45 @@ def pcbway_elic_stack(
         allowed_via_spans=allowed,
         via_processes=tuple(processes),
     )
+
+
+def pcbway_mechanical_stack(
+    layer_count: int,
+    *,
+    drill_mm: float = 0.15,
+    annular_ring_mm: float = 0.0762,
+) -> HDIStack:
+    """Build an adjacent-via cost comparison using CNC geometry.
+
+    This keeps the ELIC route topology for a direct capacity comparison,
+    but every transition uses the larger mechanical blind/buried geometry.
+    A fabricator must still define and approve the actual lamination and
+    drill sequence.
+    """
+    layer_count = int(layer_count)
+    if layer_count < 4 or layer_count % 2:
+        raise ValueError(
+            "PCBWay mechanical target must have an even layer count >= 4"
+        )
+
+    core_pair = (layer_count // 2 - 1, layer_count // 2)
+    allowed = frozenset(
+        (layer, layer + 1) for layer in range(layer_count - 1)
+    )
+    mechanical = ViaProcess(
+        name="mechanical_blind_buried",
+        drill_mm=float(drill_mm),
+        diameter_mm=float(drill_mm + 2.0 * annular_ring_mm),
+        kind="blind_buried",
+    )
+    build_up_steps = (layer_count - 2) // 2
+    return HDIStack(
+        name=f"pcbway_mechanical_adjacent_{layer_count}L",
+        layer_count=layer_count,
+        build_up_steps=build_up_steps,
+        core_pair=core_pair,
+        allowed_via_spans=allowed,
+        via_processes=tuple(
+            (pair, mechanical) for pair in sorted(allowed)
+        ),
+    )
