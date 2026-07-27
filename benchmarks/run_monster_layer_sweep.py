@@ -163,6 +163,17 @@ def _refresh_comparison(repo_root: Path, results_dir: Path) -> None:
     )
 
 
+def _remaining_candidates(
+    initial_layers: int,
+    selected: Optional[Tuple[int, Dict[str, Any]]],
+    max_layers: int,
+) -> list[int]:
+    """Choose lower qualification or upward capacity candidates."""
+    if selected is not None:
+        return [14] if selected[0] > 14 else []
+    return list(range(initial_layers + 2, max_layers + 1, 2))
+
+
 def _artifact_from_journal(journal: Dict[str, Any], key: str) -> Path:
     direct = journal.get(key)
     if direct:
@@ -269,6 +280,14 @@ def main() -> None:
     parser.add_argument("--max-iterations", type=int, default=240)
     parser.add_argument("--max-layers", type=int, default=20)
     parser.add_argument(
+        "--retry-initial",
+        action="store_true",
+        help=(
+            "rerun an incomplete attached candidate with current code "
+            "before adding layers"
+        ),
+    )
+    parser.add_argument(
         "--drc-error-target",
         type=int,
         default=100,
@@ -285,6 +304,7 @@ def main() -> None:
         "started": datetime.now().isoformat(timespec="seconds"),
         "candidate_max_iterations": args.max_iterations,
         "max_layers": args.max_layers,
+        "retry_initial": args.retry_initial,
         "drc_error_target": args.drc_error_target,
         "runs": [],
     }
@@ -309,17 +329,40 @@ def main() -> None:
         "progress": str(args.initial_progress),
         "status": initial.get("status"),
         "complete": initial_complete,
+        "reason": "attached_baseline",
     })
     selected: Optional[Tuple[int, Dict[str, Any]]] = (
         (initial_layers, initial) if initial_complete else None
     )
 
-    if initial_complete and initial_layers > 14:
-        candidates = [14]
-    else:
-        candidates = list(
-            range(initial_layers + 2, args.max_layers + 1, 2)
+    if not initial_complete and args.retry_initial:
+        state["status"] = f"retrying_{initial_layers}L"
+        _atomic_json(state_path, state)
+        progress, retry = _run_candidate(
+            repo_root,
+            args.results_dir,
+            initial_layers,
+            args.max_iterations,
+            state,
+            state_path,
         )
+        retry_complete = bool(
+            retry.get("completion", {}).get("complete", False)
+        )
+        state["runs"].append({
+            "layers": initial_layers,
+            "progress": str(progress),
+            "status": retry.get("status"),
+            "complete": retry_complete,
+            "reason": "current_code_retry",
+        })
+        _refresh_comparison(repo_root, args.results_dir)
+        if retry_complete:
+            selected = (initial_layers, retry)
+
+    candidates = _remaining_candidates(
+        initial_layers, selected, args.max_layers
+    )
     for layer_count in candidates:
         state["status"] = f"routing_{layer_count}L"
         _atomic_json(state_path, state)
@@ -339,6 +382,11 @@ def main() -> None:
             "progress": str(progress),
             "status": journal.get("status"),
             "complete": complete,
+            "reason": (
+                "lower_layer_qualification"
+                if selected is not None
+                else "capacity_expansion"
+            ),
         })
         _refresh_comparison(repo_root, args.results_dir)
         if complete:
