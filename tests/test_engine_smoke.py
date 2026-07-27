@@ -1327,6 +1327,17 @@ def test_via_pool_reroutes_only_one_stable_peer(routed):
         pf._rebuild_via_usage_from_committed()
 
 
+def test_via_keeper_rotation_tail_scales_with_route_size():
+    scale = PathFinderRouter._scaled_via_keeper_rotation_threshold
+
+    assert scale(8, 80) == 8
+    assert scale(8, 1024) == 8
+    assert scale(8, 1025) == 16
+    assert scale(8, 2048) == 16
+    assert scale(8, 8192) == 64
+    assert scale(0, 8192) == 0
+
+
 def test_path_respects_hv_discipline(routed):
     """Every lateral step must follow its layer's legal axis."""
     pf, _, _, _ = routed
