@@ -509,6 +509,7 @@ except ImportError:
 # Local config
 from .pathfinder.config import PAD_CLEARANCE_MM
 from .pad_escape_planner import PadEscapePlanner, Portal
+from .hdi_stack import HDIStack, canonical_pair
 from .board_analyzer import analyze_board_characteristics, BoardCharacteristics
 from .parameter_derivation import derive_routing_parameters, apply_derived_parameters, DerivedRoutingParameters
 from .pathfinder.via_kernels import ViaKernelManager, convert_via_metadata_to_gpu, ensure_gpu_array
@@ -704,6 +705,9 @@ class PathFinderConfig:
     via_keeper_rotation_overuse_threshold: int = 8
     via_keeper_rotation_nets_per_step: int = 1024
     allowed_via_spans: Optional[Set[Tuple[int, int]]] = None  # None = all layer pairs allowed (blind/buried)
+    # Explicit fabrication topology. When set, graph vias and emitted copper
+    # retain the stack's legal spans and span-specific drill processes.
+    hdi_stack: Optional[HDIStack] = None
 
 
 # Legacy constants
@@ -1424,15 +1428,48 @@ class Lattice3D:
         """mm → lattice"""
         return self.geom.world_to_lattice(x_mm, y_mm)
 
-    def is_via_site(self, x: int, y: int) -> bool:
-        """Return whether ordinary graph vias may occupy this lattice site."""
-        mode = getattr(self, "_via_site_mode", "all")
+    @staticmethod
+    def _via_site_policy(required_spacing: float, pitch: float):
+        """Return the sublattice policy satisfying one center spacing."""
+        required_spacing = max(0.0, float(required_spacing))
+        if required_spacing < pitch - 1e-9:
+            return "all", 1
+        if required_spacing <= pitch * np.sqrt(2.0) + 1e-9:
+            return "checkerboard", 1
+        return "stride", max(2, int(np.ceil(required_spacing / pitch)))
+
+    @staticmethod
+    def _matches_via_site_policy(
+        x: int, y: int, mode: str, stride: int
+    ) -> bool:
         if mode == "all":
             return True
         if mode == "checkerboard":
             return (x + y) % 2 == 0
-        stride = int(getattr(self, "_via_site_stride", 1))
         return x % stride == 0 and y % stride == 0
+
+    def is_via_site(
+        self,
+        x: int,
+        y: int,
+        z_from: Optional[int] = None,
+        z_to: Optional[int] = None,
+    ) -> bool:
+        """Return whether one via process may occupy this lattice site."""
+        if z_from is not None and z_to is not None:
+            pair = canonical_pair(int(z_from), int(z_to))
+            policies = getattr(self, "_via_pair_site_policies", {})
+            mode, stride = policies.get(
+                pair,
+                (
+                    getattr(self, "_via_site_mode", "all"),
+                    int(getattr(self, "_via_site_stride", 1)),
+                ),
+            )
+        else:
+            mode = getattr(self, "_via_site_mode", "all")
+            stride = int(getattr(self, "_via_site_stride", 1))
+        return self._matches_via_site_policy(x, y, mode, stride)
 
     def build_graph(
         self,
@@ -1442,6 +1479,9 @@ class Lattice3D:
         allow_any_layer_via: bool = False,
         adjacent_via_step_scale: float = 4.0,
         min_via_center_spacing: float = 0.0,
+        via_pair_center_spacing: Optional[
+            Dict[Tuple[int, int], float]
+        ] = None,
     ) -> CSRGraph:
         """
         Build graph with H/V constraints and flexible via spans.
@@ -1495,35 +1535,48 @@ class Lattice3D:
         # center spacing, restrict vias to a DRC-spaced sublattice. A
         # checkerboard preserves half the sites while increasing the nearest
         # site distance from one pitch to sqrt(2) pitches.
-        required_spacing = max(0.0, float(min_via_center_spacing))
-        if required_spacing < self.pitch - 1e-9:
-            via_site_mode = "all"
-            via_site_stride = 1
-        elif required_spacing <= self.pitch * np.sqrt(2.0) + 1e-9:
-            via_site_mode = "checkerboard"
-            via_site_stride = 1
-        else:
-            via_site_mode = "stride"
-            via_site_stride = max(
-                2, int(np.ceil(required_spacing / self.pitch))
-            )
+        default_spacing = max(0.0, float(min_via_center_spacing))
+        explicit_spacing = {
+            canonical_pair(int(a), int(b)): max(0.0, float(spacing))
+            for (a, b), spacing in (via_pair_center_spacing or {}).items()
+        }
+        pair_spacing = {
+            pair: explicit_spacing.get(pair, default_spacing)
+            for pair in legal_via_pairs_set
+        }
+        pair_policies = {
+            pair: self._via_site_policy(spacing, self.pitch)
+            for pair, spacing in pair_spacing.items()
+        }
+        self._via_pair_site_policies = pair_policies
 
+        # Calls without a layer pair use the most restrictive process. This
+        # preserves the historical conservative answer for diagnostics while
+        # graph construction uses the exact process for each span.
+        required_spacing = max(pair_spacing.values(), default=default_spacing)
+        via_site_mode, via_site_stride = self._via_site_policy(
+            required_spacing, self.pitch
+        )
         self._via_site_mode = via_site_mode
         self._via_site_stride = via_site_stride
 
-        via_site_count = sum(
-            self.is_via_site(x, y)
-            for x in range(self.x_steps)
-            for y in range(self.y_steps)
+        pair_site_counts = {
+            pair: sum(
+                self.is_via_site(x, y, *pair)
+                for x in range(self.x_steps)
+                for y in range(self.y_steps)
+            )
+            for pair in legal_via_pairs_set
+        }
+        via_site_count = min(
+            pair_site_counts.values(), default=0
         )
-        via_edge_count = (
-            2 * via_site_count * len(legal_via_pairs_set)
-        )
+        via_edge_count = 2 * sum(pair_site_counts.values())
         edge_count += via_edge_count
 
         logger.info(
-            "Pre-allocating for %s edges (%s via edges for %d pairs "
-            "on %s/%s sites; required spacing %.4fmm)",
+            "Pre-allocating for %s edges (%s via edges for %d pairs; "
+            "most restrictive process uses %s/%s sites at %.4fmm)",
             f"{edge_count:,}",
             f"{via_edge_count:,}",
             len(legal_via_pairs_set),
@@ -1595,9 +1648,11 @@ class Lattice3D:
 
         for x in range(self.x_steps):
             for y in range(self.y_steps):
-                if not self.is_via_site(x, y):
-                    continue
                 for (z_from, z_to) in legal_via_pairs_set:
+                    if not self.is_via_site(
+                        x, y, z_from, z_to
+                    ):
+                        continue
                     # Only add if this specific pair is legal
                     span = abs(z_to - z_from)
                     if adjacent_only:
@@ -2492,6 +2547,11 @@ class PathFinderRouter:
     def initialize_graph(self, board: Board) -> bool:
         """Build routing graph"""
         design_rules = getattr(board, "_design_rules", None) or {}
+        hdi_stack = getattr(self.config, "hdi_stack", None)
+        if hdi_stack is not None:
+            design_rules = dict(design_rules)
+            design_rules.update(hdi_stack.design_rules())
+            board._design_rules = design_rules
         if design_rules:
             self.config.track_width = float(
                 design_rules.get(
@@ -2551,6 +2611,15 @@ class PathFinderRouter:
         # Use board's real layer count (critical for dense boards)
         layers_from_board = getattr(board, "layer_count", None) or len(getattr(board, "layers", [])) or self.config.layer_count
         self.config.layer_count = int(layers_from_board)
+        if hdi_stack is not None:
+            if hdi_stack.layer_count != self.config.layer_count:
+                raise ValueError(
+                    f"{hdi_stack.name} requires {hdi_stack.layer_count} "
+                    f"layers, board has {self.config.layer_count}"
+                )
+            self.config.allowed_via_spans = set(
+                hdi_stack.allowed_via_spans
+            )
 
         # Domain boards store Layer objects, while geometry and keepout code
         # require string names. Prefer the board's exact copper stackup; the
@@ -2578,6 +2647,15 @@ class PathFinderRouter:
             )
 
         logger.info(f"Using {self.config.layer_count} layers from board")
+        if hdi_stack is not None:
+            logger.info(
+                "[HDI-STACK] %s (%s), %d explicit adjacent spans, "
+                "central core pair %s",
+                hdi_stack.name,
+                hdi_stack.notation,
+                len(hdi_stack.allowed_via_spans),
+                hdi_stack.core_pair,
+            )
 
         self.lattice = Lattice3D(
             bounds,
@@ -2619,6 +2697,10 @@ class PathFinderRouter:
                 + float(getattr(
                     self.config, "min_hole_to_hole", 0.0
                 )),
+            ),
+            via_pair_center_spacing=(
+                hdi_stack.center_spacing_by_span()
+                if hdi_stack is not None else None
             ),
         )
         # Lazily populated by _path_to_edges. Invalidate if this router is
@@ -4896,8 +4978,15 @@ class PathFinderRouter:
         if tracked_count > 0:
             logger.info(f"[ESCAPE-VIA] Tracked {tracked_count} escape vias in via spatial arrays")
 
-    def _layer_name_to_index(self, layer_name: str) -> Optional[int]:
+    def _layer_name_to_index(self, layer_name) -> Optional[int]:
         """Convert layer name to layer index, or None if not found"""
+        if isinstance(layer_name, (int, np.integer)):
+            layer = int(layer_name)
+            return (
+                layer
+                if 0 <= layer < int(self.config.layer_count)
+                else None
+            )
         if not hasattr(self.config, 'layer_names'):
             return None
 
@@ -9239,7 +9328,7 @@ class PathFinderRouter:
         if from_layer > to_layer:
             from_layer, to_layer = to_layer, from_layer
 
-        return {
+        via = {
             'net': net,
             'x': x_mm, 'y': y_mm,
             'from_layer': self.config.layer_names[from_layer] if from_layer < len(self.config.layer_names) else f"L{from_layer}",
@@ -9247,6 +9336,56 @@ class PathFinderRouter:
             'diameter': self.config.via_diameter,
             'drill': self.config.via_drill,
         }
+        hdi_stack = getattr(self.config, "hdi_stack", None)
+        if hdi_stack is not None:
+            process = hdi_stack.process_for_span(
+                from_layer, to_layer
+            )
+            via.update({
+                "diameter": process.diameter_mm,
+                "drill": process.drill_mm,
+                "via_process": process.name,
+                "via_kind": process.kind,
+                "hdi_stack": hdi_stack.name,
+            })
+        return via
+
+    def _expand_hdi_vias(self, vias: List[dict]) -> List[dict]:
+        """Express every emitted HDI transition as legal physical spans."""
+        hdi_stack = getattr(self.config, "hdi_stack", None)
+        if hdi_stack is None:
+            return list(vias)
+
+        expanded = []
+        for via in vias:
+            from_layer = self._layer_name_to_index(
+                via.get("from_layer")
+            )
+            to_layer = self._layer_name_to_index(
+                via.get("to_layer")
+            )
+            if from_layer is None or to_layer is None:
+                raise ValueError(
+                    "HDI via has an unknown layer span: "
+                    f"{via.get('from_layer')} -> {via.get('to_layer')}"
+                )
+            for physical_from, physical_to in hdi_stack.expand_span(
+                from_layer, to_layer
+            ):
+                lo, hi = canonical_pair(physical_from, physical_to)
+                process = hdi_stack.process_for_span(lo, hi)
+                item = dict(via)
+                item.update({
+                    "from_layer": self.config.layer_names[lo],
+                    "to_layer": self.config.layer_names[hi],
+                    "diameter": process.diameter_mm,
+                    "drill": process.drill_mm,
+                    "via_process": process.name,
+                    "via_kind": process.kind,
+                    "hdi_stack": hdi_stack.name,
+                })
+                expanded.append(item)
+        return expanded
 
     def _refresh_selected_escape_geometry(self) -> None:
         """Emit stubs only for the portal candidates selected by routing."""
@@ -9347,6 +9486,22 @@ class PathFinderRouter:
                        f"routed_vias={len(provisional_vias)} → "
                        f"total={len(final_vias)} vias after dedup")
 
+        final_vias = self._expand_hdi_vias(final_vias)
+        if getattr(self.config, "hdi_stack", None) is not None:
+            final_vias = _dedupe(
+                final_vias,
+                lambda v: (
+                    v["net"],
+                    round(v["x"], 3),
+                    round(v["y"], 3),
+                    v.get("from_layer"),
+                    v.get("to_layer"),
+                    round(v.get("drill", 0), 4),
+                    round(v.get("diameter", 0), 4),
+                    v.get("via_process"),
+                ),
+            )
+
         # Store merged geometry as provisional (for GUI display)
         self._provisional_geometry = GeometryPayload(final_tracks, final_vias)
 
@@ -9409,7 +9564,8 @@ class PathFinderRouter:
             )
             if not path:
                 continue
-            path = self._coalesce_vertical_runs(path)
+            if getattr(self.config, "hdi_stack", None) is None:
+                path = self._coalesce_vertical_runs(path)
 
             # NOTE: Escape geometry is pre-computed by PadEscapePlanner and cached.
             # It will be merged with routed geometry in emit_geometry().

@@ -36,6 +36,13 @@ def run(args) -> dict:
           f"{sum(len(n.pads) for n in board.nets)} pads")
 
     config = PathFinderConfig()
+    if args.grid_pitch is not None:
+        config.grid_pitch = args.grid_pitch
+    if args.hdi_stack == "pcbway-elic":
+        from orthoroute.algorithms.manhattan.hdi_stack import (
+            pcbway_elic_stack,
+        )
+        config.hdi_stack = pcbway_elic_stack(args.layers)
     config.portal_x_snap_max = 0.75  # pads sit half a pitch off-grid (see conftest)
     if args.direction_mode == "strict":
         config.wrong_way_cost_multiplier = float("inf")
@@ -105,6 +112,10 @@ def run(args) -> dict:
             config.preferred_layer_directions
         ),
         "layer_depth_bias": config.layer_depth_bias,
+        "grid_pitch": config.grid_pitch,
+        "hdi_stack": (
+            config.hdi_stack.name if config.hdi_stack is not None else None
+        ),
         "effective_max_iterations": config.max_iterations,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
@@ -146,6 +157,17 @@ def main():
         type=float,
         default=0.0,
         help="additive cost bias per higher layer (zero disables packing)",
+    )
+    parser.add_argument(
+        "--grid-pitch",
+        type=float,
+        help="routing lattice pitch in mm (default: router configuration)",
+    )
+    parser.add_argument(
+        "--hdi-stack",
+        choices=["none", "pcbway-elic"],
+        default="none",
+        help="explicit fabrication via topology",
     )
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--gpu", dest="use_gpu", action="store_true",

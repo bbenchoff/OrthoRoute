@@ -8,6 +8,7 @@ phase cost. Run-over-run comparison is the whole point - keep keys stable.
 """
 
 import subprocess
+from collections import Counter
 from typing import Dict, Optional
 
 
@@ -106,8 +107,38 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
     portal_grid_conflicts = int(
         getattr(pf, "_last_portal_grid_conflict_count", 0)
     )
+    hdi_stack = getattr(getattr(pf, "config", None), "hdi_stack", None)
+    hdi_metrics = None
+    if hdi_stack is not None:
+        geometry = pf.get_provisional_geometry()
+        process_counts = Counter(
+            str(via.get("via_process", "unspecified"))
+            for via in geometry.vias
+        )
+        span_counts = Counter(
+            f"{via.get('from_layer')}->{via.get('to_layer')}"
+            for via in geometry.vias
+        )
+        nonadjacent = 0
+        for via in geometry.vias:
+            start = pf._layer_name_to_index(via.get("from_layer"))
+            end = pf._layer_name_to_index(via.get("to_layer"))
+            if start is None or end is None or abs(end - start) != 1:
+                nonadjacent += 1
+        hdi_metrics = {
+            "name": hdi_stack.name,
+            "notation": hdi_stack.notation,
+            "core_pair": list(hdi_stack.core_pair),
+            "allowed_via_spans": [
+                list(pair) for pair in sorted(hdi_stack.allowed_via_spans)
+            ],
+            "via_process_counts": dict(sorted(process_counts.items())),
+            "via_span_counts": dict(sorted(span_counts.items())),
+            "nonadjacent_emitted_vias": nonadjacent,
+            "topology_valid": nonadjacent == 0,
+        }
 
-    return {
+    metrics = {
         "board": {
             "name": board.name,
             "layer_count": board.layer_count,
@@ -171,6 +202,9 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
         "timings_s": {k: round(v, 3) for k, v in (timings or {}).items()},
         "git_sha": _git_sha(),
     }
+    if hdi_metrics is not None:
+        metrics["hdi_stack"] = hdi_metrics
+    return metrics
 
 
 def _git_sha() -> Optional[str]:
