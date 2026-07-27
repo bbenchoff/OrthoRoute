@@ -33,7 +33,9 @@ def _wait_for_terminal(
     progress_path: Path,
     state: Dict[str, Any],
     state_path: Path,
+    refresh_comparison=None,
 ) -> Dict[str, Any]:
+    last_refresh_iteration = -10
     while True:
         journal = _read_json(progress_path)
         state["active_progress"] = str(progress_path)
@@ -41,6 +43,12 @@ def _wait_for_terminal(
         state["active_iteration"] = len(journal.get("iterations", []))
         state["updated"] = datetime.now().isoformat(timespec="seconds")
         _atomic_json(state_path, state)
+        if (
+            refresh_comparison is not None
+            and state["active_iteration"] >= last_refresh_iteration + 10
+        ):
+            refresh_comparison()
+            last_refresh_iteration = state["active_iteration"]
         if journal.get("status") in {"complete", "incomplete", "failed"}:
             return journal
         time.sleep(30)
@@ -62,6 +70,8 @@ def _run_candidate(
     results_dir: Path,
     layer_count: int,
     max_iterations: int,
+    state: Dict[str, Any],
+    state_path: Path,
 ) -> Tuple[Path, Dict[str, Any]]:
     previous = _latest_progress(results_dir, layer_count)
     environment = os.environ.copy()
@@ -87,10 +97,13 @@ def _run_candidate(
         / f"monster-full-{layer_count}L-mechanical-sweep.stderr.log"
     )
     started = time.time()
+    return_code = None
+    active_progress = None
+    last_refresh_iteration = -10
     with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
         "w", encoding="utf-8"
     ) as stderr:
-        return_code = subprocess.run(
+        process = subprocess.Popen(
             [
                 sys.executable,
                 str(
@@ -102,8 +115,29 @@ def _run_candidate(
             env=environment,
             stdout=stdout,
             stderr=stderr,
-            check=False,
-        ).returncode
+        )
+        while process.poll() is None:
+            candidate = _latest_progress(results_dir, layer_count)
+            if (
+                candidate is not None
+                and candidate != previous
+                and candidate.stat().st_mtime >= started
+            ):
+                active_progress = candidate
+                journal = _read_json(candidate)
+                iteration = len(journal.get("iterations", []))
+                state["active_progress"] = str(candidate)
+                state["active_status"] = journal.get("status")
+                state["active_iteration"] = iteration
+                state["updated"] = datetime.now().isoformat(
+                    timespec="seconds"
+                )
+                _atomic_json(state_path, state)
+                if iteration >= last_refresh_iteration + 10:
+                    _refresh_comparison(repo_root, results_dir)
+                    last_refresh_iteration = iteration
+            time.sleep(30)
+        return_code = process.wait()
     progress = _latest_progress(results_dir, layer_count)
     if (
         progress is None
@@ -240,7 +274,14 @@ def main() -> None:
     }
     _atomic_json(state_path, state)
 
-    initial = _wait_for_terminal(args.initial_progress, state, state_path)
+    initial = _wait_for_terminal(
+        args.initial_progress,
+        state,
+        state_path,
+        refresh_comparison=lambda: _refresh_comparison(
+            repo_root, args.results_dir
+        ),
+    )
     initial_layers = int(
         re.search(r"Backplane-(\d+)L", initial["run_name"]).group(1)
     )
@@ -271,6 +312,8 @@ def main() -> None:
             args.results_dir,
             layer_count,
             args.max_iterations,
+            state,
+            state_path,
         )
         complete = bool(
             journal.get("completion", {}).get("complete", False)
