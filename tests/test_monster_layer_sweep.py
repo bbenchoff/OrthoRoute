@@ -1,5 +1,6 @@
 from benchmarks.run_monster_layer_sweep import (
     _drc_counts,
+    _qualification_label,
     _remaining_candidates,
 )
 
@@ -39,3 +40,9 @@ def test_successful_reduced_candidate_qualifies_fourteen_layers():
 
 def test_incomplete_candidate_expands_layers_in_order():
     assert _remaining_candidates(16, None, 20) == [18, 20]
+
+
+def test_qualification_label_preserves_run_timestamp():
+    assert _qualification_label({
+        "run_name": "Backplane-16L-stuff-20260727_134657",
+    }) == "QUAL-20260727_134657"
