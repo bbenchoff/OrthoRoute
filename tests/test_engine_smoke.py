@@ -1067,6 +1067,36 @@ def test_history_hotset_cap_scales_with_live_overuse():
     assert cap(129) == 100
 
 
+def test_initial_net_order_is_reproducible_across_global_rng_state():
+    """The greedy pass must be a controlled experiment, not process RNG."""
+    import random
+
+    router = object.__new__(PathFinderRouter)
+    router.iteration = 1
+    router.lattice = type("Lattice", (), {
+        "idx_to_coord": lambda self, node: (node, 0, 0),
+    })()
+    router.accounting = type("Accounting", (), {
+        "use_gpu": False,
+        "present": np.zeros(1, dtype=np.float32),
+        "capacity": np.ones(1, dtype=np.float32),
+    })()
+    router._net_to_edges = {}
+    router._barrel_owner_nets = set()
+    router._barrel_victim_nets = set()
+    tasks = {
+        f"N{index:02d}": (index, 40 - index)
+        for index in range(20)
+    }
+
+    random.seed(1)
+    first = router._order_nets_by_difficulty(tasks)
+    random.seed(999)
+    second = router._order_nets_by_difficulty(tasks)
+
+    assert first == second
+
+
 def test_historical_only_edges_do_not_make_clean_nets_offenders():
     """Retained history prices routes but must not define live rip-up."""
     router = object.__new__(PathFinderRouter)

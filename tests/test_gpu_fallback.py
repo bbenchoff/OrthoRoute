@@ -171,3 +171,98 @@ def test_gpu_fullgraph_high_cost_rounding_does_not_cycle_parents():
     )
 
     assert path == [3, 2, 1, 0]
+
+
+def test_gpu_fullgraph_matches_reference_dijkstra_on_random_costs():
+    """CUDA SSSP must minimize edge plus entered-node costs."""
+    import heapq
+
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CUDA device unavailable")
+    except Exception:
+        pytest.skip("CUDA runtime unavailable")
+
+    width = 6
+    height = 6
+    node_count = width * height
+    rows = [[] for _ in range(node_count)]
+    for y in range(height):
+        for x in range(width):
+            node = y * width + x
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    rows[node].append(ny * width + nx)
+
+    indptr = np.zeros(node_count + 1, dtype=np.int32)
+    for node, neighbors in enumerate(rows):
+        indptr[node + 1] = indptr[node] + len(neighbors)
+    indices = np.asarray(
+        [neighbor for row in rows for neighbor in row],
+        dtype=np.int32,
+    )
+    graph = types.SimpleNamespace(
+        indptr=cp.asarray(indptr),
+        indices=cp.asarray(indices),
+    )
+    solver = CUDADijkstra(graph=graph)
+    rng = np.random.default_rng(20260727)
+
+    def reference_cost(costs, penalty, source, target):
+        distance = np.full(node_count, np.inf, dtype=np.float64)
+        distance[source] = float(penalty[source])
+        queue = [(distance[source], source)]
+        while queue:
+            current, node = heapq.heappop(queue)
+            if current != distance[node]:
+                continue
+            if node == target:
+                return current
+            for edge in range(indptr[node], indptr[node + 1]):
+                neighbor = int(indices[edge])
+                candidate = (
+                    current
+                    + float(costs[edge])
+                    + float(penalty[neighbor])
+                )
+                if candidate < distance[neighbor]:
+                    distance[neighbor] = candidate
+                    heapq.heappush(queue, (candidate, neighbor))
+        return np.inf
+
+    def returned_cost(path, costs, penalty):
+        total = float(penalty[path[0]])
+        for source, target in zip(path, path[1:]):
+            start, end = indptr[source], indptr[source + 1]
+            offset = np.flatnonzero(indices[start:end] == target)
+            assert offset.size == 1
+            total += (
+                float(costs[start + int(offset[0])])
+                + float(penalty[target])
+            )
+        return total
+
+    for _ in range(8):
+        costs = rng.uniform(0.05, 8.0, len(indices)).astype(np.float32)
+        penalty = rng.uniform(0.0, 3.0, node_count).astype(np.float32)
+        penalty[rng.random(node_count) < 0.7] = 0.0
+        source, target = rng.choice(
+            node_count, size=2, replace=False
+        ).astype(np.int32)
+        path = solver.find_path_fullgraph_gpu_seeds(
+            costs=cp.asarray(costs),
+            src_seeds=np.asarray([source], dtype=np.int32),
+            dst_targets=np.asarray([target], dtype=np.int32),
+            src_seed_costs=np.zeros(1, dtype=np.float32),
+            dst_target_costs=np.zeros(1, dtype=np.float32),
+            node_penalty=cp.asarray(penalty),
+        )
+
+        assert path
+        assert returned_cost(path, costs, penalty) == pytest.approx(
+            reference_cost(costs, penalty, int(source), int(target)),
+            rel=1e-5,
+            abs=1e-5,
+        )

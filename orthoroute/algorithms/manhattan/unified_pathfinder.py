@@ -727,6 +727,22 @@ def resolve_history_decay(config) -> float:
     return value
 
 
+def resolve_pres_fac_max(config, signal_layers: int) -> float:
+    """Respect the configured ceiling while enforcing a routing-size floor."""
+    if signal_layers <= 12:
+        layer_floor = 32.0
+    elif signal_layers <= 20:
+        layer_floor = 64.0
+    else:
+        layer_floor = 128.0
+    configured = float(getattr(config, "pres_fac_max", layer_floor))
+    if not np.isfinite(configured) or configured <= 0:
+        raise ValueError(
+            f"pres_fac_max must be finite and positive, got {configured!r}"
+        )
+    return max(configured, layer_floor)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CSR GRAPH
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5536,19 +5552,19 @@ class PathFinderRouter:
         # Base parameters from config
         pres_fac = float(getattr(cfg, 'pres_fac_init', 1.0))
         pres_fac_mult = float(getattr(cfg, 'pres_fac_mult', 1.15))
-        pres_fac_max_base = float(getattr(cfg, 'pres_fac_max', 8.0))
         hist_gain = float(getattr(cfg, 'hist_gain', 0.8))
 
-        # Scale by layer count (fewer layers = stronger penalties needed)
+        # Scale history by layer count (fewer layers need stronger memory).
+        # Present pressure uses the configured ceiling with a layer-dependent
+        # minimum; the previous code read cfg.pres_fac_max and then silently
+        # discarded it.
         if n_sig_layers <= 12:
-            pres_fac_max = 32.0  # Increased from 6.0 to allow convergence
             hist_cost_weight_mult = 1.2  # 12.0 for few layers
         elif n_sig_layers <= 20:
-            pres_fac_max = 64.0  # Increased from 8.0 to allow convergence
             hist_cost_weight_mult = 1.0  # 10.0
         else:
-            pres_fac_max = 128.0  # Increased from 10.0 to allow convergence
             hist_cost_weight_mult = 0.8  # 8.0 for many layers
+        pres_fac_max = resolve_pres_fac_max(cfg, n_sig_layers)
 
         # Allow env overrides for testing
         pres_fac_mult = float(os.getenv('ORTHO_PRES_FAC_MULT', pres_fac_mult))
@@ -5831,6 +5847,18 @@ class PathFinderRouter:
             if not self.accounting.verify_present_matches_canonical():
                 logger.warning(f"[ITER {it}] Accounting mismatch detected - potential bug")
 
+            # The pre-route host snapshot is valid for constructing this
+            # iteration's costs, but not for post-route diagnostics or the
+            # next layer-bias update. NumPy observed in-place changes while
+            # CuPy's .get() returned a stale copy, so GPU policy lagged CPU by
+            # one iteration.
+            if self.accounting.use_gpu:
+                post_present_cpu = self.accounting.present.get()
+                post_cap_cpu = self.accounting.capacity.get()
+            else:
+                post_present_cpu = self.accounting.present
+                post_cap_cpu = self.accounting.capacity
+
             # STEP 3.5: Detect via-barrel conflicts independently from edge
             # capacity. Barrel collisions identify nets to reroute; they are
             # not extra edge occupancy and must never be written into
@@ -5922,9 +5950,8 @@ class PathFinderRouter:
             # convergence condition and hotset input.
 
             # Instrumentation: via overuse ratio
-            # OPTIMIZATION: Use cached GPU transfers
-            present = present_cpu_cache
-            cap = cap_cpu_cache
+            present = post_present_cpu
+            cap = post_cap_cpu
             over = np.maximum(0, present - cap)
             # Use numpy boolean indexing for efficient via overuse calculation
             via_overuse = float(over[self._via_edges[:len(over)]].sum())
@@ -6744,11 +6771,14 @@ class PathFinderRouter:
         # Never rotate across barrel-role boundaries: moving even one forced
         # barrel owner behind its crossing track recreates the same short.
         # Ordinary congestion-only passes retain the tie-breaking rotation.
-        rotation = (
-            0
-            if owner_nets or victim_nets
-            else random.randint(0, min(5, len(scores) // 10))
-        )
+        rotation = 0
+        if not owner_nets and not victim_nets:
+            rng = random.Random(
+                42 + int(getattr(self, "iteration", 0))
+            )
+            rotation = rng.randint(
+                0, min(5, len(scores) // 10)
+            )
         ordered = [nid for _, nid in scores]
         if rotation > 0:
             ordered = ordered[rotation:] + ordered[:rotation]
@@ -8333,8 +8363,10 @@ class PathFinderRouter:
         }
         logger.info(f"[VIA-METADATA] Built metadata for {num_via_edges} via edges on CPU in {time.perf_counter() - t0:.3f}s")
 
-    def _path_to_edges(self, node_path: List[int]) -> List[int]:
-        """Map path hops to CSR edge ids with one cached graph download."""
+    def _path_to_directed_edges(
+        self, node_path: List[int]
+    ) -> List[int]:
+        """Map traversal hops to directed CSR arc ids."""
         if len(node_path) < 2:
             return []
 
@@ -8383,6 +8415,20 @@ class PathFinderRouter:
 
         edge_column = matches.argmax(axis=1)
         return (row_start + edge_column).astype(np.int64).tolist()
+
+    def _path_to_edges(self, node_path: List[int]) -> List[int]:
+        """Map a path to its undirected physical-resource arc ids.
+
+        The CSR has one arc per travel direction, but a copper segment or via
+        is one shared physical resource. Reserving both arcs makes opposite
+        traversals collide during ordinary PathFinder negotiation instead of
+        escaping to the later path-node cleanup phase.
+        """
+        forward = self._path_to_directed_edges(node_path)
+        reverse = self._path_to_directed_edges(
+            list(reversed(node_path))
+        )
+        return forward + reverse
 
     def _accumulate_node_conflict_history(self, nodes) -> None:
         """Learn each physically shorted node at most once per iteration."""
@@ -8985,15 +9031,21 @@ class PathFinderRouter:
                 continue
 
             net_id = self._get_net_id(net_name)
-            net_edges = self._net_to_edges.get(net_name)
-            if net_edges is None:
+            resource_edges = self._net_to_edges.get(net_name)
+            if resource_edges is None:
                 graph_path = self._path_without_dynamic_escape_chains(
                     net_name, path
                 )
-                net_edges = self._path_to_edges(graph_path)
-            if not net_edges:
+                # Exact physical-conflict measurement needs each traversal
+                # once; _net_to_edges contains both directional CSR arcs.
+                net_edges = self._path_to_directed_edges(graph_path)
+                edge_chunk = np.asarray(net_edges, dtype=np.int32)
+            else:
+                edge_chunk = np.asarray(
+                    resource_edges, dtype=np.int32
+                )[:len(resource_edges) // 2]
+            if edge_chunk.size == 0:
                 continue
-            edge_chunk = np.asarray(net_edges, dtype=np.int32)
             edge_chunks.append(edge_chunk)
             net_id_chunks.append(
                 np.full(edge_chunk.size, net_id, dtype=np.int32)
