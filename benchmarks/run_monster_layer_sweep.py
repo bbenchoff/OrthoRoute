@@ -236,11 +236,27 @@ def _export_and_drc(
         cwd=repo_root,
         check=True,
     )
+    drc_summary_stem = drc.with_name(drc.stem + "-summary")
+    subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "benchmarks" / "summarize_kicad_drc.py"),
+            str(drc),
+            "--output-stem",
+            str(drc_summary_stem),
+        ],
+        cwd=repo_root,
+        check=True,
+    )
     report = _read_json(drc)
     return {
         "board": str(board),
         "project": str(project),
         "drc": str(drc),
+        "drc_summary_markdown": str(
+            drc_summary_stem.with_suffix(".md")
+        ),
+        "drc_summary_csv": str(drc_summary_stem.with_suffix(".csv")),
         **_drc_counts(report),
     }
 
