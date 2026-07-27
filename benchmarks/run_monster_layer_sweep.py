@@ -140,6 +140,27 @@ def _artifact_from_journal(journal: Dict[str, Any], key: str) -> Path:
     return Path(metrics["artifacts"][key])
 
 
+def _drc_counts(report: Dict[str, Any]) -> Dict[str, int]:
+    """Count every KiCad item that still requires electrical cleanup."""
+    rule_errors = sum(
+        item.get("severity") == "error"
+        for item in report.get("violations", [])
+    )
+    warnings = sum(
+        item.get("severity") == "warning"
+        for item in report.get("violations", [])
+    )
+    unconnected = len(report.get("unconnected_items", []))
+    return {
+        "drc_errors": rule_errors,
+        "drc_warnings": warnings,
+        "unconnected_items": unconnected,
+        # KiCad stores unrouted connections separately from rule errors, but
+        # both require attention before this deliverable can be called routed.
+        "reported_errors": rule_errors + unconnected,
+    }
+
+
 def _export_and_drc(
     repo_root: Path,
     results_dir: Path,
@@ -186,15 +207,7 @@ def _export_and_drc(
         "board": str(board),
         "project": str(project),
         "drc": str(drc),
-        "drc_errors": sum(
-            item.get("severity") == "error"
-            for item in report.get("violations", [])
-        ),
-        "drc_warnings": sum(
-            item.get("severity") == "warning"
-            for item in report.get("violations", [])
-        ),
-        "unconnected_items": len(report.get("unconnected_items", [])),
+        **_drc_counts(report),
     }
 
 
@@ -205,6 +218,12 @@ def main() -> None:
     parser.add_argument("source_board", type=Path)
     parser.add_argument("--max-iterations", type=int, default=240)
     parser.add_argument("--max-layers", type=int, default=20)
+    parser.add_argument(
+        "--drc-error-target",
+        type=int,
+        default=100,
+        help="Require rule errors plus unconnected items below this count",
+    )
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parent.parent
     state_path = (
@@ -214,6 +233,9 @@ def main() -> None:
     state: Dict[str, Any] = {
         "status": "monitoring_initial",
         "started": datetime.now().isoformat(timespec="seconds"),
+        "candidate_max_iterations": args.max_iterations,
+        "max_layers": args.max_layers,
+        "drc_error_target": args.drc_error_target,
         "runs": [],
     }
     _atomic_json(state_path, state)
@@ -272,15 +294,23 @@ def main() -> None:
     state["status"] = "exporting"
     _atomic_json(state_path, state)
     state["selected_layers"] = selected[0]
-    state["deliverable"] = _export_and_drc(
+    deliverable = _export_and_drc(
         repo_root,
         args.results_dir,
         args.source_board,
         selected[0],
         selected[1],
     )
+    deliverable["drc_target_met"] = (
+        deliverable["reported_errors"] < args.drc_error_target
+    )
+    state["deliverable"] = deliverable
     _refresh_comparison(repo_root, args.results_dir)
-    state["status"] = "complete"
+    state["status"] = (
+        "complete"
+        if deliverable["drc_target_met"]
+        else "drc_target_not_met"
+    )
     state["updated"] = datetime.now().isoformat(timespec="seconds")
     _atomic_json(state_path, state)
 

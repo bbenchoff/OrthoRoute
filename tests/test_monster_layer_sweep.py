@@ -1,0 +1,28 @@
+from benchmarks.run_monster_layer_sweep import _drc_counts
+
+
+def test_drc_counts_include_unconnected_items_in_reported_errors():
+    report = {
+        "violations": [
+            {"severity": "error"},
+            {"severity": "warning"},
+            {"severity": "error"},
+        ],
+        "unconnected_items": [{}, {}, {}],
+    }
+
+    assert _drc_counts(report) == {
+        "drc_errors": 2,
+        "drc_warnings": 1,
+        "unconnected_items": 3,
+        "reported_errors": 5,
+    }
+
+
+def test_drc_counts_tolerate_missing_sections():
+    assert _drc_counts({}) == {
+        "drc_errors": 0,
+        "drc_warnings": 0,
+        "unconnected_items": 0,
+        "reported_errors": 0,
+    }
