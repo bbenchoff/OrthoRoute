@@ -1,4 +1,4 @@
-"""Supervise full mechanical monster routes and export the lowest success.
+"""Supervise full mechanical routes and export the lowest practical result.
 
 This script can attach to an already-running initial candidate by monitoring
 its progress journal. Subsequent layer candidates run to their configured
@@ -473,9 +473,9 @@ def main() -> None:
             break
 
     if selected is None:
-        state["status"] = "no_complete_candidate"
+        state["status"] = "no_practical_candidate"
         _atomic_json(state_path, state)
-        raise SystemExit("no layer candidate completed")
+        raise SystemExit("no layer candidate met the KiCad DRC target")
     state["status"] = "exporting"
     _atomic_json(state_path, state)
     state["selected_layers"] = selected[0]
