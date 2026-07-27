@@ -37,12 +37,24 @@ def _label(path: Path, journal: Dict[str, Any]) -> str:
     name = journal.get("run_name", path.stem)
     layers = re.search(r"Backplane-(\d+)L", name)
     nets = re.search(r"-(\d+)N-", name)
+    stamp = re.search(r"-(\d{8})_(\d{6})$", name)
     process = (
         "mechanical" if "pcbway_mechanical" in name else
         "ELIC" if "pcbway_elic" in name else "unspecified"
     )
     scope = f"{nets.group(1)} nets" if nets else "8,192 nets"
-    return f"{layers.group(1) if layers else '?'}L {scope} {process}"
+    identity = str(journal.get("git_sha", ""))[:7]
+    if stamp:
+        clock = stamp.group(2)
+        identity = " ".join(filter(None, (
+            identity,
+            f"{clock[:2]}:{clock[2:4]}",
+        )))
+    suffix = f" {identity}" if identity else ""
+    return (
+        f"{layers.group(1) if layers else '?'}L {scope} "
+        f"{process}{suffix}"
+    )
 
 
 def _load(paths: Iterable[Path]) -> List[Dict[str, Any]]:
@@ -69,6 +81,14 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
     barrels = [
         int(item.get("barrel_conflicts", 0)) for item in iterations
     ]
+    best_overuse = (
+        min(iterations, key=lambda item: int(item.get("overuse_total", 0)))
+        if iterations else {}
+    )
+    best_physical = (
+        min(iterations, key=lambda item: int(item.get("barrel_conflicts", 0)))
+        if iterations else {}
+    )
     completion = journal.get("completion", {})
     routed = final.get("routed_nets", journal.get("routed_nets", 0))
     scope_match = re.search(r"(\d[\d,]*) nets", run["label"])
@@ -82,10 +102,13 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
         "complete": bool(completion.get("complete", False)),
         "initial_overuse": overuse[0] if overuse else "",
         "best_overuse": min(overuse) if overuse else "",
+        "best_overuse_iteration": best_overuse.get("iteration", ""),
         "final_overuse": overuse[-1] if overuse else "",
         "initial_physical": barrels[0] if barrels else "",
         "best_physical": min(barrels) if barrels else "",
+        "best_physical_iteration": best_physical.get("iteration", ""),
         "final_physical": barrels[-1] if barrels else "",
+        "final_pres_fac": final.get("pres_fac", ""),
         "elapsed_seconds": final.get(
             "elapsed_seconds", journal.get("elapsed_seconds", "")
         ),
@@ -104,7 +127,8 @@ def _write_markdown(rows: Sequence[Dict[str, Any]], path: Path) -> None:
     columns = (
         "run", "status", "iterations", "routed_nets", "target_nets",
         "complete", "initial_overuse", "best_overuse", "final_overuse",
-        "initial_physical", "best_physical", "final_physical",
+        "best_overuse_iteration", "initial_physical", "best_physical",
+        "best_physical_iteration", "final_physical", "final_pres_fac",
         "elapsed_seconds",
     )
     lines = [
@@ -128,31 +152,44 @@ def _write_markdown(rows: Sequence[Dict[str, Any]], path: Path) -> None:
 
 
 def _points(
-    values: Sequence[int],
+    values: Sequence[float],
     x0: float,
     y0: float,
     width: float,
     height: float,
     max_iterations: int,
-    max_value: int,
+    max_value: float,
+    *,
+    log_scale: bool = True,
 ) -> str:
     result = []
-    log_max = math.log10(max(1, max_value))
+    log_max = math.log10(max(1.0, max_value))
     for index, value in enumerate(values, start=1):
         x = x0 + width * (index - 1) / max(1, max_iterations - 1)
-        normalized = math.log10(max(1, value)) / max(1.0, log_max)
+        if log_scale:
+            normalized = (
+                math.log10(max(1.0, value)) / max(1.0, log_max)
+            )
+        else:
+            normalized = max(0.0, value) / max(1.0, max_value)
         y = y0 + height * (1.0 - normalized)
         result.append(f"{x:.1f},{y:.1f}")
     return " ".join(result)
 
 
 def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
-    width, height = 1200, 760
+    width, height = 1200, 1040
     plot_x, plot_width = 90, 1040
-    panel_height = 250
+    panel_height = 200
     panels = [
-        ("Graph overuse (log scale)", "overuse_total", 90),
-        ("Physical conflict reports (log scale)", "barrel_conflicts", 410),
+        ("Graph overuse (log scale)", "overuse_total", 90, True),
+        (
+            "Physical conflict reports (log scale)",
+            "barrel_conflicts",
+            390,
+            True,
+        ),
+        ("Present congestion pressure", "pres_fac", 690, False),
     ]
     max_iterations = max(
         (len(run["iterations"]) for run in runs), default=1
@@ -164,14 +201,14 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
         '<text x="60" y="38" font-family="sans-serif" font-size="24" '
         'font-weight="bold">Reduced-layer monster routing progress</text>',
     ]
-    for title, key, y0 in panels:
+    for title, key, y0, log_scale in panels:
         maximum = max(
             (
-                int(item.get(key, 0))
+                float(item.get(key, 0))
                 for run in runs
                 for item in run["iterations"]
             ),
-            default=1,
+            default=1.0,
         )
         svg.extend([
             f'<text x="{plot_x}" y="{y0 - 18}" font-family="sans-serif" '
@@ -181,25 +218,28 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
         ])
         for tick in range(5):
             y = y0 + panel_height * tick / 4
-            exponent = math.log10(maximum) * (1.0 - tick / 4)
-            value = int(10 ** exponent)
+            if log_scale:
+                exponent = math.log10(maximum) * (1.0 - tick / 4)
+                value = f"{int(10 ** exponent):,}"
+            else:
+                value = f"{maximum * (1.0 - tick / 4):.1f}"
             svg.extend([
                 f'<line x1="{plot_x}" y1="{y:.1f}" '
                 f'x2="{plot_x + plot_width}" y2="{y:.1f}" '
                 'stroke="#e2e8f0"/>',
                 f'<text x="{plot_x - 8}" y="{y + 4:.1f}" '
                 'text-anchor="end" font-family="monospace" font-size="11">'
-                f'{value:,}</text>',
+                f'{value}</text>',
             ])
         for run_index, run in enumerate(runs):
             values = [
-                int(item.get(key, 0)) for item in run["iterations"]
+                float(item.get(key, 0)) for item in run["iterations"]
             ]
             if not values:
                 continue
             points = _points(
                 values, plot_x, y0, plot_width, panel_height,
-                max_iterations, maximum,
+                max_iterations, maximum, log_scale=log_scale,
             )
             color = COLORS[run_index % len(COLORS)]
             svg.append(
@@ -213,7 +253,7 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
                 'text-anchor="middle" font-family="sans-serif" '
                 f'font-size="11">{tick}</text>'
             )
-    legend_y = 700
+    legend_y = 960
     for index, run in enumerate(runs):
         color = COLORS[index % len(COLORS)]
         x = 80 + (index % 3) * 370
