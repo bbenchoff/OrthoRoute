@@ -697,6 +697,12 @@ class PathFinderConfig:
     physical_hotset_cap: int = 1024
     physical_hotset_min: int = 64
     physical_conflicts_per_hotset_net: float = 50.0
+    # Stable keepers prevent via-pool peers from swapping ownership every
+    # pass. Permit rotation only in a board-scaled tail: eight unresolved
+    # resources per 1,024 routed nets preserves the small-board policy while
+    # allowing a monster route's independent tails to make progress.
+    via_keeper_rotation_overuse_threshold: int = 8
+    via_keeper_rotation_nets_per_step: int = 1024
     allowed_via_spans: Optional[Set[Tuple[int, int]]] = None  # None = all layer pairs allowed (blind/buried)
 
 
@@ -6235,11 +6241,9 @@ class PathFinderRouter:
                 spatial_via_overuse = (
                     self._spatial_via_overuse_total()
                 )
-                via_tail_threshold = int(getattr(
-                    cfg,
-                    "via_keeper_rotation_overuse_threshold",
-                    8,
-                ))
+                via_tail_threshold = (
+                    self._via_keeper_rotation_threshold()
+                )
                 if not self._should_rip_for_stagnation(
                     spatial_via_overuse,
                     via_tail_threshold,
@@ -7394,6 +7398,38 @@ class PathFinderRouter:
         )
 
     @staticmethod
+    def _scaled_via_keeper_rotation_threshold(
+        base_threshold: int,
+        routed_net_count: int,
+        nets_per_step: int = 1024,
+    ) -> int:
+        """Scale a small-board via tail across independent net groups."""
+        base = max(0, int(base_threshold))
+        step = max(1, int(nets_per_step))
+        groups = max(
+            1,
+            int(np.ceil(max(0, routed_net_count) / step)),
+        )
+        return base * groups
+
+    def _via_keeper_rotation_threshold(self) -> int:
+        """Return the live route's board-scaled rotation threshold."""
+        routed_nets = sum(bool(path) for path in self.net_paths.values())
+        return self._scaled_via_keeper_rotation_threshold(
+            getattr(
+                self.config,
+                "via_keeper_rotation_overuse_threshold",
+                8,
+            ),
+            routed_nets,
+            getattr(
+                self.config,
+                "via_keeper_rotation_nets_per_step",
+                1024,
+            ),
+        )
+
+    @staticmethod
     def _physical_cleanup_drop_detected(
         previous_conflicts: Optional[int],
         current_conflicts: int,
@@ -7709,11 +7745,7 @@ class PathFinderRouter:
         )
         rotation_allowed = (
             self._spatial_via_overuse_total()
-            <= int(getattr(
-                self.config,
-                "via_keeper_rotation_overuse_threshold",
-                8,
-            ))
+            <= self._via_keeper_rotation_threshold()
         )
         new_keepers = {}
         new_member_state = {}
