@@ -212,9 +212,11 @@ def _export_and_drc(
     source_board: Path,
     layer_count: int,
     journal: Dict[str, Any],
+    *,
+    label: str = "FULL",
 ) -> Dict[str, Any]:
     geometry = _artifact_from_journal(journal, "geometry")
-    stem = f"Backplane-OrthoRoute-{layer_count}L-FULL-MECHANICAL"
+    stem = f"Backplane-OrthoRoute-{layer_count}L-{label}-MECHANICAL"
     board = results_dir / f"{stem}.kicad_pcb"
     project = results_dir / f"{stem}.kicad_pro"
     drc = results_dir / f"{stem}-drc.json"
@@ -272,6 +274,60 @@ def _export_and_drc(
     }
 
 
+def _qualification_label(journal: Dict[str, Any]) -> str:
+    match = re.search(
+        r"(\d{8}_\d{6})$",
+        str(journal.get("run_name", "")),
+    )
+    return "QUAL-" + (match.group(1) if match else "CURRENT")
+
+
+def _qualify_candidate(
+    repo_root: Path,
+    results_dir: Path,
+    source_board: Path,
+    layer_count: int,
+    journal: Dict[str, Any],
+    drc_error_target: int,
+) -> Dict[str, Any]:
+    """Use exported KiCad DRC, not zero internal conflicts, as acceptance."""
+    strict_complete = bool(
+        journal.get("completion", {}).get("complete", False)
+    )
+    result: Dict[str, Any] = {
+        "strict_complete": strict_complete,
+        "accepted": False,
+    }
+    if journal.get("status") == "failed":
+        result["reason"] = "route_failed_without_geometry"
+        return result
+    try:
+        deliverable = _export_and_drc(
+            repo_root,
+            results_dir,
+            source_board,
+            layer_count,
+            journal,
+            label=_qualification_label(journal),
+        )
+    except Exception as exc:
+        result["reason"] = (
+            f"qualification_export_failed: {type(exc).__name__}: {exc}"
+        )
+        return result
+    deliverable["drc_target_met"] = (
+        deliverable["reported_errors"] < drc_error_target
+    )
+    result["deliverable"] = deliverable
+    result["accepted"] = deliverable["drc_target_met"]
+    result["reason"] = (
+        "kicad_drc_below_target"
+        if result["accepted"]
+        else "kicad_drc_above_target"
+    )
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("initial_progress", type=Path)
@@ -321,21 +377,29 @@ def main() -> None:
     initial_layers = int(
         re.search(r"Backplane-(\d+)L", initial["run_name"]).group(1)
     )
-    initial_complete = bool(
-        initial.get("completion", {}).get("complete", False)
+    initial_qualification = _qualify_candidate(
+        repo_root,
+        args.results_dir,
+        args.source_board,
+        initial_layers,
+        initial,
+        args.drc_error_target,
     )
     state["runs"].append({
         "layers": initial_layers,
         "progress": str(args.initial_progress),
         "status": initial.get("status"),
-        "complete": initial_complete,
+        "complete": initial_qualification["strict_complete"],
+        "accepted": initial_qualification["accepted"],
+        "qualification": initial_qualification,
         "reason": "attached_baseline",
     })
     selected: Optional[Tuple[int, Dict[str, Any]]] = (
-        (initial_layers, initial) if initial_complete else None
+        (initial_layers, initial)
+        if initial_qualification["accepted"] else None
     )
 
-    if not initial_complete and args.retry_initial:
+    if selected is None and args.retry_initial:
         state["status"] = f"retrying_{initial_layers}L"
         _atomic_json(state_path, state)
         progress, retry = _run_candidate(
@@ -346,18 +410,25 @@ def main() -> None:
             state,
             state_path,
         )
-        retry_complete = bool(
-            retry.get("completion", {}).get("complete", False)
+        retry_qualification = _qualify_candidate(
+            repo_root,
+            args.results_dir,
+            args.source_board,
+            initial_layers,
+            retry,
+            args.drc_error_target,
         )
         state["runs"].append({
             "layers": initial_layers,
             "progress": str(progress),
             "status": retry.get("status"),
-            "complete": retry_complete,
+            "complete": retry_qualification["strict_complete"],
+            "accepted": retry_qualification["accepted"],
+            "qualification": retry_qualification,
             "reason": "current_code_retry",
         })
         _refresh_comparison(repo_root, args.results_dir)
-        if retry_complete:
+        if retry_qualification["accepted"]:
             selected = (initial_layers, retry)
 
     candidates = _remaining_candidates(
@@ -374,14 +445,21 @@ def main() -> None:
             state,
             state_path,
         )
-        complete = bool(
-            journal.get("completion", {}).get("complete", False)
+        qualification = _qualify_candidate(
+            repo_root,
+            args.results_dir,
+            args.source_board,
+            layer_count,
+            journal,
+            args.drc_error_target,
         )
         state["runs"].append({
             "layers": layer_count,
             "progress": str(progress),
             "status": journal.get("status"),
-            "complete": complete,
+            "complete": qualification["strict_complete"],
+            "accepted": qualification["accepted"],
+            "qualification": qualification,
             "reason": (
                 "lower_layer_qualification"
                 if selected is not None
@@ -389,7 +467,7 @@ def main() -> None:
             ),
         })
         _refresh_comparison(repo_root, args.results_dir)
-        if complete:
+        if qualification["accepted"]:
             if selected is None or layer_count < selected[0]:
                 selected = (layer_count, journal)
             break
