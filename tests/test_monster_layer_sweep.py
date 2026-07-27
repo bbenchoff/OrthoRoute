@@ -1,4 +1,7 @@
-from benchmarks.run_monster_layer_sweep import _drc_counts
+from benchmarks.run_monster_layer_sweep import (
+    _drc_counts,
+    _remaining_candidates,
+)
 
 
 def test_drc_counts_include_unconnected_items_in_reported_errors():
@@ -26,3 +29,13 @@ def test_drc_counts_tolerate_missing_sections():
         "unconnected_items": 0,
         "reported_errors": 0,
     }
+
+
+def test_successful_reduced_candidate_qualifies_fourteen_layers():
+    selected = (16, {"status": "complete"})
+
+    assert _remaining_candidates(16, selected, 20) == [14]
+
+
+def test_incomplete_candidate_expands_layers_in_order():
+    assert _remaining_candidates(16, None, 20) == [18, 20]
