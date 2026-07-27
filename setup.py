@@ -46,6 +46,12 @@ setup(
         "gpu": [
             "cupy>=10.0.0",  # For CUDA support
         ],
+        "metal": [
+            (
+                "mlx>=0.32.0; platform_system == 'Darwin' "
+                "and platform_machine == 'arm64'"
+            ),
+        ],
         "kicad": [
             # KiCad Python API dependencies would go here
             # These are typically provided by KiCad installation

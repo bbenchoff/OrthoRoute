@@ -7,7 +7,8 @@ kicad-python>=0.5.0
 PyQt6>=6.0.0
 
 # GPU acceleration (optional)
-cupy>=10.0.0
+cupy>=10.0.0; platform_system != "Darwin"
+mlx>=0.32.0; platform_system == "Darwin" and platform_machine == "arm64"
 
 # Development dependencies (optional)
 pytest>=6.0.0

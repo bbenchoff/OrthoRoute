@@ -134,6 +134,9 @@ The fix is upcoming, but has not been released yet. **To run this, do the follow
    ```bash
    pip install -r requirements.txt
    ```
+   On Apple Silicon, this installs MLX instead of CUDA/CuPy and requires a
+   native ARM Python 3.10+ on macOS 14+. An editable/package install can use
+   `pip install -e ".[metal]"`. NVIDIA systems retain the CuPy path.
 3. **Run**: Start OrthoRoute with your KiCad project open
    ```bash
    cd src
