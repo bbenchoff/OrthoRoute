@@ -7635,12 +7635,15 @@ class PathFinderRouter:
 
         present = self.accounting.present.get() if self.accounting.use_gpu else self.accounting.present
         cap = self.accounting.capacity.get() if self.accounting.use_gpu else self.accounting.capacity
-        hist = self.accounting.history.get() if self.accounting.use_gpu else self.accounting.history
-
-        # Include history in hotset selection: edges are "hot" if they have present OR historical congestion
         over = np.maximum(0, present - cap)
-        hot_edges = over + 0.1 * hist  # Gentle history influence (was 0.5 - too aggressive!)
-        over_idx = set(map(int, np.where(hot_edges > 0.5)[0]))  # Higher threshold to be more selective
+        # History belongs in the Pathfinder routing cost, not in the
+        # definition of a live offender.  Once an edge is no longer
+        # oversubscribed, selecting every net that merely touches its retained
+        # history wastes the bounded random hotset on clean nets and can make
+        # full-memory runs diverge.  Rip up nets using resources that are
+        # over capacity now; their next shortest-path search still sees the
+        # complete historical cost field.
+        over_idx = set(map(int, np.flatnonzero(over > 0)))
         via_pool_offenders = self._find_via_pool_offenders()
         total_overuse_with_vias = self.accounting.compute_overuse(
             router_instance=self
@@ -7740,10 +7743,9 @@ class PathFinderRouter:
         #     base_target = max(64, int(base_target * 0.80))
         #     logger.debug(f"[HOTSET-TREND] Good progress ({delta*100:.1f}%) → shrinking hotset to {base_target}")
 
-        # Historical edges vastly outnumber live offenders in the final tail.
-        # A fixed 100-net wave can turn a handful of conflicts into hundreds
-        # of new via collisions. Scale only the ordinary/history wave; exact
-        # physical offenders and unrouted nets still bypass this cap below.
+        # A fixed 100-net ordinary wave can turn a handful of conflicts into
+        # hundreds of new via collisions. Exact physical offenders and
+        # unrouted nets still bypass this cap below.
         base_target = self._history_hotset_cap(
             total_overuse_with_vias
         )

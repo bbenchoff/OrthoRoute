@@ -1067,6 +1067,39 @@ def test_history_hotset_cap_scales_with_live_overuse():
     assert cap(129) == 100
 
 
+def test_historical_only_edges_do_not_make_clean_nets_offenders():
+    """Retained history prices routes but must not define live rip-up."""
+    router = object.__new__(PathFinderRouter)
+    router.config = PathFinderConfig()
+    router.iteration = 2
+    router.net_paths = {
+        "LIVE": [0, 1],
+        "STALE": [2, 3],
+    }
+    router._net_to_edges = {
+        "LIVE": [0],
+        "STALE": [1],
+    }
+    router._edge_to_nets = {
+        0: {"LIVE"},
+        1: {"STALE"},
+    }
+    router.accounting = type("Accounting", (), {
+        "use_gpu": False,
+        "present": np.array([2.0, 1.0], dtype=np.float32),
+        "capacity": np.ones(2, dtype=np.float32),
+        "history": np.array([0.0, 100.0], dtype=np.float32),
+        "compute_overuse": lambda self, router_instance=None: (1, 1),
+    })()
+
+    hotset = router._build_hotset({
+        "LIVE": (0, 1),
+        "STALE": (2, 3),
+    })
+
+    assert hotset == {"LIVE"}
+
+
 def test_stagnation_rip_waits_for_spatial_via_tail():
     should_rip = PathFinderRouter._should_rip_for_stagnation
 
