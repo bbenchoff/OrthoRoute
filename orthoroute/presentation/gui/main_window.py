@@ -815,18 +815,52 @@ class OrthoRouteMainWindow(QMainWindow):
         
     def detect_gpu_status(self):
         """Detect GPU capabilities for algorithm selection"""
+        import platform
+
+        if (
+            platform.system() == "Darwin"
+            and platform.machine().lower() in {"arm64", "aarch64"}
+        ):
+            try:
+                from ...algorithms.manhattan.pathfinder.metal_dijkstra import (
+                    METAL_AVAILABLE,
+                )
+                if METAL_AVAILABLE:
+                    self.gpu_status = {
+                        'available': True,
+                        'can_use_gpu_routing': True,
+                        'backend': 'metal',
+                    }
+                    logger.info(
+                        "Apple Silicon Metal/MLX routing backend available"
+                    )
+                    return
+            except Exception as exc:
+                logger.info("Metal detection failed: %s", exc)
         try:
             # Try to detect CUDA/GPU availability
             import subprocess
             result = subprocess.run(['nvidia-smi'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
-                self.gpu_status = {'available': True, 'can_use_gpu_routing': True}
+                self.gpu_status = {
+                    'available': True,
+                    'can_use_gpu_routing': True,
+                    'backend': 'cuda',
+                }
                 logger.info("GPU detected and available for routing")
             else:
-                self.gpu_status = {'available': False, 'can_use_gpu_routing': False}
+                self.gpu_status = {
+                    'available': False,
+                    'can_use_gpu_routing': False,
+                    'backend': 'cpu',
+                }
                 logger.info("GPU not available, using CPU routing")
         except:
-            self.gpu_status = {'available': False, 'can_use_gpu_routing': False}
+            self.gpu_status = {
+                'available': False,
+                'can_use_gpu_routing': False,
+                'backend': 'cpu',
+            }
             logger.info("GPU detection failed, using CPU routing")
         
     def setup_ui(self):
@@ -912,6 +946,38 @@ class OrthoRouteMainWindow(QMainWindow):
         
         algorithm_layout.addWidget(self.algorithm_combo)
         routing_layout.addLayout(algorithm_layout)
+
+        fabrication_layout = QHBoxLayout()
+        fabrication_layout.addWidget(QLabel("Fabrication:"))
+        self.fabrication_combo = QComboBox()
+        self.fabrication_combo.addItem("Board defaults", "board_default")
+        self.fabrication_combo.addItem(
+            "PCBWay mechanical blind/buried",
+            "pcbway_mechanical",
+        )
+        self.fabrication_combo.addItem(
+            "PCBWay ELIC microvia",
+            "pcbway_elic",
+        )
+        self.fabrication_combo.setToolTip(
+            "Select the explicit via topology used to construct the "
+            "routing graph. Final stackup still requires fabricator DFM."
+        )
+        fabrication_layout.addWidget(self.fabrication_combo)
+        routing_layout.addLayout(fabrication_layout)
+
+        grid_layout = QHBoxLayout()
+        grid_layout.addWidget(QLabel("Grid pitch (mm):"))
+        self.grid_pitch_spinner = QDoubleSpinBox()
+        self.grid_pitch_spinner.setRange(0.1, 2.0)
+        self.grid_pitch_spinner.setDecimals(2)
+        self.grid_pitch_spinner.setSingleStep(0.05)
+        self.grid_pitch_spinner.setValue(0.4)
+        self.grid_pitch_spinner.setToolTip(
+            "Routing lattice pitch; reduced-layer monster runs use 0.40 mm"
+        )
+        grid_layout.addWidget(self.grid_pitch_spinner)
+        routing_layout.addLayout(grid_layout)
         
         # Batch Size Control
         batch_layout = QHBoxLayout()
@@ -934,7 +1000,13 @@ class OrthoRouteMainWindow(QMainWindow):
         except ImportError:
             self.gpu_checkbox.setChecked(False)  # Fallback if import fails
 
-        self.gpu_checkbox.setToolTip("Enable CUDA GPU acceleration for routing (experimental)")
+        accelerator = self.gpu_status.get('backend', 'GPU')
+        self.gpu_checkbox.setText(
+            f"Enable {accelerator.upper()} acceleration (beta)"
+        )
+        self.gpu_checkbox.setToolTip(
+            "Enable CUDA or Apple Silicon Metal acceleration for routing"
+        )
 
         # Disable if no GPU detected
         if hasattr(self, 'gpu_status') and not self.gpu_status.get('available', False):
@@ -1517,7 +1589,16 @@ class OrthoRouteMainWindow(QMainWindow):
         import os
         gpu_enabled = self.gpu_checkbox.isChecked()
         os.environ['ORTHO_GPU'] = '1' if gpu_enabled else '0'
-        gpu_mode = "GPU (beta)" if gpu_enabled else "CPU (safe default)"
+        backend = self.gpu_status.get('backend', 'cuda')
+        if backend == 'metal':
+            if gpu_enabled:
+                os.environ['ORTHO_BACKEND'] = 'metal'
+            elif os.environ.get('ORTHO_BACKEND') == 'metal':
+                os.environ.pop('ORTHO_BACKEND')
+        gpu_mode = (
+            f"{backend.upper()} (beta)"
+            if gpu_enabled else "CPU (safe default)"
+        )
         self.log_to_gui(f"[GPU] Using {gpu_mode} acceleration", "INFO")
 
         # Clear previous log and start fresh
@@ -1586,6 +1667,22 @@ class OrthoRouteMainWindow(QMainWindow):
             # Get pathfinder and board from plugin
             pf = self.plugin.get_pathfinder()
             board = self._create_board_from_data()
+            from ...algorithms.manhattan.hdi_stack import (
+                stack_for_profile,
+            )
+            fabrication_profile = self.fabrication_combo.currentData()
+            pf.config.grid_pitch = self.grid_pitch_spinner.value()
+            pf.config.hdi_stack = stack_for_profile(
+                fabrication_profile,
+                board.layer_count,
+            )
+            if pf.config.hdi_stack is not None:
+                self.log_to_gui(
+                    "[FAB] "
+                    f"{pf.config.hdi_stack.name}, "
+                    f"grid={pf.config.grid_pitch:.2f} mm",
+                    "INFO",
+                )
 
             # NOTE: IterationMetricsLogger not available in 22eb7db baseline
             # Metrics logging functionality removed during rollback to 22eb7db

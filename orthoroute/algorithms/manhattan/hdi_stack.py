@@ -6,7 +6,7 @@ requirements that the graph and geometry emitter must preserve.
 """
 
 from dataclasses import dataclass
-from typing import Dict, FrozenSet, Iterable, Tuple
+from typing import Dict, FrozenSet, Iterable, Optional, Tuple
 
 
 LayerPair = Tuple[int, int]
@@ -206,3 +206,18 @@ def pcbway_mechanical_stack(
             (pair, mechanical) for pair in sorted(allowed)
         ),
     )
+
+
+def stack_for_profile(
+    profile: str,
+    layer_count: int,
+) -> Optional[HDIStack]:
+    """Resolve a UI/CLI fabrication profile to an explicit stack."""
+    normalized = str(profile).strip().lower().replace("-", "_")
+    if normalized in {"", "default", "board_default", "none"}:
+        return None
+    if normalized in {"pcbway_mechanical", "mechanical"}:
+        return pcbway_mechanical_stack(layer_count)
+    if normalized in {"pcbway_elic", "elic"}:
+        return pcbway_elic_stack(layer_count)
+    raise ValueError(f"unknown fabrication profile: {profile}")
