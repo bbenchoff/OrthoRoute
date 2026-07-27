@@ -716,6 +716,17 @@ GRID_PITCH = 0.4
 LAYER_COUNT = 6
 
 
+def resolve_history_decay(config) -> float:
+    """Return the derived history-retention factor, with a test override."""
+    value = float(os.getenv(
+        "ORTHO_HISTORY_DECAY",
+        getattr(config, "history_decay", 1.0),
+    ))
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("ORTHO_HISTORY_DECAY must be between 0.0 and 1.0")
+    return value
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CSR GRAPH
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5543,6 +5554,7 @@ class PathFinderRouter:
         pres_fac_mult = float(os.getenv('ORTHO_PRES_FAC_MULT', pres_fac_mult))
         pres_fac_max = float(os.getenv('ORTHO_PRES_FAC_MAX', pres_fac_max))
         hist_gain = float(os.getenv('ORTHO_HIST_GAIN', hist_gain))
+        history_decay = resolve_history_decay(cfg)
 
         best_overuse = float('inf')
         stagnant = 0
@@ -5551,7 +5563,18 @@ class PathFinderRouter:
         self._negotiation_ran = True
 
         logger.info(f"[NEGOTIATE] {len(tasks)} nets, {cfg.max_iterations} iters")
-        logger.info(f"[PARAMS] layers={n_sig_layers} pres_fac_init={pres_fac:.2f} pres_fac_mult={pres_fac_mult:.2f} pres_fac_max={pres_fac_max:.0f} hist_gain={hist_gain:.2f} hist_weight={cfg.hist_cost_weight * hist_cost_weight_mult:.1f}")
+        logger.info(
+            "[PARAMS] layers=%d pres_fac_init=%.2f pres_fac_mult=%.2f "
+            "pres_fac_max=%.0f hist_gain=%.2f hist_weight=%.1f "
+            "history_decay=%.3f",
+            n_sig_layers,
+            pres_fac,
+            pres_fac_mult,
+            pres_fac_max,
+            hist_gain,
+            cfg.hist_cost_weight * hist_cost_weight_mult,
+            history_decay,
+        )
 
         # Build edge→src mapping for barrel conflict detection
         logger.warning("[BARREL-CONFLICT-INIT] Building edge_src_map once before routing")
@@ -5668,6 +5691,7 @@ class PathFinderRouter:
 
             # CRITICAL: Cost update ONCE per iteration (PathFinder design)
             # Toggle incremental updates via env var INCREMENTAL_COST_UPDATE=1
+            active_hist_weight = cfg.hist_cost_weight
             if os.getenv("INCREMENTAL_COST_UPDATE") == "1" and hasattr(self, '_changed_edges_previous_iteration'):
                 # INCREMENTAL: Only update edges that changed in previous iteration
                 changed_edges = self._changed_edges_previous_iteration
@@ -5696,6 +5720,7 @@ class PathFinderRouter:
             else:
                 # FULL: Update all edges (default PathFinder behavior) - use hist_cost_weight with layer scaling
                 hist_weight_scaled = cfg.hist_cost_weight * hist_cost_weight_mult
+                active_hist_weight = hist_weight_scaled
                 self.accounting.update_costs(
                     self.graph.base_costs, pres_fac, hist_weight_scaled,
                     via_cost_multiplier=via_cost_mult,
@@ -6065,7 +6090,10 @@ class PathFinderRouter:
             if it % 10 == 0:
                 hist_sum = float(self.accounting.history.sum())
                 pres_ema_sum = float(self.accounting.present_ema.sum())
-                cost_ratio = hist_sum / (pres_fac * pres_ema_sum + 1e-9)
+                cost_ratio = (
+                    active_hist_weight * hist_sum
+                    / (pres_fac * pres_ema_sum + 1e-9)
+                )
 
                 logger.debug(f"[CONVERGENCE] pres_fac={pres_fac:.2f} hist_gain={hist_gain:.2f} balance={cost_ratio:.2f}")
 
@@ -6201,11 +6229,6 @@ class PathFinderRouter:
             hist_cap_mult = 15.0 if use_history_cap else 1.0  # Reduced from 100.0 to prevent history dominance
             # FIX: Use raw present for history (present_ema lags significantly in early iterations)
             use_raw_present = True  # was: os.getenv('ORTHO_RAW_PRESENT_FOR_HIST', '0') == '1'
-
-            # Apply history decay after iteration 10 to prevent oscillation
-            # Early iterations (1-10): No decay (1.0) to build up history
-            # Later iterations (11+): Gentle decay (0.98) allows route redistribution
-            history_decay = 0.98 if it >= 10 else 1.0
 
             self.accounting.update_history(
                 hist_gain_eff,
