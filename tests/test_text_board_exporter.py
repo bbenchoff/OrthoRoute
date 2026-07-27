@@ -141,3 +141,32 @@ def test_project_export_sets_geometry_constraints(tmp_path):
     assert rules["min_through_hole_diameter"] == pytest.approx(0.15)
     assert default_class["clearance"] == pytest.approx(0.1)
     assert default_class["via_diameter"] == pytest.approx(0.3024)
+
+
+def test_export_consolidates_touching_mechanical_via_stack(tmp_path):
+    source, geometry = _write_inputs(tmp_path)
+    payload = json.loads(geometry.read_text(encoding="utf-8"))
+    payload["vias"] = [
+        {
+            "net": "N1", "x": 3, "y": 2,
+            "from_layer": "F.Cu", "to_layer": "In1.Cu",
+            "diameter": 0.3024, "drill": 0.15,
+            "via_process": "mechanical_blind_buried",
+        },
+        {
+            "net": "N1", "x": 3, "y": 2,
+            "from_layer": "In1.Cu", "to_layer": "In2.Cu",
+            "diameter": 0.3024, "drill": 0.15,
+            "via_process": "mechanical_blind_buried",
+        },
+    ]
+    geometry.write_text(json.dumps(payload), encoding="utf-8")
+    output = tmp_path / "routed.kicad_pcb"
+
+    result = export_geometry_to_board(
+        geometry, source, output, layer_count=14
+    )
+    text = output.read_text(encoding="utf-8")
+
+    assert result["vias"] == 1
+    assert '(layers "F.Cu" "In2.Cu")' in text

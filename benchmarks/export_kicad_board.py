@@ -23,6 +23,11 @@ def main() -> None:
     parser.add_argument("--layers", type=int, required=True)
     parser.add_argument("--thickness", type=float, default=1.6)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--no-consolidate-mechanical-vias",
+        action="store_true",
+        help="preserve adjacent CNC via objects instead of merging stacks",
+    )
     args = parser.parse_args()
     result = export_geometry_to_board(
         args.geometry,
@@ -31,6 +36,9 @@ def main() -> None:
         layer_count=args.layers,
         thickness_mm=args.thickness,
         limit=args.limit,
+        consolidate_mechanical_vias=(
+            not args.no_consolidate_mechanical_vias
+        ),
     )
     source_project = args.source.with_suffix(".kicad_pro")
     if source_project.exists():
