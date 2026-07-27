@@ -164,9 +164,12 @@ def _geometry_nodes(
     source_sha256: str,
     copper_layers: Sequence[str],
     limit: Optional[int],
+    consolidate_mechanical_vias: bool,
 ) -> Tuple[str, int, int]:
     tracks = geometry["tracks"]
     vias = geometry["vias"]
+    if consolidate_mechanical_vias:
+        vias = _consolidate_mechanical_vias(vias, copper_layers)
     if limit is not None:
         tracks = tracks[:limit]
         vias = vias[:limit]
@@ -219,6 +222,80 @@ def _geometry_nodes(
     return "".join(nodes), len(tracks), len(vias)
 
 
+def _consolidate_mechanical_vias(
+    vias: Sequence[Dict[str, Any]],
+    copper_layers: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Merge touching same-position CNC spans into one deeper drilled via."""
+    layer_index = {
+        name: index for index, name in enumerate(copper_layers)
+    }
+    untouched: List[Tuple[int, Dict[str, Any]]] = []
+    groups: Dict[
+        Tuple[str, float, float],
+        List[Tuple[int, int, int, Dict[str, Any]]],
+    ] = {}
+    for original_index, item in enumerate(vias):
+        if item.get("via_process") != "mechanical_blind_buried":
+            untouched.append((original_index, dict(item)))
+            continue
+        low = min(
+            layer_index[item["from_layer"]],
+            layer_index[item["to_layer"]],
+        )
+        high = max(
+            layer_index[item["from_layer"]],
+            layer_index[item["to_layer"]],
+        )
+        key = (
+            str(item["net"]),
+            float(item["x"]),
+            float(item["y"]),
+        )
+        groups.setdefault(key, []).append(
+            (low, high, original_index, item)
+        )
+
+    consolidated: List[Tuple[int, Dict[str, Any]]] = list(untouched)
+    for entries in groups.values():
+        entries.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
+        run = [entries[0]]
+        run_low, run_high = entries[0][0], entries[0][1]
+        for entry in entries[1:]:
+            low, high = entry[0], entry[1]
+            if low <= run_high:
+                run.append(entry)
+                run_high = max(run_high, high)
+            else:
+                consolidated.append(_merged_via_run(
+                    run, run_low, run_high, copper_layers
+                ))
+                run = [entry]
+                run_low, run_high = low, high
+        consolidated.append(_merged_via_run(
+            run, run_low, run_high, copper_layers
+        ))
+    consolidated.sort(key=lambda entry: entry[0])
+    return [item for _, item in consolidated]
+
+
+def _merged_via_run(
+    run: Sequence[Tuple[int, int, int, Dict[str, Any]]],
+    low: int,
+    high: int,
+    copper_layers: Sequence[str],
+) -> Tuple[int, Dict[str, Any]]:
+    first_index = min(entry[2] for entry in run)
+    merged = dict(min(run, key=lambda entry: entry[2])[3])
+    merged["from_layer"] = copper_layers[low]
+    merged["to_layer"] = copper_layers[high]
+    merged["diameter"] = max(float(entry[3]["diameter"]) for entry in run)
+    merged["drill"] = max(float(entry[3]["drill"]) for entry in run)
+    if len(run) > 1:
+        merged["consolidated_vias"] = len(run)
+    return first_index, merged
+
+
 def export_geometry_to_board(
     geometry_path: Path,
     source_path: Path,
@@ -227,6 +304,7 @@ def export_geometry_to_board(
     layer_count: int,
     thickness_mm: float = 1.6,
     limit: Optional[int] = None,
+    consolidate_mechanical_vias: bool = True,
 ) -> Dict[str, Any]:
     """Create a reduced-layer KiCad board containing routed geometry."""
     if output_path.resolve() == source_path.resolve():
@@ -254,7 +332,11 @@ def export_geometry_to_board(
             raise ValueError(f"source object still references {removed}")
 
     nodes, track_count, via_count = _geometry_nodes(
-        geometry, source_sha256, copper_layers, limit
+        geometry,
+        source_sha256,
+        copper_layers,
+        limit,
+        consolidate_mechanical_vias,
     )
     root_end = text.rfind("\n)")
     if root_end < 0 or text[root_end + 2:].strip():
@@ -271,6 +353,7 @@ def export_geometry_to_board(
         "thickness_mm": thickness_mm,
         "tracks": track_count,
         "vias": via_count,
+        "mechanical_vias_consolidated": consolidate_mechanical_vias,
         "bytes": output_path.stat().st_size,
         "source_sha256": source_sha256,
     }
