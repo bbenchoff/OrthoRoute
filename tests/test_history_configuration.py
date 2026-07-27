@@ -3,6 +3,7 @@ import pytest
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
     PathFinderConfig,
     resolve_history_decay,
+    resolve_pres_fac_max,
 )
 
 
@@ -26,3 +27,21 @@ def test_history_decay_rejects_invalid_override(monkeypatch, value):
 
     with pytest.raises(ValueError, match="between 0.0 and 1.0"):
         resolve_history_decay(PathFinderConfig())
+
+
+def test_present_pressure_keeps_layer_floor_and_explicit_higher_ceiling():
+    config = PathFinderConfig()
+    config.pres_fac_max = 10.0
+    assert resolve_pres_fac_max(config, 14) == 64.0
+
+    config.pres_fac_max = 256.0
+    assert resolve_pres_fac_max(config, 14) == 256.0
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf")])
+def test_present_pressure_rejects_invalid_ceiling(value):
+    config = PathFinderConfig()
+    config.pres_fac_max = value
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        resolve_pres_fac_max(config, 14)

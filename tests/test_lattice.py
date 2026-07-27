@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
+    EdgeAccountant,
     Lattice3D,
     PathFinderConfig,
     UnifiedPathFinder,
@@ -240,6 +241,35 @@ class TestGraphBuild:
             lattice4.node_idx(4, 3, 1),
         ]
 
-        assert len(router._path_to_edges(valid_path)) == 1
+        directed = router._path_to_directed_edges(valid_path)
+        resources = router._path_to_edges(valid_path)
+
+        assert len(directed) == 1
+        assert len(resources) == 2
+        assert set(resources) == set(
+            router._path_to_edges(list(reversed(valid_path)))
+        )
         with pytest.raises(ValueError, match="not a graph edge"):
             router._path_to_edges(invalid_path)
+
+    def test_opposite_traversals_share_physical_edge_capacity(
+        self, lattice4
+    ):
+        router = UnifiedPathFinder(PathFinderConfig(), use_gpu=False)
+        router.lattice = lattice4
+        router.graph = lattice4.build_graph(via_cost=0.7)
+        router._indptr_cpu = None
+        router._indices_cpu = None
+        a = lattice4.node_idx(2, 3, 1)
+        b = lattice4.node_idx(3, 3, 1)
+
+        forward = router._path_to_edges([a, b])
+        backward = router._path_to_edges([b, a])
+        assert set(forward) == set(backward)
+
+        router.accounting = EdgeAccountant(
+            len(router.graph.indices), use_gpu=False
+        )
+        router.accounting.commit_path(forward)
+        router.accounting.commit_path(backward)
+        assert router.accounting.compute_overuse() == (2, 2)
