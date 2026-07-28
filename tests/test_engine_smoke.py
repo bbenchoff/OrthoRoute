@@ -1419,6 +1419,85 @@ def test_slow_progress_pressure_ceiling_uses_later_events_for_pressure():
     assert observed == [64.0, 128.0, 256.0, 512.0, 1024.0, 1024.0]
 
 
+def test_pressure_trial_rejects_two_worse_higher_ceiling_windows():
+    advance = PathFinderRouter._advance_pressure_trial
+    reference_ceiling = None
+    reference_fraction = None
+    failures = 0
+
+    # Complete measured 256 and 512 windows: 512 is better and becomes the
+    # reference tier.
+    for ceiling, fraction in (
+        (256.0, 0.01221),
+        (512.0, 0.01578),
+    ):
+        (
+            reference_ceiling,
+            reference_fraction,
+            failures,
+            rejected,
+        ) = advance(
+            ceiling,
+            fraction,
+            reference_ceiling,
+            reference_fraction,
+            failures,
+        )
+        assert rejected is None
+
+    assert reference_ceiling == 512.0
+    assert reference_fraction == pytest.approx(0.01578)
+
+    # The first 1024 window is only half as efficient. Preserve the tier long
+    # enough to distinguish a delayed history effect from one noisy window.
+    (
+        reference_ceiling,
+        reference_fraction,
+        failures,
+        rejected,
+    ) = advance(
+        1024.0,
+        0.00805,
+        reference_ceiling,
+        reference_fraction,
+        failures,
+    )
+    assert failures == 1
+    assert rejected is None
+
+    # The second measured 1024 window is worse again, so return to 512.
+    (
+        reference_ceiling,
+        reference_fraction,
+        failures,
+        rejected,
+    ) = advance(
+        1024.0,
+        0.00250,
+        reference_ceiling,
+        reference_fraction,
+        failures,
+    )
+    assert rejected == 1024.0
+    assert reference_ceiling == 512.0
+    assert failures == 0
+
+
+def test_pressure_trial_accepts_a_delayed_higher_tier_breakthrough():
+    advance = PathFinderRouter._advance_pressure_trial
+    reference = (512.0, 0.015, 1)
+
+    result = advance(
+        1024.0,
+        0.013,
+        *reference,
+        minimum_ratio=0.8,
+        patience=2,
+    )
+
+    assert result == (1024.0, 0.013, 0, None)
+
+
 def test_pressure_schedule_scales_with_bounded_reroute_work():
     scale = PathFinderRouter._pressure_work_scale
 
