@@ -982,6 +982,22 @@ def test_shared_path_nodes_are_physical_conflicts(routed):
         pf._rebuild_path_node_use()
 
 
+def test_path_nodes_are_capacity_one_negotiated_resources():
+    router = object.__new__(PathFinderRouter)
+    router.path_node_use = np.array([0, 1, 2, 4], dtype=np.int16)
+
+    assert router._compute_path_node_overuse() == (4, 2)
+
+
+def test_best_route_score_combines_edge_and_node_overuse():
+    score = PathFinderRouter._negotiated_route_score
+
+    edge_better_but_resource_worse = score(0, 90, 20, 0)
+    combined_resource_better = score(0, 100, 0, 50)
+
+    assert combined_resource_better < edge_better_but_resource_worse
+
+
 def test_node_conflict_history_persists_once_per_iteration(routed):
     pf, _, _, _ = routed
     node = int(np.flatnonzero(

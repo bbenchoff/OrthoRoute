@@ -101,6 +101,18 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
     path_node_conflicts = int(
         getattr(pf, "_last_path_node_conflict_count", 0)
     )
+    if hasattr(pf, "_compute_path_node_overuse"):
+        path_node_overuse, path_node_overuse_count = (
+            pf._compute_path_node_overuse()
+        )
+    else:
+        path_node_overuse = int(getattr(
+            pf, "_last_path_node_overuse_total", 0
+        ))
+        path_node_overuse_count = int(getattr(
+            pf, "_last_path_node_overuse_count", 0
+        ))
+    negotiated_overuse = int(overuse_total) + path_node_overuse
     escape_conflicts = int(
         getattr(pf, "_last_escape_conflict_count", 0)
     )
@@ -174,6 +186,9 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             "iterations": getattr(pf, "iteration", None),
             "overuse_total": int(overuse_total),
             "overuse_count": int(overuse_count),
+            "path_node_overuse_total": path_node_overuse,
+            "path_node_overuse_count": path_node_overuse_count,
+            "negotiated_overuse_total": negotiated_overuse,
             "barrel_conflicts": barrel_conflicts,
             "exact_barrel_conflicts": exact_barrel_conflicts,
             "path_node_conflicts": path_node_conflicts,

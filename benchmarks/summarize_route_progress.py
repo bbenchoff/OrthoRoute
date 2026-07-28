@@ -81,12 +81,25 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
     barrels = [
         int(item.get("barrel_conflicts", 0)) for item in iterations
     ]
+    path_nodes = [
+        int(item.get("path_node_conflicts", 0))
+        for item in iterations
+    ]
     best_overuse = (
         min(iterations, key=lambda item: int(item.get("overuse_total", 0)))
         if iterations else {}
     )
     best_physical = (
         min(iterations, key=lambda item: int(item.get("barrel_conflicts", 0)))
+        if iterations else {}
+    )
+    best_path_nodes = (
+        min(
+            iterations,
+            key=lambda item: int(
+                item.get("path_node_conflicts", 0)
+            ),
+        )
         if iterations else {}
     )
     completion = journal.get("completion", {})
@@ -108,6 +121,12 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
         "best_physical": min(barrels) if barrels else "",
         "best_physical_iteration": best_physical.get("iteration", ""),
         "final_physical": barrels[-1] if barrels else "",
+        "initial_path_nodes": path_nodes[0] if path_nodes else "",
+        "best_path_nodes": min(path_nodes) if path_nodes else "",
+        "best_path_nodes_iteration": best_path_nodes.get(
+            "iteration", ""
+        ),
+        "final_path_nodes": path_nodes[-1] if path_nodes else "",
         "final_pres_fac": final.get("pres_fac", ""),
         "elapsed_seconds": final.get(
             "elapsed_seconds", journal.get("elapsed_seconds", "")
@@ -128,7 +147,10 @@ def _write_markdown(rows: Sequence[Dict[str, Any]], path: Path) -> None:
         "run", "status", "iterations", "routed_nets", "target_nets",
         "complete", "initial_overuse", "best_overuse", "final_overuse",
         "best_overuse_iteration", "initial_physical", "best_physical",
-        "best_physical_iteration", "final_physical", "final_pres_fac",
+        "best_physical_iteration", "final_physical",
+        "initial_path_nodes", "best_path_nodes",
+        "best_path_nodes_iteration", "final_path_nodes",
+        "final_pres_fac",
         "elapsed_seconds",
     )
     lines = [
@@ -178,7 +200,7 @@ def _points(
 
 
 def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
-    width, height = 1200, 1040
+    width, height = 1200, 1340
     plot_x, plot_width = 90, 1040
     panel_height = 200
     panels = [
@@ -189,7 +211,13 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
             390,
             True,
         ),
-        ("Present congestion pressure", "pres_fac", 690, False),
+        (
+            "Shared capacity-one path nodes (log scale)",
+            "path_node_conflicts",
+            690,
+            True,
+        ),
+        ("Present congestion pressure", "pres_fac", 990, False),
     ]
     max_iterations = max(
         (len(run["iterations"]) for run in runs), default=1
@@ -253,7 +281,7 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
                 'text-anchor="middle" font-family="sans-serif" '
                 f'font-size="11">{tick}</text>'
             )
-    legend_y = 960
+    legend_y = 1260
     for index, run in enumerate(runs):
         color = COLORS[index % len(COLORS)]
         x = 80 + (index % 3) * 370
