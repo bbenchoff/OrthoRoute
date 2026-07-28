@@ -6,6 +6,8 @@ import html
 import json
 import math
 import re
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
@@ -22,6 +24,104 @@ COLORS = (
     "#7c3aed",
     "#0f766e",
 )
+REPO_ROOT = Path(__file__).resolve().parents[1]
+UNIQUE_EDGE_ACCOUNTING_COMMIT = (
+    "43e34e0239cab4b7e0ad29e5ed1ac7e8e8baed51"
+)
+BIDIRECTIONAL_EDGE_RESERVATION_COMMIT = (
+    "76eaefd"
+)
+
+
+@lru_cache(maxsize=None)
+def _uses_unique_edge_accounting(git_sha: str) -> bool:
+    if not git_sha:
+        return False
+    result = subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            UNIQUE_EDGE_ACCOUNTING_COMMIT,
+            git_sha,
+        ],
+        cwd=REPO_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+@lru_cache(maxsize=None)
+def _edge_accounting_mode(git_sha: str) -> str:
+    if _uses_unique_edge_accounting(git_sha):
+        return "unique physical"
+    if not git_sha:
+        return "legacy directed"
+    result = subprocess.run(
+        [
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            BIDIRECTIONAL_EDGE_RESERVATION_COMMIT,
+            git_sha,
+        ],
+        cwd=REPO_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return (
+        "paired arcs normalized"
+        if result.returncode == 0 else
+        "legacy directed"
+    )
+
+
+def _physical_edge_overuse(
+    item: Dict[str, Any],
+    *,
+    edge_accounting_mode: str,
+) -> int:
+    edge = int(item.get("edge_overuse", item.get("overuse_total", 0)))
+    if edge_accounting_mode == "paired arcs normalized":
+        if edge % 2:
+            raise ValueError(
+                f"directed-arc edge overuse must be paired, got {edge}"
+            )
+        edge //= 2
+    return (
+        edge
+        + int(item.get("via_column_overuse", 0))
+        + int(item.get("via_segment_overuse", 0))
+    )
+
+
+def _normalize_iteration(
+    item: Dict[str, Any],
+    *,
+    edge_accounting_mode: str,
+) -> Dict[str, Any]:
+    normalized = dict(item)
+    physical_edge = _physical_edge_overuse(
+        item,
+        edge_accounting_mode=edge_accounting_mode,
+    )
+    normalized["_physical_edge_overuse"] = physical_edge
+    if "path_node_overuse_total" in item:
+        normalized["_physical_negotiated_overuse"] = (
+            physical_edge + int(item["path_node_overuse_total"])
+        )
+    elif "negotiated_overuse_total" in item:
+        node_component = (
+            int(item["negotiated_overuse_total"])
+            - int(item.get("overuse_total", 0))
+        )
+        normalized["_physical_negotiated_overuse"] = (
+            physical_edge + node_component
+        )
+    return normalized
 
 
 def _is_candidate_name(name: str) -> bool:
@@ -61,13 +161,23 @@ def _load(paths: Iterable[Path]) -> List[Dict[str, Any]]:
     runs = []
     for path in sorted(paths, key=lambda item: item.stat().st_mtime):
         journal = json.loads(path.read_text(encoding="utf-8"))
-        iterations = journal.get("iterations", [])
+        edge_accounting_mode = _edge_accounting_mode(
+            str(journal.get("git_sha", ""))
+        )
+        iterations = [
+            _normalize_iteration(
+                item,
+                edge_accounting_mode=edge_accounting_mode,
+            )
+            for item in journal.get("iterations", [])
+        ]
         if not iterations and journal.get("status") != "starting":
             continue
         runs.append({
             "path": path,
             "journal": journal,
             "iterations": iterations,
+            "edge_accounting_mode": edge_accounting_mode,
             "label": _label(path, journal),
         })
     return runs
@@ -75,13 +185,35 @@ def _load(paths: Iterable[Path]) -> List[Dict[str, Any]]:
 
 def _row(run: Dict[str, Any]) -> Dict[str, Any]:
     journal = run["journal"]
-    iterations = run["iterations"]
+    edge_accounting_mode = run.get(
+        "edge_accounting_mode", "unique physical"
+    )
+    iterations = [
+        (
+            item
+            if "_physical_edge_overuse" in item else
+            _normalize_iteration(
+                item,
+                edge_accounting_mode=edge_accounting_mode,
+            )
+        )
+        for item in run["iterations"]
+    ]
     final = iterations[-1] if iterations else {}
-    overuse = [int(item.get("overuse_total", 0)) for item in iterations]
-    negotiated = [
-        int(item["negotiated_overuse_total"])
+    overuse = [
+        int(item.get(
+            "_physical_edge_overuse",
+            _physical_edge_overuse(
+                item,
+                edge_accounting_mode=edge_accounting_mode,
+            ),
+        ))
         for item in iterations
-        if "negotiated_overuse_total" in item
+    ]
+    negotiated = [
+        int(item["_physical_negotiated_overuse"])
+        for item in iterations
+        if "_physical_negotiated_overuse" in item
     ]
     barrels = [
         int(item.get("barrel_conflicts", 0)) for item in iterations
@@ -91,17 +223,26 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
         for item in iterations
     ]
     best_overuse = (
-        min(iterations, key=lambda item: int(item.get("overuse_total", 0)))
+        min(
+            iterations,
+            key=lambda item: int(item.get(
+                "_physical_edge_overuse",
+                _physical_edge_overuse(
+                    item,
+                    edge_accounting_mode=edge_accounting_mode,
+                ),
+            )),
+        )
         if iterations else {}
     )
     negotiated_iterations = [
         item for item in iterations
-        if "negotiated_overuse_total" in item
+        if "_physical_negotiated_overuse" in item
     ]
     best_negotiated = (
         min(
             negotiated_iterations,
-            key=lambda item: int(item["negotiated_overuse_total"]),
+            key=lambda item: int(item["_physical_negotiated_overuse"]),
         )
         if negotiated_iterations else {}
     )
@@ -129,6 +270,7 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
         "routed_nets": routed or 0,
         "target_nets": completion.get("total_nets", target),
         "complete": bool(completion.get("complete", False)),
+        "edge_accounting": edge_accounting_mode,
         "initial_overuse": overuse[0] if overuse else "",
         "best_overuse": min(overuse) if overuse else "",
         "best_overuse_iteration": best_overuse.get("iteration", ""),
@@ -173,7 +315,8 @@ def _write_csv(rows: Sequence[Dict[str, Any]], path: Path) -> None:
 def _write_markdown(rows: Sequence[Dict[str, Any]], path: Path) -> None:
     columns = (
         "run", "status", "iterations", "routed_nets", "target_nets",
-        "complete", "initial_overuse", "best_overuse", "final_overuse",
+        "complete", "edge_accounting",
+        "initial_overuse", "best_overuse", "final_overuse",
         "best_overuse_iteration", "initial_physical", "best_physical",
         "best_physical_iteration", "final_physical",
         "initial_path_nodes", "best_path_nodes",
@@ -235,7 +378,12 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
     plot_x, plot_width = 90, 1040
     panel_height = 200
     panels = [
-        ("Graph overuse (log scale)", "overuse_total", 90, True),
+        (
+            "Unique physical edge/via overuse (log scale)",
+            "_physical_edge_overuse",
+            90,
+            True,
+        ),
         (
             "Physical conflict reports (log scale)",
             "barrel_conflicts",
@@ -250,7 +398,7 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
         ),
         (
             "Negotiated edge + exact node excess (log scale)",
-            "negotiated_overuse_total",
+            "_physical_negotiated_overuse",
             990,
             True,
         ),
