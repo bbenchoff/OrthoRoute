@@ -212,6 +212,41 @@ def test_routing_state_snapshot_is_independent_and_restorable(routed):
         assert pf.accounting.canonical[edge_idx] >= 1
 
 
+def test_restored_route_can_be_ripped_as_a_new_recovery_branch(routed):
+    """A stagnation retry must branch from restored canonical occupancy."""
+    pf, _, _, _ = routed
+    state = pf._capture_routing_state()
+    net_id = "TEST_NET"
+    expected_edges = list(pf._net_to_edges[net_id])
+
+    pf.net_paths[net_id] = []
+    pf.net_selected_portals.pop(net_id, None)
+    pf.accounting.canonical.clear()
+    pf.accounting.present.fill(0)
+    pf._net_to_edges.clear()
+    pf._edge_to_nets.clear()
+    pf._restore_routing_state(state)
+
+    pf.locked_nets.discard(net_id)
+    victims = pf._rip_top_k_offenders(k=1)
+
+    # The one-net fixture is congestion-free, so force the same bookkeeping
+    # path directly when no natural offender exists.
+    if not victims:
+        pf.accounting.present[expected_edges[0]] = (
+            pf.accounting.capacity[expected_edges[0]] + 1
+        )
+        victims = pf._rip_top_k_offenders(k=1)
+    assert victims == {net_id}
+    assert pf.net_paths[net_id] == []
+    assert net_id not in pf._net_to_edges
+    for edge_idx in expected_edges:
+        assert pf.accounting.canonical.get(edge_idx, 0) == 0
+
+    # Preserve the module-scoped fixture for the remaining tests.
+    pf._restore_routing_state(state)
+
+
 def test_selected_escape_geometry_is_physically_conflict_free(routed):
     pf, _, _, _ = routed
     pf._rebuild_escape_occupancy()
