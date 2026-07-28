@@ -78,6 +78,11 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
     iterations = run["iterations"]
     final = iterations[-1] if iterations else {}
     overuse = [int(item.get("overuse_total", 0)) for item in iterations]
+    negotiated = [
+        int(item["negotiated_overuse_total"])
+        for item in iterations
+        if "negotiated_overuse_total" in item
+    ]
     barrels = [
         int(item.get("barrel_conflicts", 0)) for item in iterations
     ]
@@ -88,6 +93,17 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
     best_overuse = (
         min(iterations, key=lambda item: int(item.get("overuse_total", 0)))
         if iterations else {}
+    )
+    negotiated_iterations = [
+        item for item in iterations
+        if "negotiated_overuse_total" in item
+    ]
+    best_negotiated = (
+        min(
+            negotiated_iterations,
+            key=lambda item: int(item["negotiated_overuse_total"]),
+        )
+        if negotiated_iterations else {}
     )
     best_physical = (
         min(iterations, key=lambda item: int(item.get("barrel_conflicts", 0)))
@@ -117,6 +133,18 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
         "best_overuse": min(overuse) if overuse else "",
         "best_overuse_iteration": best_overuse.get("iteration", ""),
         "final_overuse": overuse[-1] if overuse else "",
+        "initial_negotiated_overuse": (
+            negotiated[0] if negotiated else ""
+        ),
+        "best_negotiated_overuse": (
+            min(negotiated) if negotiated else ""
+        ),
+        "best_negotiated_overuse_iteration": best_negotiated.get(
+            "iteration", ""
+        ),
+        "final_negotiated_overuse": (
+            negotiated[-1] if negotiated else ""
+        ),
         "initial_physical": barrels[0] if barrels else "",
         "best_physical": min(barrels) if barrels else "",
         "best_physical_iteration": best_physical.get("iteration", ""),
@@ -150,6 +178,9 @@ def _write_markdown(rows: Sequence[Dict[str, Any]], path: Path) -> None:
         "best_physical_iteration", "final_physical",
         "initial_path_nodes", "best_path_nodes",
         "best_path_nodes_iteration", "final_path_nodes",
+        "initial_negotiated_overuse", "best_negotiated_overuse",
+        "best_negotiated_overuse_iteration",
+        "final_negotiated_overuse",
         "final_pres_fac",
         "elapsed_seconds",
     )
@@ -200,7 +231,7 @@ def _points(
 
 
 def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
-    width, height = 1200, 1340
+    width, height = 1200, 1660
     plot_x, plot_width = 90, 1040
     panel_height = 200
     panels = [
@@ -217,7 +248,13 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
             690,
             True,
         ),
-        ("Present congestion pressure", "pres_fac", 990, False),
+        (
+            "Negotiated edge + exact node excess (log scale)",
+            "negotiated_overuse_total",
+            990,
+            True,
+        ),
+        ("Present congestion pressure", "pres_fac", 1290, False),
     ]
     max_iterations = max(
         (len(run["iterations"]) for run in runs), default=1
@@ -232,9 +269,10 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
     for title, key, y0, log_scale in panels:
         maximum = max(
             (
-                float(item.get(key, 0))
+                float(item[key])
                 for run in runs
                 for item in run["iterations"]
+                if key in item
             ),
             default=1.0,
         )
@@ -261,7 +299,8 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
             ])
         for run_index, run in enumerate(runs):
             values = [
-                float(item.get(key, 0)) for item in run["iterations"]
+                float(item[key]) for item in run["iterations"]
+                if key in item
             ]
             if not values:
                 continue
@@ -281,7 +320,7 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
                 'text-anchor="middle" font-family="sans-serif" '
                 f'font-size="11">{tick}</text>'
             )
-    legend_y = 1260
+    legend_y = 1570
     for index, run in enumerate(runs):
         color = COLORS[index % len(COLORS)]
         x = 80 + (index % 3) * 370
