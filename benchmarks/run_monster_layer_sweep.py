@@ -174,7 +174,7 @@ def _remaining_candidates(
 ) -> List[int]:
     """Choose lower qualification or upward capacity candidates."""
     if selected is not None:
-        return [14] if selected[0] > 14 else []
+        return [selected[0] - 2] if selected[0] > 14 else []
     if candidate_layers is not None:
         return [
             layers for layers in candidate_layers
