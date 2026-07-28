@@ -339,3 +339,34 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
     assert 'width="1200" height="820"' in rendered
     assert "512-net hotset" in rendered
     assert "event 1" in rendered
+
+
+def test_hotset_policy_comparison_does_not_cross_phase_boundary():
+    hotsets = [None, 512, 512, 512, 256, 256, 1024, 1024, 1024]
+    objectives = [1000, 900, 820, 760, 740, 720, 680, 650, 620]
+    iterations = []
+    for index, (hotset, objective) in enumerate(
+        zip(hotsets, objectives),
+        start=1,
+    ):
+        row = {
+            "iteration": index,
+            "elapsed_seconds": float(index * 10),
+            "_physical_edge_overuse": objective // 10,
+            "_physical_negotiated_overuse": objective,
+            "path_node_overuse_total": objective - objective // 10,
+        }
+        if hotset is not None:
+            row["hotset_size"] = hotset
+        iterations.append(row)
+
+    snapshot = _latest_hotset_policy_snapshot([{
+        "label": "boundary test",
+        "iterations": iterations,
+    }])
+
+    phase_1024 = snapshot["phases"][-1]
+    assert phase_1024["iterations"] == "7-9"
+    assert phase_1024["matched_prior_iterations"] == "5-6"
+    assert phase_1024["matched_prior_drop_per_pass"] == 20.0
+    assert phase_1024["drop_per_pass"] == 33.3333

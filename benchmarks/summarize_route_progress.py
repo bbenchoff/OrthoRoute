@@ -1176,10 +1176,25 @@ def _latest_hotset_policy_snapshot(
             ]
             first = phase_rows[0]
             last = phase_rows[-1]
-            phase_start = rows.index(first)
-            prior_rows = rows[
-                max(0, phase_start - len(phase_rows)):phase_start
+            # Compare a widened wave only with the tail of the immediately
+            # preceding contiguous policy phase. Slicing an arbitrary number
+            # of prior rows can cross a 512 -> 256 boundary and present a
+            # mixed policy as the baseline for 1024. Use equal lengths when
+            # the prior phase is long enough, otherwise use that complete
+            # shorter phase and compare normalized per-pass/per-second rates.
+            previous_phase_rows = [
+                row for row in rows
+                if row["phase"] == phase_number - 1
             ]
+            comparison_passes = min(
+                len(phase_rows),
+                len(previous_phase_rows),
+            )
+            prior_rows = (
+                previous_phase_rows[-comparison_passes:]
+                if comparison_passes else
+                []
+            )
             elapsed = sum(
                 float(row["elapsed_seconds"]) for row in phase_rows
             )
@@ -1194,12 +1209,12 @@ def _latest_hotset_policy_snapshot(
             drop_per_pass = drop / len(phase_rows)
             prior_drop_per_pass = (
                 None
-                if len(prior_rows) != len(phase_rows) else
+                if not prior_rows else
                 prior_drop / len(prior_rows)
             )
             prior_rate = (
                 None
-                if len(prior_rows) != len(phase_rows) else
+                if not prior_rows else
                 prior_drop / max(0.001, prior_elapsed)
             )
             coverage_values = [
