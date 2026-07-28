@@ -7765,14 +7765,105 @@ class PathFinderRouter:
 
     @staticmethod
     def _history_hotset_cap(total_overuse: float) -> int:
-        """Keep historical reroutes proportional to live congestion."""
+        """Scale reroute waves without using the tail policy globally.
+
+        Small caps protect a nearly-clean route from destructive churn. A
+        monster route with tens of thousands of exact node conflicts is a
+        different regime: paying the full-graph accounting cost to move only
+        100 of 8,192 nets makes tiny minima look like useful convergence.
+        Conflict-aware selection below keeps the larger waves one-sided.
+        """
         if total_overuse <= 8:
             return 16
         if total_overuse <= 32:
             return 32
         if total_overuse <= 128:
             return 64
-        return 100
+        if total_overuse <= 2_048:
+            return 100
+        if total_overuse <= 16_384:
+            return 180
+        return 256
+
+    @staticmethod
+    def _hotset_exploration_fraction(total_overuse: float) -> float:
+        """Spend less of a severe-congestion wave on random search."""
+        if total_overuse > 16_384:
+            return 0.15
+        if total_overuse > 2_048:
+            return 0.25
+        return 0.40
+
+    @staticmethod
+    def _select_conflict_aware_hotset(
+        ranked_candidates: List[str],
+        conflict_pairs,
+        cap: int,
+        exploration_fraction: float,
+        rng,
+    ) -> List[str]:
+        """Select a one-sided high-impact wave plus bounded exploration.
+
+        Nets that currently share a path node are adjacent in the conflict
+        graph. Selecting an independent set keeps both ends of a present
+        conflict from moving together and simply exchanging ownership. Edge-
+        only offenders have no adjacency here and remain freely selectable.
+        """
+        cap = max(0, int(cap))
+        if cap == 0 or not ranked_candidates:
+            return []
+
+        candidates = list(dict.fromkeys(ranked_candidates))
+        candidate_set = set(candidates)
+        adjacency = defaultdict(set)
+        for first, second in conflict_pairs or ():
+            if (
+                first == second
+                or first not in candidate_set
+                or second not in candidate_set
+            ):
+                continue
+            adjacency[first].add(second)
+            adjacency[second].add(first)
+
+        fraction = min(1.0, max(0.0, float(exploration_fraction)))
+        primary_target = min(
+            cap,
+            max(1, int(round(cap * (1.0 - fraction)))),
+        )
+        selected = []
+        selected_set = set()
+        blocked = set()
+        remaining = []
+
+        for candidate in candidates:
+            if len(selected) >= primary_target:
+                remaining.append(candidate)
+                continue
+            if candidate in blocked:
+                continue
+            selected.append(candidate)
+            selected_set.add(candidate)
+            blocked.update(adjacency.get(candidate, ()))
+
+        if len(selected) < cap:
+            exploration = [
+                candidate
+                for candidate in remaining
+                if candidate not in selected_set
+                and candidate not in blocked
+            ]
+            rng.shuffle(exploration)
+            for candidate in exploration:
+                if candidate in blocked:
+                    continue
+                selected.append(candidate)
+                selected_set.add(candidate)
+                blocked.update(adjacency.get(candidate, ()))
+                if len(selected) >= cap:
+                    break
+
+        return selected
 
     @staticmethod
     def _should_rip_for_stagnation(
@@ -7961,21 +8052,40 @@ class PathFinderRouter:
                 int(self.config.hotset_cap),
                 self._history_hotset_cap(total_negotiated_overuse),
             )
-            hotset.update(
+            node_exploration_fraction = (
+                self._hotset_exploration_fraction(
+                    total_negotiated_overuse
+                )
+            )
+            import random
+            hotset.update(self._select_conflict_aware_hotset(
                 sorted(
                     path_node_offenders,
                     key=lambda net_id: (
                         -path_node_scores[net_id],
                         str(net_id),
                     ),
-                )[:node_cap]
-            )
+                ),
+                getattr(self, "_path_node_conflict_pairs", ()),
+                node_cap,
+                node_exploration_fraction,
+                random.Random(42 + self.iteration),
+            ))
             logger.info(
                 f"[HOTSET] no-edge-overuse; unrouted={len(unrouted)} "
                 f"ripped={len(ripped)} via_pool={len(via_pool_offenders)} "
                 f"physical={len(physical_offenders)} "
                 f"→ hotset={len(hotset)}"
             )
+            self._last_hotset_size = len(hotset)
+            self._last_hotset_cap = node_cap
+            self._last_hotset_offender_count = len(
+                path_node_offenders
+            )
+            self._last_hotset_exploration_fraction = (
+                node_exploration_fraction
+            )
+            self._last_hotset_conflict_aware = True
             return hotset
 
         # OVERUSE EXISTS: collect nets touching overused edges using fast lookup
@@ -8030,54 +8140,50 @@ class PathFinderRouter:
         # Sort by impact (highest first)
         scores.sort(reverse=True)
 
-        # ADAPTIVE CAP: Scale with overuse severity to prevent both thrashing and stagnation
-        # Formula balances: enough rip-up to make progress, not so much we destabilize
+        # Scale with the complete edge/via + node residual. A small tail needs
+        # cautious waves; severe monster-board congestion needs enough work
+        # per pass to amortize full-graph accounting.
         total_overuse = sum(float(over[ei]) for ei in over_idx)
-        base_target = max(64, min(180, len(over_idx) // 25))  # Scale with # of overused edges
 
-        # Track improvement trend for adaptive hotset sizing
-        if not hasattr(self, '_prev_overuse_for_hotset'):
-            self._prev_overuse_for_hotset = float('inf')
-
-        # DISABLED: Adaptive sizing creates disruption spikes when hotset enlarges
-        # delta = (self._prev_overuse_for_hotset - total_overuse) / max(1, self._prev_overuse_for_hotset)
-        # if delta < 0.02:  # <2% improvement - enlarge hotset (stuck, need more rip-up)
-        #     base_target = min(240, int(base_target * 1.25))
-        #     logger.debug(f"[HOTSET-TREND] Slow progress ({delta*100:.1f}%) → enlarging hotset to {base_target}")
-        # elif delta > 0.08:  # >8% improvement - shrink hotset (good progress, focus efforts)
-        #     base_target = max(64, int(base_target * 0.80))
-        #     logger.debug(f"[HOTSET-TREND] Good progress ({delta*100:.1f}%) → shrinking hotset to {base_target}")
-
-        # A fixed 100-net ordinary wave can turn a handful of conflicts into
-        # hundreds of new via collisions. Exact physical offenders and
-        # unrouted nets still bypass this cap below.
+        # Preserve small tail waves, but do not apply the 100-net tail policy
+        # to a monster route with tens of thousands of live node conflicts.
+        # Exact physical offenders and unrouted nets still bypass this cap.
         base_target = self._history_hotset_cap(
             total_negotiated_overuse
         )
 
-        self._prev_overuse_for_hotset = total_overuse
-
-        # Adjust based on progress (optional: track prev_overuse for this)
         adaptive_cap = min(self.config.hotset_cap, base_target)
 
-        # 60/40 mix: 60% top scorers + 40% random to break phase-locking
+        # Severe congestion needs predominantly high-impact work. Retain a
+        # bounded random fraction to break phase-locking, then select an
+        # independent set of current path-node conflicts so both sides do not
+        # move together and exchange ownership.
         import random
         rng = random.Random(42 + self.iteration)
-
-        K_top = int(0.6 * adaptive_cap)
-        top_scorers = [nid for _, nid in scores[:K_top]]
-        rest = [nid for _, nid in scores[K_top:]]
-        K_random = min(adaptive_cap - K_top, len(rest))
-        random_sample = rng.sample(rest, K_random) if rest else []
-
-        hotset_list = top_scorers + random_sample
 
         # Cooldown: exclude nets rerouted in previous iteration (prevents immediate re-routing)
         if not hasattr(self, '_last_reroute_iter'):
             self._last_reroute_iter = {}
 
-        hotset_with_cooldown = [nid for nid in hotset_list
-                                if self.iteration - self._last_reroute_iter.get(nid, -999) > 1]
+        ranked_with_cooldown = [
+            net_id
+            for _, net_id in scores
+            if (
+                self.iteration
+                - self._last_reroute_iter.get(net_id, -999)
+                > 1
+            )
+        ]
+        exploration_fraction = self._hotset_exploration_fraction(
+            total_negotiated_overuse
+        )
+        hotset_with_cooldown = self._select_conflict_aware_hotset(
+            ranked_with_cooldown,
+            getattr(self, "_path_node_conflict_pairs", ()),
+            adaptive_cap,
+            exploration_fraction,
+            rng,
+        )
 
         # Update last reroute iteration for selected nets
         for nid in hotset_with_cooldown:
@@ -8101,10 +8207,18 @@ class PathFinderRouter:
 
         unique_frac = len(hotset - getattr(self, '_prev_hotset', set())) / max(1, len(hotset))
         self._prev_hotset = hotset.copy()
+        self._last_hotset_size = len(hotset)
+        self._last_hotset_cap = adaptive_cap
+        self._last_hotset_offender_count = len(offenders)
+        self._last_hotset_exploration_fraction = (
+            exploration_fraction
+        )
+        self._last_hotset_conflict_aware = True
 
         logger.info(f"[HOTSET] overuse_edges={len(over_idx)} total_overuse={int(total_overuse)}, "
                     f"offenders={len(offenders)}, cap={adaptive_cap} → hotset={len(hotset)}/{len(tasks)} "
-                    f"(60% top + 40% random, unique={unique_frac:.1%})")
+                    f"(explore={exploration_fraction:.0%}, "
+                    f"conflict-aware, unique={unique_frac:.1%})")
 
         return hotset
 
