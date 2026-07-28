@@ -1325,9 +1325,16 @@ def test_rate_plateau_temporarily_expands_severe_hotset():
     router.config = PathFinderConfig()
     router.iteration = 20
     router._hotset_rate_boost_until = 25
+    router._slow_progress_event_count = 1
 
     assert router._effective_history_hotset_cap(75_000) == 512
     assert router._effective_history_hotset_cap(2_000) == 100
+
+    router._slow_progress_event_count = 2
+    assert router._effective_history_hotset_cap(75_000) == 1024
+
+    router._slow_progress_event_count = 3
+    assert router._effective_history_hotset_cap(75_000) == 1024
 
     router.iteration = 26
     assert router._effective_history_hotset_cap(75_000) == 256
