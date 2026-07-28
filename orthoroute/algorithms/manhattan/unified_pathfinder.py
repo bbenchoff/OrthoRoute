@@ -675,18 +675,14 @@ class PathFinderConfig:
     slow_progress_min_fraction: float = 0.025
     slow_progress_min_overuse: int = 16_384
     slow_progress_hotset_cap: int = 512
-    # The first measured 512-net severe window cleared 1.546x more excess per
-    # bounded iteration than its matched 256-net window while remaining
-    # essentially wall-clock neutral. A later full-board 1024-net window
-    # cleared 2.466x more per pass than the immediately preceding 256-net
-    # plateau at 0.871x wall efficiency, with no negotiated or exact-physical
-    # debt category diverging. Continue the measured doubling ladder once
-    # more on a third rate event at least one rolling window after the prior
-    # trigger. The window can still overlap the preceding boosted phase.
+    # Measured 512- and 1024-net severe windows improved iteration efficiency.
+    # A later 1638-net full-board window was substantially worse than 1024
+    # because alternating cooldown complements undid node progress. Keep the
+    # measured breadth optimum and spend later plateau events on pressure.
     slow_progress_hotset_growth_after: int = 2
-    slow_progress_hotset_cap_max: int = 2048
+    slow_progress_hotset_cap_max: int = 1024
     slow_progress_pressure_after: int = 2
-    slow_progress_pres_fac_max: float = 256.0
+    slow_progress_pres_fac_max: float = 1024.0
     # Selective PathFinder passes do unequal work. Advance pressure by a
     # bounded equivalent number of the historical 100-net reroute waves so a
     # 256/512-net pass does not delay the pressure schedule in wall time.
@@ -723,11 +719,10 @@ class PathFinderConfig:
     # has already failed for the current negotiated cost state.
     gpu_fullgraph_fail_fast_nodes: int = 1_000_000
     layer_names: List[str] = field(default_factory=lambda: ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'B.Cu'])
-    # Absolute negotiation-wave ceiling. Normal severe passes remain 256 via
-    # _history_hotset_cap(); measured slow windows may use 512, 1024, then
-    # 2048.
-    # Absolute safety ceiling for the measured 512 -> 1024 -> 2048 severe
-    # plateau ladder. Ordinary severe passes still select only 256 nets.
+    # Absolute safety ceiling. Ordinary severe passes remain 256 via
+    # _history_hotset_cap(); measured slow windows may use 512 then 1024.
+    # Explicit experiments may configure a larger independently bounded
+    # recovery ceiling without being clipped by board auto-derivation.
     hotset_cap: int = 2048
     # Physical conflicts may implicate nearly every net on a monster board.
     # Rerouting that near-global set after graph congestion is already low
@@ -6269,8 +6264,8 @@ class PathFinderRouter:
             # A monster route that improves by only a few units per pass is
             # operationally plateaued even though the strict best-value
             # counter resets. Detect inadequate rolling descent, widen the
-            # next several severe hotsets, then raise the pressure ceiling
-            # only after the wider waves have also had a full window.
+            # next several severe hotsets, then raise the pressure ceiling at
+            # later separated slow-rate checkpoints.
             negotiated_overuse_history.append(negotiated_overuse)
             slow_window = max(
                 1,
@@ -6310,17 +6305,17 @@ class PathFinderRouter:
                 )
                 old_ceiling = pres_fac_max
                 if self._slow_progress_event_count >= pressure_after:
-                    ultimate_ceiling = max(
-                        old_ceiling,
-                        float(getattr(
-                            cfg,
-                            "slow_progress_pres_fac_max",
-                            256.0,
-                        )),
-                    )
-                    pres_fac_max = min(
-                        ultimate_ceiling,
-                        max(128.0, old_ceiling * 2.0),
+                    pres_fac_max = (
+                        self._next_slow_progress_pressure_ceiling(
+                            old_ceiling,
+                            self._slow_progress_event_count,
+                            pressure_after=pressure_after,
+                            maximum_ceiling=float(getattr(
+                                cfg,
+                                "slow_progress_pres_fac_max",
+                                1024.0,
+                            )),
+                        )
                     )
                     pres_fac = min(
                         pres_fac * 1.5,
@@ -8014,6 +8009,21 @@ class PathFinderRouter:
             maximum,
             max(1.0, max(0, int(routed_task_count)) / reference),
         )
+
+    @staticmethod
+    def _next_slow_progress_pressure_ceiling(
+        current_ceiling: float,
+        event_count: int,
+        *,
+        pressure_after: int = 2,
+        maximum_ceiling: float = 1024.0,
+    ) -> float:
+        """Advance a bounded 64 -> 128 -> 256 -> 512 -> 1024 ladder."""
+        current = float(current_ceiling)
+        if int(event_count) < max(1, int(pressure_after)):
+            return current
+        ultimate = max(current, float(maximum_ceiling))
+        return min(ultimate, max(128.0, current * 2.0))
 
     def _effective_history_hotset_cap(
         self,

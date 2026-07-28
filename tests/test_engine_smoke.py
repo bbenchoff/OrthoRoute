@@ -1385,16 +1385,38 @@ def test_rate_plateau_temporarily_expands_severe_hotset():
     assert router._bounded_history_hotset_cap(75_000) == 1024
 
     router._slow_progress_event_count = 3
-    assert router._effective_history_hotset_cap(75_000) == 2048
-    assert router._bounded_history_hotset_cap(75_000) == 2048
+    assert router._effective_history_hotset_cap(75_000) == 1024
+    assert router._bounded_history_hotset_cap(75_000) == 1024
 
     router._slow_progress_event_count = 4
+    assert router._effective_history_hotset_cap(75_000) == 1024
+    assert router._bounded_history_hotset_cap(75_000) == 1024
+
+    # A deliberately configured wider experiment still bypasses the
+    # auto-derived ordinary ceiling through its own recovery guardrail.
+    router.config.slow_progress_hotset_cap_max = 2048
     assert router._effective_history_hotset_cap(75_000) == 2048
     assert router._bounded_history_hotset_cap(75_000) == 2048
 
     router.iteration = 26
     assert router._effective_history_hotset_cap(75_000) == 256
     assert router._bounded_history_hotset_cap(75_000) == 256
+
+
+def test_slow_progress_pressure_ceiling_uses_later_events_for_pressure():
+    advance = PathFinderRouter._next_slow_progress_pressure_ceiling
+    ceiling = 64.0
+    observed = []
+    for event in range(1, 7):
+        ceiling = advance(
+            ceiling,
+            event,
+            pressure_after=2,
+            maximum_ceiling=1024.0,
+        )
+        observed.append(ceiling)
+
+    assert observed == [64.0, 128.0, 256.0, 512.0, 1024.0, 1024.0]
 
 
 def test_pressure_schedule_scales_with_bounded_reroute_work():
