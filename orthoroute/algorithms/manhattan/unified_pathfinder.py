@@ -677,6 +677,11 @@ class PathFinderConfig:
     slow_progress_hotset_cap: int = 512
     slow_progress_pressure_after: int = 2
     slow_progress_pres_fac_max: float = 256.0
+    # Selective PathFinder passes do unequal work. Advance pressure by a
+    # bounded equivalent number of the historical 100-net reroute waves so a
+    # 256/512-net pass does not delay the pressure schedule in wall time.
+    pressure_reference_hotset: int = 100
+    pressure_work_scale_max: float = 2.0
     use_gpu: bool = True  # GPU algorithm fixed, validation will catch ROI construction issues
     batch_size: int = 32
     layer_count: int = 6
@@ -5927,6 +5932,23 @@ class PathFinderRouter:
                 sub_tasks = {nid: sub_tasks[nid] for nid in net_ids}
                 logger.debug(f"[SHUFFLE] Randomized net order for iteration {it}")
 
+            pressure_work_scale = (
+                self._pressure_work_scale(
+                    len(sub_tasks),
+                    reference_hotset=int(getattr(
+                        cfg,
+                        "pressure_reference_hotset",
+                        100,
+                    )),
+                    maximum_scale=float(getattr(
+                        cfg,
+                        "pressure_work_scale_max",
+                        2.0,
+                    )),
+                )
+                if it > 1 else 1.0
+            )
+            self._last_pressure_work_scale = pressure_work_scale
             routed, failed = self._route_all(sub_tasks, all_tasks=tasks, pres_fac=pres_fac, iteration=it)
 
             # Track changed edges for next iteration's incremental cost update
@@ -6678,8 +6700,16 @@ class PathFinderRouter:
                 #     pres_fac = min(pres_fac * pres_fac_mult, pres_fac_max)
 
                 # Simple exponential growth - no backoff
-                pres_fac = min(pres_fac * pres_fac_mult, pres_fac_max)
-                logger.debug(f"[ESCALATE] pres_fac={pres_fac:.2f}")
+                pres_fac = min(
+                    pres_fac
+                    * (pres_fac_mult ** pressure_work_scale),
+                    pres_fac_max,
+                )
+                logger.debug(
+                    "[ESCALATE] work_scale=%.2f pres_fac=%.2f",
+                    pressure_work_scale,
+                    pres_fac,
+                )
 
             # CRITICAL: Update prev_over_sum for next iteration's anti-thrash check
             prev_over_sum = over_sum
@@ -7899,6 +7929,20 @@ class PathFinderRouter:
         )
         threshold = max(0.0, float(minimum_fraction))
         return improvement_fraction < threshold, improvement_fraction
+
+    @staticmethod
+    def _pressure_work_scale(
+        routed_task_count: int,
+        reference_hotset: int = 100,
+        maximum_scale: float = 2.0,
+    ) -> float:
+        """Return bounded equivalent pressure steps for a selective pass."""
+        reference = max(1, int(reference_hotset))
+        maximum = max(1.0, float(maximum_scale))
+        return min(
+            maximum,
+            max(1.0, max(0, int(routed_task_count)) / reference),
+        )
 
     def _effective_history_hotset_cap(
         self,

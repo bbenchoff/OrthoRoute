@@ -1301,6 +1301,22 @@ def test_rate_plateau_temporarily_expands_severe_hotset():
     assert router._effective_history_hotset_cap(75_000) == 256
 
 
+def test_pressure_schedule_scales_with_bounded_reroute_work():
+    scale = PathFinderRouter._pressure_work_scale
+
+    assert scale(0) == pytest.approx(1.0)
+    assert scale(50) == pytest.approx(1.0)
+    assert scale(100) == pytest.approx(1.0)
+    assert scale(180) == pytest.approx(1.8)
+    assert scale(256) == pytest.approx(2.0)
+    assert scale(512) == pytest.approx(2.0)
+    assert scale(
+        256,
+        reference_hotset=128,
+        maximum_scale=3.0,
+    ) == pytest.approx(2.0)
+
+
 def test_conflict_aware_hotset_covers_conflicts_before_exploration():
     import random
 
