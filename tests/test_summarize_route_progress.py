@@ -158,3 +158,34 @@ def test_layer_fit_is_withheld_until_two_distinct_stalls():
     assert fit is not None
     assert fit["slope"] == -50_000
     assert fit["zero_layer"] == 21.8
+
+
+def test_zero_convergence_is_fit_eligible_without_a_plateau():
+    run = {
+        "label": "20L 8,192 nets mechanical current",
+        "path": Path("progress.json"),
+        "journal": {
+            "status": "complete",
+            "run_name": "Backplane-20L-20L-current",
+            "git_sha": "def",
+            "completion": {"complete": True},
+        },
+        "iterations": [
+            {
+                "iteration": 1,
+                "_physical_negotiated_overuse": 10,
+            },
+            {
+                "iteration": 2,
+                "_physical_negotiated_overuse": 0,
+            },
+        ],
+        "edge_accounting_mode": "unique physical",
+    }
+
+    row = _stall_row(run)
+
+    assert row["observation"] == "converged"
+    assert row["overuse_at_stall"] == 0
+    assert row["stall_iteration"] == 2
+    assert row["eligible_for_fit"] is True
