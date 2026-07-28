@@ -1250,6 +1250,48 @@ def test_hotset_exploration_shrinks_during_severe_congestion():
     assert fraction(16_385) == pytest.approx(0.15)
 
 
+def test_rolling_progress_detects_tiny_new_minima():
+    insufficient = PathFinderRouter._rolling_progress_insufficient
+
+    slow, fraction = insufficient(
+        [75_977, 75_900, 75_850, 75_800, 75_780, 75_733],
+        window=5,
+        minimum_fraction=0.005,
+        minimum_overuse=16_384,
+    )
+    assert slow
+    assert fraction == pytest.approx(244 / 75_977)
+
+    slow, fraction = insufficient(
+        [100_000, 98_000, 96_000, 94_000, 92_000, 90_000],
+        window=5,
+        minimum_fraction=0.005,
+        minimum_overuse=16_384,
+    )
+    assert not slow
+    assert fraction == pytest.approx(0.10)
+
+    assert insufficient(
+        [100, 99, 99, 99, 99, 99],
+        window=5,
+        minimum_fraction=0.005,
+        minimum_overuse=16_384,
+    ) == (False, None)
+
+
+def test_rate_plateau_temporarily_expands_severe_hotset():
+    router = object.__new__(PathFinderRouter)
+    router.config = PathFinderConfig()
+    router.iteration = 20
+    router._hotset_rate_boost_until = 25
+
+    assert router._effective_history_hotset_cap(75_000) == 512
+    assert router._effective_history_hotset_cap(2_000) == 100
+
+    router.iteration = 26
+    assert router._effective_history_hotset_cap(75_000) == 256
+
+
 def test_conflict_aware_hotset_covers_conflicts_before_exploration():
     import random
 
