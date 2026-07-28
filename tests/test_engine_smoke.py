@@ -1366,6 +1366,18 @@ def test_rolling_progress_detects_tiny_new_minima():
     assert fraction == pytest.approx(1_497 / 79_630)
 
 
+def test_rolling_progress_remains_active_in_intermediate_tail():
+    slow, fraction = PathFinderRouter._rolling_progress_insufficient(
+        [16_386, 16_300, 16_220, 16_150, 16_100, 16_086],
+        window=5,
+        minimum_fraction=0.025,
+        minimum_overuse=2_048,
+    )
+
+    assert slow
+    assert fraction == pytest.approx(300 / 16_386)
+
+
 def test_rate_plateau_temporarily_expands_severe_hotset():
     router = object.__new__(PathFinderRouter)
     router.config = PathFinderConfig()

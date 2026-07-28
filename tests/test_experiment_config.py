@@ -22,6 +22,7 @@ def test_effective_config_records_post_derivation_values():
         slow_progress_pressure_trial_patience=2,
         slow_progress_window=5,
         slow_progress_min_fraction=0.025,
+        slow_progress_min_overuse=2048,
     )
     router = SimpleNamespace(
         _initial_pres_fac_max=64.0,
@@ -37,6 +38,7 @@ def test_effective_config_records_post_derivation_values():
     assert snapshot["current_pressure_ceiling"] == 256.0
     assert snapshot["slow_progress_pressure_trial_min_ratio"] == 0.8
     assert snapshot["slow_progress_pressure_trial_patience"] == 2
+    assert snapshot["slow_progress_min_overuse"] == 2048
 
 
 def test_effective_config_without_router_marks_live_ceilings_unknown():
@@ -58,6 +60,7 @@ def test_effective_config_without_router_marks_live_ceilings_unknown():
         slow_progress_pressure_trial_patience=2,
         slow_progress_window=5,
         slow_progress_min_fraction=0.025,
+        slow_progress_min_overuse=2048,
     )
 
     snapshot = effective_pathfinder_config(config)

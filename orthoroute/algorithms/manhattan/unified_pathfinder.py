@@ -670,10 +670,13 @@ class PathFinderConfig:
     # small. Repeated slow windows then raise the pressure ceiling in stages.
     slow_progress_window: int = 5
     # Five passes must remove roughly 5/200 of the starting residual to stay
-    # on a 200-pass linear clearing pace. The tail has separate smaller-wave
-    # policy, so apply this only while severe congestion remains.
+    # on a 200-pass linear clearing pace. Keep the wide recovery controller
+    # active through the 2,049-16,384 intermediate regime, where ordinary
+    # breadth has already narrowed to 180 but the route is not yet a
+    # near-clean tail. At 2,048 and below, separate <=100-net tail waves
+    # protect the nearly legal best state.
     slow_progress_min_fraction: float = 0.025
-    slow_progress_min_overuse: int = 16_384
+    slow_progress_min_overuse: int = 2_048
     slow_progress_hotset_cap: int = 512
     # Measured 512- and 1024-net severe windows improved iteration efficiency.
     # A later 1638-net full-board window was substantially worse than 1024

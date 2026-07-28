@@ -286,6 +286,9 @@ try:
         "slow_progress_min_fraction": float(
             config.slow_progress_min_fraction
         ),
+        "slow_progress_min_overuse": int(
+            config.slow_progress_min_overuse
+        ),
     }
     atomic_json(progress_path, progress)
     if diagnostic_max_iterations is not None:
