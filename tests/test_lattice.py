@@ -273,3 +273,4 @@ class TestGraphBuild:
         router.accounting.commit_path(forward)
         router.accounting.commit_path(backward)
         assert router.accounting.compute_overuse() == (2, 2)
+        assert router.accounting.compute_overuse(router) == (1, 1)
