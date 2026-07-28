@@ -19,6 +19,7 @@ if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
 
 from benchmarks.metrics import collect_route_metrics
+from benchmarks.experiment_config import effective_pathfinder_config
 import orthoroute.algorithms.manhattan.unified_pathfinder as pathfinder_module
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
     PathFinderConfig,
@@ -236,6 +237,7 @@ try:
     # options intentionally disappear from the compact run name, and source
     # ancestry alone should not be required to reconstruct a long GPU run.
     progress["experiment_config"] = {
+        "stage": "requested_before_board_derivation",
         "layer_count": int(board.layer_count),
         "net_limit": int(diagnostic_net_limit),
         "max_iterations_override": (
@@ -312,6 +314,17 @@ try:
 
     def progress_callback(iteration, total, message):
         routed = sum(bool(path) for path in router.net_paths.values())
+        # PathFinder applies board-derived tuning at negotiation start, after
+        # the requested configuration above was journaled.  Record the
+        # authoritative live values on every snapshot so a terminal journal
+        # remains reproducible even if a pressure event changes the ceiling.
+        effective = effective_pathfinder_config(config, router)
+        if "effective_after_board_derivation" not in progress:
+            effective["initial_pressure_ceiling"] = float(
+                getattr(router, "_pres_fac_max_now", 0.0)
+            )
+            progress["effective_after_board_derivation"] = effective
+        progress["effective_live_config"] = effective
         def overuse_sum(use, capacity):
             if use is None or capacity is None:
                 return 0
