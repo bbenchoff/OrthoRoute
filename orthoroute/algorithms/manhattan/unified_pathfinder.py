@@ -669,7 +669,10 @@ class PathFinderConfig:
     # temporarily widen severe hotsets when the fractional descent is too
     # small. Repeated slow windows then raise the pressure ceiling in stages.
     slow_progress_window: int = 5
-    slow_progress_min_fraction: float = 0.005
+    # Five passes must remove roughly 5/200 of the starting residual to stay
+    # on a 200-pass linear clearing pace. The tail has separate smaller-wave
+    # policy, so apply this only while severe congestion remains.
+    slow_progress_min_fraction: float = 0.025
     slow_progress_min_overuse: int = 16_384
     slow_progress_hotset_cap: int = 512
     slow_progress_pressure_after: int = 2
@@ -6256,7 +6259,7 @@ class PathFinderRouter:
                     minimum_fraction=float(getattr(
                         cfg,
                         "slow_progress_min_fraction",
-                        0.005,
+                        0.025,
                     )),
                     minimum_overuse=int(getattr(
                         cfg,
@@ -7879,7 +7882,7 @@ class PathFinderRouter:
     def _rolling_progress_insufficient(
         values,
         window: int = 5,
-        minimum_fraction: float = 0.005,
+        minimum_fraction: float = 0.025,
         minimum_overuse: int = 16_384,
     ) -> Tuple[bool, Optional[float]]:
         """Return whether the best rolling descent is operationally slow."""
