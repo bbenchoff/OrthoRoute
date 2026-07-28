@@ -302,6 +302,9 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
                 "slow_progress_events": 1,
                 "slow_progress_fraction": 0.02,
                 "hotset_rate_boost_until": 7,
+                "hotset_conflict_pair_count": 20,
+                "hotset_conflict_pairs_covered": 15,
+                "hotset_conflict_pair_coverage_fraction": 0.75,
                 "escape_conflicts": 5,
                 "portal_grid_conflicts": 24,
                 "exact_barrel_conflicts": 35,
@@ -315,6 +318,7 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
     assert snapshot["rows"][1]["hotset_size"] == 512
     assert snapshot["rows"][1]["drop_per_second"] == 2.0
     assert snapshot["rows"][1]["slow_progress_fraction"] == 2.0
+    assert snapshot["rows"][1]["conflict_pair_coverage_pct"] == 75.0
     assert len(snapshot["phases"]) == 2
     assert snapshot["phases"][0]["escape_delta"] == 1
     assert snapshot["phases"][1]["portal_delta"] == -4
@@ -322,6 +326,10 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
     assert snapshot["phases"][1]["matched_prior_iterations"] == "2-2"
     assert snapshot["phases"][1]["efficiency_ratio"] == 1.0
     assert snapshot["phases"][1]["iteration_efficiency_ratio"] == 2.0
+    assert (
+        snapshot["phases"][1]["conflict_pair_coverage_pct_avg"]
+        == 75.0
+    )
     markdown = tmp_path / "hotset.md"
     svg = tmp_path / "hotset.svg"
     _write_hotset_policy_markdown(snapshot, markdown)

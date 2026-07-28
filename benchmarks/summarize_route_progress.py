@@ -1135,6 +1135,29 @@ def _latest_hotset_policy_snapshot(
                 "rate_boost_until": int(
                     current.get("hotset_rate_boost_until", 0)
                 ),
+                "conflict_pair_count": (
+                    ""
+                    if "hotset_conflict_pair_count" not in current else
+                    int(current["hotset_conflict_pair_count"])
+                ),
+                "conflict_pairs_covered": (
+                    ""
+                    if "hotset_conflict_pairs_covered" not in current else
+                    int(current["hotset_conflict_pairs_covered"])
+                ),
+                "conflict_pair_coverage_pct": (
+                    ""
+                    if (
+                        "hotset_conflict_pair_coverage_fraction"
+                        not in current
+                    ) else
+                    round(
+                        100.0 * float(current[
+                            "hotset_conflict_pair_coverage_fraction"
+                        ]),
+                        4,
+                    )
+                ),
                 "escape_conflicts": current_escape,
                 "escape_delta": current_escape - previous_escape,
                 "portal_grid_conflicts": current_portal,
@@ -1179,6 +1202,11 @@ def _latest_hotset_policy_snapshot(
                 if len(prior_rows) != len(phase_rows) else
                 prior_drop / max(0.001, prior_elapsed)
             )
+            coverage_values = [
+                float(row["conflict_pair_coverage_pct"])
+                for row in phase_rows
+                if row["conflict_pair_coverage_pct"] != ""
+            ]
             phases.append({
                 "phase": phase_number,
                 "iterations": (
@@ -1226,6 +1254,14 @@ def _latest_hotset_policy_snapshot(
                 ),
                 "pressure_start": phase_rows[0]["pres_fac"],
                 "pressure_end": phase_rows[-1]["pres_fac"],
+                "conflict_pair_coverage_pct_avg": (
+                    ""
+                    if not coverage_values else
+                    round(
+                        sum(coverage_values) / len(coverage_values),
+                        4,
+                    )
+                ),
                 "escape_start": (
                     first["escape_conflicts"] - first["escape_delta"]
                 ),
@@ -1286,6 +1322,7 @@ def _write_hotset_policy_markdown(
         "drop_per_second", "matched_prior_iterations",
         "matched_prior_drop_per_second", "efficiency_ratio",
         "edge_via_drop", "node_drop", "pressure_start", "pressure_end",
+        "conflict_pair_coverage_pct_avg",
         "escape_start", "escape_end", "escape_delta",
         "portal_start", "portal_end", "portal_delta",
         "exact_barrel_start", "exact_barrel_end", "exact_barrel_delta",
@@ -1295,6 +1332,8 @@ def _write_hotset_policy_markdown(
         "overuse_before", "overuse_after", "overuse_drop",
         "drop_per_second", "edge_via_drop", "node_drop",
         "pres_fac", "slow_progress_fraction",
+        "conflict_pair_count", "conflict_pairs_covered",
+        "conflict_pair_coverage_pct",
         "escape_conflicts", "portal_grid_conflicts",
         "exact_barrel_conflicts",
     )
@@ -1332,6 +1371,8 @@ def _write_hotset_policy_markdown(
         "`hotset_size` is the number of selected nets rerouted in the pass. "
         "`drop_per_second` is complete normalized edge/via plus path-node "
         "excess removed per wall-clock second; negative values are regressions. "
+        "`conflict_pair_coverage_pct` is the share of distinct live node-"
+        "conflict pairs with at least one endpoint in the selected wave. "
         "Escape and portal counts are retained because faster graph descent "
         "is not useful if it accumulates unpriced physical cleanup debt.",
         "",

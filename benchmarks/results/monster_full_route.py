@@ -444,6 +444,17 @@ try:
             "hotset_conflict_aware": bool(getattr(
                 router, "_last_hotset_conflict_aware", False
             )),
+            "hotset_conflict_pair_count": int(getattr(
+                router, "_last_hotset_conflict_pair_count", 0
+            )),
+            "hotset_conflict_pairs_covered": int(getattr(
+                router, "_last_hotset_conflict_pairs_covered", 0
+            )),
+            "hotset_conflict_pair_coverage_fraction": float(getattr(
+                router,
+                "_last_hotset_conflict_pair_coverage_fraction",
+                0.0,
+            )),
             "via_pool_conflict_nets": len(getattr(
                 router, "_via_pool_conflict_nets", ()
             )),
