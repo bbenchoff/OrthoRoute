@@ -4,6 +4,7 @@ from benchmarks.summarize_route_progress import (
     _is_candidate_name,
     _label,
     _latest_hotset_policy_snapshot,
+    _latest_layer_balance_history,
     _latest_layer_node_snapshot,
     _linear_layer_fit,
     _normalize_iteration,
@@ -12,6 +13,8 @@ from benchmarks.summarize_route_progress import (
     _stall_row,
     _write_layer_node_markdown,
     _write_layer_node_svg,
+    _write_layer_balance_markdown,
+    _write_layer_balance_svg,
     _write_hotset_policy_markdown,
     _write_hotset_policy_svg,
 )
@@ -257,6 +260,53 @@ def test_latest_layer_node_snapshot_selects_newest_instrumented_iteration(
     rendered = svg.read_text(encoding="utf-8")
     assert 'width="1200" height="820"' in rendered
     assert "L0: 2 excess uses" in rendered
+
+
+def test_layer_balance_history_tracks_relative_fabric_thirds(tmp_path):
+    def layers(excess):
+        return [
+            {
+                "layer": index,
+                "capacity_nodes": 100,
+                "occupied_nodes": 50,
+                "conflict_nodes": value,
+                "excess_uses": value,
+                "max_use": 2,
+            }
+            for index, value in enumerate([0, *excess, 0])
+        ]
+
+    run = {
+        "label": "8L balance test",
+        "iterations": [
+            {
+                "iteration": 1,
+                "_physical_negotiated_overuse": 80,
+                "path_node_layers": layers([10, 10, 8, 8, 6, 6]),
+            },
+            {
+                "iteration": 2,
+                "_physical_negotiated_overuse": 70,
+                "path_node_layers": layers([8, 8, 8, 8, 8, 8]),
+            },
+        ],
+    }
+
+    snapshot = _latest_layer_balance_history([run])
+
+    assert snapshot["ranges"] == ["L1-L2", "L3-L4", "L5-L6"]
+    assert snapshot["rows"][0]["internal_node_excess"] == 48
+    assert snapshot["rows"][0]["shallow_pct"] == 41.667
+    assert snapshot["rows"][1]["deep_pct"] == 33.333
+    markdown = tmp_path / "balance.md"
+    svg = tmp_path / "balance.svg"
+    _write_layer_balance_markdown(snapshot, markdown)
+    _write_layer_balance_svg(snapshot, svg)
+    assert "Relative fabric thirds" in markdown.read_text(encoding="utf-8")
+    rendered = svg.read_text(encoding="utf-8")
+    assert 'width="1200" height="820"' in rendered
+    assert "total internal excess" in rendered
+    assert "shallow L1-L2" in rendered
 
 
 def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(

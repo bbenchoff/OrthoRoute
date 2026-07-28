@@ -1051,6 +1051,255 @@ def _write_layer_node_svg(
     path.write_text("\n".join(svg), encoding="utf-8", newline="\n")
 
 
+def _latest_layer_balance_history(
+    runs: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Summarize shallow/middle/deep node excess across one live run."""
+    for run in reversed(runs):
+        rows = []
+        ranges = None
+        for iteration in run.get("iterations", []):
+            layers = iteration.get("path_node_layers")
+            if not layers or len(layers) < 5:
+                continue
+            internal = list(layers[1:-1])
+            groups = [[], [], []]
+            for index, item in enumerate(internal):
+                group = min(2, index * 3 // len(internal))
+                groups[group].append(item)
+            if any(not group for group in groups):
+                continue
+            if ranges is None:
+                ranges = [
+                    f"L{int(group[0]['layer'])}-L{int(group[-1]['layer'])}"
+                    for group in groups
+                ]
+            excess = [
+                sum(int(item["excess_uses"]) for item in group)
+                for group in groups
+            ]
+            total = sum(excess)
+            negotiated = iteration.get(
+                "_physical_negotiated_overuse",
+                iteration.get("negotiated_overuse_total"),
+            )
+            rows.append({
+                "run": run["label"],
+                "iteration": int(iteration["iteration"]),
+                "negotiated_overuse": (
+                    None if negotiated is None else int(negotiated)
+                ),
+                "internal_node_excess": total,
+                "shallow_excess": excess[0],
+                "shallow_pct": round(
+                    100.0 * excess[0] / max(1, total), 3
+                ),
+                "middle_excess": excess[1],
+                "middle_pct": round(
+                    100.0 * excess[1] / max(1, total), 3
+                ),
+                "deep_excess": excess[2],
+                "deep_pct": round(
+                    100.0 * excess[2] / max(1, total), 3
+                ),
+            })
+        if rows:
+            return {
+                "run": run["label"],
+                "ranges": ranges,
+                "rows": rows,
+            }
+    return None
+
+
+def _write_layer_balance_csv(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    rows = snapshot["rows"]
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_layer_balance_markdown(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    shallow, middle, deep = snapshot["ranges"]
+    columns = (
+        "iteration", "negotiated_overuse", "internal_node_excess",
+        "shallow_excess", "shallow_pct", "middle_excess", "middle_pct",
+        "deep_excess", "deep_pct",
+    )
+    lines = [
+        "# Layer-balance history",
+        "",
+        f"Run: `{snapshot['run']}`  ",
+        f"Relative fabric thirds: shallow `{shallow}`, middle `{middle}`, "
+        f"deep `{deep}`.",
+        "",
+        "| " + " | ".join(columns) + " |",
+        "|" + "|".join("---" for _ in columns) + "|",
+    ]
+    for row in snapshot["rows"]:
+        lines.append(
+            "| " + " | ".join(str(row[column]) for column in columns)
+            + " |"
+        )
+    lines.extend([
+        "",
+        "Each band contains one third of the internal routing layers. "
+        "Percentages divide that band's path-node excess by total internal "
+        "path-node excess for the same iteration. The graph objective also "
+        "includes edge and via-pool excess, so `negotiated_overuse` can "
+        "differ from `internal_node_excess`.",
+        "",
+    ])
+    path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+
+
+def _write_layer_balance_svg(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    width, height = 1200, 820
+    plot_x, plot_width = 100, 1040
+    top_y, panel_height = 115, 245
+    bottom_y = 465
+    rows = snapshot["rows"]
+    iterations = [int(row["iteration"]) for row in rows]
+    min_iteration, max_iteration = min(iterations), max(iterations)
+    internal_values = [
+        int(row["internal_node_excess"]) for row in rows
+    ]
+    value_min, value_max = min(internal_values), max(internal_values)
+    value_padding = max(1.0, (value_max - value_min) * 0.08)
+    y_min = max(0.0, value_min - value_padding)
+    y_max = value_max + value_padding
+    share_max = max(
+        float(row[key])
+        for row in rows
+        for key in ("shallow_pct", "middle_pct", "deep_pct")
+    )
+    share_ceiling = max(5.0, 5.0 * int((share_max * 1.15 + 4.999) / 5.0))
+
+    def x_position(iteration: int) -> float:
+        return (
+            plot_x
+            + plot_width
+            * (iteration - min_iteration)
+            / max(1, max_iteration - min_iteration)
+        )
+
+    def top_position(value: float) -> float:
+        return (
+            top_y + panel_height
+            - panel_height * (value - y_min) / max(1.0, y_max - y_min)
+        )
+
+    def share_position(value: float) -> float:
+        return (
+            bottom_y + panel_height
+            - panel_height * value / share_ceiling
+        )
+
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="60" y="38" font-family="sans-serif" font-size="24" '
+        'font-weight="bold">Layer-balance history</text>',
+        f'<text x="60" y="66" font-family="sans-serif" font-size="14">'
+        f'{html.escape(snapshot["run"])}; shallow '
+        f'{snapshot["ranges"][0]}, middle {snapshot["ranges"][1]}, deep '
+        f'{snapshot["ranges"][2]}</text>',
+        f'<text x="{plot_x}" y="98" font-family="sans-serif" '
+        'font-size="16">Internal path-node excess (zoomed scale)</text>',
+        f'<rect x="{plot_x}" y="{top_y}" width="{plot_width}" '
+        f'height="{panel_height}" fill="#fafafa" stroke="#cbd5e1"/>',
+        f'<text x="{plot_x}" y="448" font-family="sans-serif" '
+        'font-size="16">Share of internal node excess by fabric third</text>',
+        f'<rect x="{plot_x}" y="{bottom_y}" width="{plot_width}" '
+        f'height="{panel_height}" fill="#fafafa" stroke="#cbd5e1"/>',
+    ]
+    for tick in range(5):
+        fraction = tick / 4
+        top_value = y_max - fraction * (y_max - y_min)
+        top_line_y = top_y + fraction * panel_height
+        share_value = share_ceiling * (1.0 - fraction)
+        share_line_y = bottom_y + fraction * panel_height
+        svg.extend([
+            f'<line x1="{plot_x}" y1="{top_line_y:.1f}" '
+            f'x2="{plot_x + plot_width}" y2="{top_line_y:.1f}" '
+            'stroke="#e2e8f0"/>',
+            f'<text x="{plot_x - 8}" y="{top_line_y + 4:.1f}" '
+            'text-anchor="end" font-family="monospace" font-size="11">'
+            f'{int(top_value):,}</text>',
+            f'<line x1="{plot_x}" y1="{share_line_y:.1f}" '
+            f'x2="{plot_x + plot_width}" y2="{share_line_y:.1f}" '
+            'stroke="#e2e8f0"/>',
+            f'<text x="{plot_x - 8}" y="{share_line_y + 4:.1f}" '
+            'text-anchor="end" font-family="monospace" font-size="11">'
+            f'{share_value:.1f}%</text>',
+        ])
+    top_points = " ".join(
+        f'{x_position(int(row["iteration"])):.1f},'
+        f'{top_position(int(row["internal_node_excess"])):.1f}'
+        for row in rows
+    )
+    svg.append(
+        f'<polyline points="{top_points}" fill="none" stroke="#dc2626" '
+        'stroke-width="3"/>'
+    )
+    colors = {
+        "shallow_pct": "#d97706",
+        "middle_pct": "#2563eb",
+        "deep_pct": "#16a34a",
+    }
+    for key, color in colors.items():
+        points = " ".join(
+            f'{x_position(int(row["iteration"])):.1f},'
+            f'{share_position(float(row[key])):.1f}'
+            for row in rows
+        )
+        svg.append(
+            f'<polyline points="{points}" fill="none" stroke="{color}" '
+            'stroke-width="3"/>'
+        )
+    for tick in range(6):
+        iteration = round(
+            min_iteration
+            + (max_iteration - min_iteration) * tick / 5
+        )
+        x = x_position(iteration)
+        svg.extend([
+            f'<line x1="{x:.1f}" y1="{bottom_y + panel_height}" '
+            f'x2="{x:.1f}" y2="{bottom_y + panel_height + 6}" '
+            'stroke="#64748b"/>',
+            f'<text x="{x:.1f}" y="{bottom_y + panel_height + 22}" '
+            'text-anchor="middle" font-family="sans-serif" font-size="11">'
+            f'{iteration}</text>',
+        ])
+    legend = [
+        ("#dc2626", "total internal excess"),
+        ("#d97706", f"shallow {snapshot['ranges'][0]}"),
+        ("#2563eb", f"middle {snapshot['ranges'][1]}"),
+        ("#16a34a", f"deep {snapshot['ranges'][2]}"),
+    ]
+    for index, (color, label) in enumerate(legend):
+        x = 100 + index * 255
+        svg.extend([
+            f'<line x1="{x}" y1="780" x2="{x + 28}" y2="780" '
+            f'stroke="{color}" stroke-width="4"/>',
+            f'<text x="{x + 36}" y="784" font-family="sans-serif" '
+            f'font-size="12">{html.escape(label)}</text>',
+        ])
+    svg.append("</svg>")
+    path.write_text("\n".join(svg), encoding="utf-8", newline="\n")
+
+
 def _latest_hotset_policy_snapshot(
     runs: Sequence[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
@@ -1755,6 +2004,20 @@ def main() -> None:
             "layer_node_markdown": str(layer_markdown),
             "layer_node_svg": str(layer_svg),
         }
+    layer_balance = _latest_layer_balance_history(runs)
+    layer_balance_artifacts = {}
+    if layer_balance is not None:
+        balance_csv = args.output_dir / "layer-balance-history.csv"
+        balance_markdown = args.output_dir / "layer-balance-history.md"
+        balance_svg = args.output_dir / "layer-balance-history.svg"
+        _write_layer_balance_csv(layer_balance, balance_csv)
+        _write_layer_balance_markdown(layer_balance, balance_markdown)
+        _write_layer_balance_svg(layer_balance, balance_svg)
+        layer_balance_artifacts = {
+            "layer_balance_csv": str(balance_csv),
+            "layer_balance_markdown": str(balance_markdown),
+            "layer_balance_svg": str(balance_svg),
+        }
     hotset_snapshot = _latest_hotset_policy_snapshot(runs)
     hotset_artifacts = {}
     if hotset_snapshot is not None:
@@ -1780,6 +2043,7 @@ def main() -> None:
         ),
         "stall_svg": str(args.output_dir / "layer-stall-overuse.svg"),
         **layer_artifacts,
+        **layer_balance_artifacts,
         **hotset_artifacts,
     }, indent=2))
 
