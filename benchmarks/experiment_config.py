@@ -46,6 +46,12 @@ def effective_pathfinder_config(
         "slow_progress_pres_fac_max": float(
             config.slow_progress_pres_fac_max
         ),
+        "slow_progress_pressure_trial_min_ratio": float(
+            config.slow_progress_pressure_trial_min_ratio
+        ),
+        "slow_progress_pressure_trial_patience": int(
+            config.slow_progress_pressure_trial_patience
+        ),
         "slow_progress_window": int(config.slow_progress_window),
         "slow_progress_min_fraction": float(
             config.slow_progress_min_fraction

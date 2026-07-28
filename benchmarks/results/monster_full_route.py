@@ -434,6 +434,24 @@ try:
             "slow_progress_fraction": getattr(
                 router, "_last_slow_progress_fraction", None
             ),
+            "pressure_trial_reference_ceiling": getattr(
+                router, "_pressure_trial_reference_ceiling", None
+            ),
+            "pressure_trial_reference_fraction": getattr(
+                router, "_pressure_trial_reference_fraction", None
+            ),
+            "pressure_trial_underperform_count": int(getattr(
+                router, "_pressure_trial_underperform_count", 0
+            )),
+            "pressure_backoff_count": int(getattr(
+                router, "_pressure_backoff_count", 0
+            )),
+            "pressure_rejected_ceiling": getattr(
+                router, "_pressure_rejected_ceiling", None
+            ),
+            "adaptive_pressure_limit": float(getattr(
+                router, "_adaptive_pressure_limit", 0.0
+            )),
             "hotset_rate_boost_until": int(getattr(
                 router, "_hotset_rate_boost_until", 0
             )),

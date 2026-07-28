@@ -683,6 +683,10 @@ class PathFinderConfig:
     slow_progress_hotset_cap_max: int = 1024
     slow_progress_pressure_after: int = 2
     slow_progress_pres_fac_max: float = 1024.0
+    # Treat each higher ceiling as an experiment. Two consecutive windows
+    # below 80% of the last proven tier reject it and return to that tier.
+    slow_progress_pressure_trial_min_ratio: float = 0.80
+    slow_progress_pressure_trial_patience: int = 2
     # Selective PathFinder passes do unequal work. Advance pressure by a
     # bounded equivalent number of the historical 100-net reroute waves so a
     # 256/512-net pass does not delay the pressure schedule in wall time.
@@ -5682,6 +5686,16 @@ class PathFinderRouter:
         self._last_slow_progress_fraction = None
         self._hotset_rate_boost_until = 0
         self._last_slow_progress_trigger = -1_000_000
+        self._pressure_trial_reference_ceiling = None
+        self._pressure_trial_reference_fraction = None
+        self._pressure_trial_underperform_count = 0
+        self._pressure_backoff_count = 0
+        self._pressure_rejected_ceiling = None
+        self._adaptive_pressure_limit = float(getattr(
+            cfg,
+            "slow_progress_pres_fac_max",
+            1024.0,
+        ))
         self._initial_pres_fac_max = pres_fac_max
         self._pres_fac_max_now = pres_fac_max
 
@@ -6305,17 +6319,85 @@ class PathFinderRouter:
                     )),
                 )
                 old_ceiling = pres_fac_max
-                if self._slow_progress_event_count >= pressure_after:
+                rejected_ceiling = None
+                trial_ready = (
+                    self._slow_progress_event_count >= 4
+                    and int(getattr(self, "_last_hotset_size", 0))
+                    >= int(getattr(
+                        cfg,
+                        "slow_progress_hotset_cap_max",
+                        1024,
+                    ))
+                    and progress_fraction is not None
+                )
+                if trial_ready:
+                    (
+                        self._pressure_trial_reference_ceiling,
+                        self._pressure_trial_reference_fraction,
+                        self._pressure_trial_underperform_count,
+                        rejected_ceiling,
+                    ) = self._advance_pressure_trial(
+                        old_ceiling,
+                        progress_fraction,
+                        self._pressure_trial_reference_ceiling,
+                        self._pressure_trial_reference_fraction,
+                        self._pressure_trial_underperform_count,
+                        minimum_ratio=float(getattr(
+                            cfg,
+                            "slow_progress_pressure_trial_min_ratio",
+                            0.80,
+                        )),
+                        patience=int(getattr(
+                            cfg,
+                            "slow_progress_pressure_trial_patience",
+                            2,
+                        )),
+                    )
+                    if rejected_ceiling is not None:
+                        self._pressure_rejected_ceiling = (
+                            rejected_ceiling
+                        )
+                        self._adaptive_pressure_limit = min(
+                            self._adaptive_pressure_limit,
+                            float(
+                                self._pressure_trial_reference_ceiling
+                            ),
+                        )
+                        self._pressure_backoff_count += 1
+                        pres_fac_max = min(
+                            pres_fac_max,
+                            self._adaptive_pressure_limit,
+                        )
+                        pres_fac = min(pres_fac, pres_fac_max)
+                        logger.warning(
+                            "[PRESSURE-TRIAL] Rejected ceiling %.0f "
+                            "after %d underperforming windows; returning "
+                            "to proven ceiling %.0f",
+                            rejected_ceiling,
+                            int(getattr(
+                                cfg,
+                                "slow_progress_pressure_trial_patience",
+                                2,
+                            )),
+                            pres_fac_max,
+                        )
+                if (
+                    self._slow_progress_event_count >= pressure_after
+                    and rejected_ceiling is None
+                ):
                     pres_fac_max = (
                         self._next_slow_progress_pressure_ceiling(
                             old_ceiling,
                             self._slow_progress_event_count,
                             pressure_after=pressure_after,
-                            maximum_ceiling=float(getattr(
-                                cfg,
-                                "slow_progress_pres_fac_max",
-                                1024.0,
-                            )),
+                            maximum_ceiling=min(
+                                float(getattr(
+                                    cfg,
+                                    "slow_progress_pres_fac_max",
+                                    1024.0,
+                                )),
+                                self._adaptive_pressure_limit,
+                            ),
                         )
                     )
                     pres_fac = min(
@@ -8025,6 +8107,37 @@ class PathFinderRouter:
             return current
         ultimate = max(current, float(maximum_ceiling))
         return min(ultimate, max(128.0, current * 2.0))
+
+    @staticmethod
+    def _advance_pressure_trial(
+        current_ceiling: float,
+        current_fraction: float,
+        reference_ceiling: Optional[float],
+        reference_fraction: Optional[float],
+        underperform_count: int,
+        *,
+        minimum_ratio: float = 0.80,
+        patience: int = 2,
+    ) -> Tuple[float, float, int, Optional[float]]:
+        """Learn a useful pressure ceiling from complete slow-rate windows."""
+        ceiling = float(current_ceiling)
+        fraction = max(0.0, float(current_fraction))
+        if reference_ceiling is None or reference_fraction is None:
+            return ceiling, fraction, 0, None
+
+        proven_ceiling = float(reference_ceiling)
+        proven_fraction = max(0.0, float(reference_fraction))
+        if ceiling <= proven_ceiling:
+            return proven_ceiling, proven_fraction, 0, None
+
+        threshold = max(0.0, float(minimum_ratio)) * proven_fraction
+        if fraction >= threshold:
+            return ceiling, fraction, 0, None
+
+        failures = int(underperform_count) + 1
+        if failures >= max(1, int(patience)):
+            return proven_ceiling, proven_fraction, 0, ceiling
+        return proven_ceiling, proven_fraction, failures, None
 
     def _effective_history_hotset_cap(
         self,

@@ -18,6 +18,8 @@ def test_effective_config_records_post_derivation_values():
         slow_progress_hotset_cap_max=1024,
         slow_progress_pressure_after=2,
         slow_progress_pres_fac_max=1024.0,
+        slow_progress_pressure_trial_min_ratio=0.8,
+        slow_progress_pressure_trial_patience=2,
         slow_progress_window=5,
         slow_progress_min_fraction=0.025,
     )
@@ -33,6 +35,8 @@ def test_effective_config_records_post_derivation_values():
     assert snapshot["derived_pres_fac_max"] == 10.0
     assert snapshot["initial_pressure_ceiling"] == 64.0
     assert snapshot["current_pressure_ceiling"] == 256.0
+    assert snapshot["slow_progress_pressure_trial_min_ratio"] == 0.8
+    assert snapshot["slow_progress_pressure_trial_patience"] == 2
 
 
 def test_effective_config_without_router_marks_live_ceilings_unknown():
@@ -50,6 +54,8 @@ def test_effective_config_without_router_marks_live_ceilings_unknown():
         slow_progress_hotset_cap_max=1024,
         slow_progress_pressure_after=2,
         slow_progress_pres_fac_max=1024.0,
+        slow_progress_pressure_trial_min_ratio=0.8,
+        slow_progress_pressure_trial_patience=2,
         slow_progress_window=5,
         slow_progress_min_fraction=0.025,
     )
