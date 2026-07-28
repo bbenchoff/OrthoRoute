@@ -377,3 +377,45 @@ def test_hotset_policy_comparison_does_not_cross_phase_boundary():
     assert phase_1024["matched_prior_iterations"] == "5-6"
     assert phase_1024["matched_prior_drop_per_pass"] == 20.0
     assert phase_1024["drop_per_pass"] == 33.3333
+
+
+def test_hotset_policy_splits_equal_hotsets_at_pressure_tiers():
+    run = {
+        "label": "20L pressure ladder",
+        "journal": {"max_iterations": 20},
+        "iterations": [],
+    }
+    for iteration, objective, pressure in (
+        (1, 1000, 64.0),
+        (2, 900, 64.0),
+        (3, 850, 128.0),
+        (4, 825, 232.32),
+        (5, 800, 256.0),
+        (6, 790, 464.64),
+    ):
+        row = {
+            "iteration": iteration,
+            "elapsed_seconds": float(iteration * 10),
+            "_physical_edge_overuse": objective // 10,
+            "_physical_negotiated_overuse": objective,
+            "path_node_overuse_total": objective - objective // 10,
+        }
+        if iteration > 1:
+            row.update({
+                "hotset_size": 1024,
+                "hotset_cap": 1024,
+                "pres_fac": pressure,
+            })
+        run["iterations"].append(row)
+
+    snapshot = _latest_hotset_policy_snapshot([run])
+
+    assert [
+        (phase["iterations"], phase["pressure_tier"])
+        for phase in snapshot["phases"]
+    ] == [
+        ("2-2", 64),
+        ("3-3", 128),
+        ("4-5", 256),
+        ("6-6", 512),
+    ]
