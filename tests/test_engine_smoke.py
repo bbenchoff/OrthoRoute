@@ -28,6 +28,26 @@ def test_cost_balance_ignores_legal_capacity_occupancy():
     assert accounting.cost_balance_ratio(2, 10) == pytest.approx(1.0)
 
 
+def test_hot_layer_bias_increases_planar_present_cost():
+    accounting = EdgeAccountant(2)
+    accounting.present_ema[:] = [2, 2]
+    accounting.capacity[:] = [1, 1]
+
+    accounting.update_costs(
+        np.ones(2, dtype=np.float32),
+        pres_fac=10.0,
+        hist_weight=0.0,
+        add_jitter=False,
+        base_cost_weight=0.0,
+        edge_layer=np.array([0, 1], dtype=np.int32),
+        layer_bias_per_layer=np.array([2.0, 1.0], dtype=np.float32),
+        edge_kind=np.zeros(2, dtype=np.int8),
+    )
+
+    assert accounting.total_cost == pytest.approx([20.0, 10.0])
+    assert accounting._present_cost_scale == pytest.approx([20.0, 10.0])
+
+
 def _make_columnar_connector_board(columns=8):
     """Two regular columnar SMD arrays joined pad-for-pad."""
     from orthoroute.domain.models.board import (
@@ -997,6 +1017,32 @@ def test_layer_depth_bias_is_monotonic_without_congestion():
     )
 
     assert bias == pytest.approx([1.0, 1.1, 1.2, 1.3])
+
+
+def test_layer_bias_includes_capacity_one_node_excess():
+    config = PathFinderConfig()
+    router = UnifiedPathFinder(config=config, use_gpu=False)
+    router.path_node_use = np.array([2, 2, 0, 0], dtype=np.int32)
+    accounting = type("Accounting", (), {
+        "xp": np,
+        "use_gpu": False,
+        "present": np.zeros(2, dtype=np.float32),
+        "present_ema": np.zeros(2, dtype=np.float32),
+        "capacity": np.ones(2, dtype=np.float32),
+    })()
+    graph = type("Graph", (), {
+        "edge_layer": np.arange(2, dtype=np.int32),
+    })()
+
+    bias = router._compute_layer_bias(
+        accounting,
+        graph,
+        num_layers=2,
+        alpha=0.0,
+        max_boost=1.8,
+    )
+
+    assert bias == pytest.approx([1.75, 1.0])
 
 
 def test_path_node_use_prices_tracks_for_later_vias(routed):

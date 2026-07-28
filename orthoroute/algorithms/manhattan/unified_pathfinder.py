@@ -1280,17 +1280,13 @@ class EdgeAccountant:
         # base_cost_weight < 1.0 makes router prefer completion over short paths
         adjusted_base = base_costs * via_cost_multiplier * base_cost_weight * per_edge_bias
 
-        # Apply INVERTED layer bias to present term to directly pressure hot layers
-        # Base term uses per_edge_bias (hot layers cheaper for length optimization)
-        # Present term uses INVERSE (hot layers more expensive for congestion avoidance)
-        # For vias, keep bias at 1.0 (no layer-specific present penalty)
+        # Apply the same direction of layer bias to the present term. The
+        # layer estimator defines hotter layers as bias > 1, so dividing by
+        # that value would make existing congestion cheaper on exactly the
+        # layers we are trying to drain. Vias retain a neutral factor of 1.
         if (edge_layer is not None) and (layer_bias_per_layer is not None) and (edge_kind is not None):
-            # Invert bias for present: if bias=0.9 (cheap base), use 1/0.9=1.11 (expensive present)
-            # Clamp to prevent extreme values
-            inverted_bias = xp.where(per_edge_bias != 0, 1.0 / xp.maximum(per_edge_bias, 0.5), 1.0)
-            inverted_bias = xp.where(edge_kind_arr == 0, inverted_bias, 1.0)  # Only H/V edges
-            present_term = (pres_fac * inverted_bias) * over
-            self._present_cost_scale = pres_fac * inverted_bias
+            present_term = (pres_fac * per_edge_bias) * over
+            self._present_cost_scale = pres_fac * per_edge_bias
         else:
             present_term = pres_fac * over
             self._present_cost_scale = float(pres_fac)
@@ -7765,8 +7761,29 @@ class PathFinderRouter:
         present_for_bias = getattr(accountant, 'present_ema', accountant.present)
         over = xp.maximum(0, present_for_bias - accountant.capacity)
 
-        # Sum overuse per layer (ONE bincount - very fast)
+        # Sum edge overuse per layer (ONE bincount - very fast).
         per_layer_over = xp.bincount(edge_layer, weights=over, minlength=num_layers)
+
+        # Guided routing's capacity-one lattice nodes are negotiated resources
+        # too, and on the monster board they dominate the remaining objective.
+        # Omitting them can label a node-saturated layer "cool" merely because
+        # its planar edges are no longer shared. Add exact node excess in the
+        # same layer-local units before deriving the balancing bias.
+        path_node_use = (
+            getattr(self, "path_node_use_gpu", None)
+            if accountant.use_gpu else
+            getattr(self, "path_node_use", None)
+        )
+        if (
+            path_node_use is not None
+            and num_layers > 0
+            and int(path_node_use.size) % num_layers == 0
+        ):
+            path_node_over = xp.maximum(0, path_node_use - 1)
+            per_layer_over = (
+                per_layer_over
+                + path_node_over.reshape(num_layers, -1).sum(axis=1)
+            )
 
         # Normalize to create bias factors
         maxv = float(per_layer_over.max().get() if accountant.use_gpu else per_layer_over.max())
