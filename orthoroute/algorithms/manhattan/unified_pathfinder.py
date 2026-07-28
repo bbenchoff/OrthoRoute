@@ -495,7 +495,7 @@ import time
 import random
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
 from collections import defaultdict
 
 # Third-party
@@ -6759,7 +6759,11 @@ class PathFinderRouter:
                 "running detail refinement",
                 negotiated_overuse,
             )
-            detail_result = self._detail_pass(tasks, over_sum, over_cnt)
+            detail_result = self._detail_pass(
+                tasks,
+                negotiated_overuse,
+                over_cnt,
+            )
             if detail_result['success']:
                 detail_result["best_iteration"] = best_route_iteration
                 detail_result["restored_best_state"] = restored_best_state
@@ -6882,6 +6886,18 @@ class PathFinderRouter:
                 'reason': f'Failure rate ({fail_rate*100:.1f}%) and overuse ({overuse_edges} edges) within acceptable range for current layer count'
             }
 
+    def _detail_conflict_nets(
+        self,
+        edge_conflict_nets: Iterable[str] = (),
+    ) -> Set[str]:
+        """Collect offenders from every resource system for detail routing."""
+        return (
+            set(edge_conflict_nets)
+            | set(getattr(self, "_path_node_conflict_scores", {}))
+            | set(self._find_via_pool_offenders())
+            | set(getattr(self, "_barrel_conflict_nets", ()))
+        )
+
     def _detail_pass(self, tasks: Dict[str, Tuple[int, int]], initial_overuse: int, initial_edges: int) -> Dict:
         """
         Detail pass: extract conflict subgraph and route only affected nets
@@ -6909,7 +6925,12 @@ class PathFinderRouter:
             ):
                 conflict_nets.add(net_id)
 
-        logger.info(f"[DETAIL] Found {len(conflict_nets)} nets in conflict zone")
+        conflict_nets = self._detail_conflict_nets(conflict_nets)
+        logger.info(
+            "[DETAIL] Found %d nets across edge, via, node, and physical "
+            "conflict resources",
+            len(conflict_nets),
+        )
 
         if not conflict_nets:
             return {'success': False, 'error_code': 'NO-CONFLICT-NETS'}
@@ -6919,7 +6940,15 @@ class PathFinderRouter:
 
         # Detail loop: max 10 iterations with aggressive settings
         cfg = self.config
-        pres_fac = cfg.pres_fac_max * 0.5  # Start high
+        detail_pres_fac_max = max(
+            float(cfg.pres_fac_max),
+            float(getattr(
+                self,
+                "_pres_fac_max_now",
+                cfg.pres_fac_max,
+            )),
+        )
+        pres_fac = detail_pres_fac_max * 0.5  # Start high
         best_overuse = initial_overuse
 
         for detail_it in range(1, 11):
@@ -6952,10 +6981,33 @@ class PathFinderRouter:
 
             self.accounting.refresh_from_canonical()
             over_sum, over_cnt = self.accounting.compute_overuse(router_instance=self)
+            self._rebuild_node_owner()
+            _, barrel_conflicts = self._detect_barrel_conflicts()
+            self._last_barrel_conflict_count = barrel_conflicts
+            (
+                path_node_overuse,
+                _path_node_overuse_count,
+            ) = self._compute_path_node_overuse()
+            negotiated_overuse = over_sum + path_node_overuse
+            conflict_nets = self._detail_conflict_nets(conflict_nets)
+            conflict_tasks.update({
+                net_id: tasks[net_id]
+                for net_id in conflict_nets
+                if net_id in tasks
+            })
 
-            logger.info(f"[DETAIL {detail_it}/10] overuse={over_sum} edges={over_cnt}")
+            logger.info(
+                "[DETAIL %d/10] edge/via=%d nodes=%d negotiated=%d "
+                "resources=%d physical=%d",
+                detail_it,
+                over_sum,
+                path_node_overuse,
+                negotiated_overuse,
+                over_cnt,
+                barrel_conflicts,
+            )
 
-            if over_sum == 0:
+            if negotiated_overuse == 0:
                 unrouted = {
                     net_id
                     for net_id in tasks
@@ -6973,20 +7025,9 @@ class PathFinderRouter:
                         len(unrouted),
                     )
                     continue
-                self._rebuild_node_owner()
-                _, barrel_conflicts = self._detect_barrel_conflicts()
-                self._last_barrel_conflict_count = barrel_conflicts
                 if barrel_conflicts:
-                    conflict_nets = set(
-                        getattr(self, "_barrel_conflict_nets", ())
-                    )
-                    conflict_tasks.update({
-                        net_id: tasks[net_id]
-                        for net_id in conflict_nets
-                        if net_id in tasks
-                    })
                     logger.info(
-                        "[DETAIL] Edge-clean state has %d barrel "
+                        "[DETAIL] Graph-clean state has %d physical "
                         "conflicts; continuing",
                         barrel_conflicts,
                     )
@@ -6999,8 +7040,8 @@ class PathFinderRouter:
                     logger.info(f"[GPU-STATS] GPU: {self._gpu_path_count} paths ({gpu_pct:.1f}%), CPU: {self._cpu_path_count} paths ({100-gpu_pct:.1f}%)")
                 return {'success': True, 'paths': self.net_paths}
 
-            if over_sum < best_overuse:
-                best_overuse = over_sum
+            if negotiated_overuse < best_overuse:
+                best_overuse = negotiated_overuse
             else:
                 # No improvement: escalate and continue
                 pass
@@ -7013,7 +7054,10 @@ class PathFinderRouter:
                 decay_factor=0.98  # Use decay in detail pass to allow redistribution
             )
 
-            pres_fac = min(pres_fac * 1.5, cfg.pres_fac_max)
+            pres_fac = min(
+                pres_fac * 1.5,
+                detail_pres_fac_max,
+            )
 
         # Detail pass exhausted
         logger.warning(f"[DETAIL] Failed to reach zero: final overuse={best_overuse}")

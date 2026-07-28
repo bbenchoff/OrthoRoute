@@ -1631,6 +1631,28 @@ def test_physical_offenders_wait_for_path_node_cleanup(routed):
                 pf.net_paths[net_id] = old_path
 
 
+def test_detail_conflict_nets_include_every_resource_system(routed):
+    pf, _, _, _ = routed
+    old_nodes = dict(getattr(pf, "_path_node_conflict_scores", {}))
+    old_physical = set(getattr(pf, "_barrel_conflict_nets", set()))
+    original_via_offenders = pf._find_via_pool_offenders
+    try:
+        pf._path_node_conflict_scores = {"NODE": 2}
+        pf._barrel_conflict_nets = {"PHYSICAL"}
+        pf._find_via_pool_offenders = lambda: {"VIA"}
+
+        assert pf._detail_conflict_nets({"EDGE"}) == {
+            "EDGE",
+            "VIA",
+            "NODE",
+            "PHYSICAL",
+        }
+    finally:
+        pf._path_node_conflict_scores = old_nodes
+        pf._barrel_conflict_nets = old_physical
+        pf._find_via_pool_offenders = original_via_offenders
+
+
 def test_unrouted_nets_bypass_hotset_cap_and_cooldown(routed):
     pf, _, _, _ = routed
     path = pf.net_paths["TEST_NET"]
