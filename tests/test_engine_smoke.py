@@ -1256,7 +1256,7 @@ def test_rolling_progress_detects_tiny_new_minima():
     slow, fraction = insufficient(
         [75_977, 75_900, 75_850, 75_800, 75_780, 75_733],
         window=5,
-        minimum_fraction=0.005,
+        minimum_fraction=0.025,
         minimum_overuse=16_384,
     )
     assert slow
@@ -1265,7 +1265,7 @@ def test_rolling_progress_detects_tiny_new_minima():
     slow, fraction = insufficient(
         [100_000, 98_000, 96_000, 94_000, 92_000, 90_000],
         window=5,
-        minimum_fraction=0.005,
+        minimum_fraction=0.025,
         minimum_overuse=16_384,
     )
     assert not slow
@@ -1274,9 +1274,18 @@ def test_rolling_progress_detects_tiny_new_minima():
     assert insufficient(
         [100, 99, 99, 99, 99, 99],
         window=5,
-        minimum_fraction=0.005,
+        minimum_fraction=0.025,
         minimum_overuse=16_384,
     ) == (False, None)
+
+    slow, fraction = insufficient(
+        [79_630, 79_662, 79_670, 78_909, 78_436, 78_133],
+        window=5,
+        minimum_fraction=0.025,
+        minimum_overuse=16_384,
+    )
+    assert slow
+    assert fraction == pytest.approx(1_497 / 79_630)
 
 
 def test_rate_plateau_temporarily_expands_severe_hotset():
