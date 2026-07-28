@@ -5682,6 +5682,7 @@ class PathFinderRouter:
         self._last_slow_progress_fraction = None
         self._hotset_rate_boost_until = 0
         self._last_slow_progress_trigger = -1_000_000
+        self._initial_pres_fac_max = pres_fac_max
         self._pres_fac_max_now = pres_fac_max
 
         self._negotiation_ran = True
