@@ -232,6 +232,51 @@ try:
         config.path_node_penalty_base = float(
             diagnostic_path_node_penalty
         )
+    # Preserve the actual experiment knobs in the journal. Zero-valued
+    # options intentionally disappear from the compact run name, and source
+    # ancestry alone should not be required to reconstruct a long GPU run.
+    progress["experiment_config"] = {
+        "layer_count": int(board.layer_count),
+        "net_limit": int(diagnostic_net_limit),
+        "max_iterations_override": (
+            None
+            if diagnostic_max_iterations is None else
+            int(diagnostic_max_iterations)
+        ),
+        "grid_pitch": float(config.grid_pitch),
+        "fabrication_profile": fabrication_profile or None,
+        "hdi_stack": hdi_stack_mode or None,
+        "direction_mode": direction_mode,
+        "wrong_way_multiplier": float(wrong_way_multiplier),
+        "preferred_layer_directions": (
+            list(config.preferred_layer_directions)
+            if config.preferred_layer_directions is not None else
+            None
+        ),
+        "layer_depth_bias": float(config.layer_depth_bias),
+        "owner_penalty_base": float(config.owner_penalty_base),
+        "path_node_penalty_base": float(
+            config.path_node_penalty_base
+        ),
+        "ordinary_hotset_cap": int(config.hotset_cap),
+        "slow_progress_hotset_cap": int(
+            config.slow_progress_hotset_cap
+        ),
+        "slow_progress_hotset_cap_max": int(
+            config.slow_progress_hotset_cap_max
+        ),
+        "slow_progress_pressure_after": int(
+            config.slow_progress_pressure_after
+        ),
+        "slow_progress_pres_fac_max": float(
+            config.slow_progress_pres_fac_max
+        ),
+        "slow_progress_window": int(config.slow_progress_window),
+        "slow_progress_min_fraction": float(
+            config.slow_progress_min_fraction
+        ),
+    }
+    atomic_json(progress_path, progress)
     if diagnostic_max_iterations is not None:
         original_apply_derived_parameters = (
             pathfinder_module.apply_derived_parameters
