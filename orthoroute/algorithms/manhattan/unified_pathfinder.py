@@ -681,7 +681,8 @@ class PathFinderConfig:
     # cleared 2.466x more per pass than the immediately preceding 256-net
     # plateau at 0.871x wall efficiency, with no negotiated or exact-physical
     # debt category diverging. Continue the measured doubling ladder once
-    # more on a third independently separated plateau.
+    # more on a third rate event at least one rolling window after the prior
+    # trigger. The window can still overlap the preceding boosted phase.
     slow_progress_hotset_growth_after: int = 2
     slow_progress_hotset_cap_max: int = 2048
     slow_progress_pressure_after: int = 2
