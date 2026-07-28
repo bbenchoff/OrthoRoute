@@ -350,11 +350,23 @@ def _stall_row(
         key=lambda index: values[index][1],
     )
     best_iteration, best_overuse = values[best_position]
+    status = str(run["journal"].get("status", "unknown"))
+    completion = run["journal"].get("completion", {})
+    converged = (
+        best_overuse == 0
+        and (
+            status == "complete"
+            or bool(completion.get("complete", False))
+        )
+    )
     stalled = (
         len(values) - 1 - best_position >= max(1, plateau_window)
     )
-    status = str(run["journal"].get("status", "unknown"))
-    if stalled:
+    if converged:
+        observation = "converged"
+        stall_iteration = best_iteration
+        overuse_at_stall = 0
+    elif stalled:
         observation = "stalled"
         stall_iteration = values[best_position + plateau_window][0]
         overuse_at_stall = best_overuse
@@ -380,7 +392,7 @@ def _stall_row(
         "best_iteration": best_iteration,
         "best_overuse": best_overuse,
         "current_overuse": values[-1][1],
-        "eligible_for_fit": stalled,
+        "eligible_for_fit": converged or stalled,
         "progress_file": str(run["path"]),
     }
 
@@ -481,7 +493,8 @@ def _write_stall_markdown(
             f"PathFinder objective for {STALL_WINDOW} consecutive "
             "iterations. The objective is physical edge/via-pool excess "
             "plus capacity-one graph-node excess; it is not a KiCad DRC "
-            "count."
+            "count. Zero-congestion convergence is also a fit-eligible "
+            "observation."
         ),
         "",
         "| " + " | ".join(columns) + " |",
@@ -497,8 +510,8 @@ def _write_stall_markdown(
     if fit is None:
         lines.append(
             "Withheld: at least two distinct total-layer counts with "
-            "comparable full-board stalls are required. A single-layer "
-            "history cannot identify a layer-capacity slope."
+            "comparable full-board stalls or convergences are required. "
+            "A single-layer history cannot identify a layer-capacity slope."
         )
     else:
         zero = fit["zero_layer"]
@@ -518,7 +531,7 @@ def _write_stall_markdown(
         "",
         "For each layer count, the fit prefers unique-physical accounting, "
         "then paired-arc-normalized accounting, and uses the newest "
-        "available stalled run at that accounting quality.",
+        "available stalled or converged run at that accounting quality.",
         "",
     ])
     path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
@@ -612,7 +625,13 @@ def _write_stall_svg(
         x += ((index % 5) - 2) * 5
         y = y_at(value)
         selected_point = row in selected
-        color = "#dc2626" if row["eligible_for_fit"] else "#2563eb"
+        color = (
+            "#16a34a"
+            if row["observation"] == "converged" else
+            "#dc2626"
+            if row["eligible_for_fit"] else
+            "#2563eb"
+        )
         if row["eligible_for_fit"]:
             svg.append(
                 f'<circle cx="{x:.1f}" cy="{y:.1f}" r="7" '
@@ -625,9 +644,7 @@ def _write_stall_svg(
                 'stroke-width="3"/>'
             )
         weight = "bold" if selected_point else "normal"
-        state = (
-            "stall" if row["eligible_for_fit"] else "live best"
-        )
+        state = str(row["observation"]).replace("_", " ")
         short_label = (
             f"{row['layers']}L {str(row['git_sha'])[:7]} "
             f"{state}: {value:,}"
@@ -640,8 +657,8 @@ def _write_stall_svg(
         )
     if fit is None:
         fit_text = (
-            "Trend withheld: need comparable stalls at ≥2 distinct "
-            "layer counts"
+            "Trend withheld: need comparable stall/convergence points at "
+            "≥2 distinct layer counts"
         )
     else:
         zero = fit["zero_layer"]
@@ -664,6 +681,9 @@ def _write_stall_svg(
         'fill="#ffffff" stroke="#2563eb" stroke-width="3"/>',
         f'<text x="{plot_x + 330}" y="779" font-family="sans-serif" '
         'font-size="12">live/terminal point without observed stall</text>',
+        f'<circle cx="{plot_x + 720}" cy="775" r="7" fill="#16a34a"/>',
+        f'<text x="{plot_x + 734}" y="779" font-family="sans-serif" '
+        'font-size="12">zero-congestion convergence</text>',
         "</svg>",
     ])
     path.write_text("\n".join(svg), encoding="utf-8", newline="\n")
