@@ -170,3 +170,28 @@ def test_export_consolidates_touching_mechanical_via_stack(tmp_path):
 
     assert result["vias"] == 1
     assert '(layers "F.Cu" "In2.Cu")' in text
+    manifest = json.loads(
+        (tmp_path / "routed-fabrication.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["fabrication_profile"] == (
+        "pcbway_advanced_hdi_mechanical"
+    )
+    assert manifest["fabricator_approval_required"] is True
+    assert manifest["via_span_schedule"] == [{
+        "from_layer": "F.Cu",
+        "to_layer": "In2.Cu",
+        "from_index": 0,
+        "to_index": 2,
+        "copper_layers_spanned": 3,
+        "dielectric_gaps_spanned": 2,
+        "via_type": "blind",
+        "via_process": "mechanical_blind_buried",
+        "via_kind": "",
+        "diameter_mm": 0.3024,
+        "drill_mm": 0.15,
+        "count": 1,
+    }]
+    assert (tmp_path / "routed-fabrication.csv").exists()
+    assert (tmp_path / "routed-fabrication.md").exists()

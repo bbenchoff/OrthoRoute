@@ -1,6 +1,7 @@
 """Deterministic KiCad board export without requiring pcbnew Python bindings."""
 
 import hashlib
+import csv
 import json
 import re
 import uuid
@@ -296,6 +297,156 @@ def _merged_via_run(
     return first_index, merged
 
 
+def _via_span_rows(
+    vias: Sequence[Dict[str, Any]],
+    copper_layers: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Summarize the mechanical drill schedule visible to KiCad/DFM."""
+    layer_index = {
+        name: index for index, name in enumerate(copper_layers)
+    }
+    grouped: Dict[Tuple[Any, ...], int] = {}
+    for item in vias:
+        low = min(
+            layer_index[item["from_layer"]],
+            layer_index[item["to_layer"]],
+        )
+        high = max(
+            layer_index[item["from_layer"]],
+            layer_index[item["to_layer"]],
+        )
+        if low == 0 and high == len(copper_layers) - 1:
+            via_type = "through"
+        elif low == 0 or high == len(copper_layers) - 1:
+            via_type = "blind"
+        else:
+            via_type = "buried"
+        key = (
+            low,
+            high,
+            via_type,
+            str(item.get("via_process", "unspecified")),
+            str(item.get("via_kind", "")),
+            float(item["diameter"]),
+            float(item["drill"]),
+        )
+        grouped[key] = grouped.get(key, 0) + 1
+
+    rows = []
+    for key, count in sorted(grouped.items()):
+        (
+            low,
+            high,
+            via_type,
+            process,
+            kind,
+            diameter,
+            drill,
+        ) = key
+        rows.append({
+            "from_layer": copper_layers[low],
+            "to_layer": copper_layers[high],
+            "from_index": low,
+            "to_index": high,
+            "copper_layers_spanned": high - low + 1,
+            "dielectric_gaps_spanned": high - low,
+            "via_type": via_type,
+            "via_process": process,
+            "via_kind": kind,
+            "diameter_mm": diameter,
+            "drill_mm": drill,
+            "count": count,
+        })
+    return rows
+
+
+def _write_fabrication_manifest(
+    output_path: Path,
+    geometry: Dict[str, Any],
+    copper_layers: Sequence[str],
+    thickness_mm: float,
+    consolidate_mechanical_vias: bool,
+    limit: Optional[int],
+) -> Dict[str, str]:
+    """Write the exact exported via schedule for PCBWay DFM review."""
+    vias = geometry["vias"]
+    if consolidate_mechanical_vias:
+        vias = _consolidate_mechanical_vias(vias, copper_layers)
+    if limit is not None:
+        vias = vias[:limit]
+    rows = _via_span_rows(vias, copper_layers)
+    stem = output_path.with_name(output_path.stem + "-fabrication")
+    json_path = stem.with_suffix(".json")
+    csv_path = stem.with_suffix(".csv")
+    markdown_path = stem.with_suffix(".md")
+    payload = {
+        "board": str(output_path),
+        "fabrication_profile": "pcbway_advanced_hdi_mechanical",
+        "qualification": "preliminary_requires_pcbway_dfm_approval",
+        "layer_count": len(copper_layers),
+        "copper_layers": list(copper_layers),
+        "board_thickness_mm": float(thickness_mm),
+        "grid_pitch_mm": 0.4,
+        "mechanical_vias_consolidated": consolidate_mechanical_vias,
+        "via_topology": (
+            "contiguous adjacent graph hops are consolidated into one "
+            "KiCad mechanical blind/buried via"
+            if consolidate_mechanical_vias else
+            "adjacent graph hops remain separate KiCad via objects"
+        ),
+        "fabricator_approval_required": True,
+        "via_span_schedule": rows,
+    }
+    json_path.write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+        newline="\n",
+    )
+    with csv_path.open("w", encoding="utf-8", newline="") as stream:
+        fieldnames = list(rows[0]) if rows else [
+            "from_layer",
+            "to_layer",
+            "count",
+        ]
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    columns = list(rows[0]) if rows else [
+        "from_layer",
+        "to_layer",
+        "count",
+    ]
+    lines = [
+        "# Preliminary PCBWay mechanical via-span schedule",
+        "",
+        f"- Board: `{output_path.name}`",
+        f"- Copper layers: {len(copper_layers)}",
+        f"- Thickness: {float(thickness_mm):g} mm",
+        "- Grid pitch: 0.4 mm",
+        "- Status: requires PCBWay stackup/DFM approval",
+        "- Interpretation: contiguous adjacent routing hops are exported as "
+        "one normal mechanical blind/buried via.",
+        "",
+        "| " + " | ".join(columns) + " |",
+        "|" + "|".join("---" for _ in columns) + "|",
+    ]
+    for row in rows:
+        lines.append(
+            "| " + " | ".join(str(row[column]) for column in columns) + " |"
+        )
+    lines.append("")
+    markdown_path.write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return {
+        "fabrication_manifest_json": str(json_path),
+        "fabrication_manifest_csv": str(csv_path),
+        "fabrication_manifest_markdown": str(markdown_path),
+    }
+
+
 def export_geometry_to_board(
     geometry_path: Path,
     source_path: Path,
@@ -347,6 +498,14 @@ def export_geometry_to_board(
         encoding="utf-8",
         newline="\n",
     )
+    fabrication_manifests = _write_fabrication_manifest(
+        output_path,
+        geometry,
+        copper_layers,
+        thickness_mm,
+        consolidate_mechanical_vias,
+        limit,
+    )
     return {
         "output": str(output_path),
         "layers": layer_count,
@@ -356,6 +515,7 @@ def export_geometry_to_board(
         "mechanical_vias_consolidated": consolidate_mechanical_vias,
         "bytes": output_path.stat().st_size,
         "source_sha256": source_sha256,
+        **fabrication_manifests,
     }
 
 
