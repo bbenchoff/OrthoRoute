@@ -1382,6 +1382,23 @@ def test_conflict_aware_hotset_covers_conflicts_before_exploration():
     )
 
 
+def test_hotset_conflict_pair_coverage_deduplicates_undirected_pairs():
+    pair_count, covered = PathFinderRouter._conflict_pair_coverage(
+        {"A", "D"},
+        [
+            ("A", "B"),
+            ("B", "A"),
+            ("A", "C"),
+            ("D", "E"),
+            ("F", "G"),
+            ("A", "A"),
+        ],
+    )
+
+    assert pair_count == 4
+    assert covered == 3
+
+
 def test_conflict_aware_hotset_keeps_edge_only_offenders_eligible():
     import random
 

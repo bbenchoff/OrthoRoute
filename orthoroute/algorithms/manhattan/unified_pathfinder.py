@@ -8061,6 +8061,38 @@ class PathFinderRouter:
         return 0.40
 
     @staticmethod
+    def _conflict_pair_coverage(
+        selected,
+        conflict_pairs,
+    ) -> Tuple[int, int]:
+        """Return distinct live conflict pairs and pairs touched by a wave."""
+        selected_set = set(selected)
+        unique_pairs = set()
+        covered = 0
+        for first, second in conflict_pairs or ():
+            if first == second:
+                continue
+            pair = frozenset((first, second))
+            if len(pair) != 2 or pair in unique_pairs:
+                continue
+            unique_pairs.add(pair)
+            if first in selected_set or second in selected_set:
+                covered += 1
+        return len(unique_pairs), covered
+
+    def _record_hotset_conflict_coverage(self, hotset) -> None:
+        """Journal how much of the current node-conflict graph is touched."""
+        pair_count, covered = self._conflict_pair_coverage(
+            hotset,
+            getattr(self, "_path_node_conflict_pairs", ()),
+        )
+        self._last_hotset_conflict_pair_count = pair_count
+        self._last_hotset_conflict_pairs_covered = covered
+        self._last_hotset_conflict_pair_coverage_fraction = (
+            covered / pair_count if pair_count else 0.0
+        )
+
+    @staticmethod
     def _select_conflict_aware_hotset(
         ranked_candidates: List[str],
         conflict_pairs,
@@ -8398,6 +8430,7 @@ class PathFinderRouter:
                 node_exploration_fraction
             )
             self._last_hotset_conflict_aware = True
+            self._record_hotset_conflict_coverage(hotset)
             return hotset
 
         # OVERUSE EXISTS: collect nets touching overused edges using fast lookup
@@ -8526,11 +8559,14 @@ class PathFinderRouter:
             exploration_fraction
         )
         self._last_hotset_conflict_aware = True
+        self._record_hotset_conflict_coverage(hotset)
 
         logger.info(f"[HOTSET] overuse_edges={len(over_idx)} total_overuse={int(total_overuse)}, "
                     f"offenders={len(offenders)}, cap={adaptive_cap} → hotset={len(hotset)}/{len(tasks)} "
                     f"(explore={exploration_fraction:.0%}, "
-                    f"conflict-aware, unique={unique_frac:.1%})")
+                    f"conflict-aware, unique={unique_frac:.1%}, "
+                    f"pair-cover="
+                    f"{self._last_hotset_conflict_pair_coverage_fraction:.1%})")
 
         return hotset
 
