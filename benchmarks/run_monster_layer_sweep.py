@@ -206,6 +206,15 @@ def _drc_counts(report: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def _fabrication_manifest_paths(board: Path) -> Dict[str, str]:
+    stem = board.with_name(board.stem + "-fabrication")
+    return {
+        "fabrication_manifest_json": str(stem.with_suffix(".json")),
+        "fabrication_manifest_csv": str(stem.with_suffix(".csv")),
+        "fabrication_manifest_markdown": str(stem.with_suffix(".md")),
+    }
+
+
 def _export_and_drc(
     repo_root: Path,
     results_dir: Path,
@@ -270,6 +279,7 @@ def _export_and_drc(
             drc_summary_stem.with_suffix(".md")
         ),
         "drc_summary_csv": str(drc_summary_stem.with_suffix(".csv")),
+        **_fabrication_manifest_paths(board),
         **_drc_counts(report),
     }
 
