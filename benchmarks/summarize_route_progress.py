@@ -1533,11 +1533,15 @@ def _write_hotset_policy_svg(
         previous_event_count = event_count
         iteration = int(row["iteration"])
         top_x = x_position(iteration)
+        label_on_left = top_x > plot_x + 0.82 * plot_width
+        label_x = top_x - 4 if label_on_left else top_x + 4
+        label_anchor = "end" if label_on_left else "start"
         svg.extend([
             f'<line x1="{top_x:.1f}" y1="{overuse_y}" '
             f'x2="{top_x:.1f}" y2="{overuse_y + overuse_height}" '
             'stroke="#64748b" stroke-dasharray="5 4"/>',
-            f'<text x="{top_x + 4:.1f}" y="{overuse_y + 15}" '
+            f'<text x="{label_x:.1f}" y="{overuse_y + 15}" '
+            f'text-anchor="{label_anchor}" '
             'font-family="sans-serif" font-size="10" fill="#475569">'
             f'event {event_count} · p≤{row["pres_fac_max"]:g}</text>',
         ])
