@@ -1,5 +1,8 @@
+from pathlib import Path
+
 from benchmarks.run_monster_layer_sweep import (
     _drc_counts,
+    _fabrication_manifest_paths,
     _qualification_label,
     _remaining_candidates,
 )
@@ -46,3 +49,13 @@ def test_qualification_label_preserves_run_timestamp():
     assert _qualification_label({
         "run_name": "Backplane-16L-stuff-20260727_134657",
     }) == "QUAL-20260727_134657"
+
+
+def test_deliverable_records_fabrication_manifests():
+    paths = _fabrication_manifest_paths(Path("candidate.kicad_pcb"))
+
+    assert paths == {
+        "fabrication_manifest_json": "candidate-fabrication.json",
+        "fabrication_manifest_csv": "candidate-fabrication.csv",
+        "fabrication_manifest_markdown": "candidate-fabrication.md",
+    }
