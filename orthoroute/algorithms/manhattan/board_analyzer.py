@@ -13,6 +13,95 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def assign_layer_axes_by_demand(
+    signal_layers: List[int],
+    demand_h_pct: float,
+    anchor_top_is_h: bool = True,
+) -> Tuple[Set[int], Set[int]]:
+    """Allocate routing layers to H/V while retaining an alternating spine."""
+    n_signal = len(signal_layers)
+    if n_signal == 0:
+        return set(), set()
+    if n_signal == 1:
+        if demand_h_pct >= 0.5:
+            return set(signal_layers), set()
+        return set(), set(signal_layers)
+
+    h_goal = max(
+        1,
+        min(
+            n_signal - 1,
+            int(round(n_signal * float(demand_h_pct))),
+        ),
+    )
+
+    h_layers: Set[int] = set()
+    v_layers: Set[int] = set()
+    want_h = anchor_top_is_h
+    for layer in signal_layers:
+        if want_h and len(h_layers) < h_goal:
+            h_layers.add(layer)
+        else:
+            v_layers.add(layer)
+        want_h = not want_h
+
+    while len(h_layers) < h_goal and v_layers:
+        mid_layer = sorted(v_layers)[len(v_layers) // 2]
+        v_layers.remove(mid_layer)
+        h_layers.add(mid_layer)
+
+    while len(h_layers) > h_goal and h_layers:
+        mid_layer = sorted(h_layers)[len(h_layers) // 2]
+        h_layers.remove(mid_layer)
+        v_layers.add(mid_layer)
+
+    return h_layers, v_layers
+
+
+def preferred_layer_directions_for_board(
+    board,
+    layer_count: int,
+    anchor_top_is_h: bool = True,
+) -> Tuple[List[str], Set[int], Set[int], float]:
+    """Measure two-terminal board demand before graph construction.
+
+    OrthoRoute currently routes the first two pads of each net. Measure the
+    same endpoint pairs here so the graph is built with the H/V allocation
+    that the later PathFinder analysis will report.
+    """
+    demand_dx = 0.0
+    demand_dy = 0.0
+    for net in getattr(board, "nets", ()) or ():
+        pads = getattr(net, "pads", ()) or ()
+        if len(pads) < 2:
+            continue
+        first = pads[0].position
+        second = pads[1].position
+        demand_dx += abs(float(second.x) - float(first.x))
+        demand_dy += abs(float(second.y) - float(first.y))
+
+    total_demand = demand_dx + demand_dy
+    demand_h_pct = (
+        demand_dx / total_demand if total_demand > 1e-9 else 0.5
+    )
+    signal_layers = list(range(1, max(1, int(layer_count) - 1)))
+    h_layers, v_layers = assign_layer_axes_by_demand(
+        signal_layers,
+        demand_h_pct,
+        anchor_top_is_h=anchor_top_is_h,
+    )
+
+    # Outer-layer entries are required by Lattice3D but do not receive
+    # lateral routing edges. Keep their historical defaults.
+    directions = [
+        "h" if layer in h_layers else "v"
+        for layer in range(int(layer_count))
+    ]
+    if directions:
+        directions[0] = "v"
+    return directions, h_layers, v_layers, demand_h_pct
+
+
 @dataclass
 class BoardCharacteristics:
     """Physical and topological properties of the board"""
@@ -251,33 +340,10 @@ def _assign_hv_layers_by_demand(
     else:
         demand_h_pct = demand_dx / total_demand
 
-    # Determine how many H layers to allocate
-    n_signal = len(signal_layers)
-    h_goal = max(1, min(n_signal - 1, int(round(n_signal * demand_h_pct))))
-
-    # Assign layers alternating, starting from anchor
-    h_layers = set()
-    v_layers = set()
-
-    want_h = anchor_top_is_h
-    for layer in signal_layers:
-        if want_h and len(h_layers) < h_goal:
-            h_layers.add(layer)
-        else:
-            v_layers.add(layer)
-        want_h = not want_h
-
-    # Adjust if we didn't hit goal exactly (shouldn't happen with good rounding)
-    while len(h_layers) < h_goal and v_layers:
-        # Move a mid-stack V layer to H
-        mid_layer = sorted(v_layers)[len(v_layers) // 2]
-        v_layers.remove(mid_layer)
-        h_layers.add(mid_layer)
-
-    while len(h_layers) > h_goal and h_layers:
-        # Move a mid-stack H layer to V
-        mid_layer = sorted(h_layers)[len(h_layers) // 2]
-        h_layers.remove(mid_layer)
-        v_layers.add(mid_layer)
+    h_layers, v_layers = assign_layer_axes_by_demand(
+        signal_layers,
+        demand_h_pct,
+        anchor_top_is_h=anchor_top_is_h,
+    )
 
     return h_layers, v_layers, demand_h_pct
