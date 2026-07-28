@@ -368,6 +368,95 @@ def test_stagnation_recovery_does_not_alternate_two_nearly_full_sets():
     assert all(len(wave) == 20 for wave in waves)
 
 
+def test_incomplete_detail_pass_restores_best_all_nets_state():
+    class AccountingFixture:
+        use_gpu = False
+        present = np.asarray([2], dtype=np.int32)
+        capacity = np.asarray([1], dtype=np.int32)
+
+        def refresh_from_canonical(self):
+            pass
+
+        def update_costs(self, *args, **kwargs):
+            pass
+
+        def compute_overuse(self, router_instance=None):
+            return router_instance._detail_overuse.pop(0), 1
+
+        def update_history(self, *args, **kwargs):
+            pass
+
+    class DetailFixture:
+        pass
+
+    pf = DetailFixture()
+    pf.accounting = AccountingFixture()
+    pf.graph = type("Graph", (), {
+        "base_costs": np.asarray([1.0], dtype=np.float32),
+    })()
+    pf.config = type("Config", (), {
+        "pres_fac_max": 128.0,
+        "hist_cost_weight": 1.0,
+        "base_cost_weight": 1.0,
+        "hist_gain": 1.0,
+    })()
+    pf.net_paths = {"A": [0, 1]}
+    pf.stagnation_counter = 0
+    pf._last_barrel_conflict_count = 0
+    pf._gpu_path_count = 0
+    pf._cpu_path_count = 0
+    pf._detail_overuse = [3] + [4] * 9
+    pf._path_without_dynamic_escape_chains = (
+        lambda net_id, path: path
+    )
+    pf._path_to_edges = lambda path: [0]
+    pf._detail_conflict_nets = (
+        lambda edge_conflict_nets=(): {"A"}
+    )
+    pf._build_hotset = lambda tasks: {"A"}
+
+    route_generation = [0]
+
+    def route_all(tasks, all_tasks=None, pres_fac=1.0):
+        route_generation[0] += 1
+        pf.net_paths["A"] = [0, route_generation[0] + 1]
+        return 1, 0
+
+    pf._route_all = route_all
+    pf._rebuild_node_owner = lambda: None
+    pf._detect_barrel_conflicts = lambda: (set(), 0)
+    pf._compute_path_node_overuse = lambda: (0, 0)
+    pf._negotiated_route_score = (
+        UnifiedPathFinder._negotiated_route_score
+    )
+    pf._capture_routing_state = lambda: {
+        "paths": {
+            net_id: list(path)
+            for net_id, path in pf.net_paths.items()
+        },
+    }
+
+    def restore(state):
+        pf.net_paths = {
+            net_id: list(path)
+            for net_id, path in state["paths"].items()
+        }
+
+    pf._restore_routing_state = restore
+
+    result = UnifiedPathFinder._detail_pass(
+        pf,
+        {"A": (0, 1)},
+        initial_overuse=5,
+        initial_edges=1,
+    )
+
+    assert result["success"] is False
+    assert result["overuse_sum"] == 3
+    assert result["restored_best_detail_state"] is True
+    assert pf.net_paths["A"] == [0, 2]
+
+
 def test_selected_escape_geometry_is_physically_conflict_free(routed):
     pf, _, _, _ = routed
     pf._rebuild_escape_occupancy()
