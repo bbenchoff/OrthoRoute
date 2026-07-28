@@ -8,12 +8,24 @@ import numpy as np
 import pytest
 
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
+    EdgeAccountant,
     PathFinderConfig,
     PathFinderRouter,
     UnifiedPathFinder,
 )
 
 from conftest import make_two_pad_board
+
+
+def test_cost_balance_ignores_legal_capacity_occupancy():
+    accounting = EdgeAccountant(4)
+    accounting.capacity[:] = 1
+    accounting.present_ema[:] = [0, 1, 2, 4]
+    accounting.history[:] = [5, 5, 5, 5]
+
+    # Only excess uses [0, 0, 1, 3] contribute to present cost:
+    # history = 2 * 20, present = 10 * 4.
+    assert accounting.cost_balance_ratio(2, 10) == pytest.approx(1.0)
 
 
 def _make_columnar_connector_board(columns=8):

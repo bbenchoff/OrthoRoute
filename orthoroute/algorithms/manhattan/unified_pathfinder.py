@@ -955,6 +955,21 @@ class EdgeAccountant:
         self.capacity = self.xp.ones(num_edges, dtype=self.xp.float32)
         self.total_cost = None
 
+    def cost_balance_ratio(
+        self,
+        history_weight: float,
+        present_factor: float,
+    ) -> float:
+        """Compare the history and present terms actually used in costs."""
+        present_overuse = self.xp.maximum(
+            0, self.present_ema - self.capacity
+        )
+        history_cost = float(history_weight * self.history.sum())
+        present_cost = float(
+            present_factor * present_overuse.sum()
+        )
+        return history_cost / (present_cost + 1e-9)
+
     @property
     def edge_usage(self):
         """Compatibility view of canonical sparse edge occupancy."""
@@ -6179,11 +6194,9 @@ class PathFinderRouter:
 
             # Convergence diagnostics (every 10 iterations, reduced from every 5)
             if it % 10 == 0:
-                hist_sum = float(self.accounting.history.sum())
-                pres_ema_sum = float(self.accounting.present_ema.sum())
-                cost_ratio = (
-                    active_hist_weight * hist_sum
-                    / (pres_fac * pres_ema_sum + 1e-9)
+                cost_ratio = self.accounting.cost_balance_ratio(
+                    active_hist_weight,
+                    pres_fac,
                 )
 
                 logger.debug(f"[CONVERGENCE] pres_fac={pres_fac:.2f} hist_gain={hist_gain:.2f} balance={cost_ratio:.2f}")
