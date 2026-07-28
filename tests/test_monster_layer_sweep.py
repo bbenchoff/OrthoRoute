@@ -43,6 +43,17 @@ def test_successful_reduced_candidate_qualifies_fourteen_layers():
     assert _remaining_candidates(16, selected, 20) == [14]
 
 
+def test_successful_twenty_layer_candidate_backfills_eighteen():
+    selected = (20, {"status": "complete"})
+
+    assert _remaining_candidates(
+        20,
+        selected,
+        32,
+        candidate_layers=[24, 28, 32],
+    ) == [18]
+
+
 def test_incomplete_candidate_expands_layers_in_order():
     assert _remaining_candidates(16, None, 20) == [18, 20]
 
