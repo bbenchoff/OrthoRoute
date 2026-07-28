@@ -3,6 +3,8 @@ from pathlib import Path
 from benchmarks.summarize_route_progress import (
     _is_candidate_name,
     _label,
+    _normalize_iteration,
+    _physical_edge_overuse,
     _row,
 )
 
@@ -84,3 +86,21 @@ def test_comparison_row_records_where_each_minimum_occurred():
     assert row["best_path_nodes"] == 30
     assert row["best_path_nodes_iteration"] == 2
     assert row["final_pres_fac"] == 2.0
+
+
+def test_legacy_directed_arcs_normalize_to_one_physical_edge():
+    item = {
+        "edge_overuse": 20,
+        "via_column_overuse": 3,
+        "via_segment_overuse": 2,
+        "path_node_overuse_total": 40,
+    }
+
+    assert _physical_edge_overuse(
+        item, edge_accounting_mode="paired arcs normalized"
+    ) == 15
+    normalized = _normalize_iteration(
+        item, edge_accounting_mode="paired arcs normalized"
+    )
+    assert normalized["_physical_edge_overuse"] == 15
+    assert normalized["_physical_negotiated_overuse"] == 55
