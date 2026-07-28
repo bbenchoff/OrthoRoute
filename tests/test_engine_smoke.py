@@ -1250,7 +1250,7 @@ def test_hotset_exploration_shrinks_during_severe_congestion():
     assert fraction(16_385) == pytest.approx(0.15)
 
 
-def test_conflict_aware_hotset_moves_only_one_side_per_wave():
+def test_conflict_aware_hotset_covers_conflicts_before_exploration():
     import random
 
     ranked = ["A", "B", "C", "D", "E", "F", "G", "H"]
@@ -1269,9 +1269,9 @@ def test_conflict_aware_hotset_moves_only_one_side_per_wave():
     )
 
     assert len(selected) == 4
-    assert {"A", "D", "F"}.issubset(selected)
-    assert not any(
-        first in selected and second in selected
+    assert {"A", "D"}.issubset(selected)
+    assert all(
+        first in selected or second in selected
         for first, second in conflict_pairs
     )
 
@@ -1288,6 +1288,28 @@ def test_conflict_aware_hotset_keeps_edge_only_offenders_eligible():
     )
 
     assert selected == ["A", "EDGE_1", "EDGE_2"]
+
+
+def test_conflict_aware_hotset_fills_budget_on_dense_component():
+    import random
+
+    ranked = ["A", "B", "C", "D", "EDGE"]
+    conflict_pairs = {
+        (first, second)
+        for index, first in enumerate(ranked[:4])
+        for second in ranked[index + 1:4]
+    }
+
+    selected = PathFinderRouter._select_conflict_aware_hotset(
+        ranked,
+        conflict_pairs,
+        cap=5,
+        exploration_fraction=0.20,
+        rng=random.Random(42),
+    )
+
+    assert len(selected) == 5
+    assert set(selected) == set(ranked)
 
 
 def test_initial_net_order_is_reproducible_across_global_rng_state():
