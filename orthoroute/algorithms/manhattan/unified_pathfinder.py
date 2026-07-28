@@ -1037,7 +1037,12 @@ class EdgeAccountant:
 
     def compute_overuse(self, router_instance=None) -> Tuple[int, int]:
         """
-        Compute total overuse including edge AND via spatial overuse.
+        Compute physical-resource overuse including edge and via pools.
+
+        Paths reserve both directed CSR arcs of each physical segment so
+        opposite traversals collide. When a router is available, count only
+        one canonical arc per segment; otherwise one physical edge violation
+        would be weighted twice relative to a capacity-one path node.
 
         Args:
             router_instance: Optional PathFinderRouter instance for via spatial checks
@@ -1049,8 +1054,18 @@ class EdgeAccountant:
         usage = self.present.get() if self.use_gpu else self.present
         cap = self.capacity.get() if self.use_gpu else self.capacity
         edge_over = np.maximum(0, usage - cap)
+        if (
+            router_instance is not None
+            and hasattr(
+                router_instance,
+                "_canonical_edge_resource_mask",
+            )
+        ):
+            edge_over = edge_over[
+                router_instance._canonical_edge_resource_mask()
+            ]
         edge_over_sum = int(edge_over.sum())
-        edge_over_count = int((edge_over > 0).sum())
+        edge_over_count = int(np.count_nonzero(edge_over))
 
         # Via spatial overuse (NEW)
         via_col_over_sum = 0
@@ -2776,6 +2791,7 @@ class PathFinderRouter:
         # reinitialized with a different board.
         self._indptr_cpu = None
         self._indices_cpu = None
+        self._canonical_edge_resource_mask_cache = None
         # Note: graph.finalize() is now called inside build_graph() before validation
 
         # Set N for ROI checks (number of nodes in full graph)
@@ -4494,6 +4510,21 @@ class PathFinderRouter:
 
         self._edge_src = edge_src
         logger.info(f"[EDGE-SRC-MAP] Built mapping for {num_edges:,} edges")
+
+    def _canonical_edge_resource_mask(self) -> np.ndarray:
+        """Select one CSR arc for each undirected physical segment."""
+        cached = getattr(
+            self, "_canonical_edge_resource_mask_cache", None
+        )
+        if cached is not None:
+            return cached
+        self._ensure_edge_src_map()
+        destinations = self.graph.indices
+        if hasattr(destinations, "get"):
+            destinations = destinations.get()
+        mask = self._edge_src < np.asarray(destinations)
+        self._canonical_edge_resource_mask_cache = mask
+        return mask
 
     def _mark_via_barrel_ownership_for_path(self, net_name: str, path: List[int]) -> None:
         """
