@@ -489,6 +489,7 @@ Environment variables:
 """
 
 # Standard library
+import copy
 import logging
 import time
 import random
@@ -5573,6 +5574,9 @@ class PathFinderRouter:
         history_decay = resolve_history_decay(cfg)
 
         best_overuse = float('inf')
+        best_route_score = None
+        best_route_state = None
+        best_route_iteration = 0
         stagnant = 0
         prev_over_sum = float('inf')
 
@@ -6105,6 +6109,21 @@ class PathFinderRouter:
             )
             logger.warning(f"[ITER {it:3d}] nets={routed}/{routed+failed}  {status}  edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}")
 
+            # Retain the best complete routing state, not just its scalar
+            # metric. Negotiation deliberately oscillates, so the final
+            # iteration can be worse than an earlier pass. Rank states
+            # lexicographically: route every net first, then minimize graph
+            # overuse, then physical conflicts.
+            route_score = (
+                int(failed),
+                int(over_sum),
+                int(conflict_count),
+            )
+            if best_route_score is None or route_score < best_route_score:
+                best_route_score = route_score
+                best_route_state = self._capture_routing_state()
+                best_route_iteration = it
+
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0) - only first 3 iterations
             if it <= 3:
                 hist_max = float(self.accounting.history.max())
@@ -6447,11 +6466,47 @@ class PathFinderRouter:
             # CRITICAL: Update prev_over_sum for next iteration's anti-thrash check
             prev_over_sum = over_sum
 
+        # Negotiated routing can finish on an upswing. Restore the best state
+        # before refinement/export so a long run never discards its own best
+        # board merely because max_iterations landed at the wrong phase.
+        current_route_score = (
+            int(failed),
+            int(over_sum),
+            int(getattr(self, "_last_barrel_conflict_count", 0)),
+        )
+        restored_best_state = bool(
+            best_route_state is not None
+            and best_route_score is not None
+            and best_route_score < current_route_score
+        )
+        if restored_best_state:
+            self._restore_routing_state(best_route_state)
+            failed = sum(
+                1 for net_id in tasks
+                if not self.net_paths.get(net_id)
+            )
+            over_sum, over_cnt = self.accounting.compute_overuse(
+                router_instance=self
+            )
+            _, restored_barrel_conflicts = self._detect_barrel_conflicts()
+            self._last_barrel_conflict_count = restored_barrel_conflicts
+            logger.warning(
+                "[BEST-STATE] Restored iteration %d at max_iterations: "
+                "failed=%d overuse=%d edges=%d physical=%d",
+                best_route_iteration,
+                failed,
+                over_sum,
+                over_cnt,
+                restored_barrel_conflicts,
+            )
+
         # If we exited with low overuse (<100), run detail pass
         if 0 < over_sum <= 100:
             logger.info(f"[DETAIL PASS] Overuse={over_sum} at max_iters, running detail refinement")
             detail_result = self._detail_pass(tasks, over_sum, over_cnt)
             if detail_result['success']:
+                detail_result["best_iteration"] = best_route_iteration
+                detail_result["restored_best_state"] = restored_best_state
                 return detail_result
 
         # SOFT-FAIL: Analyze if more layers needed
@@ -6507,6 +6562,8 @@ class PathFinderRouter:
             'overuse_sum': over_sum,
             'overuse_edges': over_cnt,
             'failed_nets': failed,
+            'best_iteration': best_route_iteration,
+            'restored_best_state': restored_best_state,
             'layer_recommendation': layer_recommendation
         }
 
@@ -6561,12 +6618,7 @@ class PathFinderRouter:
         with fine ROI, lower via cost, higher history gain, and max 60 hotset.
         """
         logger.info("[DETAIL] Extracting conflict subgraph...")
-        original_paths = {
-            net_id: list(path)
-            for net_id, path in self.net_paths.items()
-        }
-        original_selected_portals = dict(self.net_selected_portals)
-        original_portal_layers = dict(self.net_portal_layers)
+        original_state = self._capture_routing_state()
 
         present = self.accounting.present.get() if self.accounting.use_gpu else self.accounting.present
         cap = self.accounting.capacity.get() if self.accounting.use_gpu else self.accounting.capacity
@@ -6697,12 +6749,37 @@ class PathFinderRouter:
         logger.warning(f"[DETAIL] Failed to reach zero: final overuse={best_overuse}")
         # A refinement attempt is speculative. Do not return a lower-overuse
         # state that achieved it by dropping nets.
+        self._restore_routing_state(original_state)
+        return {'success': False, 'error_code': 'DETAIL-INCOMPLETE', 'overuse_sum': best_overuse}
+
+    def _capture_routing_state(self) -> Dict:
+        """Copy the export-relevant negotiated state compactly in memory."""
+        return {
+            "paths": {
+                net_id: list(path)
+                for net_id, path in self.net_paths.items()
+            },
+            # Portal objects are mutable during retargeting. A shallow mapping
+            # copy would silently mutate the remembered best state.
+            "selected_portals": copy.deepcopy(
+                self.net_selected_portals
+            ),
+            "portal_layers": dict(self.net_portal_layers),
+        }
+
+    def _restore_routing_state(self, state: Dict) -> None:
+        """Restore paths and rebuild every derived resource index."""
         self.net_paths.clear()
-        self.net_paths.update(original_paths)
+        self.net_paths.update({
+            net_id: list(path)
+            for net_id, path in state["paths"].items()
+        })
         self.net_selected_portals.clear()
-        self.net_selected_portals.update(original_selected_portals)
+        self.net_selected_portals.update(copy.deepcopy(
+            state["selected_portals"]
+        ))
         self.net_portal_layers.clear()
-        self.net_portal_layers.update(original_portal_layers)
+        self.net_portal_layers.update(state["portal_layers"])
         self.accounting.canonical.clear()
         self.accounting.present.fill(0)
         self._net_to_edges.clear()
@@ -6714,13 +6791,16 @@ class PathFinderRouter:
                 net_id, path
             )
             edge_indices = self._path_to_edges(graph_path)
-            self.accounting.commit_path(edge_indices)
+            for edge_idx in edge_indices:
+                self.accounting.canonical[edge_idx] = (
+                    self.accounting.canonical.get(edge_idx, 0) + 1
+                )
             self._update_net_edge_tracking(net_id, edge_indices)
+        self.accounting.refresh_from_canonical()
         self._rebuild_via_usage_from_committed()
         self._rebuild_node_owner()
         self._rebuild_path_node_use()
         self._rebuild_escape_occupancy()
-        return {'success': False, 'error_code': 'DETAIL-INCOMPLETE', 'overuse_sum': best_overuse}
 
     def _order_nets_by_difficulty(self, tasks: Dict[str, Tuple[int, int]]) -> List[str]:
         """
