@@ -675,12 +675,15 @@ class PathFinderConfig:
     slow_progress_min_fraction: float = 0.025
     slow_progress_min_overuse: int = 16_384
     slow_progress_hotset_cap: int = 512
-    # The first measured 512-net severe window cleared 1.637x more excess per
-    # bounded iteration than the matched 256-net window while remaining
-    # essentially wall-clock neutral. If a second independently separated
-    # slow window survives that intervention, test one bounded 1024-net tier.
+    # The first measured 512-net severe window cleared 1.546x more excess per
+    # bounded iteration than its matched 256-net window while remaining
+    # essentially wall-clock neutral. A later full-board 1024-net window
+    # cleared 2.466x more per pass than the immediately preceding 256-net
+    # plateau at 0.871x wall efficiency, with no negotiated or exact-physical
+    # debt category diverging. Continue the measured doubling ladder once
+    # more on a third independently separated plateau.
     slow_progress_hotset_growth_after: int = 2
-    slow_progress_hotset_cap_max: int = 1024
+    slow_progress_hotset_cap_max: int = 2048
     slow_progress_pressure_after: int = 2
     slow_progress_pres_fac_max: float = 256.0
     # Selective PathFinder passes do unequal work. Advance pressure by a
@@ -720,8 +723,11 @@ class PathFinderConfig:
     gpu_fullgraph_fail_fast_nodes: int = 1_000_000
     layer_names: List[str] = field(default_factory=lambda: ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'B.Cu'])
     # Absolute negotiation-wave ceiling. Normal severe passes remain 256 via
-    # _history_hotset_cap(); measured slow windows may use 512 and then 1024.
-    hotset_cap: int = 1024
+    # _history_hotset_cap(); measured slow windows may use 512, 1024, then
+    # 2048.
+    # Absolute safety ceiling for the measured 512 -> 1024 -> 2048 severe
+    # plateau ladder. Ordinary severe passes still select only 256 nets.
+    hotset_cap: int = 2048
     # Physical conflicts may implicate nearly every net on a monster board.
     # Rerouting that near-global set after graph congestion is already low
     # destroys the best-known solution. Process the worst physical offenders
