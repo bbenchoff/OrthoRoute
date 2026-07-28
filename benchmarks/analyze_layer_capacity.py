@@ -50,6 +50,30 @@ def crossing_profile(
     return np.cumsum(delta[:-1])
 
 
+def minimum_internal_path_nodes(
+    manhattan_steps: Iterable[int],
+    portal_max_offset_steps: int,
+) -> int:
+    """Conservatively bound capacity-one internal path-node demand.
+
+    Each endpoint portal lies within ``portal_max_offset_steps`` Manhattan
+    grid steps of its snapped pad cell. By triangle inequality, both portals
+    can shorten a net's pad-to-pad Manhattan distance by at most twice that
+    offset. A path with k remaining planar hops visits at least k + 1
+    internal nodes; layer changes can only increase that count.
+
+    This is a global necessary occupancy lower bound, not a localized cut and
+    not an infeasibility proof when the resulting utilization is below 100%.
+    """
+    offset = max(0, int(portal_max_offset_steps))
+    distances = [max(0, int(steps)) for steps in manhattan_steps]
+    minimum_planar_hops = sum(
+        max(0, steps - 2 * offset)
+        for steps in distances
+    )
+    return minimum_planar_hops + len(distances)
+
+
 def _svg_polyline(
     values: np.ndarray,
     x: float,
@@ -171,8 +195,16 @@ def write_svg(
                 f'<tspan fill="{color}">—</tspan> {label}</text>'
             )
             legend_x += 245
+    node_summary = ", ".join(
+        f'{row["total_layers"]}L '
+        f'{row["node_utilization_lower_bound"]:.1%}'
+        for row in rows
+    )
     elements.extend([
-        '<text class="small" x="600" y="805" text-anchor="middle">'
+        '<text class="small" x="600" y="789" text-anchor="middle">'
+        "Portal-adjusted global internal-node occupancy lower bounds: "
+        f"{node_summary} (density diagnostic only)</text>",
+        '<text class="small" x="600" y="809" text-anchor="middle">'
         "A required-crossing curve above a strict capacity line is an "
         "impossibility proof, not a routing heuristic.</text>",
         "</svg>",
@@ -190,6 +222,15 @@ def main() -> None:
         type=int,
         nargs="+",
         default=[16, 18, 20],
+    )
+    parser.add_argument(
+        "--portal-max-offset-steps",
+        type=int,
+        default=12,
+        help=(
+            "Maximum Manhattan displacement of one portal from its "
+            "snapped pad cell (default: 12 grid steps)."
+        ),
     )
     args = parser.parse_args()
 
@@ -214,6 +255,7 @@ def main() -> None:
     y_intervals = []
     h_steps = 0
     v_steps = 0
+    manhattan_steps = []
     for net in nets:
         first, second = net.pads[:2]
         x1, y1 = geometry.world_to_lattice(
@@ -226,6 +268,14 @@ def main() -> None:
         y_intervals.append((y1, y2))
         h_steps += abs(x2 - x1)
         v_steps += abs(y2 - y1)
+        manhattan_steps.append(
+            abs(x2 - x1) + abs(y2 - y1)
+        )
+
+    minimum_path_nodes = minimum_internal_path_nodes(
+        manhattan_steps,
+        args.portal_max_offset_steps,
+    )
 
     h_crossings = crossing_profile(
         x_intervals, geometry.x_steps - 1
@@ -265,6 +315,11 @@ def main() -> None:
             * geometry.x_steps
             * (geometry.y_steps - 1)
         )
+        internal_node_capacity = (
+            len(signal_layers)
+            * geometry.x_steps
+            * geometry.y_steps
+        )
         rows.append({
             "total_layers": total_layers,
             "internal_layers": len(signal_layers),
@@ -296,6 +351,11 @@ def main() -> None:
                 int(v_crossings.max())
                 / (len(signal_layers) * geometry.x_steps)
             ),
+            "internal_node_capacity": internal_node_capacity,
+            "minimum_internal_path_nodes": minimum_path_nodes,
+            "node_utilization_lower_bound": (
+                minimum_path_nodes / internal_node_capacity
+            ),
         })
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +375,11 @@ def main() -> None:
         "horizontal_demand_fraction": h_fraction,
         "raw_horizontal_steps": h_steps,
         "raw_vertical_steps": v_steps,
+        "raw_pad_manhattan_steps": h_steps + v_steps,
+        "portal_max_offset_steps": max(
+            0, int(args.portal_max_offset_steps)
+        ),
+        "minimum_internal_path_nodes": minimum_path_nodes,
         "minimum_h_layers_global": h_required_global,
         "minimum_v_layers_global": v_required_global,
         "minimum_h_layers_cut": h_required_cut,
@@ -357,8 +422,8 @@ def main() -> None:
         ),
         "",
         "| Total | Split | H cut use | V cut use | Strict feasible | "
-        "Guided H/V cut use |",
-        "|---:|---:|---:|---:|:---:|---:|",
+        "Guided H/V cut use | Global node lower bound |",
+        "|---:|---:|---:|---:|:---:|---:|---:|",
     ]
     for row in rows:
         markdown.append(
@@ -368,13 +433,24 @@ def main() -> None:
             f'{row["v_cut_utilization"]:.1%} | '
             f'{"yes" if row["strict_cut_feasible"] else "no"} | '
             f'{row["guided_h_cut_utilization"]:.1%} / '
-            f'{row["guided_v_cut_utilization"]:.1%} |'
+            f'{row["guided_v_cut_utilization"]:.1%} | '
+            f'{row["node_utilization_lower_bound"]:.1%} |'
         )
     markdown.extend([
         "",
         (
             "This is a necessary lower bound only: passing it does not prove "
             "routability, but failing it proves strict routing impossible."
+        ),
+        "",
+        (
+            "The global node figure subtracts up to twice the configured "
+            f"{max(0, int(args.portal_max_offset_steps))}-step portal offset "
+            "from every pad-to-pad Manhattan distance, then adds one "
+            "internal node per net. It is a conservative occupancy lower "
+            "bound. A value below 100% is a density diagnostic, not a node-"
+            "cut infeasibility proof; routed/detoured wirelength must not be "
+            "substituted for necessary demand."
         ),
     ])
     stem.with_suffix(".md").write_text(
