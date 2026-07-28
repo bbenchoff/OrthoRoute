@@ -1510,6 +1510,29 @@ def _write_hotset_policy_svg(
         min(52.0, plot_width / max(1, len(rate_rows)) * 0.58),
     )
     zero_y = rate_value_y(0.0)
+    previous_event_count = 0
+    for row in rows:
+        event_count = int(row["slow_progress_events"])
+        if event_count <= previous_event_count:
+            continue
+        previous_event_count = event_count
+        iteration = int(row["iteration"])
+        top_x = x_position(iteration)
+        svg.extend([
+            f'<line x1="{top_x:.1f}" y1="{overuse_y}" '
+            f'x2="{top_x:.1f}" y2="{overuse_y + overuse_height}" '
+            'stroke="#64748b" stroke-dasharray="5 4"/>',
+            f'<text x="{top_x + 4:.1f}" y="{overuse_y + 15}" '
+            'font-family="sans-serif" font-size="10" fill="#475569">'
+            f'event {event_count} · p≤{row["pres_fac_max"]:g}</text>',
+        ])
+        if iteration in rate_iteration_index:
+            bottom_x = rate_x_position(iteration)
+            svg.append(
+                f'<line x1="{bottom_x:.1f}" y1="{rate_y}" '
+                f'x2="{bottom_x:.1f}" y2="{rate_y + rate_height}" '
+                'stroke="#64748b" stroke-dasharray="5 4"/>'
+            )
     for row in rows:
         x = x_position(int(row["iteration"]))
         color = _hotset_color(int(row["hotset_size"]))

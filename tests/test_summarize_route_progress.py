@@ -338,3 +338,4 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
     rendered = svg.read_text(encoding="utf-8")
     assert 'width="1200" height="820"' in rendered
     assert "512-net hotset" in rendered
+    assert "event 1" in rendered
