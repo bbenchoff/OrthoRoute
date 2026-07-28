@@ -719,7 +719,9 @@ class PathFinderConfig:
     # has already failed for the current negotiated cost state.
     gpu_fullgraph_fail_fast_nodes: int = 1_000_000
     layer_names: List[str] = field(default_factory=lambda: ['F.Cu', 'In1.Cu', 'In2.Cu', 'In3.Cu', 'In4.Cu', 'B.Cu'])
-    hotset_cap: int = 512  # Allow all nets to be rerouted if needed (was 150, bottleneck!)
+    # Absolute negotiation-wave ceiling. Normal severe passes remain 256 via
+    # _history_hotset_cap(); measured slow windows may use 512 and then 1024.
+    hotset_cap: int = 1024
     # Physical conflicts may implicate nearly every net on a monster board.
     # Rerouting that near-global set after graph congestion is already low
     # destroys the best-known solution. Process the worst physical offenders

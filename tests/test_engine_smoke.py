@@ -1332,6 +1332,10 @@ def test_rate_plateau_temporarily_expands_severe_hotset():
 
     router._slow_progress_event_count = 2
     assert router._effective_history_hotset_cap(75_000) == 1024
+    assert min(
+        router.config.hotset_cap,
+        router._effective_history_hotset_cap(75_000),
+    ) == 1024
 
     router._slow_progress_event_count = 3
     assert router._effective_history_hotset_cap(75_000) == 1024
