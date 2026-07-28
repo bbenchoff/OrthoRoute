@@ -867,6 +867,190 @@ def _write_svg(runs: Sequence[Dict[str, Any]], path: Path) -> None:
     path.write_text("\n".join(svg), encoding="utf-8", newline="\n")
 
 
+def _latest_layer_node_snapshot(
+    runs: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the newest iteration with layer-local path-node telemetry."""
+    for run in reversed(runs):
+        for iteration in reversed(run["iterations"]):
+            layers = iteration.get("path_node_layers")
+            if not layers:
+                continue
+            rows = []
+            for item in layers:
+                capacity = int(item["capacity_nodes"])
+                occupied = int(item["occupied_nodes"])
+                conflicts = int(item["conflict_nodes"])
+                layer = int(item["layer"])
+                rows.append({
+                    "run": run["label"],
+                    "iteration": int(iteration["iteration"]),
+                    "layer": layer,
+                    "role": (
+                        "outer"
+                        if layer in {0, len(layers) - 1}
+                        else "internal"
+                    ),
+                    "capacity_nodes": capacity,
+                    "occupied_nodes": occupied,
+                    "occupied_pct": round(
+                        100.0 * occupied / max(1, capacity), 3
+                    ),
+                    "conflict_nodes": conflicts,
+                    "conflict_pct": round(
+                        100.0 * conflicts / max(1, capacity), 3
+                    ),
+                    "excess_uses": int(item["excess_uses"]),
+                    "max_use": int(item["max_use"]),
+                })
+            return {
+                "run": run["label"],
+                "iteration": int(iteration["iteration"]),
+                "rows": rows,
+            }
+    return None
+
+
+def _write_layer_node_csv(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    rows = snapshot["rows"]
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_layer_node_markdown(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    columns = (
+        "layer", "role", "capacity_nodes", "occupied_nodes",
+        "occupied_pct", "conflict_nodes", "conflict_pct",
+        "excess_uses", "max_use",
+    )
+    lines = [
+        "# Latest layer-local path-node congestion",
+        "",
+        f"Run: `{snapshot['run']}`  ",
+        f"Iteration: {snapshot['iteration']}",
+        "",
+        "| " + " | ".join(columns) + " |",
+        "|" + "|".join("---" for _ in columns) + "|",
+    ]
+    for row in snapshot["rows"]:
+        lines.append(
+            "| " + " | ".join(str(row[column]) for column in columns)
+            + " |"
+        )
+    lines.extend([
+        "",
+        "`occupied_pct` is distinct path-node occupancy divided by the "
+        "layer's lattice-node capacity. `conflict_pct` counts capacity-one "
+        "nodes used by multiple nets; `excess_uses` includes every use above "
+        "one. Outer layers are shown for completeness but are not routing "
+        "fabric in the same sense as the internal layers.",
+        "",
+    ])
+    path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+
+
+def _write_layer_node_svg(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    width, height = 1200, 820
+    plot_x, plot_width = 90, 1040
+    rows = snapshot["rows"]
+    bar_step = plot_width / max(1, len(rows))
+    bar_width = max(4.0, bar_step * 0.64)
+    occupied_y, occupied_height = 105, 245
+    excess_y, excess_height = 465, 245
+    max_excess = max(
+        (int(row["excess_uses"]) for row in rows),
+        default=1,
+    )
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="60" y="38" font-family="sans-serif" font-size="24" '
+        'font-weight="bold">Layer-local path-node congestion</text>',
+        f'<text x="60" y="66" font-family="sans-serif" font-size="14">'
+        f'{html.escape(snapshot["run"])} — iteration '
+        f'{snapshot["iteration"]}</text>',
+        f'<text x="{plot_x}" y="90" font-family="sans-serif" '
+        'font-size="16">Distinct occupied nodes (% of layer capacity)</text>',
+        f'<rect x="{plot_x}" y="{occupied_y}" width="{plot_width}" '
+        f'height="{occupied_height}" fill="#fafafa" stroke="#cbd5e1"/>',
+        f'<text x="{plot_x}" y="450" font-family="sans-serif" '
+        'font-size="16">Excess uses on capacity-one nodes</text>',
+        f'<rect x="{plot_x}" y="{excess_y}" width="{plot_width}" '
+        f'height="{excess_height}" fill="#fafafa" stroke="#cbd5e1"/>',
+    ]
+    for tick in range(5):
+        occupied_value = 100 - tick * 25
+        occupied_line_y = occupied_y + occupied_height * tick / 4
+        excess_value = max_excess * (1.0 - tick / 4)
+        excess_line_y = excess_y + excess_height * tick / 4
+        svg.extend([
+            f'<line x1="{plot_x}" y1="{occupied_line_y:.1f}" '
+            f'x2="{plot_x + plot_width}" y2="{occupied_line_y:.1f}" '
+            'stroke="#e2e8f0"/>',
+            f'<text x="{plot_x - 8}" y="{occupied_line_y + 4:.1f}" '
+            'text-anchor="end" font-family="monospace" font-size="11">'
+            f'{occupied_value}%</text>',
+            f'<line x1="{plot_x}" y1="{excess_line_y:.1f}" '
+            f'x2="{plot_x + plot_width}" y2="{excess_line_y:.1f}" '
+            'stroke="#e2e8f0"/>',
+            f'<text x="{plot_x - 8}" y="{excess_line_y + 4:.1f}" '
+            'text-anchor="end" font-family="monospace" font-size="11">'
+            f'{int(excess_value):,}</text>',
+        ])
+    for index, row in enumerate(rows):
+        center = plot_x + (index + 0.5) * bar_step
+        occupied_height_value = (
+            occupied_height * float(row["occupied_pct"]) / 100.0
+        )
+        excess_height_value = (
+            excess_height * int(row["excess_uses"])
+            / max(1, max_excess)
+        )
+        fill = "#94a3b8" if row["role"] == "outer" else "#2563eb"
+        svg.extend([
+            f'<rect x="{center - bar_width / 2:.1f}" '
+            f'y="{occupied_y + occupied_height - occupied_height_value:.1f}" '
+            f'width="{bar_width:.1f}" height="{occupied_height_value:.1f}" '
+            f'fill="{fill}"><title>L{row["layer"]}: '
+            f'{row["occupied_pct"]}% occupied, '
+            f'{row["conflict_nodes"]:,} conflict nodes</title></rect>',
+            f'<rect x="{center - bar_width / 2:.1f}" '
+            f'y="{excess_y + excess_height - excess_height_value:.1f}" '
+            f'width="{bar_width:.1f}" height="{excess_height_value:.1f}" '
+            'fill="#dc2626"><title>'
+            f'L{row["layer"]}: {row["excess_uses"]:,} excess uses, '
+            f'max use {row["max_use"]}</title></rect>',
+            f'<text x="{center:.1f}" y="733" text-anchor="middle" '
+            'font-family="sans-serif" font-size="11">'
+            f'L{row["layer"]}</text>',
+        ])
+    svg.extend([
+        '<rect x="90" y="770" width="14" height="14" fill="#2563eb"/>',
+        '<text x="112" y="782" font-family="sans-serif" font-size="12">'
+        'internal layer occupancy</text>',
+        '<rect x="300" y="770" width="14" height="14" fill="#94a3b8"/>',
+        '<text x="322" y="782" font-family="sans-serif" font-size="12">'
+        'outer layer occupancy</text>',
+        '<rect x="500" y="770" width="14" height="14" fill="#dc2626"/>',
+        '<text x="522" y="782" font-family="sans-serif" font-size="12">'
+        'capacity-one excess uses</text>',
+        "</svg>",
+    ])
+    path.write_text("\n".join(svg), encoding="utf-8", newline="\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results_dir", type=Path)
@@ -900,6 +1084,20 @@ def main() -> None:
         stall_rows,
         args.output_dir / "layer-stall-overuse.svg",
     )
+    layer_snapshot = _latest_layer_node_snapshot(runs)
+    layer_artifacts = {}
+    if layer_snapshot is not None:
+        layer_csv = args.output_dir / "layer-node-congestion.csv"
+        layer_markdown = args.output_dir / "layer-node-congestion.md"
+        layer_svg = args.output_dir / "layer-node-congestion.svg"
+        _write_layer_node_csv(layer_snapshot, layer_csv)
+        _write_layer_node_markdown(layer_snapshot, layer_markdown)
+        _write_layer_node_svg(layer_snapshot, layer_svg)
+        layer_artifacts = {
+            "layer_node_csv": str(layer_csv),
+            "layer_node_markdown": str(layer_markdown),
+            "layer_node_svg": str(layer_svg),
+        }
     print(json.dumps({
         "runs": len(runs),
         "csv": str(args.output_dir / "reduced-layer-comparison.csv"),
@@ -910,6 +1108,7 @@ def main() -> None:
             args.output_dir / "layer-stall-overuse.md"
         ),
         "stall_svg": str(args.output_dir / "layer-stall-overuse.svg"),
+        **layer_artifacts,
     }, indent=2))
 
 

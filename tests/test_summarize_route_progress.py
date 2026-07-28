@@ -3,11 +3,14 @@ from pathlib import Path
 from benchmarks.summarize_route_progress import (
     _is_candidate_name,
     _label,
+    _latest_layer_node_snapshot,
     _linear_layer_fit,
     _normalize_iteration,
     _physical_edge_overuse,
     _row,
     _stall_row,
+    _write_layer_node_markdown,
+    _write_layer_node_svg,
 )
 
 
@@ -189,3 +192,65 @@ def test_zero_convergence_is_fit_eligible_without_a_plateau():
     assert row["overuse_at_stall"] == 0
     assert row["stall_iteration"] == 2
     assert row["eligible_for_fit"] is True
+
+
+def test_latest_layer_node_snapshot_selects_newest_instrumented_iteration(
+    tmp_path,
+):
+    old = {
+        "label": "old",
+        "iterations": [{
+            "iteration": 2,
+            "path_node_layers": [{
+                "layer": 0,
+                "capacity_nodes": 4,
+                "occupied_nodes": 2,
+                "conflict_nodes": 0,
+                "excess_uses": 0,
+                "max_use": 1,
+            }],
+        }],
+    }
+    current = {
+        "label": "20L current",
+        "iterations": [
+            {"iteration": 1},
+            {
+                "iteration": 3,
+                "path_node_layers": [
+                    {
+                        "layer": 0,
+                        "capacity_nodes": 4,
+                        "occupied_nodes": 3,
+                        "conflict_nodes": 1,
+                        "excess_uses": 2,
+                        "max_use": 3,
+                    },
+                    {
+                        "layer": 1,
+                        "capacity_nodes": 4,
+                        "occupied_nodes": 2,
+                        "conflict_nodes": 0,
+                        "excess_uses": 0,
+                        "max_use": 1,
+                    },
+                ],
+            },
+        ],
+    }
+
+    snapshot = _latest_layer_node_snapshot([old, current])
+
+    assert snapshot["run"] == "20L current"
+    assert snapshot["iteration"] == 3
+    assert snapshot["rows"][0]["occupied_pct"] == 75.0
+    assert snapshot["rows"][0]["conflict_pct"] == 25.0
+    assert snapshot["rows"][0]["role"] == "outer"
+    markdown = tmp_path / "layers.md"
+    svg = tmp_path / "layers.svg"
+    _write_layer_node_markdown(snapshot, markdown)
+    _write_layer_node_svg(snapshot, svg)
+    assert "20L current" in markdown.read_text(encoding="utf-8")
+    rendered = svg.read_text(encoding="utf-8")
+    assert 'width="1200" height="820"' in rendered
+    assert "L0: 2 excess uses" in rendered
