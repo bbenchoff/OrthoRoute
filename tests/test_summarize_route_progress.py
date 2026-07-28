@@ -3,6 +3,7 @@ from pathlib import Path
 from benchmarks.summarize_route_progress import (
     _is_candidate_name,
     _label,
+    _latest_hotset_policy_snapshot,
     _latest_layer_node_snapshot,
     _linear_layer_fit,
     _normalize_iteration,
@@ -11,6 +12,8 @@ from benchmarks.summarize_route_progress import (
     _stall_row,
     _write_layer_node_markdown,
     _write_layer_node_svg,
+    _write_hotset_policy_markdown,
+    _write_hotset_policy_svg,
 )
 
 
@@ -254,3 +257,75 @@ def test_latest_layer_node_snapshot_selects_newest_instrumented_iteration(
     rendered = svg.read_text(encoding="utf-8")
     assert 'width="1200" height="820"' in rendered
     assert "L0: 2 excess uses" in rendered
+
+
+def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
+    tmp_path,
+):
+    run = {
+        "label": "20L current",
+        "iterations": [
+            {
+                "iteration": 1,
+                "elapsed_seconds": 100.0,
+                "_physical_edge_overuse": 20,
+                "_physical_negotiated_overuse": 120,
+                "path_node_overuse_total": 100,
+                "escape_conflicts": 2,
+                "portal_grid_conflicts": 30,
+                "exact_barrel_conflicts": 50,
+            },
+            {
+                "iteration": 2,
+                "elapsed_seconds": 110.0,
+                "_physical_edge_overuse": 16,
+                "_physical_negotiated_overuse": 100,
+                "path_node_overuse_total": 84,
+                "hotset_size": 256,
+                "hotset_cap": 256,
+                "pres_fac": 2.0,
+                "pres_fac_max": 64.0,
+                "escape_conflicts": 3,
+                "portal_grid_conflicts": 28,
+                "exact_barrel_conflicts": 45,
+            },
+            {
+                "iteration": 3,
+                "elapsed_seconds": 130.0,
+                "_physical_edge_overuse": 10,
+                "_physical_negotiated_overuse": 60,
+                "path_node_overuse_total": 50,
+                "hotset_size": 512,
+                "hotset_cap": 512,
+                "pres_fac": 4.0,
+                "pres_fac_max": 64.0,
+                "slow_progress_events": 1,
+                "slow_progress_fraction": 0.02,
+                "hotset_rate_boost_until": 7,
+                "escape_conflicts": 5,
+                "portal_grid_conflicts": 24,
+                "exact_barrel_conflicts": 35,
+            },
+        ],
+    }
+
+    snapshot = _latest_hotset_policy_snapshot([run])
+
+    assert snapshot["rows"][0]["drop_per_second"] == 2.0
+    assert snapshot["rows"][1]["hotset_size"] == 512
+    assert snapshot["rows"][1]["drop_per_second"] == 2.0
+    assert snapshot["rows"][1]["slow_progress_fraction"] == 2.0
+    assert len(snapshot["phases"]) == 2
+    assert snapshot["phases"][0]["escape_delta"] == 1
+    assert snapshot["phases"][1]["portal_delta"] == -4
+    assert snapshot["phases"][1]["exact_barrel_delta"] == -10
+    assert snapshot["phases"][1]["matched_prior_iterations"] == "2-2"
+    assert snapshot["phases"][1]["efficiency_ratio"] == 1.0
+    markdown = tmp_path / "hotset.md"
+    svg = tmp_path / "hotset.svg"
+    _write_hotset_policy_markdown(snapshot, markdown)
+    _write_hotset_policy_svg(snapshot, svg)
+    assert "256" in markdown.read_text(encoding="utf-8")
+    rendered = svg.read_text(encoding="utf-8")
+    assert 'width="1200" height="820"' in rendered
+    assert "512-net hotset" in rendered
