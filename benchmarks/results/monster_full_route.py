@@ -364,6 +364,18 @@ try:
             "routed_nets": routed,
             "excluded_nets": len(progress["excluded_nets"]),
             "pres_fac": progress["pres_fac"],
+            "pres_fac_max": float(getattr(
+                router, "_pres_fac_max_now", 0.0
+            )),
+            "slow_progress_events": int(getattr(
+                router, "_slow_progress_event_count", 0
+            )),
+            "slow_progress_fraction": getattr(
+                router, "_last_slow_progress_fraction", None
+            ),
+            "hotset_rate_boost_until": int(getattr(
+                router, "_hotset_rate_boost_until", 0
+            )),
             "overuse_total": graph_overuse,
             "edge_overuse": edge_overuse,
             "via_column_overuse": via_column_overuse,

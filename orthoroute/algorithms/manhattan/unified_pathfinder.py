@@ -664,6 +664,16 @@ class PathFinderConfig:
     portal_cleanup_edge_threshold: int = 3
 
     stagnation_patience: int = 5
+    # A strictly-new minimum is not sufficient evidence of useful progress
+    # on a monster route. Measure reduction across a rolling window and
+    # temporarily widen severe hotsets when the fractional descent is too
+    # small. Repeated slow windows then raise the pressure ceiling in stages.
+    slow_progress_window: int = 5
+    slow_progress_min_fraction: float = 0.005
+    slow_progress_min_overuse: int = 16_384
+    slow_progress_hotset_cap: int = 512
+    slow_progress_pressure_after: int = 2
+    slow_progress_pres_fac_max: float = 256.0
     use_gpu: bool = True  # GPU algorithm fixed, validation will catch ROI construction issues
     batch_size: int = 32
     layer_count: int = 6
@@ -5653,6 +5663,12 @@ class PathFinderRouter:
         best_route_iteration = 0
         stagnant = 0
         prev_over_sum = float('inf')
+        negotiated_overuse_history = []
+        self._slow_progress_event_count = 0
+        self._last_slow_progress_fraction = None
+        self._hotset_rate_boost_until = 0
+        self._last_slow_progress_trigger = -1_000_000
+        self._pres_fac_max_now = pres_fac_max
 
         self._negotiation_ran = True
 
@@ -5677,6 +5693,7 @@ class PathFinderRouter:
         for it in range(1, cfg.max_iterations + 1):
             self.iteration = it
             self._pres_fac_now = pres_fac  # read by _build_owner_penalty
+            self._pres_fac_max_now = pres_fac_max
             logger.info(f"[ITER {it}] pres_fac={pres_fac:.2f}")
 
             # Log iteration 1 always-connect policy
@@ -6221,6 +6238,79 @@ class PathFinderRouter:
                 # untried high-impact victims instead of deterministically
                 # ripping the same top-k nets after every rollback.
                 self._stagnation_victim_history = set()
+
+            # A monster route that improves by only a few units per pass is
+            # operationally plateaued even though the strict best-value
+            # counter resets. Detect inadequate rolling descent, widen the
+            # next several severe hotsets, then raise the pressure ceiling
+            # only after the wider waves have also had a full window.
+            negotiated_overuse_history.append(negotiated_overuse)
+            slow_window = max(
+                1,
+                int(getattr(cfg, "slow_progress_window", 5)),
+            )
+            slow_progress, progress_fraction = (
+                self._rolling_progress_insufficient(
+                    negotiated_overuse_history,
+                    window=slow_window,
+                    minimum_fraction=float(getattr(
+                        cfg,
+                        "slow_progress_min_fraction",
+                        0.005,
+                    )),
+                    minimum_overuse=int(getattr(
+                        cfg,
+                        "slow_progress_min_overuse",
+                        16_384,
+                    )),
+                )
+            )
+            self._last_slow_progress_fraction = progress_fraction
+            trigger_separated = (
+                it - self._last_slow_progress_trigger >= slow_window
+            )
+            if slow_progress and trigger_separated:
+                self._last_slow_progress_trigger = it
+                self._slow_progress_event_count += 1
+                self._hotset_rate_boost_until = it + slow_window
+                pressure_after = max(
+                    1,
+                    int(getattr(
+                        cfg,
+                        "slow_progress_pressure_after",
+                        2,
+                    )),
+                )
+                old_ceiling = pres_fac_max
+                if self._slow_progress_event_count >= pressure_after:
+                    ultimate_ceiling = max(
+                        old_ceiling,
+                        float(getattr(
+                            cfg,
+                            "slow_progress_pres_fac_max",
+                            256.0,
+                        )),
+                    )
+                    pres_fac_max = min(
+                        ultimate_ceiling,
+                        max(128.0, old_ceiling * 2.0),
+                    )
+                    pres_fac = min(
+                        pres_fac * 1.5,
+                        pres_fac_max,
+                    )
+                self._pres_fac_max_now = pres_fac_max
+                logger.warning(
+                    "[RATE-PLATEAU %d] Best rolling descent over %d "
+                    "passes is %.3f%%; widening severe hotsets through "
+                    "iteration %d and pressure ceiling %.0f -> %.0f",
+                    self._slow_progress_event_count,
+                    slow_window,
+                    100.0 * progress_fraction,
+                    self._hotset_rate_boost_until,
+                    old_ceiling,
+                    pres_fac_max,
+                )
 
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0) - only first 3 iterations
             if it <= 3:
@@ -7786,6 +7876,57 @@ class PathFinderRouter:
         return 256
 
     @staticmethod
+    def _rolling_progress_insufficient(
+        values,
+        window: int = 5,
+        minimum_fraction: float = 0.005,
+        minimum_overuse: int = 16_384,
+    ) -> Tuple[bool, Optional[float]]:
+        """Return whether the best rolling descent is operationally slow."""
+        window = max(1, int(window))
+        if len(values) < window + 1:
+            return False, None
+        start = float(values[-window - 1])
+        if start <= max(0, int(minimum_overuse)):
+            return False, None
+        best_later = min(map(float, values[-window:]))
+        improvement_fraction = max(
+            0.0,
+            (start - best_later) / max(1.0, start),
+        )
+        threshold = max(0.0, float(minimum_fraction))
+        return improvement_fraction < threshold, improvement_fraction
+
+    def _effective_history_hotset_cap(
+        self,
+        total_overuse: float,
+    ) -> int:
+        """Apply the temporary rate-based severe-wave expansion."""
+        base = self._history_hotset_cap(total_overuse)
+        severe_threshold = int(getattr(
+            self.config,
+            "slow_progress_min_overuse",
+            16_384,
+        ))
+        if (
+            total_overuse > severe_threshold
+            and self.iteration <= int(getattr(
+                self,
+                "_hotset_rate_boost_until",
+                0,
+            ))
+        ):
+            return max(
+                base,
+                int(getattr(
+                    self.config,
+                    "slow_progress_hotset_cap",
+                    512,
+                )),
+            )
+        return base
+
+    @staticmethod
     def _hotset_exploration_fraction(total_overuse: float) -> float:
         """Spend less of a severe-congestion wave on random search."""
         if total_overuse > 16_384:
@@ -8106,7 +8247,9 @@ class PathFinderRouter:
             )
             node_cap = min(
                 int(self.config.hotset_cap),
-                self._history_hotset_cap(total_negotiated_overuse),
+                self._effective_history_hotset_cap(
+                    total_negotiated_overuse
+                ),
             )
             node_exploration_fraction = (
                 self._hotset_exploration_fraction(
@@ -8204,7 +8347,7 @@ class PathFinderRouter:
         # Preserve small tail waves, but do not apply the 100-net tail policy
         # to a monster route with tens of thousands of live node conflicts.
         # Exact physical offenders and unrouted nets still bypass this cap.
-        base_target = self._history_hotset_cap(
+        base_target = self._effective_history_hotset_cap(
             total_negotiated_overuse
         )
 
