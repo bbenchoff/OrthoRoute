@@ -29,6 +29,12 @@ from orthoroute.algorithms.manhattan.hdi_stack import (
     pcbway_elic_stack,
     pcbway_mechanical_stack,
 )
+from orthoroute.algorithms.manhattan.layer_peeling import (
+    build_peel_plan,
+    rebuild_selected_portals,
+    remap_selected_portals,
+    remap_surviving_paths,
+)
 from orthoroute.infrastructure.kicad.file_parser import KiCadFileParser
 
 
@@ -63,6 +69,7 @@ layer_directions = os.getenv("ORTHO_LAYER_DIRECTIONS", "").strip()
 layer_depth_bias = float(os.getenv("ORTHO_LAYER_DEPTH_BIAS", "0.0"))
 hdi_stack_mode = os.getenv("ORTHO_HDI_STACK", "").strip()
 grid_pitch = float(os.getenv("ORTHO_GRID_PITCH", "0.4"))
+warm_start_paths_value = os.getenv("ORTHO_WARM_START_PATHS", "").strip()
 run_tags = []
 if diagnostic_net_limit:
     run_tags.append(f"{diagnostic_net_limit}N")
@@ -311,6 +318,94 @@ try:
     cp.cuda.Stream.null.synchronize()
     timings["pad_escapes"] = time.perf_counter() - phase_started
     memory["pad_escapes"] = memory_snapshot()
+
+    all_route_nets = list(route_nets)
+    route_requests = list(route_nets)
+    peel_plan = None
+    if warm_start_paths_value:
+        warm_start_path = Path(
+            warm_start_paths_value
+        ).expanduser().resolve()
+        with gzip.open(warm_start_path, "rb") as stream:
+            warm_start = pickle.load(stream)
+        if warm_start.get("source_sha256") != source_sha:
+            raise ValueError(
+                "warm-start source hash differs from the board source"
+            )
+        source_shape = tuple(map(
+            int, warm_start["lattice"]["shape"]
+        ))
+        target_shape = (
+            int(router.lattice.x_steps),
+            int(router.lattice.y_steps),
+            int(router.lattice.layers),
+        )
+        if source_shape[:2] != target_shape[:2]:
+            raise ValueError(
+                "warm-start and reduced lattices have different X/Y shapes"
+            )
+        if source_shape[2] != target_shape[2] + 2:
+            raise ValueError(
+                "a warm peel must reduce exactly two copper layers"
+            )
+        warm_paths = {
+            str(net_id): list(path)
+            for net_id, path in warm_start["net_paths"].items()
+        }
+        peel_plan = build_peel_plan(warm_paths, source_shape)
+        if peel_plan.target_layers != target_shape[2]:
+            raise ValueError("peel plan target does not match live router")
+
+        # Populate deterministic net/pad identities before installing the
+        # committed survivors.  Only displaced nets are subsequently passed
+        # to negotiation.
+        router._parse_requests(all_route_nets)
+        survivors = remap_surviving_paths(
+            warm_paths,
+            peel_plan,
+            source_shape,
+            config.hdi_stack,
+        )
+        serialized_portals = warm_start.get("net_selected_portals")
+        if serialized_portals is not None:
+            selected_portals, portal_layers = remap_selected_portals(
+                serialized_portals,
+                survivors,
+                target_shape,
+                source_shape[2],
+            )
+        else:
+            selected_portals, portal_layers = rebuild_selected_portals(
+                router,
+                survivors,
+                target_shape,
+            )
+        router._restore_routing_state({
+            "paths": survivors,
+            "selected_portals": selected_portals,
+            "portal_layers": portal_layers,
+        })
+        displaced = set(peel_plan.displaced_nets)
+        route_requests = [
+            net for net in all_route_nets
+            if str(getattr(net, "name", "")) in displaced
+        ]
+        if len(route_requests) != len(displaced):
+            found = {
+                str(getattr(net, "name", ""))
+                for net in route_requests
+            }
+            missing = sorted(displaced - found)
+            raise ValueError(
+                f"warm peel cannot map displaced nets: {missing[:10]}"
+            )
+        progress["warm_start"] = {
+            "paths": str(warm_start_path),
+            **peel_plan.as_dict(),
+            "committed_survivor_count": len(survivors),
+            "reroute_net_count": len(route_requests),
+        }
+        atomic_json(progress_path, progress)
 
     def progress_callback(iteration, total, message):
         routed = sum(bool(path) for path in router.net_paths.values())
@@ -585,7 +680,7 @@ try:
 
     phase_started = time.perf_counter()
     result = router.route_multiple_nets(
-        route_nets,
+        route_requests,
         progress_cb=progress_callback,
     )
     cp.cuda.Stream.null.synchronize()
@@ -623,6 +718,11 @@ try:
             },
             "net_paths": router.net_paths,
             "net_portal_layers": router.net_portal_layers,
+            "net_selected_portals": router.net_selected_portals,
+            "peel_plan": (
+                peel_plan.as_dict()
+                if peel_plan is not None else None
+            ),
             "result": {
                 key: value for key, value in result.items()
                 if key != "paths"
@@ -633,7 +733,7 @@ try:
     metrics = collect_route_metrics(router, board, timings)
     selected_ids = {
         str(getattr(net, "name", None) or getattr(net, "id", ""))
-        for net in route_nets
+        for net in all_route_nets
     }
     routed_ids = {
         str(net_id)
@@ -669,7 +769,16 @@ try:
         "source_sha256": source_sha,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "effective_max_iterations": config.max_iterations,
-        "selected_routable_nets": len(route_nets),
+        "selected_routable_nets": len(all_route_nets),
+        "negotiated_routable_nets": len(route_requests),
+        "warm_start_paths": (
+            str(Path(warm_start_paths_value).expanduser().resolve())
+            if warm_start_paths_value else None
+        ),
+        "peel_plan": (
+            peel_plan.as_dict()
+            if peel_plan is not None else None
+        ),
         "layer_limit": diagnostic_layer_limit or board.layer_count,
         "adjacent_via_step_scale": config.adjacent_via_step_scale,
         "owner_penalty_base": config.owner_penalty_base,

@@ -74,6 +74,7 @@ def _run_candidate(
     layer_depth_bias: float,
     state: Dict[str, Any],
     state_path: Path,
+    warm_start_paths: Optional[Path] = None,
 ) -> Tuple[Path, Dict[str, Any]]:
     previous = _latest_progress(results_dir, layer_count)
     environment = os.environ.copy()
@@ -92,6 +93,12 @@ def _run_candidate(
         "ORTHO_SOURCE_BOARD": str(source_board.resolve()),
         "ORTHO_OUTPUT_DIR": str(results_dir.resolve()),
     })
+    if warm_start_paths is not None:
+        environment["ORTHO_WARM_START_PATHS"] = str(
+            warm_start_paths.resolve()
+        )
+    else:
+        environment.pop("ORTHO_WARM_START_PATHS", None)
     stdout_path = (
         repo_root / "benchmarks" / "results"
         / f"monster-full-{layer_count}L-mechanical-sweep.stdout.log"
@@ -426,7 +433,30 @@ def main() -> None:
         default=100,
         help="Require rule errors plus unconnected items below this count",
     )
+    parser.add_argument(
+        "--peel-after-success",
+        action="store_true",
+        help=(
+            "after the first accepted coarse route, remove the least-used "
+            "symmetric layer pair and reroute only displaced nets"
+        ),
+    )
+    parser.add_argument(
+        "--peel-min-layers",
+        type=int,
+        default=18,
+        help="lowest even total layer count attempted by warm peeling",
+    )
     args = parser.parse_args()
+    if (
+        args.peel_min_layers < 4
+        or args.peel_min_layers % 2
+        or args.peel_min_layers > args.max_layers
+    ):
+        parser.error(
+            "--peel-min-layers must be even, at least 4, and no greater "
+            "than --max-layers"
+        )
     repo_root = Path(__file__).resolve().parent.parent
     state_path = (
         repo_root / "benchmarks" / "results"
@@ -441,6 +471,8 @@ def main() -> None:
         "layer_depth_bias": args.layer_depth_bias,
         "retry_initial": args.retry_initial,
         "drc_error_target": args.drc_error_target,
+        "peel_after_success": args.peel_after_success,
+        "peel_min_layers": args.peel_min_layers,
         "runs": [],
     }
     _atomic_json(state_path, state)
@@ -519,11 +551,15 @@ def main() -> None:
         if retry_qualification["accepted"]:
             selected = (initial_layers, retry)
 
-    candidates = _remaining_candidates(
-        initial_layers,
-        selected,
-        args.max_layers,
-        candidate_layers=candidate_layers,
+    candidates = (
+        []
+        if selected is not None and args.peel_after_success
+        else _remaining_candidates(
+            initial_layers,
+            selected,
+            args.max_layers,
+            candidate_layers=candidate_layers,
+        )
     )
     last_failed_layers = initial_layers
     coarse_success_layers: Optional[int] = None
@@ -573,6 +609,7 @@ def main() -> None:
         selected is not None
         and coarse_success_layers is not None
         and candidate_layers is not None
+        and not args.peel_after_success
     ):
         for layer_count in _backfill_candidates(
             last_failed_layers,
@@ -611,6 +648,58 @@ def main() -> None:
             if qualification["accepted"]:
                 selected = (layer_count, journal)
                 break
+
+    if selected is not None and args.peel_after_success:
+        while selected[0] - 2 >= args.peel_min_layers:
+            source_layers, source_journal = selected
+            target_layers = source_layers - 2
+            source_paths = _artifact_from_journal(
+                source_journal, "paths"
+            )
+            state["status"] = (
+                f"peeling_{source_layers}L_to_{target_layers}L"
+            )
+            _atomic_json(state_path, state)
+            progress, journal = _run_candidate(
+                repo_root,
+                args.results_dir,
+                args.source_board,
+                target_layers,
+                args.max_iterations,
+                args.layer_depth_bias,
+                state,
+                state_path,
+                warm_start_paths=source_paths,
+            )
+            qualification = _qualify_candidate(
+                repo_root,
+                args.results_dir,
+                args.source_board,
+                target_layers,
+                journal,
+                args.drc_error_target,
+            )
+            state["runs"].append({
+                "layers": target_layers,
+                "source_layers": source_layers,
+                "progress": str(progress),
+                "status": journal.get("status"),
+                "complete": qualification["strict_complete"],
+                "accepted": qualification["accepted"],
+                "qualification": qualification,
+                "peel_plan": journal.get("warm_start"),
+                "reason": "symmetric_layer_pair_peel",
+            })
+            _refresh_comparison(repo_root, args.results_dir)
+            if not qualification["accepted"]:
+                state["peel_floor_failure"] = {
+                    "source_layers": source_layers,
+                    "failed_target_layers": target_layers,
+                    "progress": str(progress),
+                    "qualification": qualification,
+                }
+                break
+            selected = (target_layers, journal)
 
     if selected is None:
         state["status"] = "no_practical_candidate"
