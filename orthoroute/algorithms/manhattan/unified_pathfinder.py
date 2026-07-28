@@ -495,7 +495,7 @@ import time
 import random
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Sequence, Tuple, Set
 from collections import defaultdict
 
 # Third-party
@@ -2586,6 +2586,8 @@ class PathFinderRouter:
 
         # Rip tracking and pres_fac freezing (Fix 5)
         self._last_ripped: Set[str] = set()
+        self._last_stagnation_victims: Tuple[str, ...] = ()
+        self._stagnation_victim_history: Set[str] = set()
         self._freeze_pres_fac_until: int = 0
 
         # Connectivity check cache (optimization to avoid redundant BFS checks)
@@ -6214,6 +6216,11 @@ class PathFinderRouter:
                 best_route_score = route_score
                 best_route_state = self._capture_routing_state()
                 best_route_iteration = it
+                # A better basin deserves a fresh bounded-recovery search.
+                # Within one retained basin, recovery waves rotate through
+                # untried high-impact victims instead of deterministically
+                # ripping the same top-k nets after every rollback.
+                self._stagnation_victim_history = set()
 
             # DIAGNOSTIC: Verify history is growing (not capped at 1.0) - only first 3 iterations
             if it <= 3:
@@ -6545,6 +6552,9 @@ class PathFinderRouter:
                     self.stagnation_counter += 1
                     victims = self._rip_top_k_offenders(k=20)
                     self._last_ripped = victims
+                    self._last_stagnation_victims = tuple(
+                        sorted(victims)
+                    )
                     # Freeze pres_fac for two iterations to let the smaller
                     # hotset settle.
                     self._freeze_pres_fac_until = it + 2
@@ -8416,6 +8426,46 @@ class PathFinderRouter:
         if self.accounting.use_gpu:
             self.accounting.total_cost[:] = cp.asarray(total_cost_cpu)
 
+    def _rank_stagnation_offenders(
+        self,
+        over: np.ndarray,
+    ) -> List[Tuple[float, str]]:
+        """Rank live offenders by the complete negotiated objective."""
+        canonical_mask = self._canonical_edge_resource_mask()
+        over_idx = set(map(
+            int,
+            np.flatnonzero((over > 0) & canonical_mask),
+        ))
+        _, _, measured_node_scores = (
+            self._detect_path_node_conflicts()
+        )
+        self._path_node_conflict_scores = dict(measured_node_scores)
+
+        candidates = set(measured_node_scores)
+        for edge_idx in over_idx:
+            candidates.update(self._edge_to_nets.get(edge_idx, ()))
+
+        scores = []
+        for net_id in candidates:
+            if (
+                not self.net_paths.get(net_id)
+                or net_id in self.locked_nets
+            ):
+                continue
+            impact = float(measured_node_scores.get(net_id, 0))
+            if net_id in self._net_to_edges:
+                impact += sum(
+                    float(over[edge_idx])
+                    for edge_idx in self._net_to_edges[net_id]
+                    if edge_idx in over_idx
+                )
+            if impact > 0:
+                scores.append((impact, net_id))
+        return sorted(
+            scores,
+            key=lambda item: (-item[0], str(item[1])),
+        )
+
     def _rip_top_k_offenders(self, k=20) -> Set[str]:
         """
         Rip only the worst 16-24 nets to break stagnation (not the world).
@@ -8425,20 +8475,8 @@ class PathFinderRouter:
         present = self.accounting.present.get() if self.accounting.use_gpu else self.accounting.present
         cap = self.accounting.capacity.get() if self.accounting.use_gpu else self.accounting.capacity
         over = np.maximum(0, present - cap)
-        over_idx = set(map(int, np.where(over > 0)[0]))
-
-        # Score nets by impact on worst edges (use fast lookup)
-        scores = []
-        for net_id, path in self.net_paths.items():
-            if not path or net_id in self.locked_nets:
-                continue
-            if net_id in self._net_to_edges:
-                impact = sum(float(over[ei]) for ei in self._net_to_edges[net_id] if ei in over_idx)
-                if impact > 0:
-                    scores.append((impact, net_id))
-
-        scores.sort(reverse=True)
-        victims = {nid for _, nid in scores[:k]}
+        scores = self._rank_stagnation_offenders(over)
+        victims = self._select_stagnation_victims(scores, k)
 
         for net_id in victims:
             if self.net_paths.get(net_id) and net_id in self._net_to_edges:
@@ -8458,6 +8496,36 @@ class PathFinderRouter:
                 self.net_clean_streak[net_id] = 0
 
         logger.info(f"[STAGNATION] Ripped {len(victims)} nets (locked={len(self.locked_nets)} preserved)")
+        return victims
+
+    def _select_stagnation_victims(
+        self,
+        scores: Sequence[Tuple[float, str]],
+        k: int,
+    ) -> Set[str]:
+        """Select the next untried recovery wave around one retained best."""
+        prior_victims = getattr(
+            self, "_stagnation_victim_history", set()
+        )
+        untried = [
+            net_id for _, net_id in scores
+            if net_id not in prior_victims
+        ]
+        selected = list(untried[:k])
+        if len(selected) < k:
+            # Finish the tail of the current cycle before reusing the
+            # highest-ranked victims at the start of the next one.
+            prior_victims = set()
+            for _, net_id in scores:
+                if net_id in selected:
+                    continue
+                selected.append(net_id)
+                if len(selected) >= k:
+                    break
+        victims = set(selected)
+        self._stagnation_victim_history = (
+            prior_victims | victims
+        )
         return victims
 
     def _apply_portal_discount(self):

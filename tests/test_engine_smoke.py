@@ -259,6 +259,71 @@ def test_restored_route_can_be_ripped_as_a_new_recovery_branch(routed):
     pf._restore_routing_state(state)
 
 
+def test_stagnation_recovery_ranks_unique_edges_and_node_conflicts():
+    class RecoveryFixture:
+        pass
+
+    pf = RecoveryFixture()
+    pf.net_paths = {"EDGE_NET": [1], "NODE_NET": [2]}
+    pf.locked_nets = set()
+    pf._net_to_edges = {
+        "EDGE_NET": [0, 1],
+        "NODE_NET": [],
+    }
+    pf._edge_to_nets = {
+        0: {"EDGE_NET"},
+        1: {"EDGE_NET"},
+    }
+    pf._canonical_edge_resource_mask = lambda: np.asarray(
+        [True, False, True],
+        dtype=bool,
+    )
+    pf._detect_path_node_conflicts = lambda: (
+        set(),
+        {2, 3, 4},
+        {"NODE_NET": 3},
+    )
+
+    scores = UnifiedPathFinder._rank_stagnation_offenders(
+        pf,
+        np.asarray([2, 2, 0], dtype=np.float32),
+    )
+
+    # The mirrored reverse arc is not counted, while node-only offenders
+    # participate in the same recovery ranking.
+    assert scores == [(3.0, "NODE_NET"), (2.0, "EDGE_NET")]
+    assert pf._path_node_conflict_scores == {"NODE_NET": 3}
+
+
+def test_stagnation_recovery_rotates_victims_within_one_best_basin():
+    class RecoveryFixture:
+        pass
+
+    pf = RecoveryFixture()
+    pf._stagnation_victim_history = set()
+    scores = [(3.0, "NODE_NET"), (2.0, "EDGE_NET")]
+
+    assert UnifiedPathFinder._select_stagnation_victims(
+        pf, scores, 1
+    ) == {"NODE_NET"}
+
+    pf._stagnation_victim_history = set()
+    wider_scores = scores + [(1.0, "THIRD_NET")]
+    assert UnifiedPathFinder._select_stagnation_victims(
+        pf, wider_scores, 2
+    ) == {"NODE_NET", "EDGE_NET"}
+    # Finish the one-net tail before wrapping to the top of a new cycle.
+    assert UnifiedPathFinder._select_stagnation_victims(
+        pf, wider_scores, 2
+    ) == {"THIRD_NET", "NODE_NET"}
+    assert UnifiedPathFinder._select_stagnation_victims(
+        pf, scores, 1
+    ) == {"EDGE_NET"}
+    assert UnifiedPathFinder._select_stagnation_victims(
+        pf, scores, 1
+    ) == {"NODE_NET"}
+
+
 def test_selected_escape_geometry_is_physically_conflict_free(routed):
     pf, _, _, _ = routed
     pf._rebuild_escape_occupancy()
