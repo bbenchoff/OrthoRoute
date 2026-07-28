@@ -7003,6 +7003,17 @@ class PathFinderRouter:
         """
         logger.info("[DETAIL] Extracting conflict subgraph...")
         original_state = self._capture_routing_state()
+        best_detail_state = original_state
+        initial_unrouted = sum(
+            1 for net_id in tasks
+            if not self.net_paths.get(net_id)
+        )
+        best_detail_score = self._negotiated_route_score(
+            initial_unrouted,
+            int(initial_overuse),
+            0,
+            int(getattr(self, "_last_barrel_conflict_count", 0)),
+        )
 
         present = self.accounting.present.get() if self.accounting.use_gpu else self.accounting.present
         cap = self.accounting.capacity.get() if self.accounting.use_gpu else self.accounting.capacity
@@ -7087,6 +7098,20 @@ class PathFinderRouter:
                 _path_node_overuse_count,
             ) = self._compute_path_node_overuse()
             negotiated_overuse = over_sum + path_node_overuse
+            unrouted = {
+                net_id
+                for net_id in tasks
+                if not self.net_paths.get(net_id)
+            }
+            detail_score = self._negotiated_route_score(
+                len(unrouted),
+                over_sum,
+                path_node_overuse,
+                barrel_conflicts,
+            )
+            if detail_score < best_detail_score:
+                best_detail_score = detail_score
+                best_detail_state = self._capture_routing_state()
             conflict_nets = self._detail_conflict_nets(conflict_nets)
             conflict_tasks.update({
                 net_id: tasks[net_id]
@@ -7106,11 +7131,6 @@ class PathFinderRouter:
             )
 
             if negotiated_overuse == 0:
-                unrouted = {
-                    net_id
-                    for net_id in tasks
-                    if not self.net_paths.get(net_id)
-                }
                 if unrouted:
                     conflict_nets = unrouted
                     conflict_tasks.update({
@@ -7159,10 +7179,19 @@ class PathFinderRouter:
 
         # Detail pass exhausted
         logger.warning(f"[DETAIL] Failed to reach zero: final overuse={best_overuse}")
-        # A refinement attempt is speculative. Do not return a lower-overuse
-        # state that achieved it by dropping nets.
-        self._restore_routing_state(original_state)
-        return {'success': False, 'error_code': 'DETAIL-INCOMPLETE', 'overuse_sum': best_overuse}
+        # A refinement attempt is speculative, but a better all-nets state is
+        # still valuable to later cleanup, diagnostics, and evidence export.
+        # The lexicographic score rejects any state that bought lower overuse
+        # by dropping a net.
+        self._restore_routing_state(best_detail_state)
+        return {
+            'success': False,
+            'error_code': 'DETAIL-INCOMPLETE',
+            'overuse_sum': best_detail_score[1],
+            'restored_best_detail_state': (
+                best_detail_state is not original_state
+            ),
+        }
 
     def _capture_routing_state(self) -> Dict:
         """Copy the export-relevant negotiated state compactly in memory."""
