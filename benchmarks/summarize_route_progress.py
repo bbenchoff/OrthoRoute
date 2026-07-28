@@ -1051,6 +1051,449 @@ def _write_layer_node_svg(
     path.write_text("\n".join(svg), encoding="utf-8", newline="\n")
 
 
+def _latest_hotset_policy_snapshot(
+    runs: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return pass- and phase-level evidence for the newest hotset run."""
+    for run in reversed(runs):
+        iterations = run.get("iterations", [])
+        rows = []
+        phase = 0
+        previous_hotset = None
+        for previous, current in zip(iterations, iterations[1:]):
+            if (
+                "hotset_size" not in current
+                or "elapsed_seconds" not in previous
+                or "elapsed_seconds" not in current
+                or "_physical_negotiated_overuse" not in previous
+                or "_physical_negotiated_overuse" not in current
+            ):
+                continue
+            hotset = int(current["hotset_size"])
+            if hotset != previous_hotset:
+                phase += 1
+                previous_hotset = hotset
+            elapsed = max(
+                0.0,
+                float(current["elapsed_seconds"])
+                - float(previous["elapsed_seconds"]),
+            )
+            before = int(previous["_physical_negotiated_overuse"])
+            after = int(current["_physical_negotiated_overuse"])
+            drop = before - after
+            previous_edge = int(previous["_physical_edge_overuse"])
+            current_edge = int(current["_physical_edge_overuse"])
+            previous_node = int(previous.get("path_node_overuse_total", 0))
+            current_node = int(current.get("path_node_overuse_total", 0))
+            previous_escape = int(previous.get("escape_conflicts", 0))
+            current_escape = int(current.get("escape_conflicts", 0))
+            previous_portal = int(previous.get("portal_grid_conflicts", 0))
+            current_portal = int(current.get("portal_grid_conflicts", 0))
+            previous_barrel = int(
+                previous.get("exact_barrel_conflicts", 0)
+            )
+            current_barrel = int(
+                current.get("exact_barrel_conflicts", 0)
+            )
+            rows.append({
+                "run": run["label"],
+                "phase": phase,
+                "iteration": int(current["iteration"]),
+                "hotset_size": hotset,
+                "hotset_cap": int(current.get("hotset_cap", hotset)),
+                "elapsed_seconds": round(elapsed, 3),
+                "overuse_before": before,
+                "overuse_after": after,
+                "overuse_drop": drop,
+                "drop_pct": round(
+                    100.0 * drop / max(1, before),
+                    4,
+                ),
+                "drop_per_second": round(
+                    drop / max(0.001, elapsed),
+                    4,
+                ),
+                "edge_via_drop": previous_edge - current_edge,
+                "node_drop": previous_node - current_node,
+                "pres_fac": round(float(current.get("pres_fac", 0.0)), 6),
+                "pres_fac_max": round(
+                    float(current.get("pres_fac_max", 0.0)),
+                    6,
+                ),
+                "slow_progress_events": int(
+                    current.get("slow_progress_events", 0)
+                ),
+                "slow_progress_fraction": (
+                    ""
+                    if current.get("slow_progress_fraction") is None else
+                    round(
+                        100.0
+                        * float(current["slow_progress_fraction"]),
+                        4,
+                    )
+                ),
+                "rate_boost_until": int(
+                    current.get("hotset_rate_boost_until", 0)
+                ),
+                "escape_conflicts": current_escape,
+                "escape_delta": current_escape - previous_escape,
+                "portal_grid_conflicts": current_portal,
+                "portal_delta": current_portal - previous_portal,
+                "exact_barrel_conflicts": current_barrel,
+                "exact_barrel_delta": current_barrel - previous_barrel,
+            })
+        if not rows:
+            continue
+
+        phases = []
+        for phase_number in sorted({row["phase"] for row in rows}):
+            phase_rows = [
+                row for row in rows
+                if row["phase"] == phase_number
+            ]
+            first = phase_rows[0]
+            last = phase_rows[-1]
+            phase_start = rows.index(first)
+            prior_rows = rows[
+                max(0, phase_start - len(phase_rows)):phase_start
+            ]
+            elapsed = sum(
+                float(row["elapsed_seconds"]) for row in phase_rows
+            )
+            drop = first["overuse_before"] - last["overuse_after"]
+            rate = drop / max(0.001, elapsed)
+            prior_elapsed = sum(
+                float(row["elapsed_seconds"]) for row in prior_rows
+            )
+            prior_drop = sum(
+                int(row["overuse_drop"]) for row in prior_rows
+            )
+            prior_rate = (
+                None
+                if len(prior_rows) != len(phase_rows) else
+                prior_drop / max(0.001, prior_elapsed)
+            )
+            phases.append({
+                "phase": phase_number,
+                "iterations": (
+                    f"{first['iteration']}-{last['iteration']}"
+                ),
+                "passes": len(phase_rows),
+                "hotset_size": first["hotset_size"],
+                "elapsed_seconds": round(elapsed, 3),
+                "overuse_before": first["overuse_before"],
+                "overuse_after": last["overuse_after"],
+                "overuse_drop": drop,
+                "drop_per_second": round(rate, 4),
+                "matched_prior_iterations": (
+                    ""
+                    if prior_rate is None else
+                    f"{prior_rows[0]['iteration']}-"
+                    f"{prior_rows[-1]['iteration']}"
+                ),
+                "matched_prior_drop_per_second": (
+                    ""
+                    if prior_rate is None else
+                    round(prior_rate, 4)
+                ),
+                "efficiency_ratio": (
+                    ""
+                    if prior_rate in {None, 0.0} else
+                    round(rate / prior_rate, 4)
+                ),
+                "edge_via_drop": sum(
+                    int(row["edge_via_drop"]) for row in phase_rows
+                ),
+                "node_drop": sum(
+                    int(row["node_drop"]) for row in phase_rows
+                ),
+                "pressure_start": phase_rows[0]["pres_fac"],
+                "pressure_end": phase_rows[-1]["pres_fac"],
+                "escape_start": (
+                    first["escape_conflicts"] - first["escape_delta"]
+                ),
+                "escape_end": last["escape_conflicts"],
+                "escape_delta": (
+                    last["escape_conflicts"]
+                    - first["escape_conflicts"]
+                    + first["escape_delta"]
+                ),
+                "portal_start": (
+                    first["portal_grid_conflicts"] - first["portal_delta"]
+                ),
+                "portal_end": last["portal_grid_conflicts"],
+                "portal_delta": (
+                    last["portal_grid_conflicts"]
+                    - first["portal_grid_conflicts"]
+                    + first["portal_delta"]
+                ),
+                "exact_barrel_start": (
+                    first["exact_barrel_conflicts"]
+                    - first["exact_barrel_delta"]
+                ),
+                "exact_barrel_end": last["exact_barrel_conflicts"],
+                "exact_barrel_delta": (
+                    last["exact_barrel_conflicts"]
+                    - first["exact_barrel_conflicts"]
+                    + first["exact_barrel_delta"]
+                ),
+            })
+        return {
+            "run": run["label"],
+            "rows": rows,
+            "phases": phases,
+        }
+    return None
+
+
+def _write_hotset_policy_csv(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    rows = snapshot["rows"]
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_hotset_policy_markdown(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    phase_columns = (
+        "phase", "iterations", "passes", "hotset_size",
+        "elapsed_seconds", "overuse_before", "overuse_after",
+        "overuse_drop", "drop_per_second", "matched_prior_iterations",
+        "matched_prior_drop_per_second", "efficiency_ratio",
+        "edge_via_drop", "node_drop", "pressure_start", "pressure_end",
+        "escape_start", "escape_end", "escape_delta",
+        "portal_start", "portal_end", "portal_delta",
+        "exact_barrel_start", "exact_barrel_end", "exact_barrel_delta",
+    )
+    pass_columns = (
+        "iteration", "hotset_size", "elapsed_seconds",
+        "overuse_before", "overuse_after", "overuse_drop",
+        "drop_per_second", "edge_via_drop", "node_drop",
+        "pres_fac", "slow_progress_fraction",
+        "escape_conflicts", "portal_grid_conflicts",
+        "exact_barrel_conflicts",
+    )
+    lines = [
+        "# Hotset policy experiment",
+        "",
+        f"Run: `{snapshot['run']}`",
+        "",
+        "## Contiguous policy phases",
+        "",
+        "| " + " | ".join(phase_columns) + " |",
+        "|" + "|".join("---" for _ in phase_columns) + "|",
+    ]
+    for row in snapshot["phases"]:
+        lines.append(
+            "| " + " | ".join(
+                str(row[column]) for column in phase_columns
+            ) + " |"
+        )
+    lines.extend([
+        "",
+        "## Per-pass measurements",
+        "",
+        "| " + " | ".join(pass_columns) + " |",
+        "|" + "|".join("---" for _ in pass_columns) + "|",
+    ])
+    for row in snapshot["rows"]:
+        lines.append(
+            "| " + " | ".join(
+                str(row[column]) for column in pass_columns
+            ) + " |"
+        )
+    lines.extend([
+        "",
+        "`hotset_size` is the number of selected nets rerouted in the pass. "
+        "`drop_per_second` is complete normalized edge/via plus path-node "
+        "excess removed per wall-clock second; negative values are regressions. "
+        "Escape and portal counts are retained because faster graph descent "
+        "is not useful if it accumulates unpriced physical cleanup debt.",
+        "",
+    ])
+    path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+
+
+def _hotset_color(hotset: int) -> str:
+    if hotset <= 100:
+        return "#64748b"
+    if hotset <= 256:
+        return "#2563eb"
+    if hotset <= 512:
+        return "#ea580c"
+    if hotset <= 1024:
+        return "#9333ea"
+    return "#dc2626"
+
+
+def _write_hotset_policy_svg(
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> None:
+    width, height = 1200, 820
+    plot_x, plot_width = 95, 1030
+    overuse_y, overuse_height = 110, 260
+    rate_y, rate_height = 485, 220
+    rows = snapshot["rows"]
+    iterations = [rows[0]["iteration"] - 1] + [
+        row["iteration"] for row in rows
+    ]
+    totals = [rows[0]["overuse_before"]] + [
+        row["overuse_after"] for row in rows
+    ]
+    minimum_iteration = min(iterations)
+    maximum_iteration = max(iterations)
+    iteration_span = max(1, maximum_iteration - minimum_iteration)
+    minimum_total = min(totals)
+    maximum_total = max(totals)
+    total_padding = max(1.0, 0.08 * (maximum_total - minimum_total))
+    total_low = max(0.0, minimum_total - total_padding)
+    total_high = maximum_total + total_padding
+    total_span = max(1.0, total_high - total_low)
+    rate_rows = rows[-min(12, len(rows)):]
+    rate_iterations = [int(row["iteration"]) for row in rate_rows]
+    rate_iteration_min = min(rate_iterations)
+    rate_iteration_max = max(rate_iterations)
+    rate_iteration_span = max(1, rate_iteration_max - rate_iteration_min)
+    rates = [float(row["drop_per_second"]) for row in rate_rows]
+    rate_low = min(0.0, min(rates))
+    rate_high = max(0.0, max(rates))
+    rate_padding = max(0.25, 0.08 * (rate_high - rate_low))
+    rate_low -= rate_padding
+    rate_high += rate_padding
+    rate_span = max(0.001, rate_high - rate_low)
+
+    def x_position(iteration: int) -> float:
+        return (
+            plot_x
+            + plot_width
+            * (iteration - minimum_iteration)
+            / iteration_span
+        )
+
+    def total_y(value: float) -> float:
+        return (
+            overuse_y + overuse_height
+            - overuse_height * (value - total_low) / total_span
+        )
+
+    def rate_x_position(iteration: int) -> float:
+        return (
+            plot_x
+            + plot_width
+            * (iteration - rate_iteration_min)
+            / rate_iteration_span
+        )
+
+    def rate_value_y(value: float) -> float:
+        return (
+            rate_y + rate_height
+            - rate_height * (value - rate_low) / rate_span
+        )
+
+    points = " ".join(
+        f"{x_position(iteration):.1f},{total_y(total):.1f}"
+        for iteration, total in zip(iterations, totals)
+    )
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="60" y="38" font-family="sans-serif" font-size="24" '
+        'font-weight="bold">Hotset policy experiment</text>',
+        f'<text x="60" y="66" font-family="sans-serif" font-size="14">'
+        f'{html.escape(snapshot["run"])}</text>',
+        f'<text x="{plot_x}" y="95" font-family="sans-serif" '
+        'font-size="16">Complete negotiated excess</text>',
+        f'<rect x="{plot_x}" y="{overuse_y}" width="{plot_width}" '
+        f'height="{overuse_height}" fill="#fafafa" stroke="#cbd5e1"/>',
+        f'<polyline points="{points}" fill="none" stroke="#0f172a" '
+        'stroke-width="2"/>',
+        f'<text x="{plot_x}" y="468" font-family="sans-serif" '
+        'font-size="16">Recent excess removed per wall-clock second '
+        f'(last {len(rate_rows)} passes)</text>',
+        f'<rect x="{plot_x}" y="{rate_y}" width="{plot_width}" '
+        f'height="{rate_height}" fill="#fafafa" stroke="#cbd5e1"/>',
+        f'<line x1="{plot_x}" y1="{rate_value_y(0):.1f}" '
+        f'x2="{plot_x + plot_width}" y2="{rate_value_y(0):.1f}" '
+        'stroke="#475569" stroke-width="1"/>',
+    ]
+    for tick in range(5):
+        fraction = tick / 4
+        total_value = total_high - fraction * total_span
+        total_line_y = overuse_y + fraction * overuse_height
+        rate_value = rate_high - fraction * rate_span
+        rate_line_y = rate_y + fraction * rate_height
+        svg.extend([
+            f'<line x1="{plot_x}" y1="{total_line_y:.1f}" '
+            f'x2="{plot_x + plot_width}" y2="{total_line_y:.1f}" '
+            'stroke="#e2e8f0"/>',
+            f'<text x="{plot_x - 8}" y="{total_line_y + 4:.1f}" '
+            'text-anchor="end" font-family="monospace" font-size="11">'
+            f'{int(total_value):,}</text>',
+            f'<line x1="{plot_x}" y1="{rate_line_y:.1f}" '
+            f'x2="{plot_x + plot_width}" y2="{rate_line_y:.1f}" '
+            'stroke="#e2e8f0"/>',
+            f'<text x="{plot_x - 8}" y="{rate_line_y + 4:.1f}" '
+            'text-anchor="end" font-family="monospace" font-size="11">'
+            f'{rate_value:.1f}</text>',
+        ])
+    bar_width = max(
+        5.0,
+        min(52.0, plot_width / max(1, len(rate_rows)) * 0.58),
+    )
+    zero_y = rate_value_y(0.0)
+    for row in rows:
+        x = x_position(int(row["iteration"]))
+        color = _hotset_color(int(row["hotset_size"]))
+        svg.append(
+            f'<circle cx="{x:.1f}" cy="{total_y(row["overuse_after"]):.1f}" '
+            f'r="4.5" fill="{color}"><title>iteration '
+            f'{row["iteration"]}: {row["overuse_after"]:,} excess; '
+            f'hotset {row["hotset_size"]}</title></circle>'
+        )
+    for row in rate_rows:
+        x = rate_x_position(int(row["iteration"]))
+        rate = float(row["drop_per_second"])
+        y = rate_value_y(rate)
+        color = _hotset_color(int(row["hotset_size"]))
+        svg.extend([
+            f'<rect x="{x - bar_width / 2:.1f}" '
+            f'y="{min(y, zero_y):.1f}" width="{bar_width:.1f}" '
+            f'height="{max(1.0, abs(zero_y - y)):.1f}" fill="{color}">'
+            f'<title>iteration {row["iteration"]}: '
+            f'{row["drop_per_second"]} excess/s; '
+            f'{row["elapsed_seconds"]} s; hotset '
+            f'{row["hotset_size"]}</title></rect>',
+            f'<text x="{x:.1f}" y="731" text-anchor="middle" '
+            'font-family="sans-serif" font-size="10">'
+            f'{row["iteration"]}</text>',
+        ])
+    legend_hotsets = list(dict.fromkeys(
+        int(row["hotset_size"]) for row in rows
+    ))
+    for index, hotset in enumerate(legend_hotsets):
+        x = 95 + index * 145
+        svg.extend([
+            f'<rect x="{x}" y="770" width="14" height="14" '
+            f'fill="{_hotset_color(hotset)}"/>',
+            f'<text x="{x + 22}" y="782" font-family="sans-serif" '
+            f'font-size="12">{hotset}-net hotset</text>',
+        ])
+    svg.extend([
+        '<text x="1125" y="747" text-anchor="end" '
+        'font-family="sans-serif" font-size="11">iteration</text>',
+        "</svg>",
+    ])
+    path.write_text("\n".join(svg), encoding="utf-8", newline="\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results_dir", type=Path)
@@ -1098,6 +1541,20 @@ def main() -> None:
             "layer_node_markdown": str(layer_markdown),
             "layer_node_svg": str(layer_svg),
         }
+    hotset_snapshot = _latest_hotset_policy_snapshot(runs)
+    hotset_artifacts = {}
+    if hotset_snapshot is not None:
+        hotset_csv = args.output_dir / "hotset-policy.csv"
+        hotset_markdown = args.output_dir / "hotset-policy.md"
+        hotset_svg = args.output_dir / "hotset-policy.svg"
+        _write_hotset_policy_csv(hotset_snapshot, hotset_csv)
+        _write_hotset_policy_markdown(hotset_snapshot, hotset_markdown)
+        _write_hotset_policy_svg(hotset_snapshot, hotset_svg)
+        hotset_artifacts = {
+            "hotset_csv": str(hotset_csv),
+            "hotset_markdown": str(hotset_markdown),
+            "hotset_svg": str(hotset_svg),
+        }
     print(json.dumps({
         "runs": len(runs),
         "csv": str(args.output_dir / "reduced-layer-comparison.csv"),
@@ -1109,6 +1566,7 @@ def main() -> None:
         ),
         "stall_svg": str(args.output_dir / "layer-stall-overuse.svg"),
         **layer_artifacts,
+        **hotset_artifacts,
     }, indent=2))
 
 
