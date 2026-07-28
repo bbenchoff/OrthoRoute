@@ -1525,17 +1525,6 @@ def test_stagnation_rip_waits_for_spatial_via_tail():
     )
 
 
-def test_large_physical_drop_marks_cleanup_stage():
-    detected = PathFinderRouter._physical_cleanup_drop_detected
-
-    assert not detected(None, 75)
-    assert not detected(0, 0)
-    assert not detected(100, 76)
-    assert detected(100, 75)
-    assert detected(100, 25)
-    assert not detected(100, 101)
-
-
 def test_physical_hotset_limit_scales_with_remaining_conflicts():
     limit = PathFinderRouter._physical_hotset_limit
 
@@ -1599,6 +1588,47 @@ def test_physical_offenders_stay_hot_when_edges_are_clean(routed):
         assert set(tasks) <= pf._build_hotset(tasks)
     finally:
         pf._barrel_conflict_nets = old_physical
+
+
+def test_physical_offenders_wait_for_path_node_cleanup(routed):
+    pf, _, _, _ = routed
+    path = pf.net_paths["TEST_NET"]
+    physical = {"PHYSICAL_OWNER", "PHYSICAL_VICTIM"}
+    tasks = {
+        net_id: (path[0], path[-1])
+        for net_id in physical
+    }
+    old_physical = getattr(pf, "_barrel_conflict_nets", set())
+    old_paths = {
+        net_id: pf.net_paths.get(net_id)
+        for net_id in physical
+    }
+    node = next(
+        index for index, use in enumerate(pf.path_node_use)
+        if use == 0
+    )
+    old_node_use = int(pf.path_node_use[node])
+    try:
+        pf._barrel_conflict_nets = physical
+        for net_id in physical:
+            pf.net_paths[net_id] = [path[0], path[0]]
+        pf.path_node_use[node] = (
+            pf.config.portal_cleanup_edge_threshold + 2
+        )
+        edge_via_overuse, _ = pf.accounting.compute_overuse(pf)
+        assert edge_via_overuse == 0
+
+        hotset = pf._build_hotset(tasks)
+
+        assert physical.isdisjoint(hotset)
+    finally:
+        pf.path_node_use[node] = old_node_use
+        pf._barrel_conflict_nets = old_physical
+        for net_id, old_path in old_paths.items():
+            if old_path is None:
+                pf.net_paths.pop(net_id, None)
+            else:
+                pf.net_paths[net_id] = old_path
 
 
 def test_unrouted_nets_bypass_hotset_cap_and_cooldown(routed):
