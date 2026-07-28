@@ -5995,6 +5995,15 @@ class PathFinderRouter:
             path_node_conflicts = getattr(
                 self, "_last_path_node_conflict_count", 0
             )
+            (
+                path_node_overuse,
+                path_node_overuse_count,
+            ) = self._compute_path_node_overuse()
+            self._last_path_node_overuse_total = path_node_overuse
+            self._last_path_node_overuse_count = (
+                path_node_overuse_count
+            )
+            negotiated_overuse = over_sum + path_node_overuse
             escape_conflicts = getattr(
                 self, "_last_escape_conflict_count", 0
             )
@@ -6125,7 +6134,15 @@ class PathFinderRouter:
                 self._portal_cleanup_movable_nets = set()
 
             # Clean consolidated iteration summary (WARNING level so it shows in console)
-            status = "✓ CONVERGED" if over_sum == 0 else f"overuse={over_sum}"
+            status = (
+                "✓ CONVERGED"
+                if negotiated_overuse == 0
+                else (
+                    f"overuse={over_sum}"
+                    f" node_overuse={path_node_overuse}"
+                    f" negotiated={negotiated_overuse}"
+                )
+            )
             barrel_info = (
                 f"  barrel={barrel_conflicts}"
                 f" (exact={exact_barrel_conflicts},"
@@ -6138,12 +6155,14 @@ class PathFinderRouter:
             # Retain the best complete routing state, not just its scalar
             # metric. Negotiation deliberately oscillates, so the final
             # iteration can be worse than an earlier pass. Rank states
-            # lexicographically: route every net first, then minimize graph
-            # overuse, then physical conflicts.
-            route_score = (
-                int(failed),
-                int(over_sum),
-                int(conflict_count),
+            # lexicographically: route every net first, then minimize every
+            # negotiated graph resource (edges, via pools, and capacity-one
+            # nodes), then minimize off-graph physical conflicts.
+            route_score = self._negotiated_route_score(
+                failed,
+                over_sum,
+                path_node_overuse,
+                conflict_count,
             )
             if best_route_score is None or route_score < best_route_score:
                 best_route_score = route_score
@@ -6412,8 +6431,8 @@ class PathFinderRouter:
 
                     return {'success': True, 'paths': self.net_paths, 'converged': True}
 
-            if over_sum < best_overuse:
-                best_overuse = over_sum
+            if negotiated_overuse < best_overuse:
+                best_overuse = negotiated_overuse
                 stagnant = 0
             else:
                 stagnant += 1
@@ -6458,10 +6477,11 @@ class PathFinderRouter:
                     # so far. Otherwise repeated bounded rip-ups can walk
                     # steadily away from a good state even though the scalar
                     # best is remembered.
-                    current_route_score = (
-                        int(failed),
-                        int(over_sum),
-                        int(conflict_count),
+                    current_route_score = self._negotiated_route_score(
+                        failed,
+                        over_sum,
+                        path_node_overuse,
+                        conflict_count,
                     )
                     if (
                         best_route_state is not None
@@ -6471,7 +6491,7 @@ class PathFinderRouter:
                         self._restore_routing_state(best_route_state)
                         logger.warning(
                             "[STAGNATION] Rolled back to best iteration %d "
-                            "before recovery wave (failed=%d overuse=%d "
+                            "before recovery wave (failed=%d negotiated=%d "
                             "physical=%d)",
                             best_route_iteration,
                             best_route_score[0],
@@ -6520,10 +6540,11 @@ class PathFinderRouter:
         # Negotiated routing can finish on an upswing. Restore the best state
         # before refinement/export so a long run never discards its own best
         # board merely because max_iterations landed at the wrong phase.
-        current_route_score = (
-            int(failed),
-            int(over_sum),
-            int(getattr(self, "_last_barrel_conflict_count", 0)),
+        current_route_score = self._negotiated_route_score(
+            failed,
+            over_sum,
+            self._compute_path_node_overuse()[0],
+            getattr(self, "_last_barrel_conflict_count", 0),
         )
         restored_best_state = bool(
             best_route_state is not None
@@ -6541,19 +6562,35 @@ class PathFinderRouter:
             )
             _, restored_barrel_conflicts = self._detect_barrel_conflicts()
             self._last_barrel_conflict_count = restored_barrel_conflicts
+            (
+                path_node_overuse,
+                path_node_overuse_count,
+            ) = self._compute_path_node_overuse()
+            self._last_path_node_overuse_total = path_node_overuse
+            self._last_path_node_overuse_count = (
+                path_node_overuse_count
+            )
+            negotiated_overuse = over_sum + path_node_overuse
             logger.warning(
                 "[BEST-STATE] Restored iteration %d at max_iterations: "
-                "failed=%d overuse=%d edges=%d physical=%d",
+                "failed=%d edge/via=%d nodes=%d negotiated=%d "
+                "resources=%d physical=%d",
                 best_route_iteration,
                 failed,
                 over_sum,
+                path_node_overuse,
+                negotiated_overuse,
                 over_cnt,
                 restored_barrel_conflicts,
             )
 
         # If we exited with low overuse (<100), run detail pass
-        if 0 < over_sum <= 100:
-            logger.info(f"[DETAIL PASS] Overuse={over_sum} at max_iters, running detail refinement")
+        if 0 < negotiated_overuse <= 100:
+            logger.info(
+                "[DETAIL PASS] Negotiated overuse=%d at max_iters, "
+                "running detail refinement",
+                negotiated_overuse,
+            )
             detail_result = self._detail_pass(tasks, over_sum, over_cnt)
             if detail_result['success']:
                 detail_result["best_iteration"] = best_route_iteration
@@ -6561,7 +6598,11 @@ class PathFinderRouter:
                 return detail_result
 
         # SOFT-FAIL: Analyze if more layers needed
-        layer_recommendation = self._analyze_layer_requirements(failed, over_cnt, over_sum)
+        layer_recommendation = self._analyze_layer_requirements(
+            failed,
+            over_cnt + path_node_overuse_count,
+            negotiated_overuse,
+        )
 
         # Log GPU vs CPU pathfinding statistics
         total_paths = self._gpu_path_count + self._cpu_path_count
@@ -6570,10 +6611,17 @@ class PathFinderRouter:
             logger.info(f"[GPU-STATS] GPU: {self._gpu_path_count} paths ({gpu_pct:.1f}%), CPU: {self._cpu_path_count} paths ({100-gpu_pct:.1f}%)")
 
         # Only show warning if routing is actually incomplete
-        if failed > 0 or over_sum > 0:
+        if failed > 0 or negotiated_overuse > 0:
             logger.warning("="*80)
             logger.warning(f"ROUTING INCOMPLETE: {failed}/{len(tasks)} nets failed ({failed/len(tasks)*100:.1f}%)")
-            logger.warning(f"  Overuse: {over_cnt} edges with {over_sum} total conflicts")
+            logger.warning(
+                "  Negotiated overuse: %d resources with %d excess "
+                "uses (edge/via=%d, node=%d)",
+                over_cnt + path_node_overuse_count,
+                negotiated_overuse,
+                over_sum,
+                path_node_overuse,
+            )
             if layer_recommendation['needs_more']:
                 logger.warning(f"  RECOMMENDATION: Add {layer_recommendation['additional']} more layers (→{layer_recommendation['recommended_total']} total)")
                 logger.warning(f"  Reason: {layer_recommendation['reason']}")
@@ -6612,6 +6660,9 @@ class PathFinderRouter:
             'message': 'Complete' if success else f'{failed} unrouted, {over_cnt} overused',
             'overuse_sum': over_sum,
             'overuse_edges': over_cnt,
+            'path_node_overuse_sum': path_node_overuse,
+            'path_node_overuse_nodes': path_node_overuse_count,
+            'negotiated_overuse_sum': negotiated_overuse,
             'failed_nets': failed,
             'best_iteration': best_route_iteration,
             'restored_best_state': restored_best_state,
@@ -9139,6 +9190,30 @@ class PathFinderRouter:
         # paths if state was refreshed during a diagnostic call.
         measured_nodes = set(members)
         return pairs, measured_nodes, dict(scores)
+
+    def _compute_path_node_overuse(self) -> Tuple[int, int]:
+        """Return excess uses and over-capacity capacity-one graph nodes."""
+        if not hasattr(self, "path_node_use"):
+            return 0, 0
+        overuse = np.maximum(
+            np.asarray(self.path_node_use, dtype=np.int64) - 1,
+            0,
+        )
+        return int(overuse.sum()), int(np.count_nonzero(overuse))
+
+    @staticmethod
+    def _negotiated_route_score(
+        failed_nets: int,
+        edge_via_overuse: int,
+        path_node_overuse: int,
+        physical_conflicts: int,
+    ) -> Tuple[int, int, int]:
+        """Rank routes by the complete negotiated resource system."""
+        return (
+            int(failed_nets),
+            int(edge_via_overuse) + int(path_node_overuse),
+            int(physical_conflicts),
+        )
 
     def _detect_barrel_conflicts(self) -> Tuple[np.ndarray, int]:
         """
