@@ -9,7 +9,7 @@ import re
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 COLORS = (
@@ -30,6 +30,24 @@ UNIQUE_EDGE_ACCOUNTING_COMMIT = (
 )
 BIDIRECTIONAL_EDGE_RESERVATION_COMMIT = (
     "76eaefd"
+)
+STALL_WINDOW = 8
+STALL_COLUMNS = (
+    "layers",
+    "run",
+    "git_sha",
+    "status",
+    "edge_accounting",
+    "iterations",
+    "observation",
+    "stall_window",
+    "stall_iteration",
+    "overuse_at_stall",
+    "best_iteration",
+    "best_overuse",
+    "current_overuse",
+    "eligible_for_fit",
+    "progress_file",
 )
 
 
@@ -305,6 +323,345 @@ def _row(run: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _stall_row(
+    run: Dict[str, Any],
+    plateau_window: int = STALL_WINDOW,
+) -> Optional[Dict[str, Any]]:
+    """Summarize a comparable full-board negotiated-overuse plateau."""
+    if "8,192 nets" not in run["label"]:
+        return None
+    values = [
+        (
+            int(item["iteration"]),
+            int(item["_physical_negotiated_overuse"]),
+        )
+        for item in run["iterations"]
+        if "_physical_negotiated_overuse" in item
+    ]
+    if not values:
+        return None
+    layer_match = re.search(r"Backplane-(\d+)L", str(
+        run["journal"].get("run_name", "")
+    ))
+    if not layer_match:
+        return None
+    best_position = min(
+        range(len(values)),
+        key=lambda index: values[index][1],
+    )
+    best_iteration, best_overuse = values[best_position]
+    stalled = (
+        len(values) - 1 - best_position >= max(1, plateau_window)
+    )
+    status = str(run["journal"].get("status", "unknown"))
+    if stalled:
+        observation = "stalled"
+        stall_iteration = values[best_position + plateau_window][0]
+        overuse_at_stall = best_overuse
+    elif status == "routing":
+        observation = "live_not_stalled"
+        stall_iteration = ""
+        overuse_at_stall = ""
+    else:
+        observation = "terminal_without_plateau"
+        stall_iteration = ""
+        overuse_at_stall = ""
+    return {
+        "layers": int(layer_match.group(1)),
+        "run": run["label"],
+        "git_sha": str(run["journal"].get("git_sha", "")),
+        "status": status,
+        "edge_accounting": run["edge_accounting_mode"],
+        "iterations": len(values),
+        "observation": observation,
+        "stall_window": plateau_window,
+        "stall_iteration": stall_iteration,
+        "overuse_at_stall": overuse_at_stall,
+        "best_iteration": best_iteration,
+        "best_overuse": best_overuse,
+        "current_overuse": values[-1][1],
+        "eligible_for_fit": stalled,
+        "progress_file": str(run["path"]),
+    }
+
+
+def _accounting_rank(row: Dict[str, Any]) -> int:
+    return {
+        "unique physical": 2,
+        "paired arcs normalized": 1,
+        "legacy directed": 0,
+    }.get(str(row.get("edge_accounting", "")), -1)
+
+
+def _selected_stalls(
+    rows: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Choose the newest best-accounted stalled run per layer."""
+    selected: Dict[int, Tuple[int, int, Dict[str, Any]]] = {}
+    for order, row in enumerate(rows):
+        if not row.get("eligible_for_fit"):
+            continue
+        layers = int(row["layers"])
+        candidate = (_accounting_rank(row), order, row)
+        previous = selected.get(layers)
+        if previous is None or candidate[:2] > previous[:2]:
+            selected[layers] = candidate
+    return [
+        selected[layers][2] for layers in sorted(selected)
+    ]
+
+
+def _linear_layer_fit(
+    rows: Sequence[Dict[str, Any]],
+) -> Optional[Dict[str, float]]:
+    """Fit stalled negotiated overuse versus total copper layer count."""
+    selected = _selected_stalls(rows)
+    if len(selected) < 2:
+        return None
+    xs = [float(row["layers"]) for row in selected]
+    ys = [float(row["overuse_at_stall"]) for row in selected]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    denominator = sum((value - mean_x) ** 2 for value in xs)
+    if denominator <= 0:
+        return None
+    slope = sum(
+        (x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)
+    ) / denominator
+    intercept = mean_y - slope * mean_x
+    residual = sum(
+        (y - (slope * x + intercept)) ** 2
+        for x, y in zip(xs, ys)
+    )
+    total = sum((y - mean_y) ** 2 for y in ys)
+    r_squared = 1.0 if total == 0 else 1.0 - residual / total
+    zero_layer = -intercept / slope if slope < 0 else math.nan
+    return {
+        "points": float(len(selected)),
+        "slope": slope,
+        "intercept": intercept,
+        "r_squared": r_squared,
+        "zero_layer": zero_layer,
+    }
+
+
+def _write_stall_csv(
+    rows: Sequence[Dict[str, Any]],
+    path: Path,
+) -> None:
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=STALL_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_stall_markdown(
+    rows: Sequence[Dict[str, Any]],
+    path: Path,
+) -> None:
+    columns = (
+        "layers",
+        "run",
+        "status",
+        "edge_accounting",
+        "iterations",
+        "observation",
+        "stall_iteration",
+        "overuse_at_stall",
+        "best_iteration",
+        "best_overuse",
+        "current_overuse",
+        "eligible_for_fit",
+    )
+    lines = [
+        "# Full-board layer/stall congestion",
+        "",
+        (
+            f"A stall means no new minimum in the complete normalized "
+            f"PathFinder objective for {STALL_WINDOW} consecutive "
+            "iterations. The objective is physical edge/via-pool excess "
+            "plus capacity-one graph-node excess; it is not a KiCad DRC "
+            "count."
+        ),
+        "",
+        "| " + " | ".join(columns) + " |",
+        "|" + "|".join("---" for _ in columns) + "|",
+    ]
+    for row in rows:
+        lines.append(
+            "| " + " | ".join(str(row[column]) for column in columns)
+            + " |"
+        )
+    fit = _linear_layer_fit(rows)
+    lines.extend(["", "## Extrapolation", ""])
+    if fit is None:
+        lines.append(
+            "Withheld: at least two distinct total-layer counts with "
+            "comparable full-board stalls are required. A single-layer "
+            "history cannot identify a layer-capacity slope."
+        )
+    else:
+        zero = fit["zero_layer"]
+        zero_text = (
+            f"{zero:.2f} layers"
+            if math.isfinite(zero) else
+            "not projected because the fitted slope is non-negative"
+        )
+        lines.append(
+            f"Ordinary least-squares fit over {int(fit['points'])} "
+            f"selected layer counts: slope {fit['slope']:.1f} excess "
+            f"uses/layer, R²={fit['r_squared']:.3f}, zero intercept "
+            f"{zero_text}. This is a planning extrapolation, not a "
+            "routability proof."
+        )
+    lines.extend([
+        "",
+        "For each layer count, the fit prefers unique-physical accounting, "
+        "then paired-arc-normalized accounting, and uses the newest "
+        "available stalled run at that accounting quality.",
+        "",
+    ])
+    path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+
+
+def _write_stall_svg(
+    rows: Sequence[Dict[str, Any]],
+    path: Path,
+) -> None:
+    width, height = 1200, 820
+    plot_x, plot_y, plot_width, plot_height = 110, 120, 980, 540
+    layer_values = [14, 16, 18, 20]
+    if rows:
+        layer_values.extend(int(row["layers"]) for row in rows)
+    min_layer = min(layer_values)
+    max_layer = max(layer_values)
+    y_values = [
+        int(row["overuse_at_stall"] or row["best_overuse"])
+        for row in rows
+    ]
+    y_max = max(y_values, default=1)
+    y_max = max(1, int(math.ceil(y_max * 1.10 / 10_000) * 10_000))
+
+    def x_at(layers: float) -> float:
+        return plot_x + plot_width * (
+            (layers - min_layer) / max(1, max_layer - min_layer)
+        )
+
+    def y_at(value: float) -> float:
+        return plot_y + plot_height * (1.0 - value / y_max)
+
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="60" y="42" font-family="sans-serif" font-size="25" '
+        'font-weight="bold">Full-board plateau congestion vs copper '
+        'layers</text>',
+        '<text x="60" y="72" font-family="sans-serif" font-size="14" '
+        'fill="#475569">8,192 nets · 0.4 mm grid · physical edge/via '
+        '+ exact node excess · linear scale to zero</text>',
+        f'<rect x="{plot_x}" y="{plot_y}" width="{plot_width}" '
+        f'height="{plot_height}" fill="#fafafa" stroke="#94a3b8"/>',
+    ]
+    for tick in range(6):
+        value = y_max * (1.0 - tick / 5)
+        y = plot_y + plot_height * tick / 5
+        svg.extend([
+            f'<line x1="{plot_x}" y1="{y:.1f}" '
+            f'x2="{plot_x + plot_width}" y2="{y:.1f}" '
+            'stroke="#e2e8f0"/>',
+            f'<text x="{plot_x - 10}" y="{y + 4:.1f}" '
+            'text-anchor="end" font-family="monospace" font-size="12">'
+            f'{int(value):,}</text>',
+        ])
+    for layers in range(min_layer, max_layer + 1, 2):
+        x = x_at(layers)
+        svg.extend([
+            f'<line x1="{x:.1f}" y1="{plot_y}" x2="{x:.1f}" '
+            f'y2="{plot_y + plot_height}" stroke="#f1f5f9"/>',
+            f'<text x="{x:.1f}" y="{plot_y + plot_height + 24}" '
+            'text-anchor="middle" font-family="sans-serif" font-size="13">'
+            f'{layers}</text>',
+        ])
+    svg.extend([
+        f'<text x="{plot_x + plot_width / 2:.1f}" '
+        f'y="{plot_y + plot_height + 56}" text-anchor="middle" '
+        'font-family="sans-serif" font-size="14">Total copper layers</text>',
+        f'<text x="25" y="{plot_y + plot_height / 2:.1f}" '
+        'transform="rotate(-90 25 '
+        f'{plot_y + plot_height / 2:.1f})" text-anchor="middle" '
+        'font-family="sans-serif" font-size="14">'
+        'Negotiated excess uses at plateau</text>',
+    ])
+
+    selected = _selected_stalls(rows)
+    fit = _linear_layer_fit(rows)
+    if fit is not None:
+        x1, x2 = float(min_layer), float(max_layer)
+        y1 = max(0.0, fit["slope"] * x1 + fit["intercept"])
+        y2 = max(0.0, fit["slope"] * x2 + fit["intercept"])
+        svg.append(
+            f'<line x1="{x_at(x1):.1f}" y1="{y_at(y1):.1f}" '
+            f'x2="{x_at(x2):.1f}" y2="{y_at(y2):.1f}" '
+            'stroke="#0f172a" stroke-width="2" stroke-dasharray="8 6"/>'
+        )
+
+    for index, row in enumerate(rows):
+        value = int(row["overuse_at_stall"] or row["best_overuse"])
+        x = x_at(float(row["layers"]))
+        x += ((index % 5) - 2) * 5
+        y = y_at(value)
+        selected_point = row in selected
+        color = "#dc2626" if row["eligible_for_fit"] else "#2563eb"
+        if row["eligible_for_fit"]:
+            svg.append(
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="7" '
+                f'fill="{color}" stroke="#ffffff" stroke-width="2"/>'
+            )
+        else:
+            svg.append(
+                f'<rect x="{x - 6:.1f}" y="{y - 6:.1f}" width="12" '
+                f'height="12" fill="#ffffff" stroke="{color}" '
+                'stroke-width="3"/>'
+            )
+        weight = "bold" if selected_point else "normal"
+        svg.append(
+            f'<text x="{x + 10:.1f}" y="{y - 9:.1f}" '
+            f'font-family="sans-serif" font-size="11" '
+            f'font-weight="{weight}">{html.escape(str(row["run"]))}: '
+            f'{value:,}</text>'
+        )
+    if fit is None:
+        fit_text = (
+            "Trend withheld: need comparable stalls at ≥2 distinct "
+            "layer counts"
+        )
+    else:
+        zero = fit["zero_layer"]
+        zero_text = (
+            f"zero intercept ≈ {zero:.2f} layers"
+            if math.isfinite(zero) else
+            "no finite zero intercept"
+        )
+        fit_text = (
+            f"OLS slope {fit['slope']:.1f} excess/layer; "
+            f"R² {fit['r_squared']:.3f}; {zero_text}"
+        )
+    svg.extend([
+        f'<text x="{plot_x}" y="735" font-family="sans-serif" '
+        f'font-size="14" font-weight="bold">{html.escape(fit_text)}</text>',
+        f'<circle cx="{plot_x}" cy="775" r="7" fill="#dc2626"/>',
+        f'<text x="{plot_x + 14}" y="779" font-family="sans-serif" '
+        'font-size="12">observed ≥8-iteration stall</text>',
+        f'<rect x="{plot_x + 310}" y="769" width="12" height="12" '
+        'fill="#ffffff" stroke="#2563eb" stroke-width="3"/>',
+        f'<text x="{plot_x + 330}" y="779" font-family="sans-serif" '
+        'font-size="12">live/terminal point without observed stall</text>',
+        "</svg>",
+    ])
+    path.write_text("\n".join(svg), encoding="utf-8", newline="\n")
+
+
 def _write_csv(rows: Sequence[Dict[str, Any]], path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
@@ -496,15 +853,36 @@ def main() -> None:
     if not runs:
         raise SystemExit("no matching progress journals found")
     rows = [_row(run) for run in runs]
+    stall_rows = [
+        row for row in (_stall_row(run) for run in runs)
+        if row is not None
+    ]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(rows, args.output_dir / "reduced-layer-comparison.csv")
     _write_markdown(rows, args.output_dir / "reduced-layer-comparison.md")
     _write_svg(runs, args.output_dir / "reduced-layer-progress.svg")
+    _write_stall_csv(
+        stall_rows,
+        args.output_dir / "layer-stall-overuse.csv",
+    )
+    _write_stall_markdown(
+        stall_rows,
+        args.output_dir / "layer-stall-overuse.md",
+    )
+    _write_stall_svg(
+        stall_rows,
+        args.output_dir / "layer-stall-overuse.svg",
+    )
     print(json.dumps({
         "runs": len(runs),
         "csv": str(args.output_dir / "reduced-layer-comparison.csv"),
         "markdown": str(args.output_dir / "reduced-layer-comparison.md"),
         "svg": str(args.output_dir / "reduced-layer-progress.svg"),
+        "stall_csv": str(args.output_dir / "layer-stall-overuse.csv"),
+        "stall_markdown": str(
+            args.output_dir / "layer-stall-overuse.md"
+        ),
+        "stall_svg": str(args.output_dir / "layer-stall-overuse.svg"),
     }, indent=2))
 
 

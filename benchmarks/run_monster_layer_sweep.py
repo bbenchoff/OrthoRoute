@@ -14,7 +14,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -167,11 +167,57 @@ def _remaining_candidates(
     initial_layers: int,
     selected: Optional[Tuple[int, Dict[str, Any]]],
     max_layers: int,
-) -> list[int]:
+    candidate_layers: Optional[List[int]] = None,
+) -> List[int]:
     """Choose lower qualification or upward capacity candidates."""
     if selected is not None:
         return [14] if selected[0] > 14 else []
+    if candidate_layers is not None:
+        return [
+            layers for layers in candidate_layers
+            if initial_layers < layers <= max_layers
+        ]
     return list(range(initial_layers + 2, max_layers + 1, 2))
+
+
+def _parse_candidate_layers(
+    value: Optional[str],
+    *,
+    initial_layers: int,
+    max_layers: int,
+) -> Optional[List[int]]:
+    """Validate an optional strictly increasing coarse layer ladder."""
+    if value is None:
+        return None
+    try:
+        layers = [int(item.strip()) for item in value.split(",")]
+    except ValueError as error:
+        raise ValueError(
+            "candidate layers must be comma-separated integers"
+        ) from error
+    if not layers or any(layer % 2 for layer in layers):
+        raise ValueError("candidate layers must be non-empty and even")
+    if layers != sorted(set(layers)):
+        raise ValueError(
+            "candidate layers must be unique and strictly increasing"
+        )
+    if any(
+        layer <= initial_layers or layer > max_layers
+        for layer in layers
+    ):
+        raise ValueError(
+            "candidate layers must be above the initial layer count "
+            "and at or below max layers"
+        )
+    return layers
+
+
+def _backfill_candidates(
+    failed_layers: int,
+    accepted_layers: int,
+) -> List[int]:
+    """Return untested even layers between a failure and coarse success."""
+    return list(range(failed_layers + 2, accepted_layers, 2))
 
 
 def _artifact_from_journal(journal: Dict[str, Any], key: str) -> Path:
@@ -346,6 +392,14 @@ def main() -> None:
     parser.add_argument("--max-iterations", type=int, default=240)
     parser.add_argument("--max-layers", type=int, default=20)
     parser.add_argument(
+        "--candidate-layers",
+        help=(
+            "Comma-separated coarse expansion ladder; after its first "
+            "success, untested even layers above the last failure are "
+            "backfilled to preserve the lowest-layer result"
+        ),
+    )
+    parser.add_argument(
         "--retry-initial",
         action="store_true",
         help=(
@@ -370,6 +424,7 @@ def main() -> None:
         "started": datetime.now().isoformat(timespec="seconds"),
         "candidate_max_iterations": args.max_iterations,
         "max_layers": args.max_layers,
+        "candidate_layers": args.candidate_layers,
         "retry_initial": args.retry_initial,
         "drc_error_target": args.drc_error_target,
         "runs": [],
@@ -387,6 +442,13 @@ def main() -> None:
     initial_layers = int(
         re.search(r"Backplane-(\d+)L", initial["run_name"]).group(1)
     )
+    candidate_layers = _parse_candidate_layers(
+        args.candidate_layers,
+        initial_layers=initial_layers,
+        max_layers=args.max_layers,
+    )
+    state["candidate_layers"] = candidate_layers
+    _atomic_json(state_path, state)
     initial_qualification = _qualify_candidate(
         repo_root,
         args.results_dir,
@@ -442,8 +504,13 @@ def main() -> None:
             selected = (initial_layers, retry)
 
     candidates = _remaining_candidates(
-        initial_layers, selected, args.max_layers
+        initial_layers,
+        selected,
+        args.max_layers,
+        candidate_layers=candidate_layers,
     )
+    last_failed_layers = initial_layers
+    coarse_success_layers: Optional[int] = None
     for layer_count in candidates:
         state["status"] = f"routing_{layer_count}L"
         _atomic_json(state_path, state)
@@ -480,7 +547,50 @@ def main() -> None:
         if qualification["accepted"]:
             if selected is None or layer_count < selected[0]:
                 selected = (layer_count, journal)
+            coarse_success_layers = layer_count
             break
+        last_failed_layers = layer_count
+
+    if (
+        selected is not None
+        and coarse_success_layers is not None
+        and candidate_layers is not None
+    ):
+        for layer_count in _backfill_candidates(
+            last_failed_layers,
+            coarse_success_layers,
+        ):
+            state["status"] = f"backfilling_{layer_count}L"
+            _atomic_json(state_path, state)
+            progress, journal = _run_candidate(
+                repo_root,
+                args.results_dir,
+                layer_count,
+                args.max_iterations,
+                state,
+                state_path,
+            )
+            qualification = _qualify_candidate(
+                repo_root,
+                args.results_dir,
+                args.source_board,
+                layer_count,
+                journal,
+                args.drc_error_target,
+            )
+            state["runs"].append({
+                "layers": layer_count,
+                "progress": str(progress),
+                "status": journal.get("status"),
+                "complete": qualification["strict_complete"],
+                "accepted": qualification["accepted"],
+                "qualification": qualification,
+                "reason": "minimum_layer_backfill",
+            })
+            _refresh_comparison(repo_root, args.results_dir)
+            if qualification["accepted"]:
+                selected = (layer_count, journal)
+                break
 
     if selected is None:
         state["status"] = "no_practical_candidate"
