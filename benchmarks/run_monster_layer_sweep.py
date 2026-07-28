@@ -71,6 +71,7 @@ def _run_candidate(
     source_board: Path,
     layer_count: int,
     max_iterations: int,
+    layer_depth_bias: float,
     state: Dict[str, Any],
     state_path: Path,
 ) -> Tuple[Path, Dict[str, Any]]:
@@ -85,7 +86,7 @@ def _run_candidate(
         "ORTHO_FAB_PROFILE": "pcbway_advanced_hdi",
         "ORTHO_DIRECTION_MODE": "guided",
         "ORTHO_WRONG_WAY_MULTIPLIER": "4",
-        "ORTHO_LAYER_DEPTH_BIAS": "0.02",
+        "ORTHO_LAYER_DEPTH_BIAS": str(layer_depth_bias),
         "ORTHO_HDI_STACK": "pcbway_mechanical",
         "ORTHO_GRID_PITCH": "0.4",
         "ORTHO_SOURCE_BOARD": str(source_board.resolve()),
@@ -395,6 +396,15 @@ def main() -> None:
     parser.add_argument("--max-iterations", type=int, default=240)
     parser.add_argument("--max-layers", type=int, default=20)
     parser.add_argument(
+        "--layer-depth-bias",
+        type=float,
+        default=0.02,
+        help=(
+            "Monotonic cost added per deeper layer; use zero when testing "
+            "whether depth packing constrains a minimum-layer candidate"
+        ),
+    )
+    parser.add_argument(
         "--candidate-layers",
         help=(
             "Comma-separated coarse expansion ladder; after its first "
@@ -428,6 +438,7 @@ def main() -> None:
         "candidate_max_iterations": args.max_iterations,
         "max_layers": args.max_layers,
         "candidate_layers": args.candidate_layers,
+        "layer_depth_bias": args.layer_depth_bias,
         "retry_initial": args.retry_initial,
         "drc_error_target": args.drc_error_target,
         "runs": [],
@@ -483,6 +494,7 @@ def main() -> None:
             args.source_board,
             initial_layers,
             args.max_iterations,
+            args.layer_depth_bias,
             state,
             state_path,
         )
@@ -524,6 +536,7 @@ def main() -> None:
             args.source_board,
             layer_count,
             args.max_iterations,
+            args.layer_depth_bias,
             state,
             state_path,
         )
@@ -573,6 +586,7 @@ def main() -> None:
                 args.source_board,
                 layer_count,
                 args.max_iterations,
+                args.layer_depth_bias,
                 state,
                 state_path,
             )
