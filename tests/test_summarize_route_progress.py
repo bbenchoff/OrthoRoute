@@ -54,6 +54,7 @@ def test_comparison_row_records_where_each_minimum_occurred():
                 "iteration": 1,
                 "routed_nets": 8192,
                 "overuse_total": 20,
+                "negotiated_overuse_total": 60,
                 "barrel_conflicts": 50,
                 "path_node_conflicts": 40,
                 "pres_fac": 1.0,
@@ -62,6 +63,7 @@ def test_comparison_row_records_where_each_minimum_occurred():
                 "iteration": 2,
                 "routed_nets": 8192,
                 "overuse_total": 10,
+                "negotiated_overuse_total": 40,
                 "barrel_conflicts": 60,
                 "path_node_conflicts": 30,
                 "pres_fac": 2.0,
@@ -73,6 +75,10 @@ def test_comparison_row_records_where_each_minimum_occurred():
 
     assert row["best_overuse"] == 10
     assert row["best_overuse_iteration"] == 2
+    assert row["initial_negotiated_overuse"] == 60
+    assert row["best_negotiated_overuse"] == 40
+    assert row["best_negotiated_overuse_iteration"] == 2
+    assert row["final_negotiated_overuse"] == 40
     assert row["best_physical"] == 50
     assert row["best_physical_iteration"] == 1
     assert row["best_path_nodes"] == 30
