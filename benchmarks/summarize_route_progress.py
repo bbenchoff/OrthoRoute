@@ -1066,7 +1066,7 @@ def _latest_hotset_policy_snapshot(
         )
         rows = []
         phase = 0
-        previous_hotset = None
+        previous_policy = None
         for previous, current in zip(iterations, iterations[1:]):
             if (
                 "hotset_size" not in current
@@ -1077,9 +1077,14 @@ def _latest_hotset_policy_snapshot(
             ):
                 continue
             hotset = int(current["hotset_size"])
-            if hotset != previous_hotset:
+            pres_fac = float(current.get("pres_fac", 0.0))
+            pressure_tier = 64
+            while pressure_tier < pres_fac:
+                pressure_tier *= 2
+            policy = (hotset, pressure_tier)
+            if policy != previous_policy:
                 phase += 1
-                previous_hotset = hotset
+                previous_policy = policy
             elapsed = max(
                 0.0,
                 float(current["elapsed_seconds"])
@@ -1112,6 +1117,7 @@ def _latest_hotset_policy_snapshot(
                 "iteration": int(current["iteration"]),
                 "hotset_size": hotset,
                 "hotset_cap": int(current.get("hotset_cap", hotset)),
+                "pressure_tier": pressure_tier,
                 "elapsed_seconds": round(elapsed, 3),
                 "overuse_before": before,
                 "overuse_after": after,
@@ -1251,6 +1257,7 @@ def _latest_hotset_policy_snapshot(
                 ),
                 "passes": len(phase_rows),
                 "hotset_size": first["hotset_size"],
+                "pressure_tier": first["pressure_tier"],
                 "elapsed_seconds": round(elapsed, 3),
                 "overuse_before": first["overuse_before"],
                 "overuse_after": last["overuse_after"],
@@ -1372,6 +1379,7 @@ def _write_hotset_policy_markdown(
 ) -> None:
     phase_columns = (
         "phase", "iterations", "passes", "hotset_size",
+        "pressure_tier",
         "elapsed_seconds", "overuse_before", "overuse_after",
         "overuse_drop", "drop_per_pass",
         "required_drop_per_remaining_pass", "linear_pace_ratio",
