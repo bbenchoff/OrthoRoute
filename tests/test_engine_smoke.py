@@ -1369,32 +1369,32 @@ def test_rolling_progress_detects_tiny_new_minima():
 def test_rate_plateau_temporarily_expands_severe_hotset():
     router = object.__new__(PathFinderRouter)
     router.config = PathFinderConfig()
+    # Simulate the 8,192-net board's normal 20% auto-derived ceiling. Plateau
+    # recovery has its own bounded ceiling and must not be clipped by this.
+    router.config.hotset_cap = 1_638
     router.iteration = 20
     router._hotset_rate_boost_until = 25
     router._slow_progress_event_count = 1
 
     assert router._effective_history_hotset_cap(75_000) == 512
+    assert router._bounded_history_hotset_cap(75_000) == 512
     assert router._effective_history_hotset_cap(2_000) == 100
 
     router._slow_progress_event_count = 2
     assert router._effective_history_hotset_cap(75_000) == 1024
-    assert min(
-        router.config.hotset_cap,
-        router._effective_history_hotset_cap(75_000),
-    ) == 1024
+    assert router._bounded_history_hotset_cap(75_000) == 1024
 
     router._slow_progress_event_count = 3
     assert router._effective_history_hotset_cap(75_000) == 2048
-    assert min(
-        router.config.hotset_cap,
-        router._effective_history_hotset_cap(75_000),
-    ) == 2048
+    assert router._bounded_history_hotset_cap(75_000) == 2048
 
     router._slow_progress_event_count = 4
     assert router._effective_history_hotset_cap(75_000) == 2048
+    assert router._bounded_history_hotset_cap(75_000) == 2048
 
     router.iteration = 26
     assert router._effective_history_hotset_cap(75_000) == 256
+    assert router._bounded_history_hotset_cap(75_000) == 256
 
 
 def test_pressure_schedule_scales_with_bounded_reroute_work():
