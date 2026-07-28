@@ -1233,6 +1233,61 @@ def test_history_hotset_cap_scales_with_live_overuse():
     assert cap(33) == 64
     assert cap(128) == 64
     assert cap(129) == 100
+    assert cap(2_048) == 100
+    assert cap(2_049) == 180
+    assert cap(16_384) == 180
+    assert cap(16_385) == 256
+    assert cap(100_000) == 256
+
+
+def test_hotset_exploration_shrinks_during_severe_congestion():
+    fraction = PathFinderRouter._hotset_exploration_fraction
+
+    assert fraction(128) == pytest.approx(0.40)
+    assert fraction(2_048) == pytest.approx(0.40)
+    assert fraction(2_049) == pytest.approx(0.25)
+    assert fraction(16_384) == pytest.approx(0.25)
+    assert fraction(16_385) == pytest.approx(0.15)
+
+
+def test_conflict_aware_hotset_moves_only_one_side_per_wave():
+    import random
+
+    ranked = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    conflict_pairs = {
+        ("A", "B"),
+        ("A", "C"),
+        ("D", "E"),
+    }
+
+    selected = PathFinderRouter._select_conflict_aware_hotset(
+        ranked,
+        conflict_pairs,
+        cap=4,
+        exploration_fraction=0.25,
+        rng=random.Random(42),
+    )
+
+    assert len(selected) == 4
+    assert {"A", "D", "F"}.issubset(selected)
+    assert not any(
+        first in selected and second in selected
+        for first, second in conflict_pairs
+    )
+
+
+def test_conflict_aware_hotset_keeps_edge_only_offenders_eligible():
+    import random
+
+    selected = PathFinderRouter._select_conflict_aware_hotset(
+        ["A", "B", "EDGE_1", "EDGE_2"],
+        {("A", "B")},
+        cap=3,
+        exploration_fraction=0.0,
+        rng=random.Random(42),
+    )
+
+    assert selected == ["A", "EDGE_1", "EDGE_2"]
 
 
 def test_initial_net_order_is_reproducible_across_global_rng_state():

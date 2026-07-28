@@ -68,6 +68,7 @@ def _latest_progress(results_dir: Path, layer_count: int) -> Optional[Path]:
 def _run_candidate(
     repo_root: Path,
     results_dir: Path,
+    source_board: Path,
     layer_count: int,
     max_iterations: int,
     state: Dict[str, Any],
@@ -87,6 +88,8 @@ def _run_candidate(
         "ORTHO_LAYER_DEPTH_BIAS": "0.02",
         "ORTHO_HDI_STACK": "pcbway_mechanical",
         "ORTHO_GRID_PITCH": "0.4",
+        "ORTHO_SOURCE_BOARD": str(source_board.resolve()),
+        "ORTHO_OUTPUT_DIR": str(results_dir.resolve()),
     })
     stdout_path = (
         repo_root / "benchmarks" / "results"
@@ -477,6 +480,7 @@ def main() -> None:
         progress, retry = _run_candidate(
             repo_root,
             args.results_dir,
+            args.source_board,
             initial_layers,
             args.max_iterations,
             state,
@@ -517,6 +521,7 @@ def main() -> None:
         progress, journal = _run_candidate(
             repo_root,
             args.results_dir,
+            args.source_board,
             layer_count,
             args.max_iterations,
             state,
@@ -565,6 +570,7 @@ def main() -> None:
             progress, journal = _run_candidate(
                 repo_root,
                 args.results_dir,
+                args.source_board,
                 layer_count,
                 args.max_iterations,
                 state,

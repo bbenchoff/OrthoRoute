@@ -189,3 +189,6 @@ orthoroute_debug.log.*
 
 # Benchmark outputs
 benchmarks/results/
+!benchmarks/results/
+benchmarks/results/*
+!benchmarks/results/monster_full_route.py
