@@ -96,6 +96,8 @@ if hdi_stack_mode:
     run_tags.append(f"HDI-{hdi_stack_mode}")
 if grid_pitch != 0.4:
     run_tags.append(f"GRID-{grid_pitch:g}")
+if warm_start_paths_value:
+    run_tags.append("PEEL")
 tag = f"-{'-'.join(run_tags)}" if run_tags else ""
 run_layers = diagnostic_layer_limit or 32
 run_name = f"Backplane-{run_layers}L{tag}-{stamp}"
