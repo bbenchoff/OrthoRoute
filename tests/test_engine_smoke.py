@@ -1414,6 +1414,15 @@ def test_physical_cleanup_pauses_when_graph_reopens():
     assert not should_cleanup(0, 0, True, 3)
 
 
+def test_clean_gate_includes_capacity_one_path_nodes():
+    clean = PathFinderRouter._all_negotiated_resources_clean
+
+    assert clean(0, 0)
+    assert not clean(0, 5)
+    assert not clean(1, 0)
+    assert not clean(1, 5)
+
+
 def test_history_hotset_cap_scales_with_live_overuse():
     cap = PathFinderRouter._history_hotset_cap
 

@@ -6029,6 +6029,12 @@ class PathFinderRouter:
                 path_node_overuse_count
             )
             negotiated_overuse = over_sum + path_node_overuse
+            negotiated_resources_clean = (
+                self._all_negotiated_resources_clean(
+                    over_sum,
+                    path_node_overuse,
+                )
+            )
             physical_cleanup_threshold = int(getattr(
                 cfg,
                 "portal_cleanup_edge_threshold",
@@ -6550,12 +6556,16 @@ class PathFinderRouter:
                             # Reset if no longer jammed
                             self._layer_jam_tracker = {'layer': None, 'count': 0, 'boost_until': 0}
 
-            # Clean-phase: if overuse==0, freeze good nets and finish stragglers
-            if over_sum == 0:
+            # Clean-phase starts only after every negotiated resource is
+            # clean. Edge-only cleanliness can still leave path-node
+            # conflicts, and treating that state as complete queues the broad
+            # physical offender set before one-sided cleanup is safe.
+            if negotiated_resources_clean:
                 unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
                 if not unrouted:
                     logger.info(
-                        "[CLEAN] All nets routed with zero edge overuse; "
+                        "[CLEAN] All nets routed with zero negotiated "
+                        "resource overuse; "
                         "continuing to the barrel audit"
                     )
                 # Freeze placed nets and lower pressure for stragglers
@@ -6647,9 +6657,9 @@ class PathFinderRouter:
                     logger.warning(f"[ITER {it}] Iteration callback failed: {e}")
 
             # STEP 6: Terminate?
-            if failed == 0 and over_sum == 0:
-                # A zero edge-overuse state is rare and worth a fresh audit;
-                # never trust a skipped/stale barrel count for export.
+            if failed == 0 and negotiated_resources_clean:
+                # A fully clean negotiated state is rare and worth a fresh
+                # audit; never trust a skipped/stale barrel count for export.
                 self._rebuild_node_owner()
                 _, barrel_conflicts = self._detect_barrel_conflicts()
                 self._last_barrel_conflict_count = barrel_conflicts
@@ -6669,11 +6679,16 @@ class PathFinderRouter:
 
                 # Check barrel conflicts before declaring full convergence
                 if barrel_conflicts > 0:
-                    logger.warning(f"[CONVERGENCE] Edge overuse=0 but {barrel_conflicts} barrel conflicts remain")
-                    logger.warning(f"[CONVERGENCE] Continuing to iteration {it+1} to resolve barrel conflicts...")
-                    self._last_ripped = set(
-                        getattr(self, "_barrel_conflict_nets", ())
+                    logger.warning(
+                        "[CONVERGENCE] Negotiated overuse=0 but %d "
+                        "physical conflicts remain",
+                        barrel_conflicts,
                     )
+                    logger.warning(f"[CONVERGENCE] Continuing to iteration {it+1} to resolve barrel conflicts...")
+                    # The staged cleanup block above has already selected a
+                    # one-sided movable set. Do not overwrite it with every
+                    # physical offender: moving both peers recreates shorts
+                    # and bypasses the complete-resource cleanup gate.
                 else:
                     # TRUE convergence: zero edge overuse AND zero barrel conflicts
                     logger.info("[COLLISION] 0 edges over capacity ✓ PERFECT!")
@@ -9667,6 +9682,17 @@ class PathFinderRouter:
             physical_conflicts > 0
             and overused_edges <= max(0, int(edge_threshold))
             and overuse_total <= max(0, int(edge_threshold))
+        )
+
+    @staticmethod
+    def _all_negotiated_resources_clean(
+        edge_overuse: int,
+        path_node_overuse: int,
+    ) -> bool:
+        """Return true only when both negotiated resource systems are clean."""
+        return (
+            int(edge_overuse) == 0
+            and int(path_node_overuse) == 0
         )
 
     def _portal_cleanup_movable_components(
