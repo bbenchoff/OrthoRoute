@@ -177,6 +177,41 @@ def test_selected_portals_match_path_and_emitted_stubs(routed):
     assert portal_points <= stub_points
 
 
+def test_routing_state_snapshot_is_independent_and_restorable(routed):
+    """Long negotiation must preserve an earlier, better export state."""
+    pf, _, _, _ = routed
+    net_id = "TEST_NET"
+    live_path = list(pf.net_paths[net_id])
+    live_portal_y = pf.net_selected_portals[net_id][0].y_idx
+
+    mutated_snapshot = pf._capture_routing_state()
+    mutated_snapshot["paths"][net_id][0] = -1
+    mutated_snapshot["selected_portals"][net_id][0].y_idx += 1
+    assert pf.net_paths[net_id] == live_path
+    assert pf.net_selected_portals[net_id][0].y_idx == live_portal_y
+
+    clean_snapshot = pf._capture_routing_state()
+    expected_edges = pf._path_to_edges(
+        pf._path_without_dynamic_escape_chains(net_id, live_path)
+    )
+    pf.net_paths.clear()
+    pf.net_selected_portals.clear()
+    pf.net_portal_layers.clear()
+    pf.accounting.canonical.clear()
+    pf.accounting.present.fill(0)
+    pf._net_to_edges.clear()
+    pf._edge_to_nets.clear()
+
+    pf._restore_routing_state(clean_snapshot)
+
+    assert pf.net_paths[net_id] == live_path
+    assert pf.net_selected_portals[net_id][0].y_idx == live_portal_y
+    assert pf._net_to_edges[net_id] == expected_edges
+    assert pf.accounting.verify_present_matches_canonical()
+    for edge_idx in expected_edges:
+        assert pf.accounting.canonical[edge_idx] >= 1
+
+
 def test_selected_escape_geometry_is_physically_conflict_free(routed):
     pf, _, _, _ = routed
     pf._rebuild_escape_occupancy()
