@@ -328,6 +328,7 @@ def test_stagnation_recovery_rotates_victims_within_one_best_basin():
     ) == {"NODE_NET"}
 
     pf._stagnation_victim_history = set()
+    pf._stagnation_victim_cursor = 0
     wider_scores = scores + [(1.0, "THIRD_NET")]
     assert UnifiedPathFinder._select_stagnation_victims(
         pf, wider_scores, 2
@@ -342,6 +343,29 @@ def test_stagnation_recovery_rotates_victims_within_one_best_basin():
     assert UnifiedPathFinder._select_stagnation_victims(
         pf, scores, 1
     ) == {"NODE_NET"}
+
+
+def test_stagnation_recovery_does_not_alternate_two_nearly_full_sets():
+    class RecoveryFixture:
+        pass
+
+    pf = RecoveryFixture()
+    pf._stagnation_victim_history = set()
+    pf._stagnation_victim_cursor = 0
+    scores = [
+        (float(23 - index), f"NET_{index:02d}")
+        for index in range(23)
+    ]
+
+    waves = [
+        UnifiedPathFinder._select_stagnation_victims(
+            pf, scores, 20
+        )
+        for _ in range(5)
+    ]
+
+    assert len({frozenset(wave) for wave in waves}) == 5
+    assert all(len(wave) == 20 for wave in waves)
 
 
 def test_selected_escape_geometry_is_physically_conflict_free(routed):

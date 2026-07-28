@@ -2619,6 +2619,7 @@ class PathFinderRouter:
         self._last_ripped: Set[str] = set()
         self._last_stagnation_victims: Tuple[str, ...] = ()
         self._stagnation_victim_history: Set[str] = set()
+        self._stagnation_victim_cursor: int = 0
         self._freeze_pres_fac_until: int = 0
 
         # Connectivity check cache (optimization to avoid redundant BFS checks)
@@ -6278,6 +6279,7 @@ class PathFinderRouter:
                 # untried high-impact victims instead of deterministically
                 # ripping the same top-k nets after every rollback.
                 self._stagnation_victim_history = set()
+                self._stagnation_victim_cursor = 0
 
             # A monster route that improves by only a few units per pass is
             # operationally plateaued even though the strict best-value
@@ -9132,29 +9134,29 @@ class PathFinderRouter:
         scores: Sequence[Tuple[float, str]],
         k: int,
     ) -> Set[str]:
-        """Select the next untried recovery wave around one retained best."""
-        prior_victims = getattr(
-            self, "_stagnation_victim_history", set()
-        )
-        untried = [
-            net_id for _, net_id in scores
-            if net_id not in prior_victims
+        """Rotate a fixed-width recovery window around one retained best."""
+        ranked = [net_id for _, net_id in scores]
+        if not ranked or k <= 0:
+            return set()
+
+        # A cleared history denotes a newly retained best basin (and remains
+        # useful to lightweight test fixtures that do not run __init__).
+        if not getattr(self, "_stagnation_victim_history", set()):
+            self._stagnation_victim_cursor = 0
+
+        count = min(int(k), len(ranked))
+        start = int(getattr(
+            self, "_stagnation_victim_cursor", 0
+        )) % len(ranked)
+        selected = [
+            ranked[(start + offset) % len(ranked)]
+            for offset in range(count)
         ]
-        selected = list(untried[:k])
-        if len(selected) < k:
-            # Finish the tail of the current cycle before reusing the
-            # highest-ranked victims at the start of the next one.
-            prior_victims = set()
-            for _, net_id in scores:
-                if net_id in selected:
-                    continue
-                selected.append(net_id)
-                if len(selected) >= k:
-                    break
+        self._stagnation_victim_cursor = (
+            start + count
+        ) % len(ranked)
         victims = set(selected)
-        self._stagnation_victim_history = (
-            prior_victims | victims
-        )
+        self._stagnation_victim_history = victims
         return victims
 
     def _apply_portal_discount(self):
