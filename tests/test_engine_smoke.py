@@ -278,6 +278,11 @@ def test_columnar_connectors_use_zero_conflict_dynamic_entries():
     config.clearance = 0.1016
     config.via_diameter = 0.4
     config.via_drill = 0.15
+    # Keep this portal-seed test focused on multiple H entry depths. Demand-
+    # aware defaults are covered separately in test_board_analyzer.py.
+    config.preferred_layer_directions = [
+        "v", "h", "v", "h", "v", "h",
+    ]
     pf = UnifiedPathFinder(config=config, use_gpu=False)
 
     pf.initialize_graph(board)
@@ -1198,6 +1203,39 @@ def test_historical_only_edges_do_not_make_clean_nets_offenders():
     })
 
     assert hotset == {"LIVE"}
+
+
+def test_path_node_offenders_negotiate_while_edges_are_overused():
+    """Capacity-one nodes must not wait for edge cleanup to enter hotsets."""
+    router = object.__new__(PathFinderRouter)
+    router.config = PathFinderConfig()
+    router.iteration = 2
+    router.net_paths = {
+        "EDGE": [0, 1],
+        "NODE_ONLY": [2, 3],
+    }
+    router._net_to_edges = {
+        "EDGE": [0],
+        "NODE_ONLY": [1],
+    }
+    router._edge_to_nets = {
+        0: {"EDGE"},
+        1: {"NODE_ONLY"},
+    }
+    router._path_node_conflict_scores = {"NODE_ONLY": 7}
+    router.accounting = type("Accounting", (), {
+        "use_gpu": False,
+        "present": np.array([2.0, 1.0], dtype=np.float32),
+        "capacity": np.ones(2, dtype=np.float32),
+        "compute_overuse": lambda self, router_instance=None: (1, 1),
+    })()
+
+    hotset = router._build_hotset({
+        "EDGE": (0, 1),
+        "NODE_ONLY": (2, 3),
+    })
+
+    assert hotset == {"EDGE", "NODE_ONLY"}
 
 
 def test_stagnation_rip_waits_for_spatial_via_tail():

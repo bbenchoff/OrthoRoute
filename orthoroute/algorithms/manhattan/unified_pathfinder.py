@@ -511,7 +511,11 @@ except ImportError:
 from .pathfinder.config import PAD_CLEARANCE_MM
 from .pad_escape_planner import PadEscapePlanner, Portal
 from .hdi_stack import HDIStack, canonical_pair
-from .board_analyzer import analyze_board_characteristics, BoardCharacteristics
+from .board_analyzer import (
+    analyze_board_characteristics,
+    BoardCharacteristics,
+    preferred_layer_directions_for_board,
+)
 from .parameter_derivation import derive_routing_parameters, apply_derived_parameters, DerivedRoutingParameters
 from .pathfinder.via_kernels import ViaKernelManager, convert_via_metadata_to_gpu, ensure_gpu_array
 
@@ -2685,13 +2689,35 @@ class PathFinderRouter:
                 hdi_stack.core_pair,
             )
 
+        preferred_layer_directions = (
+            self.config.preferred_layer_directions
+        )
+        if preferred_layer_directions is None:
+            (
+                preferred_layer_directions,
+                h_layers,
+                v_layers,
+                demand_h_pct,
+            ) = preferred_layer_directions_for_board(
+                board,
+                self.config.layer_count,
+            )
+            logger.info(
+                "[LAYER-DIRECTIONS] Demand-aware graph assignment: "
+                "%d H / %d V internal layers for %.1f%% H demand "
+                "(H=%s, V=%s)",
+                len(h_layers),
+                len(v_layers),
+                demand_h_pct * 100.0,
+                sorted(h_layers),
+                sorted(v_layers),
+            )
+
         self.lattice = Lattice3D(
             bounds,
             self.config.grid_pitch,
             self.config.layer_count,
-            preferred_layer_directions=getattr(
-                self.config, "preferred_layer_directions", None
-            ),
+            preferred_layer_directions=preferred_layer_directions,
             wrong_way_cost_multiplier=getattr(
                 self.config,
                 "wrong_way_cost_multiplier",
@@ -7780,9 +7806,26 @@ class PathFinderRouter:
         # complete historical cost field.
         over_idx = set(map(int, np.flatnonzero(over > 0)))
         via_pool_offenders = self._find_via_pool_offenders()
+        path_node_scores = {
+            net_id: int(score)
+            for net_id, score in getattr(
+                self, "_path_node_conflict_scores", {}
+            ).items()
+            if net_id in tasks and int(score) > 0
+        }
+        path_node_offenders = set(path_node_scores)
+        path_node_overuse = 0
+        if hasattr(self, "path_node_use"):
+            path_node_overuse = int(np.maximum(
+                0,
+                np.asarray(self.path_node_use) - 1,
+            ).sum())
         total_overuse_with_vias = self.accounting.compute_overuse(
             router_instance=self
         )[0]
+        total_negotiated_overuse = (
+            total_overuse_with_vias + path_node_overuse
+        )
         cleanup_threshold = int(getattr(
             self.config,
             "portal_cleanup_edge_threshold",
@@ -7809,6 +7852,19 @@ class PathFinderRouter:
                 | via_pool_offenders
                 | physical_offenders
             )
+            node_cap = min(
+                int(self.config.hotset_cap),
+                self._history_hotset_cap(total_negotiated_overuse),
+            )
+            hotset.update(
+                sorted(
+                    path_node_offenders,
+                    key=lambda net_id: (
+                        -path_node_scores[net_id],
+                        str(net_id),
+                    ),
+                )[:node_cap]
+            )
             logger.info(
                 f"[HOTSET] no-edge-overuse; unrouted={len(unrouted)} "
                 f"ripped={len(ripped)} via_pool={len(via_pool_offenders)} "
@@ -7821,6 +7877,10 @@ class PathFinderRouter:
         offenders = set()
         for ei in over_idx:
             offenders.update(self._edge_to_nets.get(ei, set()))
+        # Guided H/V routing can cross at a capacity-one lattice node without
+        # sharing an edge. Negotiate those node-only offenders concurrently
+        # with edge congestion instead of deferring them to final cleanup.
+        offenders.update(path_node_offenders)
 
         # Update clean iteration counters
         for net_id in tasks.keys():
@@ -7848,9 +7908,14 @@ class PathFinderRouter:
         # Score offenders by total overuse they contribute
         scores = []
         for net_id in offenders:
+            impact = float(path_node_scores.get(net_id, 0))
             if net_id in self._net_to_edges:
-                impact = sum(float(over[ei]) for ei in self._net_to_edges[net_id] if ei in over_idx)
-                scores.append((impact, net_id))
+                impact += sum(
+                    float(over[ei])
+                    for ei in self._net_to_edges[net_id]
+                    if ei in over_idx
+                )
+            scores.append((impact, net_id))
 
         # Add unrouted with low priority
         for net_id in unrouted:
@@ -7882,7 +7947,7 @@ class PathFinderRouter:
         # hundreds of new via collisions. Exact physical offenders and
         # unrouted nets still bypass this cap below.
         base_target = self._history_hotset_cap(
-            total_overuse_with_vias
+            total_negotiated_overuse
         )
 
         self._prev_overuse_for_hotset = total_overuse
@@ -9102,6 +9167,7 @@ class PathFinderRouter:
         self._escape_conflict_pairs = set()
         self._exact_barrel_pairs = set()
         self._path_node_conflict_pairs = set()
+        self._path_node_conflict_scores = {}
         self._physical_conflict_scores = defaultdict(int)
         self._last_exact_barrel_details = []
 
@@ -9317,6 +9383,7 @@ class PathFinderRouter:
             path_node_scores,
         ) = self._detect_path_node_conflicts()
         self._path_node_conflict_pairs = set(path_node_pairs)
+        self._path_node_conflict_scores = dict(path_node_scores)
         self._last_path_node_conflict_count = len(shared_path_nodes)
         if shared_path_nodes:
             for net_name, score in path_node_scores.items():
