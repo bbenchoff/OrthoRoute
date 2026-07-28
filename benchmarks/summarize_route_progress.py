@@ -530,7 +530,7 @@ def _write_stall_svg(
 ) -> None:
     width, height = 1200, 820
     plot_x, plot_y, plot_width, plot_height = 110, 120, 980, 540
-    layer_values = [14, 16, 18, 20]
+    layer_values = [14, 16, 18, 20, 24, 28, 32]
     if rows:
         layer_values.extend(int(row["layers"]) for row in rows)
     min_layer = min(layer_values)
@@ -625,11 +625,18 @@ def _write_stall_svg(
                 'stroke-width="3"/>'
             )
         weight = "bold" if selected_point else "normal"
+        state = (
+            "stall" if row["eligible_for_fit"] else "live best"
+        )
+        short_label = (
+            f"{row['layers']}L {str(row['git_sha'])[:7]} "
+            f"{state}: {value:,}"
+        )
+        label_y = y - 10 - (index % 4) * 18
         svg.append(
-            f'<text x="{x + 10:.1f}" y="{y - 9:.1f}" '
+            f'<text x="{x + 10:.1f}" y="{label_y:.1f}" '
             f'font-family="sans-serif" font-size="11" '
-            f'font-weight="{weight}">{html.escape(str(row["run"]))}: '
-            f'{value:,}</text>'
+            f'font-weight="{weight}">{html.escape(short_label)}</text>'
         )
     if fit is None:
         fit_text = (
