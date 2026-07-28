@@ -405,6 +405,12 @@ def test_hotset_policy_splits_equal_hotsets_at_pressure_tiers():
                 "hotset_size": 1024,
                 "hotset_cap": 1024,
                 "pres_fac": pressure,
+                "adaptive_pressure_limit": 512.0,
+                "pressure_trial_reference_ceiling": 256.0,
+                "pressure_trial_reference_fraction": 0.01,
+                "pressure_trial_underperform_count": 1,
+                "pressure_backoff_count": 0,
+                "pressure_rejected_ceiling": None,
             })
         run["iterations"].append(row)
 
@@ -419,3 +425,8 @@ def test_hotset_policy_splits_equal_hotsets_at_pressure_tiers():
         ("4-5", 256),
         ("6-6", 512),
     ]
+    last = snapshot["rows"][-1]
+    assert last["adaptive_pressure_limit"] == 512.0
+    assert last["pressure_trial_reference_ceiling"] == 256.0
+    assert last["pressure_trial_reference_fraction"] == 1.0
+    assert last["pressure_trial_underperform_count"] == 1

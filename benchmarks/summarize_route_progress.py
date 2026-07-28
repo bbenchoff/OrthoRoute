@@ -1153,6 +1153,55 @@ def _latest_hotset_policy_snapshot(
                         4,
                     )
                 ),
+                "adaptive_pressure_limit": (
+                    ""
+                    if "adaptive_pressure_limit" not in current else
+                    round(
+                        float(current["adaptive_pressure_limit"]),
+                        6,
+                    )
+                ),
+                "pressure_trial_reference_ceiling": (
+                    ""
+                    if current.get(
+                        "pressure_trial_reference_ceiling"
+                    ) is None else
+                    round(
+                        float(current[
+                            "pressure_trial_reference_ceiling"
+                        ]),
+                        6,
+                    )
+                ),
+                "pressure_trial_reference_fraction": (
+                    ""
+                    if current.get(
+                        "pressure_trial_reference_fraction"
+                    ) is None else
+                    round(
+                        100.0 * float(current[
+                            "pressure_trial_reference_fraction"
+                        ]),
+                        4,
+                    )
+                ),
+                "pressure_trial_underperform_count": int(
+                    current.get(
+                        "pressure_trial_underperform_count",
+                        0,
+                    )
+                ),
+                "pressure_backoff_count": int(
+                    current.get("pressure_backoff_count", 0)
+                ),
+                "pressure_rejected_ceiling": (
+                    ""
+                    if current.get("pressure_rejected_ceiling") is None else
+                    round(
+                        float(current["pressure_rejected_ceiling"]),
+                        6,
+                    )
+                ),
                 "rate_boost_until": int(
                     current.get("hotset_rate_boost_until", 0)
                 ),
@@ -1399,6 +1448,11 @@ def _write_hotset_policy_markdown(
         "drop_per_second", "required_drop_per_remaining_pass",
         "edge_via_drop", "node_drop",
         "pres_fac", "slow_progress_fraction",
+        "adaptive_pressure_limit",
+        "pressure_trial_reference_ceiling",
+        "pressure_trial_reference_fraction",
+        "pressure_trial_underperform_count",
+        "pressure_backoff_count", "pressure_rejected_ceiling",
         "conflict_pair_count", "conflict_pairs_covered",
         "conflict_pair_coverage_pct",
         "escape_conflicts", "portal_grid_conflicts",
