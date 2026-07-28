@@ -5987,23 +5987,23 @@ class PathFinderRouter:
 
             # Store barrel conflict count for iteration summary
             self._last_barrel_conflict_count = conflict_count
-            previous_physical_conflicts = getattr(
-                self, "_previous_physical_conflict_count", None
-            )
-            if self._physical_cleanup_drop_detected(
-                previous_physical_conflicts,
-                conflict_count,
-            ):
-                self._physical_cleanup_started = True
-            self._previous_physical_conflict_count = conflict_count
             # Graph congestion and exact physical conflicts require different
-            # cleanup schedules.  Measure graph overuse before deciding whether
-            # physical offenders may enter the next hotset: mixing hundreds of
-            # physical offenders into a still-congested graph pass can repair
-            # barrels by recreating ordinary edge collisions.
+            # cleanup schedules. Measure every negotiated graph resource before
+            # deciding whether physical offenders may enter the next hotset:
+            # mixing terminal cleanup into a route with shared path nodes can
+            # repair barrels by recreating graph collisions.
             over_sum, over_cnt = self.accounting.compute_overuse(
                 router_instance=self
             )
+            (
+                path_node_overuse,
+                path_node_overuse_count,
+            ) = self._compute_path_node_overuse()
+            self._last_path_node_overuse_total = path_node_overuse
+            self._last_path_node_overuse_count = (
+                path_node_overuse_count
+            )
+            negotiated_overuse = over_sum + path_node_overuse
             physical_cleanup_threshold = int(getattr(
                 cfg,
                 "portal_cleanup_edge_threshold",
@@ -6011,7 +6011,7 @@ class PathFinderRouter:
             ))
             physical_cleanup_ready = (
                 over_cnt <= physical_cleanup_threshold
-                and over_sum <= physical_cleanup_threshold
+                and negotiated_overuse <= physical_cleanup_threshold
             )
             for portal_key in getattr(
                 self, "_barrel_owner_portal_keys", ()
@@ -6085,15 +6085,6 @@ class PathFinderRouter:
             path_node_conflicts = getattr(
                 self, "_last_path_node_conflict_count", 0
             )
-            (
-                path_node_overuse,
-                path_node_overuse_count,
-            ) = self._compute_path_node_overuse()
-            self._last_path_node_overuse_total = path_node_overuse
-            self._last_path_node_overuse_count = (
-                path_node_overuse_count
-            )
-            negotiated_overuse = over_sum + path_node_overuse
             escape_conflicts = getattr(
                 self, "_last_escape_conflict_count", 0
             )
@@ -6101,10 +6092,10 @@ class PathFinderRouter:
                 self, "_last_portal_grid_conflict_count", 0
             )
 
-            # Once ordinary graph edges are clean, repair physical conflicts
-            # one side at a time while any tiny spatial-via pool tail keeps
-            # negotiating. Waiting for both total overuse and escape conflicts
-            # to vanish lets the two ends of a physical short move together.
+            # Once every negotiated graph resource is clean, repair physical
+            # conflicts one side at a time while a tiny complete-resource tail
+            # keeps negotiating. Waiting for physical conflicts themselves to
+            # vanish would let both ends of a short move together.
             if self._should_run_one_sided_cleanup(
                 barrel_conflicts,
                 over_cnt,
@@ -6114,7 +6105,7 @@ class PathFinderRouter:
                     "portal_cleanup_edge_threshold",
                     3,
                 )),
-                overuse_total=over_sum,
+                overuse_total=negotiated_overuse,
             ):
                 entering_cleanup = not getattr(
                     self, "_freeze_selected_portals", False
@@ -6198,7 +6189,7 @@ class PathFinderRouter:
                         "portal_cleanup_edge_threshold",
                         3,
                     ))
-                    or over_sum > int(getattr(
+                    or negotiated_overuse > int(getattr(
                         cfg,
                         "portal_cleanup_edge_threshold",
                         3,
@@ -8153,18 +8144,6 @@ class PathFinderRouter:
             ),
         )
 
-    @staticmethod
-    def _physical_cleanup_drop_detected(
-        previous_conflicts: Optional[int],
-        current_conflicts: int,
-        minimum_fraction: float = 0.25,
-    ) -> bool:
-        """Recognize the large one-pass drop made by physical cleanup."""
-        if previous_conflicts is None or previous_conflicts <= 0:
-            return False
-        fraction = min(1.0, max(0.0, float(minimum_fraction)))
-        return current_conflicts <= previous_conflicts * (1.0 - fraction)
-
     def _clear_net_edge_tracking(self, net_id: str):
         """Clear edge-to-nets tracking for a net"""
         if net_id in self._net_to_edges:
@@ -8283,7 +8262,7 @@ class PathFinderRouter:
             unrouted = {nid for nid in tasks.keys() if not self.net_paths.get(nid)}
             physical_offenders = (
                 self._select_physical_hotset()
-                if total_overuse_with_vias <= cleanup_threshold
+                if total_negotiated_overuse <= cleanup_threshold
                 else set()
             )
             hotset = (
@@ -8439,7 +8418,7 @@ class PathFinderRouter:
         raw_overuse_edges = int(np.count_nonzero(over > 0))
         if (
             raw_overuse_edges <= cleanup_threshold
-            and total_overuse_with_vias <= cleanup_threshold
+            and total_negotiated_overuse <= cleanup_threshold
         ):
             physical_offenders = self._select_physical_hotset()
             # The adaptive cap is for ordinary edge congestion. Once the graph
