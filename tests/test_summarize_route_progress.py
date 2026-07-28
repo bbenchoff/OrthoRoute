@@ -264,6 +264,7 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
 ):
     run = {
         "label": "20L current",
+        "journal": {"max_iterations": 10},
         "iterations": [
             {
                 "iteration": 1,
@@ -317,6 +318,10 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
     assert snapshot["rows"][0]["drop_per_second"] == 2.0
     assert snapshot["rows"][1]["hotset_size"] == 512
     assert snapshot["rows"][1]["drop_per_second"] == 2.0
+    assert (
+        snapshot["rows"][1]["required_drop_per_remaining_pass"]
+        == 8.5714
+    )
     assert snapshot["rows"][1]["slow_progress_fraction"] == 2.0
     assert snapshot["rows"][1]["conflict_pair_coverage_pct"] == 75.0
     assert len(snapshot["phases"]) == 2
@@ -326,6 +331,8 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
     assert snapshot["phases"][1]["matched_prior_iterations"] == "2-2"
     assert snapshot["phases"][1]["efficiency_ratio"] == 1.0
     assert snapshot["phases"][1]["iteration_efficiency_ratio"] == 2.0
+    assert snapshot["phases"][1]["linear_pace_ratio"] == 4.6667
+    assert snapshot["phases"][1]["projected_zero_iteration"] == 4.5
     assert (
         snapshot["phases"][1]["conflict_pair_coverage_pct_avg"]
         == 75.0

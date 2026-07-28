@@ -1057,6 +1057,13 @@ def _latest_hotset_policy_snapshot(
     """Return pass- and phase-level evidence for the newest hotset run."""
     for run in reversed(runs):
         iterations = run.get("iterations", [])
+        max_iterations = max(
+            max(
+                (int(item.get("iteration", 0)) for item in iterations),
+                default=0,
+            ),
+            int(run.get("journal", {}).get("max_iterations", 200)),
+        )
         rows = []
         phase = 0
         previous_hotset = None
@@ -1081,6 +1088,10 @@ def _latest_hotset_policy_snapshot(
             before = int(previous["_physical_negotiated_overuse"])
             after = int(current["_physical_negotiated_overuse"])
             drop = before - after
+            remaining_passes = max(
+                1,
+                max_iterations - int(current["iteration"]),
+            )
             previous_edge = int(previous["_physical_edge_overuse"])
             current_edge = int(current["_physical_edge_overuse"])
             previous_node = int(previous.get("path_node_overuse_total", 0))
@@ -1111,6 +1122,10 @@ def _latest_hotset_policy_snapshot(
                 ),
                 "drop_per_second": round(
                     drop / max(0.001, elapsed),
+                    4,
+                ),
+                "required_drop_per_remaining_pass": round(
+                    after / remaining_passes,
                     4,
                 ),
                 "edge_via_drop": previous_edge - current_edge,
@@ -1217,6 +1232,13 @@ def _latest_hotset_policy_snapshot(
                 if not prior_rows else
                 prior_drop / max(0.001, prior_elapsed)
             )
+            remaining_passes = max(
+                1,
+                max_iterations - int(last["iteration"]),
+            )
+            required_drop_per_remaining_pass = (
+                last["overuse_after"] / remaining_passes
+            )
             coverage_values = [
                 float(row["conflict_pair_coverage_pct"])
                 for row in phase_rows
@@ -1234,6 +1256,24 @@ def _latest_hotset_policy_snapshot(
                 "overuse_after": last["overuse_after"],
                 "overuse_drop": drop,
                 "drop_per_pass": round(drop_per_pass, 4),
+                "required_drop_per_remaining_pass": round(
+                    required_drop_per_remaining_pass,
+                    4,
+                ),
+                "linear_pace_ratio": round(
+                    drop_per_pass
+                    / max(0.0001, required_drop_per_remaining_pass),
+                    4,
+                ),
+                "projected_zero_iteration": (
+                    ""
+                    if drop_per_pass <= 0 else
+                    round(
+                        int(last["iteration"])
+                        + last["overuse_after"] / drop_per_pass,
+                        2,
+                    )
+                ),
                 "matched_prior_drop_per_pass": (
                     ""
                     if prior_drop_per_pass is None else
@@ -1308,6 +1348,7 @@ def _latest_hotset_policy_snapshot(
             })
         return {
             "run": run["label"],
+            "max_iterations": max_iterations,
             "rows": rows,
             "phases": phases,
         }
@@ -1333,6 +1374,8 @@ def _write_hotset_policy_markdown(
         "phase", "iterations", "passes", "hotset_size",
         "elapsed_seconds", "overuse_before", "overuse_after",
         "overuse_drop", "drop_per_pass",
+        "required_drop_per_remaining_pass", "linear_pace_ratio",
+        "projected_zero_iteration",
         "matched_prior_drop_per_pass", "iteration_efficiency_ratio",
         "drop_per_second", "matched_prior_iterations",
         "matched_prior_drop_per_second", "efficiency_ratio",
@@ -1345,7 +1388,8 @@ def _write_hotset_policy_markdown(
     pass_columns = (
         "iteration", "hotset_size", "elapsed_seconds",
         "overuse_before", "overuse_after", "overuse_drop",
-        "drop_per_second", "edge_via_drop", "node_drop",
+        "drop_per_second", "required_drop_per_remaining_pass",
+        "edge_via_drop", "node_drop",
         "pres_fac", "slow_progress_fraction",
         "conflict_pair_count", "conflict_pairs_covered",
         "conflict_pair_coverage_pct",
@@ -1386,6 +1430,11 @@ def _write_hotset_policy_markdown(
         "`hotset_size` is the number of selected nets rerouted in the pass. "
         "`drop_per_second` is complete normalized edge/via plus path-node "
         "excess removed per wall-clock second; negative values are regressions. "
+        "`required_drop_per_remaining_pass` is the linear pace needed to "
+        f"reach graph zero by this run's iteration {snapshot['max_iterations']} "
+        "limit. `linear_pace_ratio` and `projected_zero_iteration` extrapolate "
+        "the complete phase's average; they are diagnostics, not convergence "
+        "proofs. "
         "`conflict_pair_coverage_pct` is the share of distinct live node-"
         "conflict pairs with at least one endpoint in the selected wave. "
         "Escape and portal counts are retained because faster graph descent "
