@@ -1066,6 +1066,38 @@ def test_path_nodes_are_capacity_one_negotiated_resources():
     assert router._compute_path_node_overuse() == (4, 2)
 
 
+def test_path_node_metrics_expose_layer_localized_congestion():
+    router = object.__new__(PathFinderRouter)
+    router.lattice = type("Lattice", (), {
+        "x_steps": 2,
+        "y_steps": 2,
+        "layers": 2,
+    })()
+    router.path_node_use = np.array(
+        [0, 1, 2, 4, 1, 1, 0, 0],
+        dtype=np.int16,
+    )
+
+    assert router._path_node_layer_metrics() == [
+        {
+            "layer": 0,
+            "capacity_nodes": 4,
+            "occupied_nodes": 3,
+            "conflict_nodes": 2,
+            "excess_uses": 4,
+            "max_use": 4,
+        },
+        {
+            "layer": 1,
+            "capacity_nodes": 4,
+            "occupied_nodes": 2,
+            "conflict_nodes": 0,
+            "excess_uses": 0,
+            "max_use": 1,
+        },
+    ]
+
+
 def test_best_route_score_combines_edge_and_node_overuse():
     score = PathFinderRouter._negotiated_route_score
 

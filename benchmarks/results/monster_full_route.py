@@ -385,6 +385,7 @@ try:
             "via_segment_overuse": via_segment_overuse,
             "path_node_overuse_total": path_node_overuse,
             "path_node_overuse_count": path_node_overuse_count,
+            "path_node_layers": router._path_node_layer_metrics(),
             "negotiated_overuse_total": (
                 graph_overuse + path_node_overuse
             ),

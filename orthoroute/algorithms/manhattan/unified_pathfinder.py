@@ -9673,6 +9673,42 @@ class PathFinderRouter:
         )
         return int(overuse.sum()), int(np.count_nonzero(overuse))
 
+    def _path_node_layer_metrics(self) -> List[Dict[str, int]]:
+        """Summarize capacity-one path-node occupancy by copper layer."""
+        if not hasattr(self, "path_node_use") or not hasattr(
+            self, "lattice"
+        ):
+            return []
+        plane_size = int(
+            self.lattice.x_steps * self.lattice.y_steps
+        )
+        layer_count = int(self.lattice.layers)
+        use = np.asarray(self.path_node_use, dtype=np.int64)
+        if (
+            plane_size <= 0
+            or layer_count <= 0
+            or use.size != plane_size * layer_count
+        ):
+            return []
+
+        metrics = []
+        for layer in range(layer_count):
+            layer_use = use[
+                layer * plane_size:(layer + 1) * plane_size
+            ]
+            excess = np.maximum(layer_use - 1, 0)
+            metrics.append({
+                "layer": layer,
+                "capacity_nodes": plane_size,
+                "occupied_nodes": int(np.count_nonzero(layer_use)),
+                "conflict_nodes": int(np.count_nonzero(excess)),
+                "excess_uses": int(excess.sum()),
+                "max_use": (
+                    int(layer_use.max()) if layer_use.size else 0
+                ),
+            })
+        return metrics
+
     @staticmethod
     def _negotiated_route_score(
         failed_nets: int,
