@@ -6427,6 +6427,31 @@ class PathFinderRouter:
                     )
                     stagnant = 0
                 else:
+                    # Keep accumulated PathFinder history, but branch each
+                    # speculative recovery wave from the best routing found
+                    # so far. Otherwise repeated bounded rip-ups can walk
+                    # steadily away from a good state even though the scalar
+                    # best is remembered.
+                    current_route_score = (
+                        int(failed),
+                        int(over_sum),
+                        int(conflict_count),
+                    )
+                    if (
+                        best_route_state is not None
+                        and best_route_score is not None
+                        and best_route_score < current_route_score
+                    ):
+                        self._restore_routing_state(best_route_state)
+                        logger.warning(
+                            "[STAGNATION] Rolled back to best iteration %d "
+                            "before recovery wave (failed=%d overuse=%d "
+                            "physical=%d)",
+                            best_route_iteration,
+                            best_route_score[0],
+                            best_route_score[1],
+                            best_route_score[2],
+                        )
                     self.stagnation_counter += 1
                     victims = self._rip_top_k_offenders(k=20)
                     self._last_ripped = victims
