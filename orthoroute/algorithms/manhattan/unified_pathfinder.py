@@ -675,6 +675,12 @@ class PathFinderConfig:
     slow_progress_min_fraction: float = 0.025
     slow_progress_min_overuse: int = 16_384
     slow_progress_hotset_cap: int = 512
+    # The first measured 512-net severe window cleared 1.637x more excess per
+    # bounded iteration than the matched 256-net window while remaining
+    # essentially wall-clock neutral. If a second independently separated
+    # slow window survives that intervention, test one bounded 1024-net tier.
+    slow_progress_hotset_growth_after: int = 2
+    slow_progress_hotset_cap_max: int = 1024
     slow_progress_pressure_after: int = 2
     slow_progress_pres_fac_max: float = 256.0
     # Selective PathFinder passes do unequal work. Advance pressure by a
@@ -6316,13 +6322,17 @@ class PathFinderRouter:
                         pres_fac_max,
                     )
                 self._pres_fac_max_now = pres_fac_max
+                boosted_hotset_cap = self._effective_history_hotset_cap(
+                    negotiated_overuse
+                )
                 logger.warning(
                     "[RATE-PLATEAU %d] Best rolling descent over %d "
-                    "passes is %.3f%%; widening severe hotsets through "
-                    "iteration %d and pressure ceiling %.0f -> %.0f",
+                    "passes is %.3f%%; widening severe hotsets to %d "
+                    "through iteration %d and pressure ceiling %.0f -> %.0f",
                     self._slow_progress_event_count,
                     slow_window,
                     100.0 * progress_fraction,
+                    boosted_hotset_cap,
                     self._hotset_rate_boost_until,
                     old_ceiling,
                     pres_fac_max,
@@ -7998,13 +8008,46 @@ class PathFinderRouter:
                 0,
             ))
         ):
-            return max(
-                base,
+            initial_cap = max(
+                1,
                 int(getattr(
                     self.config,
                     "slow_progress_hotset_cap",
                     512,
                 )),
+            )
+            maximum_cap = max(
+                initial_cap,
+                int(getattr(
+                    self.config,
+                    "slow_progress_hotset_cap_max",
+                    initial_cap,
+                )),
+            )
+            growth_after = max(
+                1,
+                int(getattr(
+                    self.config,
+                    "slow_progress_hotset_growth_after",
+                    2,
+                )),
+            )
+            event_count = max(
+                1,
+                int(getattr(
+                    self,
+                    "_slow_progress_event_count",
+                    1,
+                )),
+            )
+            growth_steps = max(0, event_count - growth_after + 1)
+            boosted_cap = min(
+                maximum_cap,
+                initial_cap * (2 ** growth_steps),
+            )
+            return max(
+                base,
+                boosted_cap,
             )
         return base
 

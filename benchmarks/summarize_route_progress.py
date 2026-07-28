@@ -1168,6 +1168,12 @@ def _latest_hotset_policy_snapshot(
             prior_drop = sum(
                 int(row["overuse_drop"]) for row in prior_rows
             )
+            drop_per_pass = drop / len(phase_rows)
+            prior_drop_per_pass = (
+                None
+                if len(prior_rows) != len(phase_rows) else
+                prior_drop / len(prior_rows)
+            )
             prior_rate = (
                 None
                 if len(prior_rows) != len(phase_rows) else
@@ -1184,6 +1190,17 @@ def _latest_hotset_policy_snapshot(
                 "overuse_before": first["overuse_before"],
                 "overuse_after": last["overuse_after"],
                 "overuse_drop": drop,
+                "drop_per_pass": round(drop_per_pass, 4),
+                "matched_prior_drop_per_pass": (
+                    ""
+                    if prior_drop_per_pass is None else
+                    round(prior_drop_per_pass, 4)
+                ),
+                "iteration_efficiency_ratio": (
+                    ""
+                    if prior_drop_per_pass in {None, 0.0} else
+                    round(drop_per_pass / prior_drop_per_pass, 4)
+                ),
                 "drop_per_second": round(rate, 4),
                 "matched_prior_iterations": (
                     ""
@@ -1264,7 +1281,9 @@ def _write_hotset_policy_markdown(
     phase_columns = (
         "phase", "iterations", "passes", "hotset_size",
         "elapsed_seconds", "overuse_before", "overuse_after",
-        "overuse_drop", "drop_per_second", "matched_prior_iterations",
+        "overuse_drop", "drop_per_pass",
+        "matched_prior_drop_per_pass", "iteration_efficiency_ratio",
+        "drop_per_second", "matched_prior_iterations",
         "matched_prior_drop_per_second", "efficiency_ratio",
         "edge_via_drop", "node_drop", "pressure_start", "pressure_end",
         "escape_start", "escape_end", "escape_delta",
@@ -1358,9 +1377,10 @@ def _write_hotset_policy_svg(
     total_span = max(1.0, total_high - total_low)
     rate_rows = rows[-min(12, len(rows)):]
     rate_iterations = [int(row["iteration"]) for row in rate_rows]
-    rate_iteration_min = min(rate_iterations)
-    rate_iteration_max = max(rate_iterations)
-    rate_iteration_span = max(1, rate_iteration_max - rate_iteration_min)
+    rate_iteration_index = {
+        iteration: index
+        for index, iteration in enumerate(rate_iterations)
+    }
     rates = [float(row["drop_per_second"]) for row in rate_rows]
     rate_low = min(0.0, min(rates))
     rate_high = max(0.0, max(rates))
@@ -1387,8 +1407,8 @@ def _write_hotset_policy_svg(
         return (
             plot_x
             + plot_width
-            * (iteration - rate_iteration_min)
-            / rate_iteration_span
+            * (rate_iteration_index[iteration] + 0.5)
+            / len(rate_rows)
         )
 
     def rate_value_y(value: float) -> float:

@@ -321,6 +321,7 @@ def test_hotset_policy_snapshot_measures_contiguous_wave_efficiency(
     assert snapshot["phases"][1]["exact_barrel_delta"] == -10
     assert snapshot["phases"][1]["matched_prior_iterations"] == "2-2"
     assert snapshot["phases"][1]["efficiency_ratio"] == 1.0
+    assert snapshot["phases"][1]["iteration_efficiency_ratio"] == 2.0
     markdown = tmp_path / "hotset.md"
     svg = tmp_path / "hotset.svg"
     _write_hotset_policy_markdown(snapshot, markdown)
