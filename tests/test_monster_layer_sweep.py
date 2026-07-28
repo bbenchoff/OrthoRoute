@@ -1,8 +1,10 @@
 from pathlib import Path
 
 from benchmarks.run_monster_layer_sweep import (
+    _backfill_candidates,
     _drc_counts,
     _fabrication_manifest_paths,
+    _parse_candidate_layers,
     _qualification_label,
     _remaining_candidates,
 )
@@ -43,6 +45,29 @@ def test_successful_reduced_candidate_qualifies_fourteen_layers():
 
 def test_incomplete_candidate_expands_layers_in_order():
     assert _remaining_candidates(16, None, 20) == [18, 20]
+
+
+def test_explicit_coarse_ladder_skips_to_requested_layers():
+    assert _remaining_candidates(
+        16,
+        None,
+        32,
+        candidate_layers=[20, 24, 28, 32],
+    ) == [20, 24, 28, 32]
+
+
+def test_coarse_ladder_backfills_minimum_even_layer_after_success():
+    assert _backfill_candidates(16, 20) == [18]
+    assert _backfill_candidates(20, 24) == [22]
+    assert _backfill_candidates(28, 32) == [30]
+
+
+def test_candidate_layer_parser_requires_ordered_even_bounded_layers():
+    assert _parse_candidate_layers(
+        "20,24,28,32",
+        initial_layers=16,
+        max_layers=32,
+    ) == [20, 24, 28, 32]
 
 
 def test_qualification_label_preserves_run_timestamp():

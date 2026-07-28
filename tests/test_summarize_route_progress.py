@@ -3,9 +3,11 @@ from pathlib import Path
 from benchmarks.summarize_route_progress import (
     _is_candidate_name,
     _label,
+    _linear_layer_fit,
     _normalize_iteration,
     _physical_edge_overuse,
     _row,
+    _stall_row,
 )
 
 
@@ -104,3 +106,55 @@ def test_legacy_directed_arcs_normalize_to_one_physical_edge():
     )
     assert normalized["_physical_edge_overuse"] == 15
     assert normalized["_physical_negotiated_overuse"] == 55
+
+
+def test_stall_row_requires_eight_passes_without_a_new_minimum():
+    iterations = [
+        {
+            "iteration": index,
+            "_physical_negotiated_overuse": (
+                100 - index if index <= 3 else 97 + index
+            ),
+        }
+        for index in range(1, 12)
+    ]
+    run = {
+        "label": "16L 8,192 nets mechanical current",
+        "path": Path("progress.json"),
+        "journal": {
+            "status": "failed",
+            "run_name": "Backplane-16L-16L-current",
+            "git_sha": "abc",
+        },
+        "iterations": iterations,
+        "edge_accounting_mode": "unique physical",
+    }
+
+    row = _stall_row(run)
+
+    assert row["observation"] == "stalled"
+    assert row["best_iteration"] == 3
+    assert row["overuse_at_stall"] == 97
+    assert row["stall_iteration"] == 11
+    assert row["eligible_for_fit"] is True
+
+
+def test_layer_fit_is_withheld_until_two_distinct_stalls():
+    one = [{
+        "layers": 16,
+        "overuse_at_stall": 290_000,
+        "eligible_for_fit": True,
+        "edge_accounting": "unique physical",
+    }]
+    assert _linear_layer_fit(one) is None
+
+    two = one + [{
+        "layers": 20,
+        "overuse_at_stall": 90_000,
+        "eligible_for_fit": True,
+        "edge_accounting": "unique physical",
+    }]
+    fit = _linear_layer_fit(two)
+    assert fit is not None
+    assert fit["slope"] == -50_000
+    assert fit["zero_layer"] == 21.8
