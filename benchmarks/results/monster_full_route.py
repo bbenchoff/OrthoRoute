@@ -367,6 +367,9 @@ try:
             "pres_fac_max": float(getattr(
                 router, "_pres_fac_max_now", 0.0
             )),
+            "pressure_work_scale": float(getattr(
+                router, "_last_pressure_work_scale", 1.0
+            )),
             "slow_progress_events": int(getattr(
                 router, "_slow_progress_event_count", 0
             )),
