@@ -8077,6 +8077,25 @@ class PathFinderRouter:
             )
         return base
 
+    def _bounded_history_hotset_cap(
+        self,
+        total_overuse: float,
+    ) -> int:
+        """Resolve the ordinary cap and an explicit plateau-recovery wave.
+
+        Board parameter derivation may lower ``config.hotset_cap`` (for
+        example, to 20% of the net count).  That is the normal-pass safety
+        ceiling, not a second ceiling on the separately bounded recovery
+        controller.  When recovery deliberately requests a larger wave, its
+        own ``slow_progress_hotset_cap_max`` is the applicable guardrail.
+        """
+        base_cap = self._history_hotset_cap(total_overuse)
+        effective_cap = self._effective_history_hotset_cap(total_overuse)
+        configured_cap = max(1, int(self.config.hotset_cap))
+        if effective_cap > base_cap:
+            configured_cap = max(configured_cap, effective_cap)
+        return min(configured_cap, effective_cap)
+
     @staticmethod
     def _hotset_exploration_fraction(total_overuse: float) -> float:
         """Spend less of a severe-congestion wave on random search."""
@@ -8416,11 +8435,8 @@ class PathFinderRouter:
                 | via_pool_offenders
                 | physical_offenders
             )
-            node_cap = min(
-                int(self.config.hotset_cap),
-                self._effective_history_hotset_cap(
-                    total_negotiated_overuse
-                ),
+            node_cap = self._bounded_history_hotset_cap(
+                total_negotiated_overuse
             )
             node_exploration_fraction = (
                 self._hotset_exploration_fraction(
@@ -8519,11 +8535,9 @@ class PathFinderRouter:
         # Preserve small tail waves, but do not apply the 100-net tail policy
         # to a monster route with tens of thousands of live node conflicts.
         # Exact physical offenders and unrouted nets still bypass this cap.
-        base_target = self._effective_history_hotset_cap(
+        adaptive_cap = self._bounded_history_hotset_cap(
             total_negotiated_overuse
         )
-
-        adaptive_cap = min(self.config.hotset_cap, base_target)
 
         # Severe congestion needs predominantly high-impact work. Retain a
         # bounded random fraction to break phase-locking, then select an
