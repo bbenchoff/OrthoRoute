@@ -7802,19 +7802,29 @@ class PathFinderRouter:
         exploration_fraction: float,
         rng,
     ) -> List[str]:
-        """Select a one-sided high-impact wave plus bounded exploration.
+        """Select a conflict-covering wave plus bounded exploration.
 
-        Nets that currently share a path node are adjacent in the conflict
-        graph. Selecting an independent set keeps both ends of a present
-        conflict from moving together and simply exchanging ownership. Edge-
-        only offenders have no adjacency here and remain freely selectable.
+        _route_all clears and recommits each selected net sequentially, with
+        live edge and node occupancy refreshed between nets.  Selecting a
+        global independent set is therefore unnecessary: on a dense conflict
+        component it can collapse a nominally large wave to only a handful
+        of nets.  Instead, greedily cover the greatest number of still-live
+        conflict pairs.  After those pairs are covered, prefer candidates
+        that do not duplicate a selected conflict endpoint, then fill the
+        requested budget.  The final exploratory slice is shuffled but also
+        fills its allocation.
         """
         cap = max(0, int(cap))
         if cap == 0 or not ranked_candidates:
             return []
 
         candidates = list(dict.fromkeys(ranked_candidates))
+        cap = min(cap, len(candidates))
         candidate_set = set(candidates)
+        rank = {
+            candidate: index
+            for index, candidate in enumerate(candidates)
+        }
         adjacency = defaultdict(set)
         for first, second in conflict_pairs or ():
             if (
@@ -7827,41 +7837,87 @@ class PathFinderRouter:
             adjacency[second].add(first)
 
         fraction = min(1.0, max(0.0, float(exploration_fraction)))
-        primary_target = min(
-            cap,
-            max(1, int(round(cap * (1.0 - fraction)))),
+        primary_target = max(
+            1,
+            min(cap, int(round(cap * (1.0 - fraction)))),
         )
         selected = []
         selected_set = set()
-        blocked = set()
-        remaining = []
+        remaining_adjacency = {
+            candidate: set(adjacency.get(candidate, ()))
+            for candidate in candidates
+        }
 
-        for candidate in candidates:
-            if len(selected) >= primary_target:
-                remaining.append(candidate)
+        # Greedy vertex-cover approximation.  Lazy heap entries make degree
+        # updates proportional to the affected conflict pairs instead of
+        # rescanning every candidate for every slot.
+        import heapq
+        degree_heap = [
+            (-len(remaining_adjacency[candidate]), rank[candidate], candidate)
+            for candidate in candidates
+            if remaining_adjacency[candidate]
+        ]
+        heapq.heapify(degree_heap)
+        while len(selected) < primary_target and degree_heap:
+            negative_degree, _, candidate = heapq.heappop(degree_heap)
+            if candidate in selected_set:
                 continue
-            if candidate in blocked:
+            live_degree = len(remaining_adjacency[candidate])
+            if -negative_degree != live_degree:
+                heapq.heappush(
+                    degree_heap,
+                    (-live_degree, rank[candidate], candidate),
+                )
                 continue
+            if live_degree == 0:
+                break
             selected.append(candidate)
             selected_set.add(candidate)
-            blocked.update(adjacency.get(candidate, ()))
+            for neighbor in tuple(remaining_adjacency[candidate]):
+                remaining_adjacency[neighbor].discard(candidate)
+                heapq.heappush(
+                    degree_heap,
+                    (
+                        -len(remaining_adjacency[neighbor]),
+                        rank[neighbor],
+                        neighbor,
+                    ),
+                )
+            remaining_adjacency[candidate].clear()
+
+        # Fill the deterministic part with nonredundant candidates first.
+        # Edge-only offenders have no adjacency and therefore stay eligible
+        # ahead of the opposite endpoint of an already covered conflict.
+        if len(selected) < primary_target:
+            nonredundant = [
+                candidate
+                for candidate in candidates
+                if candidate not in selected_set
+                and not (
+                    adjacency.get(candidate, set()) & selected_set
+                )
+            ]
+            nonredundant_set = set(nonredundant)
+            redundant = [
+                candidate
+                for candidate in candidates
+                if candidate not in selected_set
+                and candidate not in nonredundant_set
+            ]
+            for candidate in nonredundant + redundant:
+                selected.append(candidate)
+                selected_set.add(candidate)
+                if len(selected) >= primary_target:
+                    break
 
         if len(selected) < cap:
             exploration = [
                 candidate
-                for candidate in remaining
+                for candidate in candidates
                 if candidate not in selected_set
-                and candidate not in blocked
             ]
             rng.shuffle(exploration)
-            for candidate in exploration:
-                if candidate in blocked:
-                    continue
-                selected.append(candidate)
-                selected_set.add(candidate)
-                blocked.update(adjacency.get(candidate, ()))
-                if len(selected) >= cap:
-                    break
+            selected.extend(exploration[:cap - len(selected)])
 
         return selected
 
