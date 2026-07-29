@@ -8179,8 +8179,15 @@ class PathFinderRouter:
         if ceiling <= proven_ceiling:
             return proven_ceiling, proven_fraction, 0, None
 
+        # A zero-descent reference cannot establish a ratio threshold:
+        # ``minimum_ratio * 0`` is zero, which would incorrectly certify
+        # another zero-descent higher tier as a breakthrough.  Against a
+        # stalled reference, require the higher tier to produce some actual
+        # descent; otherwise count the window toward ordinary rejection.
         threshold = max(0.0, float(minimum_ratio)) * proven_fraction
-        if fraction >= threshold:
+        improved_from_zero = proven_fraction <= 0.0 and fraction > 0.0
+        meets_ratio = proven_fraction > 0.0 and fraction >= threshold
+        if improved_from_zero or meets_ratio:
             return ceiling, fraction, 0, None
 
         failures = int(underperform_count) + 1
