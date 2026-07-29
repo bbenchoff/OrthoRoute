@@ -192,3 +192,7 @@ benchmarks/results/
 !benchmarks/results/
 benchmarks/results/*
 !benchmarks/results/monster_full_route.py
+
+# Generated local monster-route iteration table
+/LAYER_ITERATION_TABLE.csv
+/LAYER_ITERATION_TABLE.md
