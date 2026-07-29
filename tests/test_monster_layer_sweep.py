@@ -2,6 +2,7 @@ from pathlib import Path
 
 from benchmarks.run_monster_layer_sweep import (
     _backfill_candidates,
+    _defect_census_paths,
     _drc_counts,
     _fabrication_manifest_paths,
     _parse_candidate_layers,
@@ -94,4 +95,14 @@ def test_deliverable_records_fabrication_manifests():
         "fabrication_manifest_json": "candidate-fabrication.json",
         "fabrication_manifest_csv": "candidate-fabrication.csv",
         "fabrication_manifest_markdown": "candidate-fabrication.md",
+    }
+
+
+def test_deliverable_records_defect_site_census():
+    paths = _defect_census_paths(Path("candidate-drc.json"))
+
+    assert paths == {
+        "defect_sites_json": "candidate-drc-defect-sites.json",
+        "defect_sites_csv": "candidate-drc-defect-sites.csv",
+        "defect_sites_markdown": "candidate-drc-defect-sites.md",
     }
