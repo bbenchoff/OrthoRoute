@@ -1632,6 +1632,21 @@ def test_pressure_trial_accepts_a_delayed_higher_tier_breakthrough():
     assert result == (1024.0, 0.013, 0, None)
 
 
+def test_pressure_trial_rejects_repeated_zero_descent_above_zero_baseline():
+    advance = PathFinderRouter._advance_pressure_trial
+    reference = (512.0, 0.0, 0)
+
+    first = advance(1024.0, 0.0, *reference)
+    assert first == (512.0, 0.0, 1, None)
+
+    second = advance(1024.0, 0.0, *first[:3])
+    assert second == (512.0, 0.0, 0, 1024.0)
+
+    # Any real descent is a breakthrough relative to a stalled reference.
+    improved = advance(1024.0, 0.001, *reference)
+    assert improved == (1024.0, 0.001, 0, None)
+
+
 def test_pressure_schedule_scales_with_bounded_reroute_work():
     scale = PathFinderRouter._pressure_work_scale
 
