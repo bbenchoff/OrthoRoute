@@ -1,6 +1,10 @@
 import json
 
-from benchmarks.summarize_kicad_drc import summarize, write_summary
+from benchmarks.summarize_kicad_drc import (
+    defect_site_census,
+    summarize,
+    write_summary,
+)
 
 
 def test_summarize_groups_rule_and_connectivity_items():
@@ -56,7 +60,44 @@ def test_write_summary_reports_combined_electrical_errors(tmp_path):
     assert result["unconnected_items"] == 2
     assert result["reported_errors"] == 3
     assert result["warnings"] == 1
+    assert result["defect_site_census"]["defect_site_count"] == 1
     assert (tmp_path / "summary.csv").exists()
+    assert (tmp_path / "summary-defect-sites.csv").exists()
     assert "Reported electrical errors: 3" in (
         tmp_path / "summary.md"
     ).read_text(encoding="utf-8")
+
+
+def test_defect_site_census_deduplicates_colocated_electrical_reports():
+    report = {
+        "violations": [
+            {
+                "severity": "error",
+                "type": "clearance",
+                "items": [{"pos": {"x": 10.0, "y": 20.0}}],
+            },
+            {
+                "severity": "error",
+                "type": "shorting_items",
+                "items": [{"pos": {"x": 10.2, "y": 20.0}}],
+            },
+            {
+                "severity": "error",
+                "type": "hole_clearance",
+                "items": [{"pos": {"x": 10.4, "y": 20.0}}],
+            },
+            {
+                "severity": "warning",
+                "type": "hole_to_hole",
+                "items": [{"pos": {"x": 10.0, "y": 20.0}}],
+            },
+        ]
+    }
+
+    rows = defect_site_census(report)
+
+    assert len(rows) == 1
+    assert rows[0]["report_count"] == 3
+    assert rows[0]["report_types"] == (
+        "clearance:1;hole_clearance:1;shorting_items:1"
+    )

@@ -174,6 +174,25 @@ def _refresh_comparison(repo_root: Path, results_dir: Path) -> None:
     )
 
 
+def _refresh_cost_curve(
+    results_dir: Path,
+    state: Dict[str, Any],
+    state_path: Path,
+) -> None:
+    try:
+        from benchmarks.summarize_layer_cost_curve import (
+            write_layer_cost_curve,
+        )
+    except ModuleNotFoundError:
+        from summarize_layer_cost_curve import write_layer_cost_curve
+
+    state["layer_cost_curve"] = write_layer_cost_curve(
+        state,
+        results_dir / "layer-cost-curve",
+    )
+    _atomic_json(state_path, state)
+
+
 def _remaining_candidates(
     initial_layers: int,
     selected: Optional[Tuple[int, Dict[str, Any]]],
@@ -272,6 +291,15 @@ def _fabrication_manifest_paths(board: Path) -> Dict[str, str]:
     }
 
 
+def _defect_census_paths(drc: Path) -> Dict[str, str]:
+    stem = drc.with_name(drc.stem + "-defect-sites")
+    return {
+        "defect_sites_json": str(stem.with_suffix(".json")),
+        "defect_sites_csv": str(stem.with_suffix(".csv")),
+        "defect_sites_markdown": str(stem.with_suffix(".md")),
+    }
+
+
 def _export_and_drc(
     repo_root: Path,
     results_dir: Path,
@@ -337,6 +365,7 @@ def _export_and_drc(
         ),
         "drc_summary_csv": str(drc_summary_stem.with_suffix(".csv")),
         **_fabrication_manifest_paths(board),
+        **_defect_census_paths(drc),
         **_drc_counts(report),
     }
 
@@ -512,6 +541,7 @@ def main() -> None:
         "qualification": initial_qualification,
         "reason": "attached_baseline",
     })
+    _refresh_cost_curve(args.results_dir, state, state_path)
     selected: Optional[Tuple[int, Dict[str, Any]]] = (
         (initial_layers, initial)
         if initial_qualification["accepted"] else None
@@ -547,6 +577,7 @@ def main() -> None:
             "qualification": retry_qualification,
             "reason": "current_code_retry",
         })
+        _refresh_cost_curve(args.results_dir, state, state_path)
         _refresh_comparison(repo_root, args.results_dir)
         if retry_qualification["accepted"]:
             selected = (initial_layers, retry)
@@ -597,6 +628,7 @@ def main() -> None:
                 else "capacity_expansion"
             ),
         })
+        _refresh_cost_curve(args.results_dir, state, state_path)
         _refresh_comparison(repo_root, args.results_dir)
         if qualification["accepted"]:
             if selected is None or layer_count < selected[0]:
@@ -644,11 +676,13 @@ def main() -> None:
                 "qualification": qualification,
                 "reason": "minimum_layer_backfill",
             })
+            _refresh_cost_curve(args.results_dir, state, state_path)
             _refresh_comparison(repo_root, args.results_dir)
             if qualification["accepted"]:
                 selected = (layer_count, journal)
                 break
 
+    fresh_bias_control_used = False
     if selected is not None and args.peel_after_success:
         while selected[0] - 2 >= args.peel_min_layers:
             source_layers, source_journal = selected
@@ -690,6 +724,7 @@ def main() -> None:
                 "peel_plan": journal.get("warm_start"),
                 "reason": "symmetric_layer_pair_peel",
             })
+            _refresh_cost_curve(args.results_dir, state, state_path)
             _refresh_comparison(repo_root, args.results_dir)
             if not qualification["accepted"]:
                 state["peel_floor_failure"] = {
@@ -698,7 +733,62 @@ def main() -> None:
                     "progress": str(progress),
                     "qualification": qualification,
                 }
-                break
+                if fresh_bias_control_used:
+                    break
+                fresh_bias_control_used = True
+                state["status"] = (
+                    f"fresh_bias_control_{target_layers}L"
+                )
+                _atomic_json(state_path, state)
+                control_progress, control = _run_candidate(
+                    repo_root,
+                    args.results_dir,
+                    args.source_board,
+                    target_layers,
+                    args.max_iterations,
+                    args.layer_depth_bias,
+                    state,
+                    state_path,
+                )
+                control_qualification = _qualify_candidate(
+                    repo_root,
+                    args.results_dir,
+                    args.source_board,
+                    target_layers,
+                    control,
+                    args.drc_error_target,
+                )
+                state["runs"].append({
+                    "layers": target_layers,
+                    "source_layers": None,
+                    "progress": str(control_progress),
+                    "status": control.get("status"),
+                    "complete": control_qualification["strict_complete"],
+                    "accepted": control_qualification["accepted"],
+                    "qualification": control_qualification,
+                    "reason": "fresh_route_after_failed_peel",
+                })
+                state["warm_start_bias_control"] = {
+                    "layers": target_layers,
+                    "peel_accepted": False,
+                    "fresh_accepted": control_qualification["accepted"],
+                    "fresh_progress": str(control_progress),
+                    "qualification": control_qualification,
+                }
+                _refresh_cost_curve(
+                    args.results_dir, state, state_path
+                )
+                _refresh_comparison(repo_root, args.results_dir)
+                if not control_qualification["accepted"]:
+                    state["floor_confirmed"] = {
+                        "failed_layers": target_layers,
+                        "accepted_from_above": source_layers,
+                        "peel_progress": str(progress),
+                        "fresh_progress": str(control_progress),
+                    }
+                    break
+                selected = (target_layers, control)
+                continue
             selected = (target_layers, journal)
 
     if selected is None:
