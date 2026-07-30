@@ -810,6 +810,26 @@ def resolve_history_decay(config) -> float:
     return value
 
 
+def enforce_present_matches_canonical(accounting, iteration) -> None:
+    """Check the present==canonical accounting invariant.
+
+    Default: log a warning and continue (historical behavior). With
+    ORTHO_STRICT=1 raise RuntimeError naming the iteration, so corruption is
+    caught at the pass that introduced it instead of surfacing as downstream
+    routing weirdness.
+    """
+    if accounting.verify_present_matches_canonical():
+        return
+    if os.getenv("ORTHO_STRICT") == "1":
+        raise RuntimeError(
+            f"[ITER {iteration}] Accounting mismatch: present does not "
+            "match canonical (ORTHO_STRICT=1)"
+        )
+    logger.warning(
+        f"[ITER {iteration}] Accounting mismatch detected - potential bug"
+    )
+
+
 def warn_if_penalties_exceed_float32_budget(config) -> None:
     """Warn when a configured penalty can erase float32 base-cost gradients.
 
@@ -6322,9 +6342,10 @@ class PathFinderRouter:
             # CRITICAL: Refresh present to reflect committed paths
             self.accounting.refresh_from_canonical()
 
-            # ACCOUNTING SANITY CHECK: Verify present matches canonical
-            if not self.accounting.verify_present_matches_canonical():
-                logger.warning(f"[ITER {it}] Accounting mismatch detected - potential bug")
+            # ACCOUNTING SANITY CHECK: Verify present matches canonical.
+            # ORTHO_STRICT=1 turns the mismatch into a hard failure so
+            # corruption is caught at the iteration that introduced it.
+            enforce_present_matches_canonical(self.accounting, it)
 
             # The pre-route host snapshot is valid for constructing this
             # iteration's costs, but not for post-route diagnostics or the

@@ -189,7 +189,15 @@ Checked: both suites green with and without `ORTHO_PROFILE=1`; a live smoke test
 
 ## Phase 7 — Strict invariant mode
 
-_(pending)_
+The warn-and-continue on `verify_present_matches_canonical()` failure in
+`_pathfinder_negotiation` moved into a small module function
+`enforce_present_matches_canonical(accounting, iteration)` (so it is testable without
+a router): default behavior identical (WARNING, continue); with `ORTHO_STRICT=1` it
+raises `RuntimeError` naming the iteration. New `tests/unit/test_strict_invariant.py`
+(3 tests, modeled on `tests/unit/test_edge_accountant.py`): corrupt `present` directly
+→ default warns / strict raises; clean accountant passes in both modes.
+
+Tests: **345 passed / 9 skipped** (+3 new) + 80, green.
 
 ## Phase 8 — God-class decomposition
 
