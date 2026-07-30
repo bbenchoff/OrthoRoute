@@ -176,6 +176,7 @@ iteration_*.md
 *_ANALYSIS.md
 *_REPORT.md
 *_PLAN.md
+/notes/
 
 # Additional log files
 orthoroute.log.*
