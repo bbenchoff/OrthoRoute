@@ -539,6 +539,7 @@ except ImportError:
 
 # Local imports
 from ...domain.models.board import Board
+from ...shared.profiling import profile_span, log_profile_summary
 from .pathfinder.kicad_geometry import KiCadGeometry
 
 # GPU pathfinding
@@ -6602,6 +6603,7 @@ class PathFinderRouter:
                 f"edges={over_cnt}  via_overuse={via_ratio:.0f}%{barrel_info}  "
                 f"iter={iter_elapsed:.1f}s  total={cumulative_elapsed:.1f}s"
             )
+            log_profile_summary()  # one [PROFILE] line per iteration when ORTHO_PROFILE=1
             _iteration_metrics.append({
                 'iter': it,
                 'nets_routed': routed,
@@ -7742,20 +7744,21 @@ class PathFinderRouter:
             # Only clear if we're actually re-routing this net
             if net_id in self.net_paths and self.net_paths[net_id]:
                 self._clear_escape_occupancy(net_id)
-                # Use cached edges if available, otherwise compute
-                if net_id in self._net_to_edges:
-                    old_edges = self._net_to_edges[net_id]
-                else:
-                    old_edges = self._path_to_edges(self.net_paths[net_id])
-                self._clear_via_barrel_ownership_for_path(
-                    net_id, self.net_paths[net_id]
-                )
-                self._clear_path_node_use(self.net_paths[net_id])
-                self.accounting.clear_path(old_edges)
-                if live_present_costs:
-                    self.accounting.refresh_live_present_costs(old_edges)
-                # Clear old tracking before re-routing
-                self._clear_net_edge_tracking(net_id)
+                with profile_span("clear_path"):
+                    # Use cached edges if available, otherwise compute
+                    if net_id in self._net_to_edges:
+                        old_edges = self._net_to_edges[net_id]
+                    else:
+                        old_edges = self._path_to_edges(self.net_paths[net_id])
+                    self._clear_via_barrel_ownership_for_path(
+                        net_id, self.net_paths[net_id]
+                    )
+                    self._clear_path_node_use(self.net_paths[net_id])
+                    self.accounting.clear_path(old_edges)
+                    if live_present_costs:
+                        self.accounting.refresh_live_present_costs(old_edges)
+                    # Clear old tracking before re-routing
+                    self._clear_net_edge_tracking(net_id)
 
             # Calculate adaptive ROI radius based on net length
             src_x, src_y, src_z = self.lattice.idx_to_coord(src)
@@ -7835,9 +7838,10 @@ class PathFinderRouter:
                         # makes foreign via barrels free to enter precisely
                         # where dense connector fields need the strongest
                         # discrimination.
-                        owner_penalty = self._build_owner_penalty_gpu(
-                            net_id
-                        )
+                        with profile_span("owner_penalty"):
+                            owner_penalty = self._build_owner_penalty_gpu(
+                                net_id
+                            )
                         route_costs = costs
                         if getattr(
                             self, "_freeze_selected_portals", False
@@ -7920,25 +7924,28 @@ class PathFinderRouter:
 
                                 # Commit path and continue to next net
                                 edge_indices = self._path_to_edges(graph_path)
-                                self.accounting.commit_path(edge_indices)
-                                if live_present_costs:
-                                    self.accounting.refresh_live_present_costs(
-                                        edge_indices
-                                    )
+                                with profile_span("commit_path"):
+                                    self.accounting.commit_path(edge_indices)
+                                    if live_present_costs:
+                                        self.accounting.refresh_live_present_costs(
+                                            edge_indices
+                                        )
 
                                 self.net_paths[net_id] = path
                                 if hasattr(self, '_via_dirty_nets'):
                                     self._via_dirty_nets.add(net_id)
 
                                 # CRITICAL: Mark via barrel ownership IMMEDIATELY for next net in same iteration!
-                                self._mark_via_barrel_ownership_for_path(net_id, path)
-                                self._mark_path_node_use(path)
+                                with profile_span("via_ownership"):
+                                    self._mark_via_barrel_ownership_for_path(net_id, path)
+                                    self._mark_path_node_use(path)
 
-                                self._mark_escape_occupancy(
-                                    net_id,
-                                    self.net_selected_portals[net_id],
-                                )
-                                self._update_net_edge_tracking(net_id, edge_indices)
+                                with profile_span("tracking"):
+                                    self._mark_escape_occupancy(
+                                        net_id,
+                                        self.net_selected_portals[net_id],
+                                    )
+                                    self._update_net_edge_tracking(net_id, edge_indices)
                                 routed_this_pass += 1
                                 continue  # Skip ROI extraction and CPU routing
                             else:
@@ -8210,25 +8217,28 @@ class PathFinderRouter:
                     if use_portals else path
                 )
                 edge_indices = self._path_to_edges(graph_path)
-                self.accounting.commit_path(edge_indices)  # bumps present for next iteration
-                if live_present_costs:
-                    self.accounting.refresh_live_present_costs(
-                        edge_indices
-                    )
+                with profile_span("commit_path"):
+                    self.accounting.commit_path(edge_indices)  # bumps present for next iteration
+                    if live_present_costs:
+                        self.accounting.refresh_live_present_costs(
+                            edge_indices
+                        )
 
                 self.net_paths[net_id] = path
                 if hasattr(self, '_via_dirty_nets'):
                     self._via_dirty_nets.add(net_id)
 
                 # CRITICAL: Mark via barrel ownership IMMEDIATELY for next net in same iteration!
-                self._mark_via_barrel_ownership_for_path(net_id, path)
-                self._mark_path_node_use(path)
+                with profile_span("via_ownership"):
+                    self._mark_via_barrel_ownership_for_path(net_id, path)
+                    self._mark_path_node_use(path)
 
                 # Store portal entry/exit layers if using portals
                 if use_portals and entry_layer is not None and exit_layer is not None:
                     self.net_portal_layers[net_id] = (entry_layer, exit_layer)
                 # Update edge-to-nets tracking
-                self._update_net_edge_tracking(net_id, edge_indices)
+                with profile_span("tracking"):
+                    self._update_net_edge_tracking(net_id, edge_indices)
                 routed_this_pass += 1
             else:
                 failed_this_pass += 1

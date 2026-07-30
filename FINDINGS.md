@@ -164,7 +164,28 @@ Tests: 342/9 + 80, green.
 
 ## Phase 6 — Per-net phase instrumentation
 
-_(pending)_
+New `orthoroute/shared/profiling.py`, gated on `ORTHO_PROFILE=1` (read once at import
+into a module bool):
+
+- `profile_span(label)` — context manager; when enabled it opens an NVTX range (CuPy
+  resolved lazily and only when enabled; absence is harmless) and accumulates
+  `perf_counter` deltas into a module dict. When disabled it returns a shared no-op
+  singleton — one boolean check and no dict writes, no perf_counter, no NVTX (verified
+  by test: `profile_span(x) is _NULL_SPAN`).
+- `log_profile_summary()` — logs one `[PROFILE] label=1.23s ...` line (sorted by cost)
+  and resets; wired into `_pathfinder_negotiation` right after the `[ITER n]` line.
+
+Instrumented regions:
+- `find_path_fullgraph_gpu_seeds` (cuda_dijkstra.py): `seed_prep` (terminal dedupe +
+  transfers + node-penalty upload), `pool_reset` (pool alloc/fills/key init),
+  `bitmap_setup` (frontier scatter + owner bitmap build — two spans, same label),
+  `kernel` (persistent launch, or the whole multi-launch loop), `backtrace`.
+- `_route_all` (unified_pathfinder.py): `clear_path`, `owner_penalty`, and — on both
+  the GPU fast path and the ROI fallback commit block — `commit_path`, `via_ownership`,
+  `tracking`.
+
+Checked: both suites green with and without `ORTHO_PROFILE=1`; a live smoke test with
+`ORTHO_PROFILE=1` produced `[PROFILE] kernel=0.09s seed_prep=0.02s`.
 
 ## Phase 7 — Strict invariant mode
 

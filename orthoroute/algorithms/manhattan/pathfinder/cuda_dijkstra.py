@@ -14,6 +14,7 @@ import logging
 from typing import List, Optional, Tuple
 
 from .cuda_common import DEVICE_PRELUDE
+from ....shared.profiling import profile_span
 
 try:
     import cupy as cp
@@ -3580,74 +3581,77 @@ class CUDADijkstra:
                 cp.asarray(unique_costs, dtype=cp.float32),
             )
 
-        src_seeds_gpu, src_seed_costs_gpu = _prepare_terminals(
-            src_seeds, src_seed_costs, "source seed"
-        )
-        dst_targets_gpu, dst_target_costs_gpu = _prepare_terminals(
-            dst_targets, dst_target_costs, "destination target"
-        )
-        if node_penalty is not None:
-            node_penalty_gpu = cp.asarray(
-                node_penalty, dtype=cp.float32
-            ).reshape(1, -1)
-            if node_penalty_gpu.shape[1] != num_nodes:
-                raise ValueError(
-                    f"node_penalty has {node_penalty_gpu.shape[1]} nodes, "
-                    f"expected {num_nodes}"
-                )
-            use_node_penalty = True
-            node_penalty_stride = num_nodes
-            # Source seeds are initialized directly rather than reached by a
-            # relaxation, so the kernel would otherwise never charge their
-            # entry-node ownership cost.
-            src_seed_costs_gpu = (
-                src_seed_costs_gpu
-                + node_penalty_gpu.ravel()[src_seeds_gpu]
+        with profile_span("seed_prep"):
+            src_seeds_gpu, src_seed_costs_gpu = _prepare_terminals(
+                src_seeds, src_seed_costs, "source seed"
             )
-        else:
-            node_penalty_gpu = self._zero_node_penalty
-            use_node_penalty = False
-            node_penalty_stride = 0
+            dst_targets_gpu, dst_target_costs_gpu = _prepare_terminals(
+                dst_targets, dst_target_costs, "destination target"
+            )
+            if node_penalty is not None:
+                node_penalty_gpu = cp.asarray(
+                    node_penalty, dtype=cp.float32
+                ).reshape(1, -1)
+                if node_penalty_gpu.shape[1] != num_nodes:
+                    raise ValueError(
+                        f"node_penalty has {node_penalty_gpu.shape[1]} nodes, "
+                        f"expected {num_nodes}"
+                    )
+                use_node_penalty = True
+                node_penalty_stride = num_nodes
+                # Source seeds are initialized directly rather than reached by a
+                # relaxation, so the kernel would otherwise never charge their
+                # entry-node ownership cost.
+                src_seed_costs_gpu = (
+                    src_seed_costs_gpu
+                    + node_penalty_gpu.ravel()[src_seeds_gpu]
+                )
+            else:
+                node_penalty_gpu = self._zero_node_penalty
+                use_node_penalty = False
+                node_penalty_stride = 0
 
         # Initialize bit-packed frontier (K=1, frontier_words) — vectorized scatter-or
-        frontier_words = (num_nodes + 31) // 32
-        frontier = cp.zeros((1, frontier_words), dtype=cp.uint32)  # 2D array for K=1
-        src_words = (src_seeds_gpu >> 5).astype(cp.int32)
-        src_bits = (src_seeds_gpu & 31).astype(cp.uint32)
-        cupyx.scatter_add(frontier[0], src_words, cp.uint32(1) << src_bits)
+        with profile_span("bitmap_setup"):
+            frontier_words = (num_nodes + 31) // 32
+            frontier = cp.zeros((1, frontier_words), dtype=cp.uint32)  # 2D array for K=1
+            src_words = (src_seeds_gpu >> 5).astype(cp.int32)
+            src_bits = (src_seeds_gpu & 31).astype(cp.uint32)
+            cupyx.scatter_add(frontier[0], src_words, cp.uint32(1) << src_bits)
         logger.info(f"[GPU-SEEDS] Initialized frontier with {len(src_seeds)} seeds")
 
-        # Allocate stamp pools if needed (device-resident optimization)
-        if self.dist_val_pool is None or self.dist_val_pool.shape[1] < num_nodes:
-            N_max = max(num_nodes, 5_000_000)
-            logger.debug(f"[GPU-SEEDS] Allocated stamp pools: N_max={N_max}")
-            self.dist_val_pool = cp.full((1, N_max), cp.inf, dtype=cp.float32)
-            self.parent_val_pool = cp.full((1, N_max), -1, dtype=cp.int32)
-            # Allocate 64-bit atomic key pool (cycle-proof parent updates)
-            INF_KEY = 0x7F800000FFFFFFFF  # float +inf (upper 32) | parent -1 (lower 32)
-            self.best_key_pool = cp.full((1, N_max), INF_KEY, dtype=cp.uint64)
+        with profile_span("pool_reset"):
+            # Allocate stamp pools if needed (device-resident optimization)
+            if self.dist_val_pool is None or self.dist_val_pool.shape[1] < num_nodes:
+                N_max = max(num_nodes, 5_000_000)
+                logger.debug(f"[GPU-SEEDS] Allocated stamp pools: N_max={N_max}")
+                self.dist_val_pool = cp.full((1, N_max), cp.inf, dtype=cp.float32)
+                self.parent_val_pool = cp.full((1, N_max), -1, dtype=cp.int32)
+                # Allocate 64-bit atomic key pool (cycle-proof parent updates)
+                INF_KEY = 0x7F800000FFFFFFFF  # float +inf (upper 32) | parent -1 (lower 32)
+                self.best_key_pool = cp.full((1, N_max), INF_KEY, dtype=cp.uint64)
 
-        # Reset the persistent pools in place.  The previous implementation
-        # allocated two redundant full-graph arrays and then copied them into
-        # these pools for every net.
-        dist_view = self.dist_val_pool[0, :num_nodes]
-        parent_view = self.parent_val_pool[0, :num_nodes]
-        dist_view.fill(cp.inf)
-        parent_view.fill(-1)
-        dist_view[src_seeds_gpu] = src_seed_costs_gpu
-        logger.info(
-            f"[GPU-SEEDS] Initialized {len(src_seeds_gpu)} source seeds"
-        )
+            # Reset the persistent pools in place.  The previous implementation
+            # allocated two redundant full-graph arrays and then copied them into
+            # these pools for every net.
+            dist_view = self.dist_val_pool[0, :num_nodes]
+            parent_view = self.parent_val_pool[0, :num_nodes]
+            dist_view.fill(cp.inf)
+            parent_view.fill(-1)
+            dist_view[src_seeds_gpu] = src_seed_costs_gpu
+            logger.info(
+                f"[GPU-SEEDS] Initialized {len(src_seeds_gpu)} source seeds"
+            )
 
-        # Initialize best_key_pool for source seeds with their entry costs.
-        INF_KEY = 0x7F800000FFFFFFFF  # +inf (upper 32 bits) | parent=-1 (lower 32 bits)
-        # Reset all keys to INF_KEY first
-        self.best_key_pool[0, :num_nodes] = INF_KEY
-        seed_cost_bits = src_seed_costs_gpu.view(cp.uint32).astype(cp.uint64)
-        seed_keys = (
-            seed_cost_bits << cp.uint64(32)
-        ) | cp.uint64(0xFFFFFFFF)
-        self.best_key_pool[0, src_seeds_gpu] = seed_keys
+            # Initialize best_key_pool for source seeds with their entry costs.
+            INF_KEY = 0x7F800000FFFFFFFF  # +inf (upper 32 bits) | parent=-1 (lower 32 bits)
+            # Reset all keys to INF_KEY first
+            self.best_key_pool[0, :num_nodes] = INF_KEY
+            seed_cost_bits = src_seed_costs_gpu.view(cp.uint32).astype(cp.uint64)
+            seed_keys = (
+                seed_cost_bits << cp.uint64(32)
+            ) | cp.uint64(0xFFFFFFFF)
+            self.best_key_pool[0, src_seeds_gpu] = seed_keys
 
         # Determine lattice dimensions for coordinate encoding
         # For full-graph routing: use linear layout
@@ -3663,35 +3667,36 @@ class CUDADijkstra:
         goal_coords = cp.array([[goal_x, goal_y, goal_z]], dtype=cp.int32)  # (K=1, 3)
 
         # Create bitmap - owner-aware if provided, otherwise all-ones (no filtering)
-        bitmap_words = (num_nodes + 31) // 32
-        if allowed_bitmap is not None:
-            # Use provided owner-aware bitmap
-            # If already a CuPy array (built on GPU), use directly — no upload needed
-            if isinstance(allowed_bitmap, cp.ndarray):
-                roi_bitmaps = allowed_bitmap.reshape(1, -1)
+        with profile_span("bitmap_setup"):
+            bitmap_words = (num_nodes + 31) // 32
+            if allowed_bitmap is not None:
+                # Use provided owner-aware bitmap
+                # If already a CuPy array (built on GPU), use directly — no upload needed
+                if isinstance(allowed_bitmap, cp.ndarray):
+                    roi_bitmaps = allowed_bitmap.reshape(1, -1)
+                else:
+                    roi_bitmaps = cp.asarray(allowed_bitmap, dtype=cp.uint32).reshape(1, -1)
+                bitmap_words = int(roi_bitmaps.shape[1])
+                use_bitmap = True
+
+                # CRITICAL: Force-allow source/dest seeds (prevents frontier empty!)
+                # This happens IN THE GPU CODE to guarantee seeds are always reachable
+                seed_nodes = cp.unique(cp.concatenate([src_seeds_gpu, dst_targets_gpu]))
+                seed_words = (seed_nodes >> 5).astype(cp.int32)
+                seed_bits = (seed_nodes & 31).astype(cp.uint32)
+                force_mask = cp.zeros(bitmap_words, dtype=cp.uint32)
+                cupyx.scatter_add(
+                    force_mask, seed_words, cp.uint32(1) << seed_bits
+                )
+                roi_bitmaps[0] |= force_mask
+
+                # Count allowed nodes for sanity
+                total_bits_set = int(cp.count_nonzero(roi_bitmaps))
+                logger.debug(f"[GPU-SEEDS] Owner-aware bitmap: {bitmap_words} words, ~{total_bits_set} bits set, seeds force-allowed")
             else:
-                roi_bitmaps = cp.asarray(allowed_bitmap, dtype=cp.uint32).reshape(1, -1)
-            bitmap_words = int(roi_bitmaps.shape[1])
-            use_bitmap = True
-
-            # CRITICAL: Force-allow source/dest seeds (prevents frontier empty!)
-            # This happens IN THE GPU CODE to guarantee seeds are always reachable
-            seed_nodes = cp.unique(cp.concatenate([src_seeds_gpu, dst_targets_gpu]))
-            seed_words = (seed_nodes >> 5).astype(cp.int32)
-            seed_bits = (seed_nodes & 31).astype(cp.uint32)
-            force_mask = cp.zeros(bitmap_words, dtype=cp.uint32)
-            cupyx.scatter_add(
-                force_mask, seed_words, cp.uint32(1) << seed_bits
-            )
-            roi_bitmaps[0] |= force_mask
-
-            # Count allowed nodes for sanity
-            total_bits_set = int(cp.count_nonzero(roi_bitmaps))
-            logger.debug(f"[GPU-SEEDS] Owner-aware bitmap: {bitmap_words} words, ~{total_bits_set} bits set, seeds force-allowed")
-        else:
-            # Default: all bits set (no filtering)
-            roi_bitmaps = cp.full((1, bitmap_words), 0xFFFFFFFF, dtype=cp.uint32)
-            use_bitmap = False
+                # Default: all bits set (no filtering)
+                roi_bitmaps = cp.full((1, bitmap_words), 0xFFFFFFFF, dtype=cp.uint32)
+                use_bitmap = False
 
         # Ensure ALL CSR arrays are CuPy (on GPU)
         indptr_gpu = cp.asarray(self.indptr) if not isinstance(self.indptr, cp.ndarray) else self.indptr
@@ -3752,26 +3757,27 @@ class CUDADijkstra:
                 logger.debug("[GPU-SEEDS] Persistent kernel compiled successfully!")
 
             # Launch persistent kernel with stamp pool arrays and owner-aware bitmap
-            best_dst_result, best_dist_result, iterations_done = pk.launch_persistent_kernel(
-                self._persistent_kernel,
-                indptr_gpu,
-                indices_gpu,
-                costs_gpu,
-                num_nodes,
-                src_seeds_gpu,
-                dst_targets_gpu,
-                self.dist_val_pool[0, :num_nodes],  # Use stamp pool slice
-                self.parent_val_pool[0, :num_nodes],  # Use stamp pool slice
-                self.best_key_pool[0, :num_nodes],  # Use best_key pool slice for atomic keys
-                frontier_words,
-                allowed_bitmap_gpu=data['roi_bitmaps'][0],
-                use_bitmap=bool(data['use_bitmap']),
-                node_penalty_gpu=data['node_penalty'],
-                use_node_penalty=bool(data['use_node_penalty']),
-                src_seed_costs_gpu=src_seed_costs_gpu,
-                dst_target_costs_gpu=dst_target_costs_gpu,
-                max_iterations=max_iterations
-            )
+            with profile_span("kernel"):
+                best_dst_result, best_dist_result, iterations_done = pk.launch_persistent_kernel(
+                    self._persistent_kernel,
+                    indptr_gpu,
+                    indices_gpu,
+                    costs_gpu,
+                    num_nodes,
+                    src_seeds_gpu,
+                    dst_targets_gpu,
+                    self.dist_val_pool[0, :num_nodes],  # Use stamp pool slice
+                    self.parent_val_pool[0, :num_nodes],  # Use stamp pool slice
+                    self.best_key_pool[0, :num_nodes],  # Use best_key pool slice for atomic keys
+                    frontier_words,
+                    allowed_bitmap_gpu=data['roi_bitmaps'][0],
+                    use_bitmap=bool(data['use_bitmap']),
+                    node_penalty_gpu=data['node_penalty'],
+                    use_node_penalty=bool(data['use_node_penalty']),
+                    src_seed_costs_gpu=src_seed_costs_gpu,
+                    dst_target_costs_gpu=dst_target_costs_gpu,
+                    max_iterations=max_iterations
+                )
 
             logger.debug(f"[GPU-SEEDS] Persistent kernel complete: {iterations_done} iterations, dist={best_dist_result:.2f}")
 
@@ -3786,49 +3792,50 @@ class CUDADijkstra:
         else:
             logger.debug("[GPU-SEEDS] Using MULTI-LAUNCH kernel (Python loop)")
             # Wavefront expansion loop
-            for iteration in range(max_iterations):
-                # OPTIMIZATION: Only log progress every 100 iterations to reduce overhead
-                if DEBUG_VERBOSE_GPU and iteration % 100 == 0:
-                    active_count = int(cp.count_nonzero(frontier))
-                    target_dists = self.dist_val_pool[0, dst_targets_gpu]
-                    min_target_dist = float(cp.min(target_dists))
-                    logger.debug(f"[GPU-SEEDS] Iteration {iteration}: frontier_words={active_count}, min_target_dist={min_target_dist}")
+            with profile_span("kernel"):
+                for iteration in range(max_iterations):
+                    # OPTIMIZATION: Only log progress every 100 iterations to reduce overhead
+                    if DEBUG_VERBOSE_GPU and iteration % 100 == 0:
+                        active_count = int(cp.count_nonzero(frontier))
+                        target_dists = self.dist_val_pool[0, dst_targets_gpu]
+                        min_target_dist = float(cp.min(target_dists))
+                        logger.debug(f"[GPU-SEEDS] Iteration {iteration}: frontier_words={active_count}, min_target_dist={min_target_dist}")
 
-                # Expand wavefront (reuses existing infrastructure)
-                # Note: frontier is modified in-place by _expand_wavefront_parallel
-                try:
-                    self._expand_wavefront_parallel(data, 1, frontier)
-                except Exception as e:
-                    logger.error(f"[GPU-SEEDS] Wavefront expansion failed at iteration {iteration}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    break
-
-                # OPTIMIZATION: Only check destinations every 10 iterations to reduce GPU→CPU sync
-                # Trade-off: May run a few extra iterations after reaching goal, but much faster overall
-                if iteration % 10 == 0 or iteration < 10:
-                    target_dists = self.dist_val_pool[0, dst_targets_gpu]
-                    min_dist = float(cp.min(target_dists))
-
-                    if min_dist < float('inf'):
-                        best_idx = int(cp.argmin(target_dists))
-                        best_dst = int(dst_targets_gpu[best_idx])
-                        best_dist = min_dist
-                        logger.debug(f"[GPU-SEEDS] Path found at iteration {iteration+1}: best_dst={best_dst}, dist={best_dist:.2f}")
+                    # Expand wavefront (reuses existing infrastructure)
+                    # Note: frontier is modified in-place by _expand_wavefront_parallel
+                    try:
+                        self._expand_wavefront_parallel(data, 1, frontier)
+                    except Exception as e:
+                        logger.error(f"[GPU-SEEDS] Wavefront expansion failed at iteration {iteration}: {e}")
+                        import traceback
+                        traceback.print_exc()
                         break
 
-                    # Check upper bound hint
-                    if ub_hint is not None and min_dist > ub_hint:
-                        logger.debug(f"[GPU-SEEDS] Exceeding upper bound hint {ub_hint} at iteration {iteration}")
-                        break
+                    # OPTIMIZATION: Only check destinations every 10 iterations to reduce GPU→CPU sync
+                    # Trade-off: May run a few extra iterations after reaching goal, but much faster overall
+                    if iteration % 10 == 0 or iteration < 10:
+                        target_dists = self.dist_val_pool[0, dst_targets_gpu]
+                        min_dist = float(cp.min(target_dists))
 
-                # OPTIMIZATION: Only check for empty frontier periodically (every 50 iters) or near end
-                # Frontier going empty is rare, so this check can be infrequent
-                if iteration % 50 == 0 or iteration > max_iterations - 10:
-                    active_count = int(cp.count_nonzero(frontier))
-                    if active_count == 0:
-                        logger.debug(f"[GPU-SEEDS] Frontier empty at iteration {iteration}")
-                        break
+                        if min_dist < float('inf'):
+                            best_idx = int(cp.argmin(target_dists))
+                            best_dst = int(dst_targets_gpu[best_idx])
+                            best_dist = min_dist
+                            logger.debug(f"[GPU-SEEDS] Path found at iteration {iteration+1}: best_dst={best_dst}, dist={best_dist:.2f}")
+                            break
+
+                        # Check upper bound hint
+                        if ub_hint is not None and min_dist > ub_hint:
+                            logger.debug(f"[GPU-SEEDS] Exceeding upper bound hint {ub_hint} at iteration {iteration}")
+                            break
+
+                    # OPTIMIZATION: Only check for empty frontier periodically (every 50 iters) or near end
+                    # Frontier going empty is rare, so this check can be infrequent
+                    if iteration % 50 == 0 or iteration > max_iterations - 10:
+                        active_count = int(cp.count_nonzero(frontier))
+                        if active_count == 0:
+                            logger.debug(f"[GPU-SEEDS] Frontier empty at iteration {iteration}")
+                            break
 
         # Check final state
         if best_dst is None:
@@ -3840,9 +3847,10 @@ class CUDADijkstra:
         # Reconstruct on device and transfer only the resulting path.  Copying
         # the entire parent array cost 32 MB of PCIe traffic per monster-board
         # net even though typical paths contain only hundreds of nodes.
-        path = self._backtrace_fullgraph_path(
-            self.best_key_pool[0, :num_nodes], best_dst, num_nodes
-        )
+        with profile_span("backtrace"):
+            path = self._backtrace_fullgraph_path(
+                self.best_key_pool[0, :num_nodes], best_dst, num_nodes
+            )
         if path is None:
             return None
         logger.info(f"[GPU-SEEDS] Path reconstructed: length={len(path)}, from seed={path[0]} to target={best_dst}")
