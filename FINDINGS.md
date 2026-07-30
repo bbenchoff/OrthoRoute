@@ -86,7 +86,59 @@ Tests: 342/9 + 80, green.
 
 ## Phase 4 — Solver graveyard purge
 
-_(pending)_
+`cuda_dijkstra.py`: 5,928 → 3,922 lines. `persistent_kernel.py`: 702 → 501 (net of the
+Phase 1 addition). Every deletion was preceded by a repo-wide grep (tests, benchmarks,
+scripts, main.py, and getattr-style dynamic dispatch checked); the unit suite ran green
+after each cut.
+
+**Important correction to the audit's dead list** — `find_paths_on_rois` is NOT dead:
+the live entry point `find_path_roi_gpu` wraps its single ROI into a batch and calls it.
+That keeps the whole near-far batch pipeline alive: `_prepare_batch`, `_normalize_batch`,
+`_run_near_far`, the wavefront/compaction/persistent/delta-stepping helpers,
+`_reconstruct_paths`, and the `K_pool` pool arrays (`dist_val_pool`, `dist_stamp_pool`,
+`near_bits_pool`, …). All kept.
+
+Deleted (no reference anywhere outside the dead cluster itself; internal call chains
+removed callers-before-callees):
+
+- `find_path_single` → `find_path_batch` (only caller of it)
+- `route_batch_persistent`
+- `find_path_multisource_multisink_gpu` → `_prepare_batch_multisource`,
+  `_run_near_far_multisink` → `_relax_near_bucket_gpu`, `_advance_threshold`,
+  `_split_near_far_buckets` (multisink loop was their only caller)
+- `find_paths_bidirectional_batch` → `find_path_bidirectional` → `_transpose_csr`,
+  `_unpack_frontier`, `_expand_frontier_single`
+- Bonus dead helpers found during verification (not in the audit list, provably
+  uncalled): `_slice_per_roi`, `_relax_edges_parallel`
+- Dead kernels whose last user was deleted (or never existed): `relax_kernel`,
+  `procedural_neighbor_kernel`, `persistent_kernel_stamped` (~535 lines),
+  `accountant_kernel`; in `persistent_kernel.py`, the never-compiled
+  `PERSISTENT_SSSP_KERNEL_CODE` bit-packed variant (~240 lines; only the QUEUE variant
+  is used by `create_persistent_kernel`)
+- Orphaned instance attribute `_persistent_kernel_version` (no reader, getattr included)
+
+Kept and worth noting:
+- `_fallback_cpu_dijkstra` (now cuda_dijkstra.py:3247) also has zero callers, but it was
+  not on the audit's list and is the only CPU-correctness fallback living inside the GPU
+  solver class, so it was left in place. Candidate for a future cut — or for re-wiring.
+- `USE_DELTA_STEPPING`/`USE_PERSISTENT_KERNEL` paths inside `_run_near_far` are disabled
+  by config flags but reachable; untouched.
+
+Removed tests: none — no test referenced any deleted symbol (test counts unchanged).
+Kept — referenced by tooling: none (benchmarks/ and scripts/ reference no dead entry
+point).
+
+Preamble dedup: new `pathfinder/cuda_common.py` exports `DEVICE_PRELUDE`
+(`atomicMinFloat`, `f2u`, `pack_key`, `atomicMinDistanceKey`). Prepended to
+`wavefront_kernel`, `active_list_kernel`, `persistent_kernel` (cuda_dijkstra.py) and
+`PERSISTENT_QUEUE_SSSP_KERNEL_CODE` (persistent_kernel.py); local copies removed.
+Verified by token-level diff of assembled source vs. original: `wavefront_kernel` is
+token-identical; the other three gain only the (previously absent, unused) helper
+functions and lose nothing — the five original copies differed only in whitespace,
+parameter names, and `__forceinline__` qualifiers. Note: `via_kernels.py` contains no
+copies of these functions (audit said it did; it does not).
+
+Tests after phase: 342 passed / 9 skipped + 80 passed — identical to baseline.
 
 ## Phase 5 — Hygiene: constants, pins, cost budget
 

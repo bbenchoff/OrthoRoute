@@ -6,6 +6,8 @@ Eliminates kernel launch overhead by running persistently on device.
 
 import logging
 
+from .cuda_common import DEVICE_PRELUDE
+
 try:
     import cupy as cp
     CUDA_AVAILABLE = True
@@ -83,293 +85,17 @@ def _cooperative_grid_size(kernel, threads_per_block):
     _launch_config_cache[cache_key] = num_blocks
     return num_blocks
 
-# PERSISTENT SSSP KERNEL
-# This kernel launches ONCE per net and runs until:
-# 1. ANY destination in dst_bitmap is reached, OR
-# 2. Frontier is empty (no path), OR
-# 3. Max iterations reached
-PERSISTENT_SSSP_KERNEL_CODE = r'''
-#include <cooperative_groups.h>
-
-// CUDA constants
-#define CUDA_INFINITY __int_as_float(0x7f800000)
-
-// Custom atomic min for float using compare-and-swap
-__device__ float atomicMinFloat(float* addr, float value) {
-    int* addr_as_int = (int*)addr;
-    int old = *addr_as_int, assumed;
-    do {
-        assumed = old;
-        float old_val = __int_as_float(assumed);
-        if (old_val <= value) break;
-        old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
-    } while (assumed != old);
-    return __int_as_float(old);
-}
-
-// Atomically replace a packed (distance, parent) key only when distance
-// strictly improves.  Comparing the whole key lets an equal float32 distance
-// replace its parent based on node ID; after large penalties, sub-ULP edges
-// then create flat-distance parent cycles.
-__device__ unsigned long long atomicMinDistanceKey(
-    unsigned long long* address,
-    unsigned long long val
-) {
-    unsigned long long old = *address;
-    unsigned long long assumed;
-    do {
-        assumed = old;
-        unsigned int old_dist = (unsigned int)(assumed >> 32);
-        unsigned int new_dist = (unsigned int)(val >> 32);
-        if (new_dist >= old_dist) break;
-        old = atomicCAS(address, assumed, val);
-    } while (assumed != old);
-    return old;
-}
-
-// Pack distance and parent into 64-bit key for atomic operations
-__device__ __forceinline__ unsigned long long pack_key(float dist, int parent) {
-    unsigned int dist_bits = __float_as_uint(dist);
-    return ((unsigned long long)dist_bits << 32) | (unsigned long long)(unsigned int)parent;
-}
-
-extern "C" __global__
-void persistent_sssp_kernel(
-    const int* indptr,                  // CSR indptr for full graph
-    const int* indices,                 // CSR indices
-    const float* weights,               // CSR weights
-    const int num_nodes,                // Total nodes in graph
-    const int* src_seeds,               // Source seed array
-    const int num_srcs,                 // Number of sources
-    const int* dst_targets,             // Array of destination indices
-    const int num_dsts,                 // Number of destinations
-    float* dist,                        // Distance array (num_nodes,)
-    int* parent,                        // Parent array (num_nodes,)
-    unsigned long long* best_key,       // 64-bit atomic keys (dist+parent packed)
-    unsigned int* frontier_curr,        // Current frontier (bit-packed)
-    unsigned int* frontier_next,        // Next frontier (bit-packed)
-    const int frontier_words,           // Number of uint32 words for frontier
-    const unsigned int* allowed_bitmap, // Optional hard node filter
-    const int bitmap_words,             // Words in allowed_bitmap
-    const int use_bitmap,               // 1 = enforce bitmap
-    const float* node_penalty,           // Optional cost for entering each node
-    const int use_node_penalty,          // 1 = add node_penalty[neighbor]
-    int* settled_flag,                  // Flag: 1 when path found
-    int* best_dst,                      // Output: best destination found
-    float* best_dist,                   // Output: best distance found
-    const int max_iterations,           // Maximum iterations
-    int* iteration_count,               // Output: actual iterations performed
-    int* has_active_global              // Global flag for frontier empty check
-) {
-    const int tid = threadIdx.x;
-    const int bid = blockIdx.x;
-    const int global_tid = bid * blockDim.x + tid;
-    const int total_threads = blockDim.x * gridDim.x;
-
-    // Get grid-wide cooperative group for synchronization across ALL blocks
-    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-
-    // Thread 0: Initialize global state
-    if (global_tid == 0) {
-        *iteration_count = 0;
-        *settled_flag = 0;
-        *best_dst = -1;
-        *best_dist = CUDA_INFINITY;
-    }
-    grid.sync();
-
-    // Initialize source seeds (distributed across all threads)
-    for (int s = global_tid; s < num_srcs; s += total_threads) {
-        int seed = src_seeds[s];
-        if (seed >= 0 && seed < num_nodes) {
-            dist[seed] = 0.0f;
-            parent[seed] = -1;
-            // Initialize best_key with SRC_KEY (dist=0.0, parent=-1)
-            best_key[seed] = pack_key(0.0f, -1);
-
-            // Add to frontier
-            int word_idx = seed / 32;
-            int bit_pos = seed % 32;
-            atomicOr(&frontier_curr[word_idx], 1u << bit_pos);
-        }
-    }
-    grid.sync();
-
-    // Main persistent loop - runs until convergence
-    for (int iteration = 0; iteration < max_iterations; iteration++) {
-        // Early exit if path found
-        if (*settled_flag) break;
-
-        // Update iteration counter (thread 0 only)
-        if (global_tid == 0) {
-            *iteration_count = iteration;
-        }
-
-        // Clear next frontier (distributed)
-        for (int w = global_tid; w < frontier_words; w += total_threads) {
-            frontier_next[w] = 0;
-        }
-        grid.sync();
-
-        // Process frontier - each block handles different words
-        for (int word_idx = bid; word_idx < frontier_words; word_idx += gridDim.x) {
-            unsigned int word = frontier_curr[word_idx];
-            if (word == 0) continue;
-
-            // Each thread processes different bits
-            for (int bit = tid; bit < 32; bit += blockDim.x) {
-                if (!((word >> bit) & 1)) continue;
-
-                int node = word_idx * 32 + bit;
-                if (node >= num_nodes) continue;
-
-                float node_dist = dist[node];
-                if (isinf(node_dist)) continue;
-
-                // Expand neighbors
-                int e0 = indptr[node];
-                int e1 = indptr[node + 1];
-
-                for (int e = e0; e < e1; e++) {
-                    int neighbor = indices[e];
-                    if (neighbor < 0 || neighbor >= num_nodes) continue;
-
-                    if (use_bitmap) {
-                        int nbr_word = neighbor >> 5;
-                        int nbr_bit = neighbor & 31;
-                        if (nbr_word >= bitmap_words ||
-                            ((allowed_bitmap[nbr_word] >> nbr_bit) & 1u) == 0) {
-                            continue;
-                        }
-                    }
-
-                    float edge_cost = weights[e];
-                    if (use_node_penalty) {
-                        edge_cost += node_penalty[neighbor];
-                    }
-                    float g_new = node_dist + edge_cost;
-
-                    // Pack new key with distance and parent
-                    unsigned long long new_key = pack_key(g_new, node);
-
-                    // Single atomic operation on 64-bit key - eliminates race condition!
-                    unsigned long long old_key = atomicMinDistanceKey(
-                        &best_key[neighbor], new_key
-                    );
-
-                    // Only the winning thread proceeds
-                    if ((unsigned int)(new_key >> 32)
-                            < (unsigned int)(old_key >> 32)) {
-                        // We won! Update dist and parent arrays (for compatibility)
-                        dist[neighbor] = g_new;
-                        atomicExch(&parent[neighbor], node);
-
-                        // Add to next frontier
-                        int nbr_word = neighbor / 32;
-                        int nbr_bit = neighbor % 32;
-                        atomicOr(&frontier_next[nbr_word], 1u << nbr_bit);
-                    }
-                }
-            }
-        }
-        grid.sync();
-
-        // Check if any destination reached
-        for (int d = global_tid; d < num_dsts; d += total_threads) {
-            int dst = dst_targets[d];
-            if (dst < 0 || dst >= num_nodes) continue;
-
-            float dst_dist = dist[dst];
-            if (!isinf(dst_dist)) {
-                // Found a path! Update best
-                atomicMinFloat(best_dist, dst_dist);
-
-                // Check if this is the best distance
-                if (fabsf(dst_dist - *best_dist) < 1e-8f) {
-                    atomicExch(best_dst, dst);
-                    atomicExch(settled_flag, 1);
-                }
-            }
-        }
-        grid.sync();
-
-        // Early exit if settled
-        if (*settled_flag) break;
-
-        // Check if frontier is empty (use global flag, not shared)
-        if (global_tid == 0) {
-            *has_active_global = 0;  // Reset global flag
-        }
-        grid.sync();  // Ensure reset is visible
-
-        // All threads check their portion of frontier_next
-        for (int w = global_tid; w < frontier_words; w += total_threads) {
-            if (frontier_next[w] != 0) {
-                atomicExch(has_active_global, 1);  // Global atomic write
-            }
-        }
-        grid.sync();  // CRITICAL: Grid-wide sync to ensure all blocks finish checking
-
-        if (*has_active_global == 0) {
-            // No more work - terminate
-            break;
-        }
-
-        // Swap frontiers for next iteration
-        for (int w = global_tid; w < frontier_words; w += total_threads) {
-            frontier_curr[w] = frontier_next[w];
-        }
-        grid.sync();  // CRITICAL: Grid-wide sync before next iteration
-    }
-}
-'''
-
-# Queue-based successor to the bit-packed implementation above.  A monster
-# graph has more than 250,000 frontier words, while a single wave normally
-# contains only a few thousand nodes.  Scanning and clearing every word three
-# times per wave made work proportional to the whole board rather than to the
-# search frontier.
-PERSISTENT_QUEUE_SSSP_KERNEL_CODE = r'''
-#include <cooperative_groups.h>
-
-#define CUDA_INFINITY __int_as_float(0x7f800000)
-
-__device__ float atomicMinFloat(float* addr, float value) {
-    int* addr_as_int = (int*)addr;
-    int old = *addr_as_int, assumed;
-    do {
-        assumed = old;
-        float old_val = __int_as_float(assumed);
-        if (old_val <= value) break;
-        old = atomicCAS(addr_as_int, assumed, __float_as_int(value));
-    } while (assumed != old);
-    return __int_as_float(old);
-}
-
-__device__ unsigned long long atomicMinDistanceKey(
-    unsigned long long* address,
-    unsigned long long value
-) {
-    unsigned long long old = *address;
-    unsigned long long assumed;
-    do {
-        assumed = old;
-        unsigned int old_dist = (unsigned int)(assumed >> 32);
-        unsigned int new_dist = (unsigned int)(value >> 32);
-        if (new_dist >= old_dist) break;
-        old = atomicCAS(address, assumed, value);
-    } while (assumed != old);
-    return old;
-}
-
-__device__ __forceinline__ unsigned long long pack_key(
-    float dist,
-    int parent
-) {
-    return ((unsigned long long)__float_as_uint(dist) << 32)
-        | (unsigned long long)(unsigned int)parent;
-}
-
+# Queue-based persistent kernel (successor to an earlier bit-packed frontier
+# implementation).  A monster graph has more than 250,000 frontier words,
+# while a single wave normally contains only a few thousand nodes.  Scanning
+# and clearing every word three times per wave made work proportional to the
+# whole board rather than to the search frontier.
+PERSISTENT_QUEUE_SSSP_KERNEL_CODE = (
+    '#include <cooperative_groups.h>\n'
+    '\n'
+    '#define CUDA_INFINITY __int_as_float(0x7f800000)\n'
+    + DEVICE_PRELUDE
+    + r'''
 extern "C" __global__
 void persistent_queue_sssp_kernel(
     const int* indptr,
@@ -586,6 +312,7 @@ void persistent_queue_sssp_kernel(
     }
 }
 '''
+)
 
 
 def create_persistent_kernel():
