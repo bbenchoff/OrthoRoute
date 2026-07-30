@@ -14,7 +14,7 @@ from orthoroute.algorithms.manhattan.unified_pathfinder import (
     UnifiedPathFinder,
 )
 
-from conftest import make_two_pad_board
+from tests.conftest import make_two_pad_board
 
 
 def test_cost_balance_ignores_legal_capacity_occupancy():

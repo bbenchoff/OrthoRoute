@@ -260,8 +260,19 @@ def apply_derived_parameters(config, derived: DerivedRoutingParameters):
 
     config.stagnation_patience = derived.stagnation_patience
 
-    # Use the higher of derived or config max_iterations (respects command-line override)
-    config.max_iterations = max(config.max_iterations, derived.max_iterations)
+    # Increase the dataclass default for large boards, but preserve an
+    # explicitly configured limit (for example a CLI or smoke-test budget).
+    explicitly_configured = "max_iterations" in vars(config)
+    if not explicitly_configured:
+        config.max_iterations = max(
+            config.max_iterations,
+            derived.max_iterations,
+        )
+    else:
+        logger.info(
+            "Preserving explicit max_iterations=%s",
+            config.max_iterations,
+        )
     logger.info(f"Max iterations: {config.max_iterations}")
 
     logger.info("Parameters applied successfully")

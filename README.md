@@ -113,7 +113,7 @@ _Testing / examples are the following_:
 - An NVIDIA CUDA 12 GPU on Windows/Linux, or Apple Silicon on macOS
 - Enough accelerator memory for the board and routing grid
 
-### Installation
+### Installation Methods
 
 1. Clone the repository.
 2. Build and deploy the native IPC plugin:
@@ -182,14 +182,23 @@ Plus graph structure, node ownership, buffers: +20-25 GB
 3. **Route your nets** - OrthoRoute will automatically:
    - Extract board data via KiCad IPC API
    - Build 3D routing lattice (multi-layer Manhattan routing)
-   - Map all pads to the routing graph
+   - Map pads to routing graph
    - Route nets using GPU-accelerated PathFinder
-4. **Monitor progress** in the interactive PCB viewer
-5. **Import back to KiCad**
+5. **Monitor progress** in the interactive PCB viewer
+6. **Review results** - tracks and vias are automatically added to KiCad
 
-### CLI Mode (For Development)
-1. **Navigate to the OrthoRoute Folder** Wherever it's installed via KiCad
-2. **Run from CLI**: `python main.py --test-manhattan`
+### Standalone Mode (For Testing)
+```bash
+# Built-in acceptance test (synthetic board routing)
+python main.py --test-manhattan
+
+# Run regression tests
+pytest tests/                                    # All tests (unit + regression)
+pytest tests/regression/test_backplane.py -v    # Full regression suite (63 tests)
+pytest tests/unit/ -v                           # Unit tests only (167 tests)
+```
+
+**Note:** CLI mode (`python main.py cli board.kicad_pcb`) is designed for development/debugging and requires KiCad to be running with the board open in PCB Editor.
 
 ### Cloud (Headless, Kicad-less) Mode
 Headless mode is designed for instances when you would like to route a board, but it won't fit in your GPU. This mode is actually several functions that allow for running a routing algorithm _without KiCad_.
@@ -227,6 +236,37 @@ Third, import the routing solution back into KiCad:
 Typical use case: Cloud GPU routing
 
 Upload your .ORP file to a cloud GPU instance (Vast.ai, RunPod, etc.), run the routing there, then download the .ORS file back to your local machine for import. This allows routing large boards on powerful GPUs with more memory. Details on the file format are available [in the docs](docs/ORP_ORS_file_formats.md)
+
+### Debug Mode & Logging
+
+By default OrthoRoute runs in **normal mode** — minimal log output, no iteration screenshots:
+
+| Behaviour | Normal mode (default) | Debug mode (`ORTHO_DEBUG=1`) |
+|---|---|---|
+| Log file level | `WARNING` only (~66 milestone lines/run) | `DEBUG` (full detail) |
+| Iteration screenshots | Disabled | Saved to `debug_output/` at 8× resolution |
+| Screenshot frequency | — | Every N iterations (`ORTHO_SCREENSHOT_FREQ`) |
+| Screenshot scale | — | 8× default (`ORTHO_SCREENSHOT_SCALE`) |
+
+**Enable debug mode before launching KiCad (PowerShell):**
+```powershell
+$env:ORTHO_DEBUG = '1'
+start kicad          # or however you launch KiCad
+```
+
+**Fine-tune screenshot output:**
+```powershell
+$env:ORTHO_DEBUG             = '1'   # master switch
+$env:ORTHO_SCREENSHOT_FREQ   = '5'   # screenshot every 5 iterations
+$env:ORTHO_SCREENSHOT_SCALE  = '4'   # 4× resolution instead of 8×
+```
+
+**Disable again:**
+```powershell
+Remove-Item Env:ORTHO_DEBUG
+```
+
+Log files are always written to `<plugin_dir>/logs/` regardless of mode.
 
 ### There's something wrong with the KiCad IPC API
 

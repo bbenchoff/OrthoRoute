@@ -24,44 +24,54 @@ OrthoRoute is designed as an IPC API plugin for KiCad 9.0+, which allows it to r
 
 ## The PCM + IPC Bug on Windows
 
+### Current Status (April 2026)
+
+**Issue:** [KiCad bug #19465](https://gitlab.com/kicad/code/kicad/-/issues/19465) — IPC API plugins cannot be installed via Plugin & Content Manager
+
+**Workaround:** Manual installation required (see Installation section below)
+
+**Expected Fix:** KiCad development team is working on a resolution
+
 ### The Problem
 
-When attempting to install an IPC plugin via PCM with `"runtime": "ipc"` in `metadata.json`:
+When attempting to install an IPC plugin via PCM with `"runtime": {"type": "python"}` in `plugin.json`:
 
 ```json
 {
-  "versions": [{
-    "version": "1.0.0",
-    "status": "stable",
-    "kicad_version": "9.0",
-    "runtime": "ipc"  // This causes a crash!
-  }]
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "runtime": {
+    "type": "python",
+    "min_version": "3.10"
+  }
 }
 ```
 
-**Result:** KiCad crashes immediately during installation on Windows (tested on KiCad 9.0.1, 9.0.2, 9.0.6).
+**Result:** Plugin installation may succeed, but the plugin doesn't appear in KiCad's toolbar or menu on Windows.
 
-### What We Tried
+### What We Tried (and What Works)
 
-1. **Pure IPC Plugin via PCM**
+1. ✅ **Hybrid SWIG + IPC Approach (CURRENT SOLUTION)**
+   - Package as SWIG plugin for PCM compatibility
+   - Use `__init__.py` for ActionPlugin registration (toolbar button)
+   - Launch `main.py` via subprocess that connects to IPC API
+   - Include `plugin.json` + `metadata.json` + icons for full metadata
+   - Result: ✅ **Works!** Installable via PCM, appears in toolbar, uses IPC API
+
+2. ❌ **Pure IPC Plugin via PCM**
    - Created `plugin.json` with proper schema
-   - Set `"runtime": "ipc"` in metadata.json
-   - Result: ❌ KiCad crashes during installation
+   - Set `"runtime": {"type": "python"}` 
+   - Result: ❌ Plugin doesn't appear in KiCad UI after installation
 
-2. **Manual IPC Installation** (bypassing PCM)
-   - Extract plugin folder to `C:\Users\<user>\Documents\KiCad\9.0\plugins\`
-   - KiCad scans and loads plugin.json
-   - Result: ✅ Works! But requires manual installation
+3. ✅ **Manual IPC Installation** (bypass PCM)
+   - Extract plugin folder to `Documents/KiCad/9.0/3rdparty/plugins/`
+   - Ensure folder name: `com_github_bbenchoff_orthoroute` (underscores, not dots)
+   - Restart KiCad
+   - Result: ✅ Works! But requires manual steps
 
-3. **SWIG Plugin Running Code Directly**
-   - Package as SWIG plugin (no runtime field in metadata)
+4. ❌ **SWIG Plugin Running Code Directly**
+   - Package as SWIG plugin (no runtime field)
    - Run OrthoRoute code in KiCad's embedded Python
    - Result: ❌ Missing dependencies (numpy, PyQt6, cupy, psutil, etc.)
-
-4. **SWIG Wrapper + Subprocess Launch**
-   - SWIG plugin installs via PCM
-   - Launches `python main.py` as subprocess with system Python
-   - Result: ❌ Subprocess doesn't get IPC environment variables (KICAD_API_SOCKET, KICAD_API_TOKEN)
 
 ## Technical Details
 
@@ -178,33 +188,128 @@ class OrthoRoutePlugin(pcbnew.ActionPlugin):
 OrthoRoutePlugin().register()
 ```
 
-## Current Solution
+## Current Solution (OrthoRoute Implementation)
 
-Since IPC plugins via PCM don't work on Windows, and SWIG plugins can't access external dependencies, **there is currently no perfect solution for PCM distribution**.
+OrthoRoute uses a **hybrid SWIG + IPC approach** that combines the best of both worlds:
 
-### Recommended Solution: Manual IPC Installation
+### Architecture
 
-**This is the confirmed working approach used by production plugins like layout_stamp.**
+1. **SWIG ActionPlugin Entry Point** (`__init__.py`)
+   - Registers toolbar button via `pcbnew.ActionPlugin`
+   - Detects system Python executable
+   - Launches `main.py` as subprocess with IPC environment
+   - No dependency conflicts (runs in KiCad Python)
 
-1. **Manual IPC Installation**
-   - Distribute as a ZIP with instructions to extract to `plugins/` folder
-   - KiCad manages venv and dependencies automatically via `requirements.txt`
-   - Best user experience once installed
-   - **Critical:** Users must manually enable IPC API in KiCad settings (Preferences → Plugins)
-   - Downside: No "one-click" PCM install
+2. **IPC API Application** (`main.py`)
+   - Runs in system Python environment with full dependencies
+   - Connects to KiCad via IPC API using environment variables
+   - Accesses board data, creates geometry, writes back to PCB
 
-### Alternative Workarounds (Not Recommended)
+3. **Complete Metadata** (for future PCM compatibility)
+   - `plugin.json` — IPC API descriptor with action definitions
+   - `metadata.json` — KiCad PCM package metadata
+   - `icon-24.png`, `icon-64.png` — Toolbar icons (24×24 and 64×64)
 
-2. **SWIG + External Script** (Historical - doesn't work)
-   - SWIG plugin installs via PCM
-   - Downloads/launches separate Python script
-   - Requires documenting external Python setup
-   - Complex for users
+### Build System
 
-3. **Wait for KiCad Fix**
-   - The `"runtime": "ipc"` crash appears to be a KiCad bug
-   - May be fixed in future releases
-   - Monitor KiCad GitLab issues
+**Build Script**: `build.py`
+
+```bash
+# Build plugin package + ZIP
+python build.py
+
+# Build and deploy to local KiCad
+python build.py --deploy
+
+# Clean build directory
+python build.py --clean
+```
+
+**Output Structure** (in `build/`):
+```
+com_github_bbenchoff_orthoroute/     # Plugin directory
+├── __init__.py                      # SWIG ActionPlugin registration
+├── main.py                          # IPC application entry point
+├── plugin.json                      # IPC API descriptor
+├── metadata.json                    # PCM metadata
+├── icon-24.png                      # Toolbar icon (24×24)
+├── icon-64.png                      # Toolbar icon (64×64)
+├── requirements.txt                 # Python dependencies
+├── LICENSE
+├── orthoroute.json                  # Runtime configuration
+├── graphics/
+│   └── kicad_theme.json            # PCB viewer colors
+└── orthoroute/                      # Application package
+    ├── algorithms/
+    ├── domain/
+    ├── infrastructure/
+    └── presentation/
+
+OrthoRoute-1.0.0.zip                # Installable package (114 files, 720 KB)
+```
+
+**ZIP Structure** (for manual installation):
+```
+metadata.json                        # PCM metadata at root
+plugins/
+  com_github_bbenchoff_orthoroute/   # Plugin package
+    [... all files above ...]
+```
+
+### Development Workflow
+
+**Fast Iteration** (during development):
+```powershell
+# Make code changes, then sync to KiCad (no rebuild)
+.\copy_to_kicad.ps1
+
+# Restart KiCad to reload changes
+```
+
+**Full Build** (for distribution):
+```bash
+python build.py --deploy    # Build + install locally
+# Test in KiCad
+# If working, commit and tag release
+```
+
+### Installation Methods
+
+**Method 1: Automated Deploy (Developers)**
+```bash
+git clone https://github.com/bbenchoff/OrthoRoute.git
+cd OrthoRoute
+pip install -r requirements.txt
+python build.py --deploy    # Builds and installs to KiCad
+```
+
+**Method 2: Manual ZIP Install (End Users)**
+1. Download `OrthoRoute-X.X.X.zip` from releases
+2. Extract to `Documents/KiCad/9.0/3rdparty/plugins/`
+3. Verify folder name is `com_github_bbenchoff_orthoroute` (underscores, not dots)
+4. Restart KiCad
+5. Toolbar icon should appear in PCB Editor
+
+**Method 3: PCM Install (Future — When Bug #19465 is Fixed)**
+1. Open KiCad → Plugin and Content Manager
+2. Search for "OrthoRoute"
+3. Click "Install"
+4. Restart KiCad
+
+### Plugin Visibility Checklist
+
+If the toolbar icon doesn't appear after installation:
+
+1. ✅ **Verify folder name**: Must be `com_github_bbenchoff_orthoroute` (underscores)
+2. ✅ **Check icon files exist**:
+   - `icon-24.png` (2,733 bytes)
+   - `icon-64.png` (4,030 bytes)
+3. ✅ **Verify metadata**:
+   - `plugin.json` with `"show-button": true`
+   - `metadata.json` present
+4. ✅ **Check logs**: `<plugin_dir>/logs/latest.log`
+5. ✅ **Restart KiCad**: Plugin metadata only loads at startup
+6. ✅ **Enable IPC API**: `Preferences → Plugins → Enable Python API`
 
 ## Working Examples
 

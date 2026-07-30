@@ -33,7 +33,7 @@ def run_pipeline(board, router):
     
     # Step 2: Preflight validation using shared checks
     logger.info(f"[PIPELINE] Step 2: Running preflight validation...")
-    from ..algorithms.manhattan.graph_checks import preflight_graph
+    from ..algorithms.manhattan.rrg import preflight_graph
     if not preflight_graph(router.graph_state):
         raise RuntimeError("PREFLIGHT failed - graph validation errors detected")
     
@@ -50,7 +50,7 @@ def run_pipeline(board, router):
     router.map_all_pads(board)
     
     # Validate lattice freeze after pad mapping
-    from ..algorithms.manhattan.graph_checks import validate_lattice_integrity
+    from ..algorithms.manhattan.rrg import validate_lattice_integrity
     if not validate_lattice_integrity(router.graph_state):
         raise RuntimeError("LATTICE INTEGRITY failed - lattice was mutated during pad mapping")
     

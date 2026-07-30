@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QGroupBox, QScrollArea, QTabWidget, QProgressBar,
     QStatusBar, QMenuBar, QToolBar, QApplication, QMessageBox,
     QCheckBox, QSpinBox, QDoubleSpinBox, QComboBox, QSlider,
-    QFrame, QSizePolicy, QLineEdit, QFileDialog
+    QFrame, QSizePolicy, QLineEdit, QFileDialog, QMenu
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QSize, QRect, QPoint, QPointF,
@@ -167,6 +167,14 @@ class PCBViewer(QWidget):
         # Draw vias
         if self.show_vias:
             self._draw_vias(painter)
+
+        # Draw copper zones
+        if self.show_zones:
+            self._draw_zones(painter)
+
+        # Draw keepout rule areas
+        if self.show_keepouts:
+            self._draw_keepouts(painter)
         
     def _draw_board_outline(self, painter: QPainter):
         """Draw the board outline"""
@@ -241,12 +249,12 @@ class PCBViewer(QWidget):
         """Draw existing tracks/traces with performance optimization"""
         tracks = self.board_data.get('tracks', [])
         
-        logger.info(f"_draw_tracks called: board_data has {len(tracks)} tracks")
+        logger.debug(f"_draw_tracks called: board_data has {len(tracks)} tracks")
         if tracks:
-            logger.info(f"First track: {tracks[0]}")
+            logger.debug(f"First track: {tracks[0]}")
 
         if not tracks:
-            logger.info("No tracks to draw - returning early")
+            logger.debug("No tracks to draw - returning early")
             return
             
         # CRITICAL PERFORMANCE FIX: Viewport culling and LOD
@@ -262,8 +270,8 @@ class PCBViewer(QWidget):
             margin = max(visible_rect.width(), visible_rect.height()) * 0.1
             visible_rect = visible_rect.adjusted(-margin, -margin, margin, margin)
 
-            logger.info(f"VIEWPORT DEBUG: visible_rect = ({visible_rect.left():.1f}, {visible_rect.top():.1f}) -> ({visible_rect.right():.1f}, {visible_rect.bottom():.1f})")
-            logger.info(f"VIEWPORT DEBUG: zoom_level = {zoom_level:.3f}")
+            logger.debug(f"VIEWPORT DEBUG: visible_rect = ({visible_rect.left():.1f}, {visible_rect.top():.1f}) -> ({visible_rect.right():.1f}, {visible_rect.bottom():.1f})")
+            logger.debug(f"VIEWPORT DEBUG: zoom_level = {zoom_level:.3f}")
         except Exception as e:
             # Fallback: render everything if transform fails
             logger.warning(f"VIEWPORT DEBUG: Transform failed ({e}), using fallback viewport")
@@ -334,8 +342,8 @@ class PCBViewer(QWidget):
                         board_min_y, board_max_y = bounds[1], bounds[3]
                         in_bounds_x = board_min_x <= x1 <= board_max_x and board_min_x <= x2 <= board_max_x
                         in_bounds_y = board_min_y <= y1 <= board_max_y and board_min_y <= y2 <= board_max_y
-                        logger.info(f"COORD VERIFY: Track ({x1:.1f},{y1:.1f})->({x2:.1f},{y2:.1f}) in_bounds=({in_bounds_x},{in_bounds_y})")
-                        logger.info(f"COORD VERIFY: Board bounds ({board_min_x:.1f},{board_min_y:.1f})->({board_max_x:.1f},{board_max_y:.1f})")
+                        logger.debug(f"COORD VERIFY: Track ({x1:.1f},{y1:.1f})->({x2:.1f},{y2:.1f}) in_bounds=({in_bounds_x},{in_bounds_y})")
+                        logger.debug(f"COORD VERIFY: Board bounds ({board_min_x:.1f},{board_min_y:.1f})->({board_max_x:.1f},{board_max_y:.1f})")
 
                 # Handle both layer formats: integer and string
                 layer_raw = track.get('layer', 0)
@@ -349,6 +357,9 @@ class PCBViewer(QWidget):
                         layer = f'In{layer_raw-1}.Cu'  # Internal layers In1.Cu, In2.Cu, etc.
                 else:
                     layer = layer_raw
+                    # Normalize kipy proto enum names: "BL_F_Cu" -> "F.Cu"
+                    if isinstance(layer, str) and layer.startswith('BL_'):
+                        layer = layer[3:].replace('_', '.')
                 
                 # TEMPORARY: Disable viewport culling to debug coordinate system
                 # PERFORMANCE: Skip tracks outside visible viewport
@@ -358,7 +369,7 @@ class PCBViewer(QWidget):
 
                 # DEBUG: Log first few tracks to see coordinate ranges
                 if drawn_tracks < 5:
-                    logger.info(f"TRACK COORDS #{drawn_tracks+1}: ({x1:.1f},{y1:.1f})->({x2:.1f},{y2:.1f}) layer={layer}")
+                    logger.debug(f"TRACK COORDS #{drawn_tracks+1}: ({x1:.1f},{y1:.1f})->({x2:.1f},{y2:.1f}) layer={layer}")
 
                 # DISABLED: Skip viewport culling for now
                 # if (visible_rect.contains(line_start) or
@@ -379,7 +390,7 @@ class PCBViewer(QWidget):
                 if layer not in self.visible_layers:
                     # Log layer visibility issue for first few tracks
                     if drawn_tracks < 3:
-                        logger.info(f"TRACK LAYER FILTERED #{drawn_tracks+1}: track layer '{layer}' not in visible_layers {list(self.visible_layers)}")
+                        logger.debug(f"TRACK LAYER FILTERED #{drawn_tracks+1}: track layer '{layer}' not in visible_layers {list(self.visible_layers)}")
                     continue
                 
                 # Set color based on layer
@@ -403,18 +414,21 @@ class PCBViewer(QWidget):
                 # Use actual track dimensions (just like footprints are drawn)
                 # Convert mm to scene coordinates - same as footprints use
                 line_width = width  # Use actual track width in mm
-                painter.setPen(QPen(color, line_width))
+                pen = QPen(color, line_width)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
                 painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
                 drawn_tracks += 1
                 
                 # Log first few tracks drawn
                 if drawn_tracks <= 3:
-                    logger.info(f"TRACK DRAWN #{drawn_tracks}: ({x1:.3f},{y1:.3f}) -> ({x2:.3f},{y2:.3f}) width={line_width} layer={layer}")
+                    logger.debug(f"TRACK DRAWN #{drawn_tracks}: ({x1:.3f},{y1:.3f}) -> ({x2:.3f},{y2:.3f}) width={line_width} layer={layer}")
                 
             except (KeyError, TypeError):
                 continue
         
-        logger.info(f"_draw_tracks completed: drew {drawn_tracks} tracks, culled {culled_tracks} (viewport + limit), total {len(tracks)} available")
+        logger.debug(f"_draw_tracks completed: drew {drawn_tracks} tracks, culled {culled_tracks} (viewport + limit), total {len(tracks)} available")
                 
     def _line_intersects_rect(self, x1, y1, x2, y2, rect):
         """Check if a line intersects with a rectangle (simple bounding box check)"""
@@ -567,10 +581,10 @@ class PCBViewer(QWidget):
         vias = self.board_data.get('vias', [])
 
         if not vias:
-            logger.info("_draw_vias: No vias to draw")
+            logger.debug("_draw_vias: No vias to draw")
             return  # No vias to draw
 
-        logger.info(f"_draw_vias called: board_data has {len(vias)} vias")
+        logger.debug(f"_draw_vias called: board_data has {len(vias)} vias")
             
         # Get zoom level for LOD optimization
         zoom_level = painter.transform().m11()
@@ -680,8 +694,90 @@ class PCBViewer(QWidget):
                 logger.warning(f"Invalid via data: {via}, error: {e}")
                 continue
 
-        logger.info(f"_draw_vias completed: drew {drawn_vias} vias out of {len(vias)} available")
-                
+        logger.debug(f"_draw_vias completed: drew {drawn_vias} vias out of {len(vias)} available")
+
+    def _draw_zones(self, painter: QPainter):
+        """Draw copper fill zones (pours)"""
+        zones = self.board_data.get('zones', [])
+        if not zones:
+            return
+
+        logger.debug(f"_draw_zones called: {len(zones)} zones")
+        drawn_zones = 0
+
+        for zone in zones:
+            try:
+                layer_names = zone.get('layers', [])
+                filled = zone.get('filled', {})
+
+                # Prefer filled polygons (post-pour); fall back to outline
+                if filled:
+                    polys_to_draw = [(layer, pts)
+                                     for layer, poly_list in filled.items()
+                                     for pts in poly_list]
+                elif zone.get('outline'):
+                    layer = layer_names[0] if layer_names else 'F.Cu'
+                    polys_to_draw = [(layer, zone['outline'])]
+                else:
+                    continue
+
+                for layer_name, pts in polys_to_draw:
+                    if not pts or len(pts) < 3:
+                        continue
+
+                    # Skip if layer is not visible
+                    if layer_name not in self.visible_layers:
+                        continue
+
+                    color = self.color_scheme.get_layer_color(layer_name)
+                    fill_color = QColor(color)
+                    fill_color.setAlpha(60)  # Semi-transparent fill
+                    outline_color = QColor(color)
+                    outline_color.setAlpha(120)
+
+                    painter.setPen(QPen(outline_color, 0.05))
+                    painter.setBrush(QBrush(fill_color))
+
+                    polygon = QPolygonF([QPointF(p[0], p[1]) for p in pts])
+                    painter.drawPolygon(polygon)
+                    drawn_zones += 1
+
+            except Exception as e:
+                logger.warning(f"Error drawing zone: {e}")
+                continue
+
+        logger.debug(f"_draw_zones completed: drew {drawn_zones} fill polygons")
+
+    def _draw_keepouts(self, painter: QPainter):
+        """Draw keepout rule areas as hatched / dashed outlines."""
+        keepouts = self.board_data.get('keepouts', [])
+        if not keepouts:
+            return
+
+        HATCH_COLOR = QColor(255, 80, 80, 120)   # red-ish, semi-transparent
+        FILL_COLOR  = QColor(255, 80, 80, 25)    # very faint red fill
+
+        pen = QPen(HATCH_COLOR, 0.08)
+        pen.setStyle(Qt.PenStyle.DashLine)
+
+        for keepout in keepouts:
+            outline = keepout.get('outline', [])
+            if len(outline) < 3:
+                continue
+
+            layers = keepout.get('layers', [])
+            # Skip if none of the keepout's layers are visible
+            if layers and not any(ln in self.visible_layers for ln in layers):
+                continue
+
+            try:
+                painter.setPen(pen)
+                painter.setBrush(QBrush(FILL_COLOR))
+                polygon = QPolygonF([QPointF(p[0], p[1]) for p in outline])
+                painter.drawPolygon(polygon)
+            except Exception as e:
+                logger.warning(f"Error drawing keepout: {e}")
+
     def wheelEvent(self, event: QWheelEvent):
         """Handle mouse wheel for zooming"""
         zoom_factor = 1.2 if event.angleDelta().y() > 0 else 1.0 / 1.2
@@ -710,11 +806,81 @@ class PCBViewer(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.is_panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
-    
+
+    def _screen_to_world(self, screen_pos) -> tuple:
+        """Convert a screen QPoint to world (mm) coordinates."""
+        cx = self.width()  / 2.0
+        cy = self.height() / 2.0
+        wx = screen_pos.x() / self.zoom_factor - cx / self.zoom_factor + self.pan_x
+        wy = screen_pos.y() / self.zoom_factor - cy / self.zoom_factor + self.pan_y
+        return wx, wy
+
+    @staticmethod
+    def _point_in_polygon(px: float, py: float, polygon) -> bool:
+        """Ray-casting PIP test."""
+        n = len(polygon)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = polygon[i][0], polygon[i][1]
+            xj, yj = polygon[j][0], polygon[j][1]
+            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi + 1e-15) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def contextMenuEvent(self, event):
+        """Right-click: show keepout constraints when clicking inside a keepout area."""
+        keepouts = self.board_data.get('keepouts', []) if hasattr(self, 'board_data') else []
+        if not keepouts:
+            return
+
+        wx, wy = self._screen_to_world(event.pos())
+
+        hit = None
+        for ko in keepouts:
+            outline = ko.get('outline', [])
+            if len(outline) >= 3 and self._point_in_polygon(wx, wy, outline):
+                hit = ko
+                break
+
+        if hit is None:
+            return
+
+        menu = QMenu(self)
+        name = hit.get('name') or '(unnamed)'
+        title_action = menu.addAction(f"Keepout: {name}")
+        title_action.setEnabled(False)
+        menu.addSeparator()
+
+        CONSTRAINTS = [
+            ('keepout_tracks',      'No Tracks'),
+            ('keepout_vias',        'No Vias'),
+            ('keepout_copper',      'No Copper Fills'),
+            ('keepout_pads',        'No Pads'),
+            ('keepout_footprints',  'No Footprints'),
+        ]
+
+        layers = hit.get('layers', [])
+        layers_action = menu.addAction(f"Layers: {', '.join(layers) if layers else 'all'}")
+        layers_action.setEnabled(False)
+        menu.addSeparator()
+
+        for key, label in CONSTRAINTS:
+            val = hit.get(key, False)
+            mark = '\u2718  ' if val else '\u2713  '   # ✘ blocked, ✓ allowed
+            a = menu.addAction(f"{mark}{label}")
+            a.setEnabled(False)
+
+        menu.exec(event.globalPos())
+
     def debug_screenshot(self, filename_prefix: str = "debug_routing", scale_factor: int = 1, output_dir: str = None):
-        """Capture screenshot of the PCB viewer for debugging with optional high-res rendering"""
+        """Capture screenshot of the PCB viewer for debugging with optional high-res rendering.
+        The Qt render happens on the calling (GUI) thread; the PNG write is offloaded to a
+        background thread so routing is not stalled by disk I/O."""
         try:
             import os
+            import threading
             from datetime import datetime
 
             # Determine output directory
@@ -729,37 +895,34 @@ class PCBViewer(QWidget):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
             filename = f"{debug_dir}/{filename_prefix}_{timestamp}.png"
 
-            # Capture the widget at specified resolution
+            # --- Render on GUI thread (must not be moved to background) ---
             if scale_factor > 1:
-                # High-res rendering
                 widget_size = self.size()
                 scaled_size = widget_size * scale_factor
 
-                # Create high-res image
                 image = QImage(scaled_size, QImage.Format.Format_ARGB32)
                 image.fill(Qt.GlobalColor.transparent)
 
-                # Render widget to image with scaling
                 painter = QPainter(image)
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
                 painter.scale(scale_factor, scale_factor)
                 self.render(painter)
                 painter.end()
-
-                # Save the image
-                success = image.save(filename, "PNG")
             else:
-                # Standard resolution
-                pixmap = self.grab()
-                success = pixmap.save(filename, "PNG")
+                image = self.grab().toImage()
 
-            if success:
-                print(f"DEBUG: Screenshot saved to {filename} (scale={scale_factor}x)")
-                return filename
-            else:
-                print(f"DEBUG: Failed to save screenshot to {filename}")
-                return None
+            # --- Write PNG in background thread (non-blocking) ---
+            def _save(img, path, sf):
+                ok = img.save(path, "PNG")
+                if ok:
+                    print(f"DEBUG: Screenshot saved to {path} (scale={sf}x)")
+                else:
+                    print(f"DEBUG: Failed to save screenshot to {path}")
+
+            t = threading.Thread(target=_save, args=(image, filename, scale_factor), daemon=True)
+            t.start()
+            return filename
 
         except Exception as e:
             print(f"DEBUG: Screenshot error: {e}")
@@ -1808,14 +1971,14 @@ class OrthoRouteMainWindow(QMainWindow):
                         self.pcb_viewer.update()
                         QApplication.processEvents()
 
-                    # Memory-efficient screenshot controls
+                    # Screenshots: off by default, enabled only in debug mode (ORTHO_DEBUG=1)
                     import os
-                    disable_screenshots = os.environ.get('ORTHO_NO_SCREENSHOTS', '0') == '1'
+                    debug_mode = os.environ.get('ORTHO_DEBUG', '0') == '1'
                     screenshot_freq = int(os.environ.get('ORTHO_SCREENSHOT_FREQ', '1'))
                     screenshot_scale = int(os.environ.get('ORTHO_SCREENSHOT_SCALE', '8'))
 
-                    # Only capture screenshots if enabled and at appropriate frequency
-                    if not disable_screenshots and (iteration % screenshot_freq == 0):
+                    # Only capture screenshots in debug mode and at appropriate frequency
+                    if debug_mode and (iteration % screenshot_freq == 0):
                         screenshot_name = f"{iteration+3:02d}_iteration_{iteration:02d}"
                         self.pcb_viewer.show_airwires = False  # Hide airwires for clarity
                         self.pcb_viewer.fit_to_view()
@@ -2079,11 +2242,11 @@ class OrthoRouteMainWindow(QMainWindow):
             else:
                 pads_orphaned += 1
                 if pads_orphaned <= 5:  # Log first few orphaned pads
-                    logger.warning(f"DEBUG: Orphaned pad '{pad.id}' with component_id '{pad.component_id}' - not found in components_dict")
+                    logger.debug(f"Orphaned pad '{pad.id}' with component_id '{pad.component_id}' - assigning to generic component")
 
-        # FALLBACK: Create a generic component for orphaned pads
+        # FALLBACK: Create a generic component for orphaned pads (e.g. mounting holes, fiducials)
         if pads_orphaned > 0:
-            logger.info(f"DEBUG: Creating generic component for {pads_orphaned} orphaned pads")
+            logger.info(f"Assigning {pads_orphaned} unmatched pads (mounting holes/fiducials) to generic component")
             generic_component = Component(
                 id="GENERIC_COMPONENT",
                 reference="GENERIC_COMPONENT",

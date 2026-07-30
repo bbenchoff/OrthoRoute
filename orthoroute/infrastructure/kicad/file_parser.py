@@ -76,7 +76,7 @@ class KiCadFileParser:
         nets = self._collect_nets(net_table, components)
 
         board_data = {
-            "title": self._extract_title(root) or path.stem,
+            "title": self._extract_title(root) or "Untitled Board",
             "version": version,
             "layers": self._extract_layers(root),
             "components": components,
@@ -219,6 +219,10 @@ class KiCadFileParser:
             pad_number = vals[0] if len(vals) > 0 else ""
             pad_type = vals[1] if len(vals) > 1 else "smd"
             pad_shape = vals[2] if len(vals) > 2 else "circle"
+
+            # Mechanical NPTHs do not participate in electrical routing.
+            if pad_type == "np_thru_hole" or not pad_number:
+                continue
 
             at = child(pad_node, "at")
             at_vals = atoms(at) if at is not None else []
