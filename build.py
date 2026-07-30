@@ -29,6 +29,8 @@ PLUGIN_MANIFEST = "plugin.json"
 PLUGIN_ENTRYPOINT = "kicad_plugin.py"
 PLUGIN_REQUIREMENTS = "requirements-kicad.txt"
 SWIG_PLUGIN_DIR_NAME = "com_github_bbenchoff_orthoroute"
+PCM_SCHEMA = "https://go.kicad.org/pcm/schemas/v2"
+PCM_MIN_KICAD_VERSION = "10.0"
 
 
 def _read_version(project_root: Path) -> str:
@@ -125,10 +127,16 @@ class KiCadPluginBuilder:
         self.version = _read_version(self.project_root)
         self.package_dir = self.output_root / PLUGIN_IDENTIFIER
         self.swig_package_dir = self.output_root / SWIG_PLUGIN_DIR_NAME
+        self.pcm_package_dir = self.output_root / "pcm"
         self.zip_path = (
             self.project_root
             / "build"
             / f"OrthoRoute-{self.version}-KiCad-IPC.zip"
+        )
+        self.pcm_zip_path = (
+            self.project_root
+            / "build"
+            / f"OrthoRoute-{self.version}-KiCad-PCM.zip"
         )
 
     @property
@@ -150,6 +158,8 @@ class KiCadPluginBuilder:
         _remove_tree(self.output_root, self.output_root.parent)
         if self.zip_path.exists():
             self.zip_path.unlink()
+        if self.pcm_zip_path.exists():
+            self.pcm_zip_path.unlink()
 
     def _copy_files(self) -> None:
         self.package_dir.mkdir(parents=True)
@@ -272,16 +282,155 @@ runtime wheels are large.
                     )
         return self.zip_path
 
-    def build(self, make_zip: bool = True) -> Path:
+    def _pcm_metadata(self) -> dict:
+        """Return metadata for KiCad 10's Plugin and Content Manager."""
+        return {
+            "$schema": PCM_SCHEMA,
+            "name": PLUGIN_NAME,
+            "description": (
+                "GPU-accelerated PCB autorouter using PathFinder negotiated "
+                "congestion on a Manhattan lattice."
+            ),
+            "description_full": (
+                "OrthoRoute is an open-source PCB autorouter for KiCad. "
+                "It connects through KiCad's IPC API, provides an interactive "
+                "board viewer, enforces keepout rule areas, and can use CUDA "
+                "or Apple MLX acceleration when available."
+            ),
+            "identifier": PLUGIN_IDENTIFIER,
+            "type": "plugin",
+            "author": {
+                "name": "OrthoRoute contributors",
+                "contact": {
+                    "github": "https://github.com/bbenchoff/OrthoRoute",
+                },
+            },
+            "maintainer": {
+                "name": "Ben Benchoff",
+                "contact": {
+                    "github": "https://github.com/bbenchoff",
+                },
+            },
+            "license": "MIT",
+            "resources": {
+                "homepage": "https://github.com/bbenchoff/OrthoRoute",
+                "repository": "https://github.com/bbenchoff/OrthoRoute",
+            },
+            "tags": ["autorouter", "pcb", "routing"],
+            "versions": [
+                {
+                    "version": self.version,
+                    "status": "stable",
+                    "kicad_version": PCM_MIN_KICAD_VERSION,
+                    "platforms": ["windows", "macos", "linux"],
+                    "runtime": "ipc",
+                },
+            ],
+        }
+
+    def create_pcm_zip(self) -> Path:
+        """Create a KiCad 10 PCM archive suitable for Install from File."""
+        plugins_dir = self.pcm_package_dir / "plugins"
+        resources_dir = self.pcm_package_dir / "resources"
+        self.pcm_package_dir.mkdir(parents=True)
+        _copy_tree(self.package_dir, plugins_dir)
+        resources_dir.mkdir()
+        shutil.copy2(
+            self.project_root / "graphics" / "icon64.png",
+            resources_dir / "icon.png",
+        )
+        metadata = self._pcm_metadata()
+        (self.pcm_package_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        self.validate_pcm_package()
+
+        self.pcm_zip_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(
+            self.pcm_zip_path,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as archive:
+            for source in sorted(self.pcm_package_dir.rglob("*")):
+                if source.is_file():
+                    archive.write(
+                        source,
+                        source.relative_to(self.pcm_package_dir).as_posix(),
+                    )
+        return self.pcm_zip_path
+
+    def validate_pcm_package(self) -> dict:
+        metadata_path = self.pcm_package_dir / "metadata.json"
+        plugin_root = self.pcm_package_dir / "plugins"
+        required = (
+            metadata_path,
+            self.pcm_package_dir / "resources" / "icon.png",
+            plugin_root / PLUGIN_MANIFEST,
+            plugin_root / PLUGIN_ENTRYPOINT,
+            plugin_root / "requirements.txt",
+        )
+        missing = [
+            path.relative_to(self.pcm_package_dir).as_posix()
+            for path in required
+            if not path.is_file()
+        ]
+        if missing:
+            raise RuntimeError(f"PCM package is missing required files: {missing}")
+
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        required_keys = {
+            "name",
+            "description",
+            "description_full",
+            "identifier",
+            "type",
+            "author",
+            "license",
+            "resources",
+            "versions",
+        }
+        missing_keys = required_keys - metadata.keys()
+        if missing_keys:
+            raise RuntimeError(
+                f"PCM metadata is missing fields: {sorted(missing_keys)}"
+            )
+        if metadata.get("$schema") != PCM_SCHEMA:
+            raise RuntimeError("PCM metadata must target KiCad schema v2")
+        if metadata["identifier"] != PLUGIN_IDENTIFIER:
+            raise RuntimeError("PCM identifier does not match plugin identifier")
+        if len(metadata["versions"]) != 1:
+            raise RuntimeError("Archive metadata must contain exactly one version")
+        version = metadata["versions"][0]
+        if version.get("runtime") != "ipc":
+            raise RuntimeError("PCM package must declare the IPC runtime")
+        forbidden_download_fields = {
+            "download_url",
+            "download_sha256",
+            "download_size",
+            "install_size",
+        }
+        if forbidden_download_fields & version.keys():
+            raise RuntimeError(
+                "Archive metadata must not contain download_* or size fields"
+            )
+        return metadata
+
+    def build(self, make_zip: bool = True, make_pcm_zip: bool = True) -> Path:
         LOGGER.info("Building %s %s native KiCad IPC plugin", PLUGIN_NAME, self.version)
         self.clean()
         self._copy_files()
         self.validate()
         if make_zip:
             self.create_zip()
+        if make_pcm_zip:
+            self.create_pcm_zip()
         LOGGER.info("Package: %s", self.package_dir)
         if make_zip:
-            LOGGER.info("ZIP: %s", self.zip_path)
+            LOGGER.info("Manual-install ZIP: %s", self.zip_path)
+        if make_pcm_zip:
+            LOGGER.info("KiCad PCM ZIP: %s", self.pcm_zip_path)
         return self.package_dir
 
     def deploy(
@@ -345,6 +494,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip creation of the manual-install ZIP",
     )
     parser.add_argument(
+        "--no-pcm-zip",
+        action="store_true",
+        help="Skip creation of the KiCad 10 PCM Install-from-File ZIP",
+    )
+    parser.add_argument(
         "--clean",
         action="store_true",
         help="Remove generated plugin build artifacts and exit",
@@ -360,7 +514,10 @@ def main(argv: list[str] | None = None) -> int:
             LOGGER.info("Removed legacy build artifact: %s", path)
         return 0
 
-    builder.build(make_zip=not args.no_zip)
+    builder.build(
+        make_zip=not args.no_zip,
+        make_pcm_zip=not args.no_pcm_zip,
+    )
     if args.deploy:
         builder.deploy(kicad_version=args.kicad_version)
         LOGGER.info(
