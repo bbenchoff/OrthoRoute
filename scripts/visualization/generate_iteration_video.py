@@ -7,8 +7,8 @@ Shows routing progress across iterations:
 - Iteration 1, 2, 3... with stats
 
 Usage:
-    python viz/generate_iteration_video.py <run_folder>
-    python viz/generate_iteration_video.py debug_output/run_20251104_205922
+    python scripts/visualization/generate_iteration_video.py <run_folder>
+    python scripts/visualization/generate_iteration_video.py debug_output/run_20251104_205922
 """
 
 import sys

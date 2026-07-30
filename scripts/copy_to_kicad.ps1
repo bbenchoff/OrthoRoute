@@ -2,22 +2,22 @@
 # Fast dev sync: copies Python sources and config directly to the local KiCad plugin folder.
 # Use instead of `python build.py --deploy` when you only changed .py files or orthoroute.json.
 #
-# Usage:  .\copy_to_kicad.ps1
-#         .\copy_to_kicad.ps1 -Verbose   # show each copied file
-#         .\copy_to_kicad.ps1 -Validate  # run smoke test after copy
+# Usage:  .\scripts\copy_to_kicad.ps1
+#         .\scripts\copy_to_kicad.ps1 -Verbose   # show each copied file
+#         .\scripts\copy_to_kicad.ps1 -Validate  # run smoke test after copy
 
 [CmdletBinding()]
 param(
+    [string]$KiCadVersion = "10.0",
     [switch]$Validate
 )
 
-$src = $PSScriptRoot
+$src = Split-Path $PSScriptRoot -Parent
 
 # Resolve the KiCad plugin directory portably.
-# KiCad 9.0 stores 3rd-party plugins under Documents\KiCad\9.0\3rdparty\plugins\.
+# KiCad stores SWIG plugins under Documents\KiCad\<version>\3rdparty\plugins\.
 # [Environment]::GetFolderPath('MyDocuments') follows OneDrive/corporate folder
 # redirection automatically, so this works on any machine.
-$kicadVersion = "9.0"
 $pluginName   = "com_github_bbenchoff_orthoroute"
 $docs = [System.Environment]::GetFolderPath('MyDocuments')
 $dst  = Join-Path $docs "KiCad\$kicadVersion\3rdparty\plugins\$pluginName"
