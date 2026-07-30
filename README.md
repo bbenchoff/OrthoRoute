@@ -64,21 +64,12 @@ Note this is _not_ a fully parallel autorouter; in OrthoRoute, nets are still ro
 
 - KiCad Integration: Built as a native KiCad plugin using the IPC API
 - GPU-Accelerated Routing: Uses CUDA/CuPy
-- Multiple Routing Algorithms
-  - Manhattan Routing: Specialized for orthogonal routing patterns (horizontal/vertical layer pairs)
-  - Lee's Wavefront: Traditional routing (experimental)
+- Manhattan Routing: Specialized for orthogonal routing patterns (horizontal/vertical layer pairs)
 - Real-time Visualization: Interactive 2D board view with zoom, pan, and layer controls
 - Checkpoint system for instant resume after crashes (experimental)
 - Headless (Cloud) Routing: Rent an A100 GPU in some datacenter
 
 ## Screenshots
-
-_Testing / examples are the following_:
-
-- [CSEduino v4](https://github.com/jpralves/cseduino/tree/master/boards/2-layer)
-- [Sacred65 keyboard PCB](https://github.com/LordsBoards/Sacred65)
-- [RP2040 Minimal board](https://datasheets.raspberrypi.com/rp2040/Minimal-KiCAD.zip)
-- [Really Complex Backplane](https://github.com/bbenchoff/OrthoRoute/TestBoards)
 
 ### Main Interface
 
@@ -100,12 +91,6 @@ _Testing / examples are the following_:
   <em>OrthoRoute plugin showing a successful Manhattan route</em>
 </div>
 
-<div align="center">
-  <img src="graphics/screenshots/Screencap1-rpi.png" alt="OrthoRoute Interface" width="800">
-  <br>
-  <em>OrthoRoute plugin showing real-time PCB visualization with airwires and routing analysis</em>
-</div>
-
 ## Quick Start
 
 ### Prerequisites
@@ -115,70 +100,48 @@ _Testing / examples are the following_:
 
 ### Installation Methods
 
-For KiCad 10, run `python build.py`, then open **Plugin and Content
-Manager > Install from File...** and select:
+#### Install the KiCad package
 
-```text
-build/OrthoRoute-1.0.0-KiCad-PCM.zip
+1. Download `OrthoRoute-1.0.0-KiCad-PCM.zip` from the `/build` folder, or build it from source using
+   the instructions below.
+2. In KiCad 10, open **Plugin and Content Manager** and choose
+   **Install from File...**.
+3. Select the OrthoRoute PCM ZIP.
+4. Enable the API server under **Preferences > Plugins**.
+5. Restart PCB Editor and allow several minutes for KiCad to create
+   OrthoRoute's isolated Python environment and install its dependencies.
+6. Open a board and launch **OrthoRoute** from
+   **Tools > External Plugins**.
+
+#### Build the package from source
+
+Clone the repository and run the package builder:
+
+```bash
+git clone https://github.com/bbenchoff/OrthoRoute.git
+cd OrthoRoute
+python build.py
 ```
 
-Enable the API server under **Preferences > Plugins**, restart PCB Editor, and
-allow several minutes for KiCad to create OrthoRoute's isolated Python
-environment and install its GUI and accelerator dependencies.
+The builder creates:
 
-For development or a source checkout:
+- `build/OrthoRoute-1.0.0-KiCad-PCM.zip` for KiCad 10's
+  **Install from File...** command
+- `build/OrthoRoute-1.0.0-KiCad-IPC.zip` for manual native-plugin installation
 
-1. Clone the repository.
-2. Build and deploy the native IPC plugin:
-   ```bash
-   python build.py --deploy
-   ```
-3. Enable the API server in KiCad under **Preferences → Plugins**.
-4. Restart PCB Editor. KiCad creates OrthoRoute's isolated Python environment
-   and installs its dependencies; the first load can take several minutes.
-5. Open a board and click **Launch OrthoRoute** on the PCB Editor toolbar.
+Developers can build and deploy directly into their newest local KiCad
+installation:
 
-`python build.py` also creates a manual native-IPC ZIP under `build/`.
-Standalone development remains available with `python main.py`.
+```bash
+python build.py --deploy
+```
+
+Use `python build.py --deploy --kicad-version 10.0` to target KiCad 10
+explicitly. Standalone development remains available with `python main.py`.
 
 ## Will it work with _my_ GPU?
 
-On larger boards with many layers, the memory requirements for OrthoRoute become excessive. As an example, I'll show what is needed for the reason I built this: a 200x200mm board with 32 layers. This is a _very_ large graph, within an order of magnitude of the largest FPGAs available. 
-
-| Board Specs | → | Lattice Size |
-|-------------|---|--------------|
-| 200mm × 200mm | → | 500 × 500 nodes |
-| Grid pitch: 0.4mm | → | (200 ÷ 0.4 = 500) |
-| Layers: 32 | → | Z dimension: 32 |
-| **Result** | → | **8,000,000 nodes** |
-
-Total nodes: 500 × 500 × 32 = **8,000,000 nodes**
-Edges: ~8M nodes × 6 neighbors = **~48 million edges**
-
-#### Memory requirements:
-
-PathFinder stores multiple arrays per edge (distance, parent, cost, history, present usage, etc.):
- - ~48M edges × 32 bytes per edge = 1.5 GB per array
- - × 8 arrays (distance, parent, cost, history, present, capacity, etc.)
- - = ~12 GB base
-
-Plus graph structure, node ownership, buffers: +20-25 GB
-
-**GPU Recommendations:**
-
-| Board Size | Layers | Grid Pitch | Nodes | VRAM Needed | GPU Required |
-|------------|--------|------------|-------|-------------|--------------|
-| 100×100mm | 6 | 0.4mm | 375k | 8-12 GB | RTX 3080, RTX 4070 |
-| 150×150mm | 18 | 0.4mm | 2.53M | 18-24 GB | RTX 4090 |
-| 200×200mm | 18 | 0.4mm | 4.5MM | 24-30 GB | RTX 6000 Ada (48GB) |
-| 200×200mm | 32 | 0.4mm | 8M | 35-40 GB| A100 80GB, H100 |
-| 300×300mm | 32 | 0.4mm | 18M | 60-80 GB | H100 80GB |
-
-**Rule of thumb:**
- - Calculate nodes: (board_width_mm ÷ grid_pitch_mm) × (board_height_mm ÷ grid_pitch_mm) × num_layers
- - Estimate VRAM: nodes ÷ 200,000 = GB needed (conservative estimate)
- - Example: 8M nodes ÷ 200,000 = 40 GB minimum
- - This list of recommended GPUs is either going to be hilarious or sad in a decade
+As long as you have an NVIDIA card or Apple Silicon, yeah, probably. If it doesn't run on your card/computer, [open a new issue](https://github.com/bbenchoff/OrthoRoute/issues).
 
 **Important distinction:**
 - **VRAM usage** is determined by board dimensions, layers, and grid pitch (not net count)
@@ -281,59 +244,6 @@ Remove-Item Env:ORTHO_DEBUG
 
 Log files are always written to `<plugin_dir>/logs/` regardless of mode.
 
-### There's something wrong with the KiCad IPC API
-
-For reasons I don't comprehend, the KiCad IPC API only works when the "Select Items" (the arrow pointer) is active and nothing is selected. The API doesn't work if you're trying to route tracks or drawing text. If you do, something like this message will pop up:
-
-<div align="center">
-  <img src="graphics/screenshots/EnableKiCadAPI.png" alt="OrthoRoute Error" width="600">
-  <br>
-  <em>The KiCad IPC API is not working</em>
-</div>
-
-I don't know what to tell you about this. I'll start an issue with KiCad or something
-
-## Building
-
-### Create Plugin Package
-```bash
-python build.py
-```
-
-This creates:
-
-- `OrthoRoute-1.0.0-KiCad-PCM.zip` for KiCad 10 **Install from File...**
-- `OrthoRoute-1.0.0-KiCad-IPC.zip` for manual native-plugin installation
-
-Build and install directly into the newest local KiCad version:
-```bash
-python build.py --deploy
-```
-
-Target a specific KiCad user-data version:
-```bash
-python build.py --deploy --kicad-version 10.0
-```
-
-## Current Status
-
-### ✅ Working Features
-- **Unified PathFinder**: Consolidated GPU-accelerated routing engine with CSR matrix optimization
-- **End-to-End Routing**: Complete routing pipeline from board parsing to geometry generation
-- **GPU Acceleration**: CUDA-accelerated wavefront expansion and parallel processing
-- **KiCad Integration**: Full IPC API support for real-time board data extraction
-- **Interactive Visualization**: Real-time PCB viewer with routing progress updates
-- **Graph Validation**: Preflight checks and lattice integrity validation
-- **Headless/Cloud Routing**: Route on a GPU in a datacenter somewhere
-
-
-### 🔄 In Development
-- **Advanced DRC Integration**: Enhanced design rule checking
-- **Push-and-Shove**: Improving the 'traditional' autorouter
-- **Rip-up and Retry**: Did I mention the 'traditional' autorouter is crap?
-- **Differential Pairs**: Right now it's just single traces
-- **BGA Portal Escapes**: Modifying the current Manhattan escape routing to support BGA packages
-
 ##  Contributing
 
 Please see [`docs/contributing.md`](docs/contributing.md) for guidelines.
@@ -344,7 +254,7 @@ If something's not working or you just don't like it, first please complain. Com
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - KiCad development team for the excellent IPC API
 - NVIDIA for CUDA/CuPy GPU acceleration support
