@@ -30,6 +30,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Status codes written to metadata[1] by the backtrace_parent kernel in
+# _backtrace_fullgraph_path.  Keep in sync with the kernel source.
+BACKTRACE_OK = 1            # reached a root (parent == -1)
+BACKTRACE_TRUNCATED = 0     # ran out of capacity before reaching a root
+BACKTRACE_OUT_OF_RANGE = -2  # parent pointer left [0, num_nodes)
+BACKTRACE_SELF_LOOP = -3    # node is its own parent
+
 # ============================================================================
 # PERFORMANCE: GPU DIAGNOSTIC VERBOSITY CONTROL
 # ============================================================================
@@ -3912,11 +3919,29 @@ class CUDADijkstra:
             ),
         )
         length, status = self._fullgraph_backtrace_meta.get().tolist()
-        if status != 1 or length <= 0:
-            logger.error(
-                "[GPU-SEEDS] Device backtrace failed "
-                f"(status={status}, length={length}, capacity={capacity})"
-            )
+        if status != BACKTRACE_OK or length <= 0:
+            if status == BACKTRACE_TRUNCATED:
+                logger.error(
+                    "[GPU-SEEDS] Device backtrace TRUNCATED: path hit the "
+                    f"{capacity}-node capacity without reaching a root — "
+                    "likely a parent cycle or a genuinely longer path"
+                )
+            elif status == BACKTRACE_OUT_OF_RANGE:
+                logger.error(
+                    "[GPU-SEEDS] Device backtrace failed: parent pointer "
+                    f"left [0, {num_nodes}) after {length} nodes "
+                    "(corrupt parent keys)"
+                )
+            elif status == BACKTRACE_SELF_LOOP:
+                logger.error(
+                    "[GPU-SEEDS] Device backtrace failed: node is its own "
+                    f"parent after {length} nodes (corrupt parent keys)"
+                )
+            else:
+                logger.error(
+                    "[GPU-SEEDS] Device backtrace failed "
+                    f"(status={status}, length={length}, capacity={capacity})"
+                )
             return None
 
         return self._fullgraph_backtrace_buffer[:length].get()[::-1].tolist()

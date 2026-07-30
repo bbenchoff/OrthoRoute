@@ -7,7 +7,10 @@ kicad-python>=0.5.0
 PyQt6>=6.0.0
 
 # GPU acceleration (optional)
-cupy>=10.0.0; platform_system != "Darwin"
+# CuPy 13+ matches the CUDA 12 requirement in the README and the
+# cupyx.scatter_add / RawKernel behavior the solvers rely on.
+# For prebuilt wheels, install `cupy-cuda12x>=13` instead of source-building.
+cupy>=13; platform_system != "Darwin"
 mlx>=0.32.0; platform_system == "Darwin" and platform_machine == "arm64"
 
 # Development dependencies (optional)

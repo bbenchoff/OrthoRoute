@@ -685,6 +685,21 @@ class PathFinderConfig:
     # Accumulated history prevents the owner from returning to the same
     # locally attractive but globally impossible escape column.
     portal_barrel_history_penalty: float = 25.0
+    # FLOAT32 COST DYNAMIC-RANGE BUDGET
+    # ────────────────────────────────────────────────────────────────────
+    # All edge costs accumulate in float32. The working magnitudes:
+    #   • base lateral cost:        ~0.4 (grid_pitch)
+    #   • pres_fac cap:             up to 1024 (slow_progress_pres_fac_max)
+    #   • owner penalty:            25 × pres_fac  (≈ 2.6e4 at the cap)
+    #   • portal-cleanup penalties: 1e6
+    # float32 has a 24-bit significand, so the representable quantum near
+    # magnitude M is about M / 2^23 — at 1e6 that is ~0.06, i.e. adding a
+    # 1e6 penalty already rounds away sub-0.06 cost differences (a sixth of
+    # a base lateral step). Any penalty above 2^23 × base cost (~3.4e6 at
+    # 0.4) erases base-cost gradients ENTIRELY on paths that cross it:
+    # penalty + base == penalty in float32, and route choice under the
+    # penalty becomes arbitrary. warn_if_penalties_exceed_float32_budget()
+    # (called from PathFinderRouter.__init__) logs a warning past that line.
     portal_cleanup_edge_penalty: float = 1_000_000.0
     portal_cleanup_node_penalty: float = 1_000_000.0
     portal_cleanup_escape_penalty: float = 1_000_000.0
@@ -792,6 +807,46 @@ def resolve_history_decay(config) -> float:
     if not 0.0 <= value <= 1.0:
         raise ValueError("ORTHO_HISTORY_DECAY must be between 0.0 and 1.0")
     return value
+
+
+def warn_if_penalties_exceed_float32_budget(config) -> None:
+    """Warn when a configured penalty can erase float32 base-cost gradients.
+
+    See the FLOAT32 COST DYNAMIC-RANGE BUDGET comment in PathFinderConfig.
+    Past 2^23 x base cost, `penalty + base == penalty` in float32, so route
+    choice on penalized paths no longer sees path length at all. Warning
+    only — behavior is unchanged.
+    """
+    base_cost = float(getattr(config, "grid_pitch", 0.4))
+    if base_cost <= 0:
+        return
+    budget = (2.0 ** 23) * base_cost
+    peak_pres = max(
+        float(getattr(config, "pres_fac_max", 0.0)),
+        float(getattr(config, "slow_progress_pres_fac_max", 0.0)),
+    )
+    penalties = {
+        "portal_cleanup_edge_penalty": float(
+            getattr(config, "portal_cleanup_edge_penalty", 0.0)),
+        "portal_cleanup_node_penalty": float(
+            getattr(config, "portal_cleanup_node_penalty", 0.0)),
+        "portal_cleanup_escape_penalty": float(
+            getattr(config, "portal_cleanup_escape_penalty", 0.0)),
+        "escape_reservation_penalty": float(
+            getattr(config, "escape_reservation_penalty", 0.0)),
+        "owner_penalty_base x peak pres_fac": float(
+            getattr(config, "owner_penalty_base", 0.0)) * peak_pres,
+        "path_node_penalty_base x peak pres_fac": float(
+            getattr(config, "path_node_penalty_base", 0.0)) * peak_pres,
+    }
+    for name, value in penalties.items():
+        if value > budget:
+            logger.warning(
+                "[FLOAT32-BUDGET] %s = %.3g exceeds 2^23 x base cost "
+                "(%.3g): float32 accumulation will erase base-cost "
+                "gradients on penalized paths",
+                name, value, budget,
+            )
 
 
 def resolve_pres_fac_max(config, signal_layers: int) -> float:
@@ -2622,6 +2677,7 @@ class PathFinderRouter:
         logger.debug(f"[CONFIG] use_gpu={self.config.use_gpu}")
         logger.debug(f"[CONFIG] use_gpu_sequential={getattr(self.config, 'use_gpu_sequential', True)}")
         logger.debug(f"[CONFIG] use_incremental_cost_update={getattr(self.config, 'use_incremental_cost_update', False)}")
+        warn_if_penalties_exceed_float32_budget(self.config)
 
         self.lattice: Optional[Lattice3D] = None
         self.graph: Optional[CSRGraph] = None

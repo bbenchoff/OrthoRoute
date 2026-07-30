@@ -142,7 +142,25 @@ Tests after phase: 342 passed / 9 skipped + 80 passed — identical to baseline.
 
 ## Phase 5 — Hygiene: constants, pins, cost budget
 
-_(pending)_
+1. **Backtrace status codes**: `BACKTRACE_OK/TRUNCATED/OUT_OF_RANGE/SELF_LOOP` module
+   constants in `cuda_dijkstra.py`, used in `_backtrace_fullgraph_path`'s status check.
+   Truncation (length hit capacity) now logs its own distinct message; out-of-range and
+   self-loop parents get specific messages too. Kernel source unchanged (constants
+   documented as "keep in sync with the kernel source").
+2. **Dependency pins**: `requirements.txt` floor raised `cupy>=10.0.0` → `cupy>=13`
+   with a note pointing at `cupy-cuda12x>=13` wheels; `setup.py` gpu extra aligned
+   (`cupy>=13`). `requirements-kicad.txt` already pinned `cupy-cuda12x>=13.4,<14` — the
+   authoritative KiCad-env pin was already correct; README's CUDA 12 text needed no
+   change.
+3. **Float32 cost budget**: comment block in `PathFinderConfig` next to the cleanup
+   penalties documenting the magnitudes (base 0.4, pres_fac ≤1024, owner 25×pres_fac,
+   cleanup 1e6, quantum ~0.06 at 1e6). New `warn_if_penalties_exceed_float32_budget()`
+   (warning only, never raises) checks the cleanup/reservation penalties and
+   owner/path-node × peak-pres_fac products against 2^23 × grid_pitch; wired into
+   `PathFinderRouter.__init__` next to the existing config logging. Defaults are all
+   inside the budget, so no warning fires out of the box.
+
+Tests: 342/9 + 80, green.
 
 ## Phase 6 — Per-net phase instrumentation
 
