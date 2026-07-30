@@ -834,36 +834,3 @@ def show_gui():
     """Entry point for GUI mode."""
     plugin = KiCadPlugin()
     plugin.show_gui()
-
-
-# For KiCad Action Plugin compatibility
-try:
-    import pcbnew
-    
-    class OrthoRoutePlugin(pcbnew.ActionPlugin):
-        """KiCad Action Plugin wrapper."""
-        
-        def defaults(self):
-            """Set plugin defaults."""
-            self.name = "OrthoRoute"
-            self.category = "Routing"
-            self.description = "Advanced PCB autorouter with Manhattan routing"
-            self.show_toolbar_button = True
-            self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
-        
-        def Run(self):
-            """Run the plugin."""
-            plugin = KiCadPlugin()
-            success = plugin.run()
-            
-            if success:
-                pcbnew.Refresh()  # Refresh KiCad display
-            
-            return success
-    
-    # Register the plugin
-    OrthoRoutePlugin().register()
-    
-except ImportError:
-    # pcbnew not available - running outside KiCad
-    logger.info("pcbnew not available - plugin can only run in standalone mode")

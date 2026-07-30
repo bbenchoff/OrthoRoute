@@ -108,40 +108,25 @@ _Testing / examples are the following_:
 
 ## Quick Start
 
-**KiCAD IS CURRENTLY BROKEN** with regards to support of IPC API plugins installed via the Content and Plugin manager. The workaround is to run this outside the Content and Plugin manager. This is documented here:
-
-- https://gitlab.com/kicad/code/kicad/-/issues/19465
-- https://forum.kicad.info/t/kicad-9-0-python-api-ipc-api/57236
-
-The fix is upcoming, but has not been released yet. **To run this, do the following:**
-
-- Clone the OrthoRoute repo
-- in the OrthoRoute/ folder, run `pip install -r requirements.txt`
-- Once that's done, run `python main.py`, with a board open in KiCad, and 'Enable KiCad API' selected in Preferences -> Plugins
-
-
-
 ### Prerequisites
-- **KiCad 9.0+** with IPC API support
-- **Python 3.12+**
-- **PyQt6**
-- **kipy** (KiCad IPC client)
+- **KiCad 10.0+** with the API server enabled under Preferences → Plugins
+- An NVIDIA CUDA 12 GPU on Windows/Linux, or Apple Silicon on macOS
+- Enough accelerator memory for the board and routing grid
 
 ### Installation
 
-1. **Download**: Get the latest release or clone the repository
-2. **Install Dependencies**:
+1. Clone the repository.
+2. Build and deploy the native IPC plugin:
    ```bash
-   pip install -r requirements.txt
+   python build.py --deploy
    ```
-   On Apple Silicon, this installs MLX instead of CUDA/CuPy and requires a
-   native ARM Python 3.10+ on macOS 14+. An editable/package install can use
-   `pip install -e ".[metal]"`. NVIDIA systems retain the CuPy path.
-3. **Run**: Start OrthoRoute with your KiCad project open
-   ```bash
-   cd src
-   python main.py
-   ```
+3. Enable the API server in KiCad under **Preferences → Plugins**.
+4. Restart PCB Editor. KiCad creates OrthoRoute's isolated Python environment
+   and installs its dependencies; the first load can take several minutes.
+5. Open a board and click **Launch OrthoRoute** on the PCB Editor toolbar.
+
+`python build.py` also creates a manual-install ZIP under `build/`.
+Standalone development remains available with `python main.py`.
 
 ## Will it work with _my_ GPU?
 
@@ -192,8 +177,8 @@ Plus graph structure, node ownership, buffers: +20-25 GB
 ## Usage
 
 ### GUI Mode (Recommended)
-1. **Open your PCB** in KiCad 9.0+ with IPC API enabled
-2. **Launch OrthoRoute Plugin** via the Plugin Manager
+1. **Open your PCB** in KiCad 10.0+ with the API server enabled
+2. **Launch OrthoRoute** from the PCB Editor toolbar
 3. **Route your nets** - OrthoRoute will automatically:
    - Extract board data via KiCad IPC API
    - Build 3D routing lattice (multi-layer Manhattan routing)
@@ -261,7 +246,16 @@ I don't know what to tell you about this. I'll start an issue with KiCad or some
 ```bash
 python build.py
 ```
-Install via Plugin Manager
+
+Build and install directly into the newest local KiCad version:
+```bash
+python build.py --deploy
+```
+
+Target a specific KiCad user-data version:
+```bash
+python build.py --deploy --kicad-version 10.0
+```
 
 ## Current Status
 

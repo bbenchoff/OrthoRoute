@@ -1,0 +1,30 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "com.github.bbenchoff.orthoroute",
+  "name": "OrthoRoute",
+  "description": "GPU-accelerated PCB autorouter using PathFinder negotiated congestion on a Manhattan lattice.",
+  "runtime": {
+    "type": "python",
+    "min_version": "3.11"
+  },
+  "actions": [
+    {
+      "identifier": "route-board",
+      "name": "Launch OrthoRoute",
+      "description": "Open OrthoRoute for the active PCB",
+      "show-button": true,
+      "scopes": [
+        "pcb"
+      ],
+      "entrypoint": "kicad_plugin.py",
+      "icons-light": [
+        "graphics/icon24.png",
+        "graphics/icon64.png"
+      ],
+      "icons-dark": [
+        "graphics/icon24.png",
+        "graphics/icon64.png"
+      ]
+    }
+  ]
+}

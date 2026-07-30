@@ -1,0 +1,11 @@
+# Runtime dependencies installed by KiCad into the plugin's isolated environment.
+kicad-python>=0.5,<0.8
+numpy>=2.2,<3
+psutil>=7,<8
+PyQt6>=6.9,<7
+requests>=2.32,<3
+
+# OrthoRoute's accelerator backends. CuPy provides the Windows/Linux NVIDIA
+# path; MLX is used on Apple Silicon.
+cupy-cuda12x>=13.4,<14; platform_system != "Darwin"
+mlx>=0.32,<0.33; platform_system == "Darwin" and platform_machine == "arm64"
