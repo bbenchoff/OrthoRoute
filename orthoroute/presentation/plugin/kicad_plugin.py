@@ -40,7 +40,8 @@ class KiCadPlugin:
     def _setup_logging(self):
         """Setup logging configuration for plugin."""
         # NOTE: Logging already configured by init_logging() in main.py
-        # init_logging() sets up: DEBUG→file (logs/), WARNING→console
+        # Normal mode:  WARNING→file (~66 milestone lines/run), WARNING→console
+        # Debug mode:   DEBUG→file (full detail), WARNING→console  [set ORTHO_DEBUG=1]
         # DO NOT modify handler levels here to prevent console spam
         pass
     
@@ -154,6 +155,11 @@ class KiCadPlugin:
         logger.info(f"[BOARD DEBUG] About to create Board with layer_count={layer_count}")
         board = Board(id="gui-board", name="GUI Board", layer_count=layer_count)
         board.nets = nets
+        # Attach keepout rule areas so the router can block constrained lattice nodes
+        if hasattr(self, 'board_data') and self.board_data:
+            board.keepouts = self.board_data.get('keepouts', [])
+            if board.keepouts:
+                logger.info(f"[BOARD DEBUG] Attached {len(board.keepouts)} keepout areas to Board")
         logger.info(f"[BOARD DEBUG] Created Board domain object: board.layer_count={board.layer_count}")
         
         # SAME THREE CALLS AS CLI
@@ -347,10 +353,17 @@ class KiCadPlugin:
     def run_with_gui(self):
         """Run plugin with full interactive GUI using new architecture components."""
         try:
+            print("[OrthoRoute:GUI] run_with_gui() entered")
+            import sys as _sys
+            _sys.stdout.flush()
             logger.info("Loading board from KiCad using rich interface for GUI")
             
+            print("[OrthoRoute:GUI] Importing PyQt6...")
+            _sys.stdout.flush()
             from PyQt6.QtWidgets import QApplication, QMessageBox
             import sys
+            print("[OrthoRoute:GUI] PyQt6 imported OK")
+            _sys.stdout.flush()
             
             # Create Qt application
             app = QApplication.instance()
@@ -359,16 +372,24 @@ class KiCadPlugin:
                 app.setApplicationName("OrthoRoute")
                 app.setApplicationVersion("1.0.0")
                 app.setOrganizationName("OrthoRoute")
+            print("[OrthoRoute:GUI] QApplication ready")
+            _sys.stdout.flush()
             
             # Connect to KiCad and get board data using the rich interface
             logger.info("Connecting to KiCad to get rich board data...")
             
             try:
+                print("[OrthoRoute:GUI] Importing RichKiCadInterface...")
+                _sys.stdout.flush()
                 from ...infrastructure.kicad.rich_kicad_interface import RichKiCadInterface
                 kicad_interface = RichKiCadInterface()
+                print("[OrthoRoute:GUI] RichKiCadInterface created, connecting...")
+                _sys.stdout.flush()
                 
                 # Connect to running KiCad instance
                 if not kicad_interface.connect():
+                    print("[OrthoRoute:GUI] FAILED to connect to KiCad IPC API")
+                    _sys.stdout.flush()
                     QMessageBox.critical(None, "KiCad Connection Error", 
                                        "Could not connect to KiCad via IPC API.\n\n"
                                        "Make sure KiCad is running and has a PCB file open,\n"
@@ -376,12 +397,16 @@ class KiCadPlugin:
                     logger.error("Failed to connect to KiCad")
                     return False
                 
+                print("[OrthoRoute:GUI] Connected to KiCad! Getting board data...")
+                _sys.stdout.flush()
                 logger.info("Connected to KiCad via rich IPC API")
                 
                 # Get rich board data from the currently open PCB
                 board_data = kicad_interface.get_board_data()
                 
                 if not board_data or len(board_data.get('pads', [])) == 0:
+                    print(f"[OrthoRoute:GUI] No board data! board_data={board_data is not None}, pads={len(board_data.get('pads', [])) if board_data else 0}")
+                    _sys.stdout.flush()
                     QMessageBox.critical(None, "No Board Data", 
                                        "No valid board data found.\n\n"
                                        "Make sure you have a PCB file open in KiCad\n"
@@ -389,6 +414,8 @@ class KiCadPlugin:
                     logger.error("No valid board data found")
                     return False
                 
+                print(f"[OrthoRoute:GUI] Board loaded: {len(board_data.get('pads', []))} pads, {len(board_data.get('nets', {}))} nets")
+                _sys.stdout.flush()
                 logger.info(f"Loaded rich board data from KiCad: {len(board_data.get('pads', []))} pads, {len(board_data.get('nets', {}))} nets")
 
                 # Store layer count for Board domain object creation
@@ -405,10 +432,14 @@ class KiCadPlugin:
                 # STEP 4: Initialize UnifiedPathFinder with the REAL board data (GUI PATH FIX)
                 
                 # Create and show the full-featured OrthoRoute window
+                print("[OrthoRoute:GUI] Creating main window...")
+                _sys.stdout.flush()
                 from ..gui.main_window import OrthoRouteMainWindow
                 window = OrthoRouteMainWindow(board_data, kicad_interface, plugin=self)
                 window.show()
                 
+                print("[OrthoRoute:GUI] Window shown, entering event loop")
+                _sys.stdout.flush()
                 logger.info("OrthoRoute rich GUI launched successfully!")
                 
                 # Run the application
@@ -416,8 +447,11 @@ class KiCadPlugin:
                 return result == 0
                 
             except Exception as e:
-                logger.error(f"Failed to connect to KiCad or get board data: {e}")
+                print(f"[OrthoRoute:GUI] EXCEPTION in IPC: {e}")
                 import traceback
+                traceback.print_exc()
+                _sys.stdout.flush()
+                logger.error(f"Failed to connect to KiCad or get board data: {e}")
                 logger.error(traceback.format_exc())
                 QMessageBox.critical(None, "KiCad Error", 
                                    f"Failed to connect to KiCad or get board data:\n{e}\n\n"
@@ -428,8 +462,12 @@ class KiCadPlugin:
                 return False
             
         except Exception as e:
-            logger.error(f"GUI execution failed: {e}")
+            print(f"[OrthoRoute:GUI] OUTER EXCEPTION: {e}")
             import traceback
+            traceback.print_exc()
+            import sys as _s2
+            _s2.stdout.flush()
+            logger.error(f"GUI execution failed: {e}")
             logger.error(traceback.format_exc())
             # Fall back to headless mode
             return self.run()
@@ -492,6 +530,7 @@ class KiCadPlugin:
                     layer_count = 6  # fallback
                 logger.info(f"Board layer stack: {layer_count} copper layers detected")
                 self.layer_count = layer_count
+                self.board_data = board_data  # Store for keepout access in route_all()
 
                 # STEP 4: Initialize UnifiedPathFinder with the REAL board data (GUI PATH FIX)
                 

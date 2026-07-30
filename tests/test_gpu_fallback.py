@@ -6,7 +6,7 @@ import types
 import numpy as np
 import pytest
 
-from conftest import make_two_pad_board
+from tests.conftest import make_two_pad_board
 from orthoroute.algorithms.manhattan.unified_pathfinder import (
     PathFinderConfig,
     UnifiedPathFinder,

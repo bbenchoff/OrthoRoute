@@ -98,12 +98,64 @@ def _ipc_retry(func, desc: str, max_retries: int = 3, sleep_s: float = 0.5):
             msg = str(e)
             last_err = e
             logger.warning(f"IPC '{desc}' failed (attempt {attempt}/{max_retries}): {msg}")
-            if "Timed out" in msg or "AS_BUSY" in msg or "busy" in msg.lower():
+            if ("Timed out" in msg or "AS_BUSY" in msg or "busy" in msg.lower()
+                    or "Connection refused" in msg or "refused" in msg.lower()):
                 time.sleep(sleep_s)
                 continue
             break
     if last_err:
         raise last_err
+
+
+class _SWIGNetWrapper:
+    """Thin wrapper around a pcbnew NetInfo item exposing the kipy-compatible interface."""
+    __slots__ = ('_item',)
+
+    def __init__(self, item):
+        self._item = item
+
+    @property
+    def name(self) -> str:
+        try:
+            return self._item.GetNetname()
+        except Exception:
+            return ''
+
+    @property
+    def code(self) -> int:
+        try:
+            return self._item.GetNet()
+        except Exception:
+            return 0
+
+
+class _SWIGBoardWrapper:
+    """Thin wrapper around a pcbnew BOARD exposing the kipy Board interface used by
+    OrthoRouteMainWindow: .filename property and get_nets()."""
+    __slots__ = ('_board',)
+
+    def __init__(self, pcbnew_board):
+        self._board = pcbnew_board
+
+    @property
+    def filename(self) -> str:
+        try:
+            return self._board.GetFileName()
+        except Exception:
+            return 'Unknown'
+
+    def get_nets(self):
+        """Return a list of net-like objects each with .name and .code."""
+        nets = []
+        try:
+            info = self._board.GetNetInfo()
+            for code in range(info.GetNetCount()):
+                item = info.GetNetItem(code)
+                if item is not None:
+                    nets.append(_SWIGNetWrapper(item))
+        except Exception:
+            pass
+        return nets
 
 
 class RichKiCadInterface:
@@ -113,6 +165,8 @@ class RichKiCadInterface:
         self.client = None
         self.board = None
         self.connected = False
+        self._mode = 'ipc'       # 'ipc' or 'swig'
+        self._swig_board = None  # raw pcbnew board in SWIG mode
 
     def connect(self) -> bool:
         """Connect to KiCad via IPC API"""
@@ -138,34 +192,63 @@ class RichKiCadInterface:
 
             # Get board to confirm connection - try different methods
             try:
-                # Method 1: Try get_board directly
-                self.board = _ipc_retry(self.client.get_board, "get_board", max_retries=2, sleep_s=0.5)
+                # Method 1: get_board() — preferred, works when IPC server is enabled
+                self.board = _ipc_retry(self.client.get_board, "get_board", max_retries=3, sleep_s=1.0)
             except Exception as e1:
                 logger.warning(f"get_board failed: {e1}")
                 try:
-                    # Method 2: Try getting open documents first
-                    docs = self.client.get_open_documents()
+                    # Method 2: get_open_documents(doc_type) — doc_type int from DocumentType enum
+                    # DOCTYPE_PCB is 2 in KiCad's proto; import the constant when available
+                    try:
+                        from kipy.proto.common.types_pb2 import DocumentType  # type: ignore
+                        doc_type_pcb = DocumentType.Value('DOCTYPE_PCB')
+                    except Exception:
+                        doc_type_pcb = 2  # fallback: DOCTYPE_PCB is 2 in KiCad 9 protos
+                    docs = self.client.get_open_documents(doc_type_pcb)
                     if docs and len(docs) > 0:
-                        # Use first open document
-                        self.board = docs[0]
-                        logger.info(f"Retrieved board from open documents: {getattr(self.board, 'name', 'Unknown')}")
+                        # get_open_documents returns DocumentSpecifiers, not Board objects.
+                        # Use the first specifier to retrieve the actual board.
+                        specifier = docs[0]
+                        self.board = self.client.get_board()
+                        logger.info(f"Retrieved board via open documents specifier: {getattr(specifier, 'identifier', 'Unknown')}")
                     else:
-                        raise Exception("No open documents found")
+                        raise Exception("No open PCB documents found")
                 except Exception as e2:
-                    logger.warning(f"get_open_documents failed: {e2}")
-                    # Method 3: Try direct board access
-                    self.board = self.client.board
-                    if not self.board:
-                        raise Exception("No board available through any method")
+                    logger.warning(f"get_open_documents fallback failed: {e2}")
+                    raise Exception(
+                        "Could not retrieve board via IPC. "
+                        "Make sure: (1) a PCB file is open in KiCad, "
+                        "(2) 'Enable Python API' is checked in KiCad Preferences > Plugins."
+                    ) from e2
                     
             self.connected = True
             logger.info("Connected to KiCad IPC API and retrieved board")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to connect to KiCad: {e}")
-            self.connected = False
-            return False
+            logger.error(f"Failed to connect to KiCad via IPC: {e}")
+            # --- SWIG fallback: use pcbnew when running inside KiCad as an action plugin ---
+            try:
+                import pcbnew  # type: ignore
+                swig_board = pcbnew.GetBoard()
+                if swig_board is None:
+                    logger.error("SWIG fallback: pcbnew.GetBoard() returned None — open a PCB first")
+                    self.connected = False
+                    return False
+                self._swig_board = swig_board
+                self.board = _SWIGBoardWrapper(swig_board)
+                self._mode = 'swig'
+                self.connected = True
+                logger.info("IPC unavailable; connected via SWIG fallback (running inside KiCad)")
+                return True
+            except ImportError:
+                logger.error("Neither IPC nor SWIG (pcbnew) available — cannot connect to KiCad")
+                self.connected = False
+                return False
+            except Exception as e_swig:
+                logger.error(f"SWIG fallback also failed: {e_swig}")
+                self.connected = False
+                return False
 
     def get_board_filename(self) -> str:
         """Get the current board filename using KiCad Python API"""
@@ -206,6 +289,9 @@ class RichKiCadInterface:
             logger.error("Not connected to KiCad")
             return None
 
+        if self._mode == 'swig':
+            return self._extract_board_data_swig()
+
         try:
             board = self.board
             logger.info("Extracting comprehensive board data from KiCad...")
@@ -225,11 +311,14 @@ class RichKiCadInterface:
             # Extract tracks
             logger.info("Extracting existing tracks...")
             tracks = self._extract_tracks(board)
-            logger.info(f"Loaded {len(tracks)} existing tracks from KiCad")
-            
-            # Extract zones (copper pours)
+
+            # Extract vias
+            logger.info("Extracting existing vias...")
+            vias = self._extract_vias(board)
+
+            # Extract zones (copper pours) and keepout rule areas
             logger.info("Extracting zones...")
-            zones = self._extract_zones(board)
+            zones, keepouts = self._extract_zones(board)
             logger.info(f"Found {len(zones)} zones")
             
             # Extract nets with pad connectivity
@@ -268,7 +357,9 @@ class RichKiCadInterface:
                 'pads': pads,
                 'components': components,
                 'tracks': tracks,
+                'vias': vias,
                 'zones': zones,
+                'keepouts': keepouts,
                 'nets': nets_data,
                 'airwires': airwires,
                 'bounds': bounds,
@@ -280,7 +371,7 @@ class RichKiCadInterface:
             }
             
             logger.info(f"Extracted board data: {filename} ({width:.1f}x{height:.1f}mm, {layer_count} copper layers)")
-            logger.info(f"  {len(routable_nets)} routable nets, {len(components)} components, {len(tracks)} tracks, {len(zones)} zones")
+            logger.info(f"  {len(routable_nets)} routable nets, {len(components)} components, {len(tracks)} tracks, {len(vias)} vias, {len(zones)} zones, {len(keepouts)} keepouts")
             logger.info(f"  Generated {len(airwires)} airwires for visualization")
             logger.info(f"  Extracted {len(drc_rules.get('netclasses', {}))} netclasses with design rules")
             
@@ -288,6 +379,140 @@ class RichKiCadInterface:
             
         except Exception as e:
             logger.error(f"Failed to extract board data: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+
+    def _extract_board_data_swig(self) -> Optional[Dict]:
+        """Extract board data dict using the pcbnew SWIG API (IPC fallback path)."""
+        try:
+            import pcbnew  # type: ignore
+            board = self._swig_board
+            iu = float(getattr(pcbnew, 'IU_PER_MM', 1e6))  # internal units per mm (1e6 in KiCad 7+)
+
+            # --- Layers ---
+            layer_count = board.GetCopperLayerCount()
+
+            # --- Nets ---
+            nets: Dict[str, Dict] = {}
+            netinfo = board.GetNetInfo()
+            for code in range(netinfo.GetNetCount()):
+                item = netinfo.GetNetItem(code)
+                if item is None:
+                    continue
+                name = item.GetNetname()
+                if name:
+                    nets[name] = {'name': name, 'code': code, 'pads': []}
+
+            # --- Pads ---
+            pads: List[Dict] = []
+            for pad in board.GetPads():
+                try:
+                    pos = pad.GetPosition()
+                    size = pad.GetSize()
+                    drill_x = 0.0
+                    try:
+                        drill_size = pad.GetDrillSize()
+                        drill_x = drill_size.x / iu
+                    except Exception:
+                        pass
+                    parent = pad.GetParent()
+                    ref = parent.GetReference() if parent and hasattr(parent, 'GetReference') else ''
+                    has_drill = drill_x > 0
+                    net_name = pad.GetNetname()
+                    pad_dict = {
+                        'component': ref,
+                        'name': pad.GetNumber(),
+                        'net_name': net_name,
+                        'net_code': pad.GetNetCode(),
+                        'x': pos.x / iu,
+                        'y': pos.y / iu,
+                        'width': size.x / iu,
+                        'height': size.y / iu,
+                        'drill': drill_x,
+                        'layers': ['F.Cu', 'B.Cu'] if has_drill else ['F.Cu'],
+                        'type': 'through_hole' if has_drill else 'smd',
+                    }
+                    pads.append(pad_dict)
+                    # Register pad in nets dict
+                    if net_name and net_name in nets:
+                        nets[net_name]['pads'].append(pad_dict)
+                except Exception as ex:
+                    logger.warning(f"SWIG: error extracting pad: {ex}")
+
+            # --- Tracks & Vias ---
+            tracks: List[Dict] = []
+            vias: List[Dict] = []
+            for item in board.GetTracks():
+                try:
+                    cls = item.GetClass()
+                    if cls == 'PCB_VIA':
+                        pos = item.GetPosition()
+                        vias.append({
+                            'x': pos.x / iu,
+                            'y': pos.y / iu,
+                            'diameter': item.GetWidth() / iu,
+                            'drill': item.GetDrillValue() / iu,
+                            'from_layer': board.GetLayerName(item.TopLayer()),
+                            'to_layer': board.GetLayerName(item.BottomLayer()),
+                            'net_name': item.GetNetname(),
+                        })
+                    else:
+                        s = item.GetStart()
+                        e = item.GetEnd()
+                        tracks.append({
+                            'start_x': s.x / iu,
+                            'start_y': s.y / iu,
+                            'end_x': e.x / iu,
+                            'end_y': e.y / iu,
+                            'width': item.GetWidth() / iu,
+                            'layer': board.GetLayerName(item.GetLayer()),
+                            'net_name': item.GetNetname(),
+                        })
+                except Exception as ex:
+                    logger.warning(f"SWIG: error extracting track/via: {ex}")
+
+            filename = board.GetFileName()
+            # Board bounds (approximate from pads)
+            if pads:
+                xs = [p['x'] for p in pads]
+                ys = [p['y'] for p in pads]
+                bounds = (min(xs), min(ys), max(xs), max(ys))
+                width  = bounds[2] - bounds[0]
+                height = bounds[3] - bounds[1]
+            else:
+                bounds = (0.0, 0.0, 100.0, 100.0)
+                width, height = 100.0, 100.0
+
+            layer_names = [board.GetLayerName(pcbnew.F_Cu)]
+            for i in range(1, layer_count - 1):
+                layer_names.append(board.GetLayerName(pcbnew.In1_Cu + i - 1))
+            if layer_count > 1:
+                layer_names.append(board.GetLayerName(pcbnew.B_Cu))
+
+            logger.info(
+                f"SWIG extraction: {len(pads)} pads, {len(nets)} nets, "
+                f"{layer_count} layers, {len(tracks)} tracks, {len(vias)} vias"
+            )
+            return {
+                'filename': filename,
+                'pads': pads,
+                'components': [],
+                'tracks': tracks,
+                'vias': vias,
+                'zones': [],
+                'keepouts': [],
+                'nets': nets,
+                'airwires': [],
+                'bounds': bounds,
+                'width': width,
+                'height': height,
+                'layers': layer_count,
+                'layer_names': layer_names,
+                'drc_rules': {'netclasses': {}, 'min_track_width': 0.1, 'min_clearance': 0.1},
+            }
+        except Exception as e:
+            logger.error(f"SWIG board data extraction failed: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return None
@@ -453,23 +678,171 @@ class RichKiCadInterface:
                 except Exception as e:
                     logger.warning(f"Error extracting track: {e}")
                     continue
-                    
+
         except Exception as e:
             logger.error(f"Error extracting tracks: {e}")
-            
+
+        logger.info(f"Loaded {len(tracks)} existing tracks from KiCad")
         return tracks
 
-    def _extract_zones(self, board) -> List[Dict]:
-        """Extract copper zones/pours"""
-        zones = []
+    def _extract_vias(self, board) -> List[Dict]:
+        """Extract existing vias using KiCad IPC API"""
+        vias = []
         try:
-            # KiCad zone extraction would go here
-            # For now, return empty list as zones are complex
-            pass
+            from kipy.board_types import BoardLayer, ViaType
+        except ImportError:
+            logger.warning("kipy not available — skipping via extraction")
+            return vias
+
+        def _layer_id_to_name(layer_id) -> str:
+            try:
+                proto_name = BoardLayer.Name(layer_id)
+                if proto_name.startswith("BL_"):
+                    return proto_name[3:].replace("_", ".")
+                return proto_name
+            except Exception:
+                return f"layer_{layer_id}"
+
+        # ViaType proto enum names → GUI via type strings
+        _via_type_map = {
+            "VT_THROUGH":      "through",
+            "VT_BLIND_BURIED": "blind_buried",
+            "VT_MICRO":        "micro",
+        }
+
+        try:
+            board_vias = _ipc_retry(board.get_vias, "get_vias", max_retries=3, sleep_s=0.5)
+            logger.info(f"Found {len(board_vias)} vias using KiCad API")
+
+            for via in board_vias:
+                try:
+                    pos = via.position
+                    x = float(pos.x) / 1e6
+                    y = float(pos.y) / 1e6
+                    diameter = float(via.diameter) / 1e6
+                    drill    = float(via.drill_diameter) / 1e6
+                    net_name = via.net.name if via.net is not None else ''
+                    type_proto = ViaType.Name(via.type)
+                    via_type = _via_type_map.get(type_proto, "through")
+
+                    # For through vias the layers are always F.Cu→B.Cu.
+                    # For blind/buried vias read from the padstack drill span.
+                    try:
+                        drill_obj = via.padstack.drill
+                        start_layer = _layer_id_to_name(drill_obj.start_layer)
+                        end_layer   = _layer_id_to_name(drill_obj.end_layer)
+                    except Exception:
+                        start_layer = "F.Cu"
+                        end_layer   = "B.Cu"
+
+                    vias.append({
+                        'x':           x,
+                        'y':           y,
+                        'diameter':    diameter,
+                        'drill':       drill,
+                        'type':        via_type,
+                        'start_layer': start_layer,
+                        'end_layer':   end_layer,
+                        'net_name':    net_name,
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Error extracting via: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error extracting vias: {e}")
+
+        logger.info(f"Loaded {len(vias)} existing vias from KiCad")
+        return vias
+
+    def _extract_zones(self, board) -> tuple:
+        """Extract copper zones/pours and rule area keepouts using KiCad IPC API.
+        Returns (zones, keepouts) tuple."""
+        zones = []
+        keepouts = []
+        try:
+            from kipy.board_types import BoardLayer, ZoneType
+
+            def _layer_id_to_name(layer_id) -> str:
+                try:
+                    proto_name = BoardLayer.Name(layer_id)
+                    if proto_name.startswith("BL_"):
+                        return proto_name[3:].replace("_", ".")
+                    return proto_name
+                except Exception:
+                    return f"layer_{layer_id}"
+
+            def _poly_to_points(poly_with_holes) -> List[List[float]]:
+                """Convert a PolygonWithHoles outline to a list of [x, y] mm points."""
+                pts = []
+                try:
+                    for node in poly_with_holes.outline.nodes:
+                        if node.has_point:
+                            pts.append([float(node.point.x) / 1e6,
+                                        float(node.point.y) / 1e6])
+                except Exception:
+                    pass
+                return pts
+
+            board_zones = _ipc_retry(board.get_zones, "get_zones", max_retries=3, sleep_s=0.5)
+            logger.info(f"Found {len(board_zones)} zones using KiCad API")
+
+            for zone in board_zones:
+                try:
+                    type_name = ZoneType.Name(zone.type)
+                    net_name = zone.net.name if zone.net is not None else ""
+                    logger.info(f"Zone: name='{zone.name}' type={type_name} net='{net_name}' layers={[_layer_id_to_name(l) for l in zone.layers]}")
+
+                    if zone.type == ZoneType.ZT_RULE_AREA:
+                        # Extract keepout constraints from rule area
+                        ra = zone._proto.rule_area_settings
+                        outline_pts = _poly_to_points(zone.outline)
+                        layer_names = [_layer_id_to_name(l) for l in zone.layers]
+                        keepout = {
+                            'name':              zone.name,
+                            'layers':            layer_names,
+                            'outline':           outline_pts,
+                            'keepout_tracks':    ra.keepout_tracks,
+                            'keepout_vias':      ra.keepout_vias,
+                            'keepout_copper':    ra.keepout_copper,
+                            'keepout_pads':      ra.keepout_pads,
+                            'keepout_footprints':ra.keepout_footprints,
+                        }
+                        keepouts.append(keepout)
+                        logger.info(f"Keepout '{zone.name}': tracks={ra.keepout_tracks} vias={ra.keepout_vias} copper={ra.keepout_copper} pads={ra.keepout_pads} layers={layer_names}")
+                        continue
+
+                    net_name = zone.net.name if zone.net is not None else ""
+                    layer_names = [_layer_id_to_name(l) for l in zone.layers]
+                    outline_pts = _poly_to_points(zone.outline)
+
+                    # Collect filled polygon outlines per layer
+                    filled = {}
+                    for layer_id, poly_list in zone.filled_polygons.items():
+                        layer_name = _layer_id_to_name(layer_id)
+                        filled[layer_name] = [_poly_to_points(p) for p in poly_list]
+
+                    zones.append({
+                        'net_name':  net_name,
+                        'layers':    layer_names,
+                        'outline':   outline_pts,
+                        'filled':    filled,
+                        'priority':  zone.priority,
+                        'name':      zone.name,
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Error extracting zone: {e}")
+                    continue
+
+        except ImportError:
+            logger.info("kipy not available — skipping zone extraction")
         except Exception as e:
             logger.error(f"Error extracting zones: {e}")
-            
-        return zones
+
+        logger.info(f"Loaded {len(zones)} copper zones and {len(keepouts)} keepout areas from KiCad")
+        return zones, keepouts
 
     def _extract_nets(self, board, pads: List[Dict]) -> Dict[str, Dict]:
         """Extract nets with pad connectivity"""
@@ -692,7 +1065,7 @@ class RichKiCadInterface:
             if ipc_data and ipc_data.get('all_netclasses'):
                 return self._process_ipc_drc_data(ipc_data)
         except Exception as e:
-            logger.warning(f"IPC-based DRC extraction failed: {e}")
+            logger.info(f"IPC-based DRC extraction not available ({e}), using defaults")
 
         # Fallback to safe defaults
         logger.info("Using fallback DRC defaults")

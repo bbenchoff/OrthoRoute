@@ -13,7 +13,6 @@ I swear to fucking god there is never going to be a discord or slack for this sh
 - Blind/buried via support (870 via pairs)
 
 **What needs work:**
-- ⚠️ No unit tests
 - ⚠️ Large files (3,936-line UnifiedPathFinder class)
 - ⚠️ Configuration scattered across multiple places
 
@@ -41,10 +40,15 @@ cd OrthoRoute
 # Install dependencies
 pip install -r requirements.txt
 
-# Run a quick test
+# Run tests to verify setup
+pytest tests/                    # All tests (unit + regression)
+pytest tests/unit/ -v            # Unit tests only (167 tests)
+pytest tests/regression/ -v      # Regression tests (63 tests)
+
+# Run a quick acceptance test
 python main.py --test-manhattan
 
-# Or launch the GUI (requires KiCad running)
+# Or launch the plugin (requires KiCad running with a board open)
 python main.py plugin
 ```
 
@@ -89,29 +93,26 @@ Don't try to refactor the entire 3,936-line UnifiedPathFinder on your first PR. 
 
 ### 2. **Areas That Need Help**
 
-#### **Critical Priority: Tests**
-The project has **zero unit tests**. This is the biggest blocker to refactoring.
+#### **Testing: Foundation Established ✅**
 
-**Start here:**
-```python
-# tests/test_lattice_builder.py
-def test_lattice_node_count():
-    """Verify lattice creates correct number of nodes"""
-    builder = LatticeBuilder(Nx=10, Ny=10, Nz=6)
-    lattice = builder.build()
-    assert lattice.num_nodes == 10 * 10 * 6
+**Current Status:**
+- ✅ **167 unit tests** passing (algorithms, graph building, data structures)
+- ✅ **63 regression tests** passing (validates against golden result baseline)
+- ✅ **Golden result documented**: April 10, 2026 — 512/512 nets routed, zero overuse, 18.4 min
+- ✅ **Test suite ready** for CI/CD integration
 
-def test_manhattan_adjacency():
-    """Verify no diagonal edges in graph"""
-    # Check that all edges connect orthogonally
-```
+**Test Coverage:**
+- Unit tests: `pad_escape_planner.py`, `board_analyzer.py`, via conflict resolution, geometry validation
+- Regression tests: board loading, routing quality, convergence, performance metrics, iteration stability
+- Golden baseline: TestBackplane.kicad_pcb (18 layers, 1,604 pads, 512 nets)
 
-**What to test:**
-- Lattice building (node count, adjacency)
-- CSR matrix construction (integrity checks)
-- Via pooling accounting (usage counts)
-- Portal escape planning (DRC compliance)
-- Pad mapping (nearest node finding)
+**Where You Can Help:**
+- Add tests for edge cases (zero-pad nets, single-layer boards, dense BGA fanouts)
+- Improve test documentation (more inline comments explaining test intent)
+- Add property-based tests (hypothesis library) for graph integrity
+- Implement mocking for KiCad API calls (currently uses real IPC connections)
+
+See **[tests/README.md](../tests/README.md)** and **[tests/run_golden_regression.md](../tests/run_golden_regression.md)** for complete test documentation.
 
 #### **High Priority: Refactoring**
 
@@ -191,26 +192,7 @@ def build_lattice(
 
 ### Testing
 
-**When you add tests (please do!):**
-- Use `pytest`
-- Test files in `tests/` directory
-- Name test files `test_*.py`
-- Name test functions `test_*`
-- One assertion per test (mostly)
-
-**Example:**
-```python
-# tests/test_via_pooling.py
-import pytest
-from orthoroute.algorithms.manhattan.unified_pathfinder import UnifiedPathFinder
-
-def test_via_column_accounting():
-    """Verify via column usage increments correctly"""
-    pf = UnifiedPathFinder()
-    # Setup...
-    pf._increment_via_column_use(x=5, y=10)
-    assert pf.via_col_use[5, 10] == 1
-```
+Use `pytest`. Test files in `tests/`. See **[tests/README.md](../tests/README.md)** for full details.
 
 ### Git Workflow
 

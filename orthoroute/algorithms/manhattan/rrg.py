@@ -819,49 +819,83 @@ def preflight_graph(graph_state) -> bool:
     
     logger.info(f"[PREFLIGHT] Starting graph validation on graph_state id = {id(graph_state)}...")
 
-    # DEBUG: Show what attributes the graph_state actually has
-    logger.info(f"[PREFLIGHT] DEBUG: graph_state attributes: {dir(graph_state)}")
-    logger.info(f"[PREFLIGHT] DEBUG: hasattr(graph_state, 'indptr'): {hasattr(graph_state, 'indptr')}")
-    if hasattr(graph_state, 'indptr'):
-        logger.info(f"[PREFLIGHT] DEBUG: graph_state.indptr: {graph_state.indptr}")
-        logger.info(f"[PREFLIGHT] DEBUG: graph_state.indptr is None: {graph_state.indptr is None}")
-        if graph_state.indptr is not None:
-            logger.info(f"[PREFLIGHT] DEBUG: graph_state.indptr type: {type(graph_state.indptr)}")
+    # graph_state stores CPU arrays under *_cpu names; accept both for compatibility
+    indptr  = getattr(graph_state, 'indptr_cpu',  None) or getattr(graph_state, 'indptr',  None)
+    indices = getattr(graph_state, 'indices_cpu', None) or getattr(graph_state, 'indices', None)
+    weights = getattr(graph_state, 'weights_cpu', None) or getattr(graph_state, 'weights', None)
 
-    # Basic validation - check if we have required arrays
-    if not hasattr(graph_state, 'indptr') or graph_state.indptr is None:
+    if indptr is None:
         logger.error("[PREFLIGHT] FAILED: Missing indptr array")
         return False
-        
-    if not hasattr(graph_state, 'indices') or graph_state.indices is None:
+
+    if indices is None:
         logger.error("[PREFLIGHT] FAILED: Missing indices array")
         return False
-        
-    if not hasattr(graph_state, 'weights') or graph_state.weights is None:
+
+    if weights is None:
         logger.error("[PREFLIGHT] FAILED: Missing weights array")
         return False
-    
+
     # Check array sizes match
-    if len(graph_state.indices) != len(graph_state.weights):
-        logger.error(f"[PREFLIGHT] FAILED: indices({len(graph_state.indices)}) != weights({len(graph_state.weights)})")
+    if len(indices) != len(weights):
+        logger.error(f"[PREFLIGHT] FAILED: indices({len(indices)}) != weights({len(weights)})")
         return False
-    
+
     # Check indptr bounds
-    if len(graph_state.indptr) == 0:
+    if len(indptr) == 0:
         logger.error("[PREFLIGHT] FAILED: Empty indptr array")
         return False
-        
+
     # Log basic stats
-    num_nodes = len(graph_state.indptr) - 1 if len(graph_state.indptr) > 0 else 0
-    num_edges = len(graph_state.indices)
-    
+    num_nodes = len(indptr) - 1 if len(indptr) > 0 else 0
+    num_edges = len(indices)
+
     logger.info(f"[PREFLIGHT] Graph has {num_nodes} nodes, {num_edges} edges")
-    logger.info(f"[PREFLIGHT] indptr[0]={graph_state.indptr[0]}, indptr[-1]={graph_state.indptr[-1]}")
-    
+    logger.info(f"[PREFLIGHT] indptr[0]={indptr[0]}, indptr[-1]={indptr[-1]}")
+
     # Validate indptr bounds
-    if graph_state.indptr[-1] != num_edges:
-        logger.error(f"[PREFLIGHT] FAILED: indptr[-1]={graph_state.indptr[-1]} != num_edges={num_edges}")
+    if indptr[-1] != num_edges:
+        logger.error(f"[PREFLIGHT] FAILED: indptr[-1]={indptr[-1]} != num_edges={num_edges}")
         return False
-    
+
     logger.info("[PREFLIGHT] All basic validations passed")
+    return True
+
+
+def validate_lattice_integrity(graph_state) -> bool:
+    """Validate that the lattice was not mutated during pad mapping.
+
+    Checks that the CSR structure (node/edge counts) recorded at graph-init
+    time still matches the live arrays in graph_state.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    logger.info("[LATTICE] Starting post-mapping integrity check...")
+
+    indptr  = getattr(graph_state, 'indptr_cpu',  None) or getattr(graph_state, 'indptr',  None)
+    indices = getattr(graph_state, 'indices_cpu', None) or getattr(graph_state, 'indices', None)
+
+    if indptr is None or indices is None:
+        logger.error("[LATTICE] FAILED: CSR arrays missing after pad mapping")
+        return False
+
+    expected_nodes = getattr(graph_state, 'lattice_node_count', None)
+    if expected_nodes is not None and len(indptr) - 1 != expected_nodes:
+        logger.error(
+            f"[LATTICE] FAILED: node count changed — expected {expected_nodes}, "
+            f"got {len(indptr) - 1}"
+        )
+        return False
+
+    if indptr[-1] != len(indices):
+        logger.error(
+            f"[LATTICE] FAILED: edge count inconsistent — "
+            f"indptr[-1]={indptr[-1]} != len(indices)={len(indices)}"
+        )
+        return False
+
+    logger.info(
+        f"[LATTICE] Integrity OK: {len(indptr) - 1} nodes, {len(indices)} edges"
+    )
     return True

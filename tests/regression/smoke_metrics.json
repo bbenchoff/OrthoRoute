@@ -1,0 +1,48 @@
+{
+  "_comment": "Smoke test baselines for 100-net synthetic board. Fast validation checkpoint for optimization cycles.",
+  "_board": "Synthetic smoke board — 100 nets, 4-8 layers (generated in conftest.py), ~30s routing time",
+  "_note": "These are conservative thresholds with headroom. Update after establishing actual smoke test baselines.",
+
+  "nets_routed": 100,
+  "total_nets": 100,
+
+  "gpu": {
+    "_source": "Smoke test baseline — to be measured, currently estimated",
+    "_note": "Expected: ~10-20 iterations, <60s total, converged with zero overuse. Thresholds = estimated × 1.50 headroom for safety.",
+    "converged": true,
+    "iterations_max": 30,
+    "total_time_s_max": 90,
+    "iter_avg_time_s_max": 5.0,
+    "iter_1_time_s_max": 15.0,
+    "overuse_final_max": 0,
+    "tracks_delta_min": 100,
+    "vias_delta_min": 50,
+    "barrel_conflicts_max": 100
+  },
+
+  "cpu": {
+    "_source": "CPU-only smoke baseline — to be measured",
+    "_note": "Run: pytest tests/regression/test_smoke.py -v (with CPU-only mode if available)",
+    "converged": true,
+    "iterations_max": 40,
+    "total_time_s_max": 180,
+    "iter_avg_time_s_max": 10.0,
+    "iter_1_time_s_max": 30.0,
+    "overuse_final_max": 0,
+    "tracks_delta_min": 100,
+    "vias_delta_min": 50,
+    "barrel_conflicts_max": 150
+  },
+
+  "_thresholds_note": "All *_max/*_min values are soft warnings unless noted HARD FAIL. Tests auto-detect GPU=YES/NO from log. Update these values after running actual smoke test baselines.",
+  "iterations_max": 30,
+  "total_time_s_max": 90,
+  "iter_avg_time_s_max": 5.0,
+  "iter_1_time_s_max": 15.0,
+  "overuse_final_max": 0,
+  "tracks_delta_min": 100,
+  "vias_delta_min": 50,
+  "barrel_conflicts_max": 100,
+
+  "_update_instructions": "To update with actual baselines: 1) Run smoke test with ORTHO_DEBUG=1, 2) Parse logs/latest.log with scripts/analyze_log.py --json, 3) Set thresholds to actual_value × 1.50 for headroom, 4) Update this file, 5) Re-run scripts/optimize_and_validate.ps1 --compare to validate"
+}

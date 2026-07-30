@@ -52,8 +52,6 @@ gpu_parallelization.py
 orthoroute.log
 *.tmp
 *.temp
-tests/
-tests/*
 logs/
 logs/*
 checkpoints/
@@ -128,6 +126,10 @@ standalone_*.py
 quick_*.py
 *temp*.py
 
+# Un-ignore pytest test files inside the tests/ directory
+!tests/**test_*.py
+!tests/**/test_*.py
+
 # Debug output directory
 debug_output/
 
@@ -145,7 +147,6 @@ viz/*.mp4
 # Generated documentation
 docs/_build/
 docs/api/
-.github/
 
 # Log files
 *.log

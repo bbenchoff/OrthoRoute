@@ -13,6 +13,7 @@ mlx>=0.32.0; platform_system == "Darwin" and platform_machine == "arm64"
 # Development dependencies (optional)
 pytest>=6.0.0
 pytest-cov>=2.0.0
+scipy>=1.10.0
 black>=21.0.0
 flake8>=3.8.0
 mypy>=0.800
