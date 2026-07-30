@@ -8,7 +8,7 @@
     only — they are removed after KiCad exits.
 
 .PARAMETER KiCadVersion
-    KiCad major version to launch. Default: 9.0
+    KiCad major version to launch. Default: 10.0
 
 .PARAMETER ScreenshotFreq
     Save a PCB screenshot every N routing iterations. Default: 5 (0 = every iteration).
@@ -24,27 +24,37 @@
     Calls scripts/optimize_and_validate.ps1 with smoke test.
 
 .EXAMPLE
-    .\launch_kicad_debug.ps1
-    .\launch_kicad_debug.ps1 -KiCadVersion 10.0
-    .\launch_kicad_debug.ps1 -ScreenshotFreq 10 -ScreenshotScale 4
-    .\launch_kicad_debug.ps1 -NoScreenshots
-    .\launch_kicad_debug.ps1 -RunValidation  # Run smoke test after KiCad exits
+    .\scripts\launch_kicad_debug.ps1
+    .\scripts\launch_kicad_debug.ps1 -KiCadVersion 10.0
+    .\scripts\launch_kicad_debug.ps1 -ScreenshotFreq 10 -ScreenshotScale 4
+    .\scripts\launch_kicad_debug.ps1 -NoScreenshots
+    .\scripts\launch_kicad_debug.ps1 -RunValidation
 #>
 
 param(
-    [string]$KiCadVersion   = "9.0",
+    [string]$KiCadVersion   = "10.0",
     [int]   $ScreenshotFreq  = 5,
     [int]   $ScreenshotScale = 8,
     [switch]$NoScreenshots,
     [switch]$RunValidation
 )
 
-$kicadExe = "C:\Program Files\KiCad\$KiCadVersion\bin\kicad.exe"
+$kicadRoots = @(
+    (Join-Path $env:LOCALAPPDATA "Programs\KiCad"),
+    (Join-Path $env:ProgramFiles "KiCad")
+)
+$kicadExe = $kicadRoots |
+    ForEach-Object { Join-Path $_ "$KiCadVersion\bin\kicad.exe" } |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
 
-if (-not (Test-Path $kicadExe)) {
-    Write-Error "KiCad $KiCadVersion not found at: $kicadExe"
+if (-not $kicadExe) {
+    Write-Error "KiCad $KiCadVersion was not found in a per-user or machine installation."
     Write-Host  "Available versions:"
-    Get-ChildItem "C:\Program Files\KiCad" -Directory | Select-Object -ExpandProperty Name
+    $kicadRoots |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        ForEach-Object { Get-ChildItem -LiteralPath $_ -Directory } |
+        Select-Object -ExpandProperty Name -Unique
     exit 1
 }
 
@@ -86,7 +96,7 @@ Write-Host "  Press Ctrl+C here to kill KiCad and clean up env vars." -Foregroun
 Write-Host ""
 # --- Sync plugin sources before launching ---
 Write-Host "Syncing plugin sources..." -ForegroundColor DarkCyan
-& "$PSScriptRoot\copy_to_kicad.ps1"
+& "$PSScriptRoot\copy_to_kicad.ps1" -KiCadVersion $KiCadVersion
 Write-Host ""
 try {
     # Start KiCad — it inherits env vars from this process
@@ -115,7 +125,7 @@ try {
         Write-Host "  Smoke test (100 nets, <30s) to verify routing still works..."
         Write-Host ""
         
-        $validateScript = Join-Path $PSScriptRoot "scripts\optimize_and_validate.ps1"
+        $validateScript = Join-Path $PSScriptRoot "optimize_and_validate.ps1"
         if (Test-Path $validateScript) {
             try {
                 & $validateScript -SkipDeploy -TestBoard smoke

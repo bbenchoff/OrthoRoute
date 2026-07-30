@@ -24,7 +24,7 @@
     Skip copy_to_kicad.ps1 sync step. Use when plugin folder is already up to date.
 
 .PARAMETER ProfileMode
-    Enable ORTHO_DEBUG=1 for detailed profiling logs. Increases log size ~10-20×.
+    Enable ORTHO_DEBUG=1 for detailed profiling logs. Increases log size ~10-20x.
 
 .PARAMETER Compare
     Path to golden metrics file for validation (e.g., tests/regression/smoke_metrics.json).
@@ -122,7 +122,7 @@ function Test-Prerequisites {
     }
     
     if ($issues.Count -gt 0) {
-        Write-Host "❌ Prerequisites check failed:" -ForegroundColor Red
+        Write-Host "ERROR: Prerequisites check failed:" -ForegroundColor Red
         $issues | ForEach-Object { Write-Host "   - $_" -ForegroundColor Yellow }
         exit 3
     }
@@ -136,10 +136,10 @@ function Invoke-Deployment {
     param([string]$Root)
     
     Write-Host ""
-    Write-Host "📦 DEPLOYMENT" -ForegroundColor Cyan
+    Write-Host "DEPLOYMENT" -ForegroundColor Cyan
     Write-Host ("=" * 80)
     
-    $copyScript = Join-Path $Root "copy_to_kicad.ps1"
+    $copyScript = Join-Path $Root "scripts\copy_to_kicad.ps1"
     
     if ($SkipDeploy) {
         Write-Host "  Skipped (--SkipDeploy)" -ForegroundColor DarkGray
@@ -154,13 +154,13 @@ function Invoke-Deployment {
     try {
         & $copyScript
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "❌ Deployment failed (exit code $LASTEXITCODE)" -ForegroundColor Red
+            Write-Host "ERROR: Deployment failed (exit code $LASTEXITCODE)" -ForegroundColor Red
             return $false
         }
-        Write-Host "✅ Deployment successful" -ForegroundColor Green
+        Write-Host "Deployment successful" -ForegroundColor Green
         return $true
     } catch {
-        Write-Host "❌ Deployment error: $_" -ForegroundColor Red
+        Write-Host "ERROR: Deployment error: $_" -ForegroundColor Red
         return $false
     }
 }
@@ -177,7 +177,7 @@ function Invoke-RegressionTest {
     )
     
     Write-Host ""
-    Write-Host "🧪 TESTING" -ForegroundColor Cyan
+    Write-Host "TESTING" -ForegroundColor Cyan
     Write-Host ("=" * 80)
     Write-Host "  Test board:    $Board"
     Write-Host "  Profiling:     $(if ($EnableProfiling) { 'ENABLED (ORTHO_DEBUG=1)' } else { 'disabled' })"
@@ -262,11 +262,11 @@ function Invoke-LogAnalysis {
     )
     
     Write-Host ""
-    Write-Host "📊 LOG ANALYSIS" -ForegroundColor Cyan
+    Write-Host "LOG ANALYSIS" -ForegroundColor Cyan
     Write-Host ("=" * 80)
     
     if (-not $LogPath -or -not (Test-Path $LogPath)) {
-        Write-Host "❌ Log file not found: $LogPath" -ForegroundColor Red
+        Write-Host "ERROR: Log file not found: $LogPath" -ForegroundColor Red
         return $null
     }
     
@@ -310,7 +310,7 @@ function Invoke-LogAnalysis {
         }
         
     } catch {
-        Write-Host "❌ Log analysis error: $_" -ForegroundColor Red
+        Write-Host "ERROR: Log analysis error: $_" -ForegroundColor Red
         return $null
     }
 }
@@ -320,9 +320,9 @@ function Invoke-LogAnalysis {
 # =============================================================================
 
 Write-Host ""
-Write-Host "═══════════════════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host ("=" * 80) -ForegroundColor Cyan
 Write-Host "  OrthoRoute Optimization & Validation Workflow" -ForegroundColor Cyan
-Write-Host "═══════════════════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host ("=" * 80) -ForegroundColor Cyan
 
 # Check prerequisites
 Test-Prerequisites -Root $repoRoot
@@ -331,7 +331,7 @@ Test-Prerequisites -Root $repoRoot
 $deploySuccess = Invoke-Deployment -Root $repoRoot
 if (-not $deploySuccess) {
     Write-Host ""
-    Write-Host "❌ WORKFLOW FAILED: Deployment error" -ForegroundColor Red
+    Write-Host "WORKFLOW FAILED: Deployment error" -ForegroundColor Red
     exit 3
 }
 
@@ -339,7 +339,7 @@ if (-not $deploySuccess) {
 $testResult = Invoke-RegressionTest -Root $repoRoot -Board $TestBoard -EnableProfiling $ProfileMode
 if (-not $testResult.Success) {
     Write-Host ""
-    Write-Host "❌ WORKFLOW FAILED: Test failed (exit code $($testResult.ExitCode))" -ForegroundColor Red
+    Write-Host "WORKFLOW FAILED: Test failed (exit code $($testResult.ExitCode))" -ForegroundColor Red
     Write-Host "   Routing did not complete successfully or test encountered errors" -ForegroundColor Yellow
     exit 1
 }
@@ -350,7 +350,7 @@ $analysisResult = Invoke-LogAnalysis -Root $repoRoot -LogPath $logPath -GoldenPa
 
 if ($null -eq $analysisResult) {
     Write-Host ""
-    Write-Host "⚠️  WORKFLOW WARNING: Log analysis failed" -ForegroundColor Yellow
+    Write-Host "WORKFLOW WARNING: Log analysis failed" -ForegroundColor Yellow
     Write-Host "   Test passed but could not parse metrics" -ForegroundColor Yellow
     exit 0  # Test succeeded, analysis is bonus
 }
@@ -358,40 +358,40 @@ if ($null -eq $analysisResult) {
 # Step 4: Display log if requested
 if ($ShowLog -and $logPath -and (Test-Path $logPath)) {
     Write-Host ""
-    Write-Host "📄 FULL LOG" -ForegroundColor Cyan
+    Write-Host "FULL LOG" -ForegroundColor Cyan
     Write-Host ("=" * 80)
     Get-Content $logPath
 }
 
 # Step 5: Final status
 Write-Host ""
-Write-Host "═══════════════════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host ("=" * 80) -ForegroundColor Cyan
 
 if ($Compare) {
     # With golden comparison
     if ($analysisResult.ExitCode -eq 0) {
-        Write-Host "✅ WORKFLOW COMPLETE: All validations passed" -ForegroundColor Green
-        Write-Host "   Test passed ✓  Golden comparison passed ✓" -ForegroundColor Green
+        Write-Host "WORKFLOW COMPLETE: All validations passed" -ForegroundColor Green
+        Write-Host "   Test passed; golden comparison passed" -ForegroundColor Green
         exit 0
     } elseif ($analysisResult.ExitCode -eq 1 -and $analysisResult.Metrics) {
         # Check if it's a soft warning or hard failure
         $comparison = $analysisResult.Metrics.comparison
         if ($comparison -and $comparison.overall_status -eq 'WARN') {
-            Write-Host "⚠️  WORKFLOW COMPLETE: Performance regression detected" -ForegroundColor Yellow
-            Write-Host "   Test passed ✓  Golden comparison shows warnings (soft regression)" -ForegroundColor Yellow
+            Write-Host "WORKFLOW COMPLETE: Performance regression detected" -ForegroundColor Yellow
+            Write-Host "   Test passed; golden comparison shows warnings (soft regression)" -ForegroundColor Yellow
             exit 2  # Soft regression
         } else {
-            Write-Host "❌ WORKFLOW FAILED: Golden comparison failed" -ForegroundColor Red
+            Write-Host "WORKFLOW FAILED: Golden comparison failed" -ForegroundColor Red
             Write-Host "   Test passed but metrics outside acceptable thresholds" -ForegroundColor Red
             exit 1  # Hard failure
         }
     } else {
-        Write-Host "❌ WORKFLOW FAILED: Log analysis error" -ForegroundColor Red
+        Write-Host "WORKFLOW FAILED: Log analysis error" -ForegroundColor Red
         exit 1
     }
 } else {
     # No comparison, just test success
-    Write-Host "✅ WORKFLOW COMPLETE: Test passed" -ForegroundColor Green
+    Write-Host "WORKFLOW COMPLETE: Test passed" -ForegroundColor Green
     Write-Host "   (No golden comparison performed - use -Compare to validate performance)" -ForegroundColor DarkGray
     exit 0
 }

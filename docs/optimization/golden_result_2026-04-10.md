@@ -381,10 +381,10 @@ python -c "import cupy; print(cupy.cuda.runtime.getDeviceCount())"
 
 ```powershell
 # Copy to KiCad plugin directory
-.\copy_to_kicad.ps1
+.\scripts\copy_to_kicad.ps1
 
 # Launch KiCad
-.\launch_kicad_debug.ps1
+.\scripts\launch_kicad_debug.ps1
 
 # In KiCad PCB Editor:
 # 1. Open TestBoards/TestBackplane.kicad_pcb

@@ -6,7 +6,7 @@ Creates frames (one per net) showing:
 - Left side: Board name, net counter, net name
 
 Usage:
-    python viz/generate_net_tour_video.py <path_to_kicad_pcb>
+    python scripts/visualization/generate_net_tour_video.py <path_to_kicad_pcb>
 """
 
 import sys

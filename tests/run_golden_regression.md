@@ -8,7 +8,7 @@ This document describes how to run the full regression test against the **Golden
 
 ```powershell
 # 1. Launch KiCad with TestBackplane
-.\launch_kicad_debug.ps1
+.\scripts\launch_kicad_debug.ps1
 
 # 2. In KiCad: Tools → External Plugins → OrthoRoute → Begin Autorouting
 

@@ -261,7 +261,7 @@ plugins/
 **Fast Iteration** (during development):
 ```powershell
 # Make code changes, then sync to KiCad (no rebuild)
-.\copy_to_kicad.ps1
+.\scripts\copy_to_kicad.ps1
 
 # Restart KiCad to reload changes
 ```
