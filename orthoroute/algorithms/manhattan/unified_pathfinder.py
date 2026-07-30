@@ -541,6 +541,23 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Set once per process, the first time the GPU fast path dies on a CUDA
+# infrastructure error (OOM, cooperative-launch failure, driver error).  The
+# first occurrence warns loudly; repeats only log at DEBUG so a misconfigured
+# GPU is visible without flooding the log once per net.
+_gpu_fastpath_cuda_warned = False
+
+
+def _is_cuda_infrastructure_error(exc: BaseException) -> bool:
+    """True when ``exc`` is raised by CuPy/CUDA rather than routing logic.
+
+    Covers ``cupy.cuda.runtime.CUDARuntimeError``,
+    ``cupy.cuda.memory.OutOfMemoryError``, and driver errors — all live in
+    modules named ``cupy`` or ``cupy_backends``.
+    """
+    module = type(exc).__module__ or ""
+    return module.startswith("cupy")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2662,6 +2679,8 @@ class PathFinderRouter:
         # GPU vs CPU pathfinding usage tracking
         self._gpu_path_count = 0  # Number of paths found using GPU
         self._cpu_path_count = 0  # Number of paths found using CPU
+        # CUDA infrastructure failures in the GPU fast path this run
+        self._gpu_fastpath_cuda_failures = 0
 
         # Legacy attributes for compatibility
         self._instance_tag = f"PF-{int(time.time() * 1000) % 100000}"
@@ -7156,6 +7175,13 @@ class PathFinderRouter:
         if total_paths > 0:
             gpu_pct = (self._gpu_path_count / total_paths) * 100
             logger.warning(f"[GPU-STATS] GPU: {self._gpu_path_count} paths ({gpu_pct:.1f}%), CPU: {self._cpu_path_count} paths ({100-gpu_pct:.1f}%)")
+        if getattr(self, '_gpu_fastpath_cuda_failures', 0) > 0:
+            logger.warning(
+                "[GPU-STATS] GPU fast path hit %d CUDA infrastructure "
+                "failure(s) this run; those nets fell back to CPU ROI "
+                "routing (see first warning for details)",
+                self._gpu_fastpath_cuda_failures,
+            )
 
         # Only show warning if routing is actually incomplete
         if failed > 0 or negotiated_overuse > 0:
@@ -7859,10 +7885,38 @@ class PathFinderRouter:
                             logger.warning(f"[GPU-SEEDS] Empty seed arrays, skipping GPU fast path")
                 except Exception as e:
                     gpu_fullgraph_failed = True
-                    logger.warning(
-                        f"[GPU-SEEDS] GPU fast path failed: {e}; "
-                        "falling back to cost-based ROI routing"
-                    )
+                    if _is_cuda_infrastructure_error(e):
+                        # Infrastructure failure (OOM, cooperative-launch
+                        # failure, driver error) — not a routing outcome.
+                        # Warn loudly once per process, then count quietly.
+                        self._gpu_fastpath_cuda_failures += 1
+                        global _gpu_fastpath_cuda_warned
+                        if not _gpu_fastpath_cuda_warned:
+                            _gpu_fastpath_cuda_warned = True
+                            logger.warning(
+                                "[GPU-SEEDS] GPU fast path failed "
+                                "(%s: %s). Falling back to CPU ROI routing "
+                                "— expect roughly 10x slower. If this is a "
+                                "cooperative-launch failure, your GPU may "
+                                "have too few SMs for the persistent kernel.",
+                                type(e).__name__, e,
+                            )
+                        else:
+                            logger.debug(
+                                "[GPU-SEEDS] CUDA failure #%d in GPU fast "
+                                "path (%s: %s)",
+                                self._gpu_fastpath_cuda_failures,
+                                type(e).__name__, e,
+                            )
+                    else:
+                        logger.warning(
+                            f"[GPU-SEEDS] GPU fast path failed: {e}; "
+                            "falling back to cost-based ROI routing"
+                        )
+                        logger.debug(
+                            "[GPU-SEEDS] GPU fast path traceback:",
+                            exc_info=True,
+                        )
 
             # For a long net on a huge board, the "ROI" below is the entire
             # graph.  Falling through to CPU multisource Dijkstra can take

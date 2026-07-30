@@ -43,7 +43,22 @@ present); code is unreachable without CuPy. Only one launch site exists
 
 ## Phase 2 — Exception discipline in the GPU fast path
 
-_(pending)_
+In `_route_all`'s handler around `find_path_fullgraph_gpu_seeds`:
+
+- Added module-level `_is_cuda_infrastructure_error()` — true when the exception type's
+  module starts with `cupy` (covers `cupy.cuda.runtime.CUDARuntimeError`,
+  `cupy.cuda.memory.OutOfMemoryError`, and `cupy_backends.*` driver errors). No new
+  top-level cupy import.
+- CUDA infrastructure errors: first occurrence per process logs an actionable WARNING
+  (names the exception, notes the ~10x CPU fallback and the cooperative-launch/SM-count
+  suspicion); repeats log at DEBUG with a running count. Per-run counter
+  `self._gpu_fastpath_cuda_failures` is reported in the existing `[GPU-STATS]`
+  end-of-run summary.
+- Non-CUDA exceptions: unchanged WARNING, plus the full traceback now logged at DEBUG
+  (`exc_info=True`) so real bugs aren't invisible.
+- Fallback behavior and the expected no-path `None` flow are untouched.
+
+Tests: 342/9 + 80, green.
 
 ## Phase 3 — Documentation drift
 
@@ -72,6 +87,13 @@ _(pending)_
 ## Unanticipated findings
 
 _(collected as encountered; recorded, not fixed, per the task rules)_
+
+- **`GPUConfig.USE_PERSISTENT_KERNEL = False`** (unified_pathfinder.py ~line 578) with the
+  comment "DISABLED: Hangs on cooperative kernel launch; using wavefront with atomic keys
+  instead." The Phase 1 occupancy fix addresses the most likely cause of exactly that hang
+  (a grid of 80 blocks that can't all be resident). Worth re-testing the persistent kernel
+  on real hardware with the new grid sizing before considering it permanently dead. Not
+  flipped here — that would be a behavior change.
 
 - Phase 4 note (verified before starting): the believed-dead methods reference each other —
   `find_path_single` → `find_path_batch`, `find_path_multisource_multisink_gpu` →
