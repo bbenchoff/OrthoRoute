@@ -56,9 +56,9 @@ With this architecture -- the PathFinder algorithm on a very large graph, within
 
 1. Everyone who's routing giant backplanes probably has a gaming PC. Or you can rent a GPU from whatever company is advertising on MUNI bus stops this month.
 2. The PathFinder algorithm requires hundreds of billions of calculations for every iteration, making single-core CPU computation glacially slow. 
-3. With CUDA, I can implement a SSSP (parallel Dijkstra) to find a path through a weighted graph very fast. 
+3. With CUDA, I can implement a parallel SSSP (a frontier-based label-correcting search, Bellman-Ford family) to find a path through a weighted graph very fast. 
 
-Note this is _not_ a fully parallel autorouter; in OrthoRoute, nets are still routed in sequence on a shared congestion map. The parallelism lives inside the shortest-path search: a CUDA SSSP (“parallel Dijkstra”) kernel makes each individual net’s pathfinding fast, but it doesn’t route many nets simultaneously.
+Note this is _not_ a fully parallel autorouter; in OrthoRoute, nets are still routed in sequence on a shared congestion map. The parallelism lives inside the shortest-path search: a CUDA SSSP kernel makes each individual net’s pathfinding fast, but it doesn’t route many nets simultaneously.
 
 ## Features
 

@@ -18,7 +18,9 @@ CORE PATHFINDER LOOP:
      a) REFRESH: Rebuild usage from committed net paths (clean accounting)
      b) UPDATE_COSTS: Apply congestion penalties (present + historical)
      c) HOTSET: Select only nets touching overused edges (adaptive cap)
-     d) ROUTE: Route hotset nets using heap-based Dijkstra on ROI subgraphs
+     d) ROUTE: Route hotset nets — primary path is full-graph GPU supersource
+        label-correcting search (find_path_fullgraph_gpu_seeds); heap-based
+        Dijkstra on ROI subgraphs is the CPU fallback
      e) COMMIT: Update edge usage and tracking structures
      f) CHECK: If no overuse → SUCCESS, exit
      g) ESCALATE: Increase present_factor pressure for next iteration
@@ -26,7 +28,8 @@ CORE PATHFINDER LOOP:
 
 KEY INSIGHT: PathFinder uses economics - overused edges get expensive, forcing
 nets to find alternatives. Historical cost prevents oscillation. Portal escapes
-provide cheap entry to inner layers to spread routing across all 18 layers.
+provide cheap entry to inner layers to spread routing across every layer of the
+stack (up to 32 layers supported; the flagship TestBackplane board uses 32).
 
 ═══════════════════════════════════════════════════════════════════════════════
 PRECOMPUTED PAD ESCAPE ARCHITECTURE (THE BREAKTHROUGH)
@@ -102,8 +105,11 @@ KEY ADVANTAGES:
 
 RESULTS:
 ───────────────────────────────────────────────────────────────────────────────
-• Before: 16% completion (73/464 nets), F.Cu saturated, inner layers idle
-• After: Expected 80-90%+ completion, even layer utilization, clean geometry
+Living sources of truth (this block used to hold era-specific numbers that
+drifted stale):
+• docs/optimization/ — measured baselines and optimization history
+• tests/regression/golden_metrics.json — the metrics the regression suite
+  actually enforces
 
 ═══════════════════════════════════════════════════════════════════════════════
 GRAPH REPRESENTATION & DATA STRUCTURES
@@ -113,7 +119,9 @@ GRAPH REPRESENTATION & DATA STRUCTURES
 ───────────────────────────────────────────────────────────────────────────────
 • Grid: (x_steps × y_steps × layers) nodes
   - x_steps, y_steps: Board dimensions ÷ grid_pitch (default 0.4mm)
-  - layers: Copper layer count (6-18 typical, supports up to 32)
+  - layers: Copper layer count (supports up to 32; the flagship TestBackplane
+    board uses 32 — examples below that assume an 18-layer stack are just
+    examples)
 
 • Node indexing: flat_idx = layer × (x_steps × y_steps) + y × x_steps + x
   - Fast arithmetic: layer = idx ÷ plane_size
@@ -127,7 +135,7 @@ LAYER DISCIPLINE (H/V Manhattan Routing):
   - L2 (In2.Cu): Vertical
   - L3 (In3.Cu): Horizontal
   - ... continues alternating
-• B.Cu (L17): Opposite polarity of F.Cu
+• B.Cu (last layer; L17 on an 18-layer board): Opposite polarity of F.Cu
 
 CSR GRAPH (Compressed Sparse Row):
 ───────────────────────────────────────────────────────────────────────────────
@@ -238,8 +246,10 @@ STEP 2: BUILD HOTSET
 STEP 3: ROUTE NETS IN HOTSET
   • For each net:
     a) Clear old path from accounting (if exists)
-    b) Extract ROI: Typically 5K-50K nodes from 1.6M total
-    c) Run heap-based Dijkstra on ROI: O(E_roi × log V_roi)
+    b) PRIMARY: full-graph GPU supersource label-correcting search
+       (find_path_fullgraph_gpu_seeds) — no ROI extraction needed
+    c) FALLBACK: extract ROI (typically 5K-50K nodes from the full graph)
+       and run heap-based Dijkstra on it: O(E_roi × log V_roi)
     d) Fallback to larger ROI if needed (max 5 per iteration)
     e) Commit path: Update canonical, present, net_to_edges, edge_to_nets
 
@@ -282,25 +292,26 @@ ADAPTIVE ROI SIZING:
 • Stagnation bonus: +0.6mm per stagnation event (grows when stuck)
 • Fallback: If ROI fails, retry with radius=60 (limit 5 fallbacks/iteration)
 
-SimpleDijkstra: HEAP-BASED O(E log V) SSSP
+SimpleDijkstra: HEAP-BASED O(E log V) SSSP (CPU FALLBACK)
 ───────────────────────────────────────────────────────────────────────────────
 • Priority queue: Python heapq with (distance, node) tuples
 • Operates on ROI subgraph (not full graph)
 • Early termination when destination reached
 • Visited tracking prevents re-expansion
-• Typical performance: 0.1-0.5s per net on 18-layer board
 
-MULTI-SOURCE/MULTI-SINK (for portal routing - TO BE IMPLEMENTED):
-• Initialize heap with multiple (distance, node) entries for all portal layers
-• Terminate when ANY destination portal layer reached
-• Choose best entry/exit layers dynamically per net
+MULTI-SOURCE/MULTI-SINK (portal routing):
+• Implemented as supersource/supersink seeding: every portal-layer candidate
+  enters the search with its terminal cost; the search terminates on the best
+  destination candidate, choosing entry/exit layers per net dynamically
 
-GPU SUPPORT (currently disabled):
+GPU SUPPORT (primary runtime path):
 ───────────────────────────────────────────────────────────────────────────────
-• config.use_gpu defaults to False
-• GPU arrays available but SimpleDijkstra runs on CPU
-• Avoids host↔device copy overhead without GPU SSSP kernel
-• Future: GPU near-far/delta-stepping when fully vectorized
+• The main path routes on the FULL graph with a GPU frontier/queue
+  label-correcting search (Bellman-Ford family) using strict-improvement
+  packed atomic keys and destination upper-bound pruning — see
+  pathfinder/cuda_dijkstra.py find_path_fullgraph_gpu_seeds
+• Heap-based ROI Dijkstra above is the CPU fallback when CuPy/CUDA is
+  unavailable or the GPU path fails
 
 ═══════════════════════════════════════════════════════════════════════════════
 BLIND/BURIED VIA SUPPORT
@@ -470,14 +481,13 @@ KEY METHODS:
 • _rebuild_usage_from_committed_nets(): Clean accounting
 • _apply_portal_discount(): Reduce via cost at terminals
 
-PORTAL METHODS (TO BE IMPLEMENTED):
+PORTAL METHODS:
 • _plan_portal_for_pad(): Choose escape point 1.2-5mm from pad
 • _get_portal_seeds(): Multi-layer entry points with discounted costs
-• _route_with_portals(): Multi-source/multi-sink Dijkstra
-• _emit_portal_geometry(): Vertical escape stubs + trimmed via stacks
-• _retarget_failed_portals(): Adjust portals when nets fail repeatedly
-• _gpu_roi_near_far_sssp_with_metrics(): GPU shortest path solver
 • emit_geometry(): Converts paths to KiCad tracks/vias
+(multi-source/multi-sink routing itself happens through the GPU supersource
+seeding in _route_all; portal retargeting lives in
+_retarget_portals_for_net)
 
 ═══════════════════════════════════════════════════════════════════════════════
 

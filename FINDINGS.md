@@ -62,7 +62,27 @@ Tests: 342/9 + 80, green.
 
 ## Phase 3 — Documentation drift
 
-_(pending)_
+Documentation-only changes (no code):
+
+- Core-loop step (d) and negotiation STEP 3 now name the full-graph GPU supersource
+  label-correcting search as the primary path, ROI heap Dijkstra as the CPU fallback.
+- Layer counts: header now states 32-layer support and the 32-layer flagship board up
+  front, marks the remaining 18-layer material as examples, generalized "all 18 layers"
+  and "B.Cu (L17)".
+- RESULTS block replaced with pointers to `docs/optimization/` and
+  `tests/regression/golden_metrics.json` (both verified to exist).
+- "Dijkstra" prose for the GPU solver corrected to frontier/queue label-correcting
+  (Bellman-Ford family) in the module docstring, in the `cuda_dijkstra.py` header
+  (with an explicit "module name is historical" note — no file/class renames), and in
+  the README's two "parallel Dijkstra" mentions.
+- Beyond the plan's list, two sections that directly contradicted the corrected claims
+  were also fixed (still prose-only): "GPU SUPPORT (currently disabled)" — it is the
+  primary runtime path — and two "(TO BE IMPLEMENTED)" tags on portal machinery that
+  has long been implemented (the listed-but-nonexistent methods `_route_with_portals`,
+  `_emit_portal_geometry`, `_retarget_failed_portals`,
+  `_gpu_roi_near_far_sssp_with_metrics` were removed from the method list).
+
+Tests: 342/9 + 80, green.
 
 ## Phase 4 — Solver graveyard purge
 

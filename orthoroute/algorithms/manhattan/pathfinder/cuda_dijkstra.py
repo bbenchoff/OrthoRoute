@@ -1,8 +1,13 @@
 """
-CUDA GPU Dijkstra Pathfinding
+CUDA GPU Shortest-Path Solvers
 
 Clean, focused GPU implementation for parallel shortest path computation.
 This module handles ONLY GPU pathfinding - all graph state remains in unified_pathfinder.py
+
+Naming note: the module name is historical. The primary solver
+(find_path_fullgraph_gpu_seeds) is a frontier/queue label-correcting search
+(Bellman-Ford family) with strict-improvement packed atomic keys and
+destination upper-bound pruning — not heap-based Dijkstra.
 """
 
 import logging
