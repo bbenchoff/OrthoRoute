@@ -63,7 +63,7 @@ Note this is _not_ a fully parallel autorouter; in OrthoRoute, nets are still ro
 ## Features
 
 - KiCad Integration: Built as a native KiCad plugin using the IPC API
-- GPU-Accelerated Routing: Uses CUDA/CuPy
+- GPU-Accelerated Routing: Uses CUDA/CuPy or Apple Silicon/Metal
 - Manhattan Routing: Specialized for orthogonal routing patterns (horizontal/vertical layer pairs)
 - Real-time Visualization: Interactive 2D board view with zoom, pan, and layer controls
 - Checkpoint system for instant resume after crashes (experimental)
