@@ -306,7 +306,7 @@ runtime wheels are large.
                 },
             },
             "maintainer": {
-                "name": "Ben Benchoff",
+                "name": "Brian Benchoff",
                 "contact": {
                     "github": "https://github.com/bbenchoff",
                 },
