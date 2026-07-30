@@ -102,8 +102,9 @@ Note this is _not_ a fully parallel autorouter; in OrthoRoute, nets are still ro
 
 #### Install the KiCad package
 
-1. Download `OrthoRoute-1.0.0-KiCad-PCM.zip` from the `/build` folder, or build it from source using
-   the instructions below.
+1. Download
+   [`OrthoRoute-1.0.0-KiCad-PCM.zip`](https://github.com/bbenchoff/OrthoRoute/releases/download/v1.0.0/OrthoRoute-1.0.0-KiCad-PCM.zip),
+   or build it from source using the instructions below.
 2. In KiCad 10, open **Plugin and Content Manager** and choose
    **Install from File...**.
 3. Select the OrthoRoute PCM ZIP.
