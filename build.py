@@ -1,506 +1,373 @@
-"""
-OrthoRoute Build System - Creates manual installation package for KiCad IPC plugins
-Follows the working example from layout_stamp (https://github.com/hraftery/layout_stamp)
+#!/usr/bin/env python3
+"""Build and deploy the native KiCad IPC plugin package.
+
+KiCad 10 discovers IPC plugins under ``<KiCad documents>/<version>/plugins``.
+Each plugin is a directory containing ``plugin.json`` and an action entrypoint.
+KiCad creates a dedicated virtual environment and installs ``requirements.txt``
+before exposing the action in PCB Editor.
 """
 
-import os
-import sys
+from __future__ import annotations
+
+import argparse
 import json
-import shutil
-import zipfile
 import logging
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Optional
-
-logging.basicConfig(level=logging.INFO, format='%(message)s')
-logger = logging.getLogger(__name__)
-
-class OrthoRouteBuildSystem:
-    """Build system for OrthoRoute manual installation package"""
-
-    def __init__(self, project_root: Path = None):
-        self.project_root = project_root or Path(__file__).parent
-        self.build_dir = self.project_root / "build"
-        self.version = "1.0.0"
-        self.plugin_identifier = "com.github.bbenchoff.orthoroute"
-        self.plugin_name = "OrthoRoute"
-
-    def clean_build_directory(self):
-        """Clean the build directory"""
-        logger.info("Cleaning build directory...")
-        if self.build_dir.exists():
-            shutil.rmtree(self.build_dir)
-        self.build_dir.mkdir(exist_ok=True)
-        logger.info(f"[OK] Build directory cleaned: {self.build_dir}")
-
-    def create_plugin_json(self) -> Dict:
-        """Create plugin.json using modern schema v1 (strict compliance)"""
-        return {
-            "$schema": "https://go.kicad.org/api/schemas/v1",
-            "identifier": self.plugin_identifier,
-            "name": self.plugin_name,
-            "description": "GPU-accelerated PCB autorouter with Manhattan routing and real-time visualization",
-            "runtime": {
-                "type": "python",
-                "min_version": "3.10"
-            },
-            "actions": [
-                {
-                    "identifier": "orthoroute.route",
-                    "name": "OrthoRoute",
-                    "description": "Launch OrthoRoute GPU-accelerated autorouter",
-                    "scopes": ["pcb"],
-                    "entrypoint": "main.py",
-                    "show-button": True,
-                    "icons-light": ["icon-24.png", "icon-48.png"]
-                }
-            ]
-        }
-
-    def copy_core_files(self, package_dir: Path):
-        """Copy core plugin files for manual installation"""
-        logger.info(f"Copying core files to {package_dir.name}...")
-
-        # Copy the orthoroute package directory
-        orthoroute_src = self.project_root / "orthoroute"
-        if orthoroute_src.exists():
-            orthoroute_dst = package_dir / "orthoroute"
-            shutil.copytree(orthoroute_src, orthoroute_dst)
-            py_files = len(list(orthoroute_src.rglob('*.py')))
-            logger.info(f"  [OK] Copied orthoroute package: {py_files} Python files")
-
-        # Copy main.py entry point
-        main_file = self.project_root / "main.py"
-        if main_file.exists():
-            shutil.copy2(main_file, package_dir / "main.py")
-            logger.info(f"  [OK] Copied main.py entry point")
-
-        # Create plugin.json
-        plugin_json = self.create_plugin_json()
-        with open(package_dir / "plugin.json", 'w', encoding='utf-8') as f:
-            json.dump(plugin_json, f, indent=2)
-        logger.info(f"  [OK] Created plugin.json (modern schema v1)")
-
-        # Copy icons (rename to match plugin.json)
-        graphics_src = self.project_root / "graphics"
-        if graphics_src.exists():
-            # Copy and rename icon24.png -> icon-24.png
-            icon24_src = graphics_src / "icon24.png"
-            if icon24_src.exists():
-                shutil.copy2(icon24_src, package_dir / "icon-24.png")
-                logger.info(f"  [OK] Copied icon-24.png")
-
-            # Copy and rename icon64.png -> icon-48.png (or create if needed)
-            icon48_src = graphics_src / "icon64.png"
-            if icon48_src.exists():
-                shutil.copy2(icon48_src, package_dir / "icon-48.png")
-                logger.info(f"  [OK] Copied icon-48.png")
-
-        # Copy requirements.txt
-        requirements_file = self.project_root / "requirements.txt"
-        if requirements_file.exists():
-            shutil.copy2(requirements_file, package_dir / "requirements.txt")
-            logger.info("  [OK] Copied requirements.txt")
-
-        # Copy LICENSE
-        license_file = self.project_root / "LICENSE"
-        if license_file.exists():
-            shutil.copy2(license_file, package_dir / "LICENSE")
-            logger.info("  [OK] Copied LICENSE")
-
-    def create_installation_instructions(self, package_dir: Path):
-        """Create detailed installation instructions"""
-        instructions = f"""# OrthoRoute {self.version} - Manual Installation Instructions
-
-## ⚠️ Important: IPC API Must Be Enabled
-
-Before installing this plugin, you MUST enable the IPC API in KiCad:
-
-1. Open KiCad
-2. Go to Preferences → Plugins
-3. Check the box "Enable Python API"
-4. Click OK
-5. Restart KiCad
-
-## Installation Instructions
-
-### Windows
-1. Extract the `{self.plugin_identifier}` folder from this ZIP
-2. Copy it to: `C:\\Users\\<your-username>\\Documents\\KiCad\\9.0\\plugins\\`
-3. Restart KiCad
-4. The OrthoRoute button should appear in the PCB Editor toolbar
-
-### macOS
-1. Extract the `{self.plugin_identifier}` folder from this ZIP
-2. Copy it to: `/Users/<your-username>/Documents/KiCad/9.0/plugins/`
-3. Restart KiCad
-4. The OrthoRoute button should appear in the PCB Editor toolbar
-
-### Linux
-1. Extract the `{self.plugin_identifier}` folder from this ZIP
-2. Copy it to: `~/.local/share/KiCad/9.0/plugins/`
-3. Restart KiCad
-4. The OrthoRoute button should appear in the PCB Editor toolbar
-
-## Dependency Management
-
-KiCad will automatically create a virtual environment and install dependencies
-from requirements.txt when you first run the plugin.
-
-The virtual environment is located at:
-- Windows: `C:\\Users\\<username>\\AppData\\Local\\KiCad\\9.0\\python-environments\\{self.plugin_identifier}\\`
-- macOS: `/Users/<username>/Library/Caches/KiCad/9.0/python-environments/{self.plugin_identifier}/`
-- Linux: `~/.cache/KiCad/9.0/python-environments/{self.plugin_identifier}/`
-
-## Requirements
-
-- KiCad 9.0 or later
-- Python 3.10 or later (usually included with KiCad)
-- Dependencies listed in requirements.txt (auto-installed by KiCad)
-
-## Troubleshooting
-
-### Plugin button doesn't appear
-- Verify IPC API is enabled (Preferences → Plugins)
-- Check that the folder name matches: `{self.plugin_identifier}`
-- Restart KiCad after installation
-- Check KiCad logs for errors: `Documents/KiCad/9.0/logs/`
-
-### Dependencies not installing
-- Check your internet connection
-- Look at: `Documents/KiCad/9.0/logs/api.log` for installation errors
-- Manually activate the venv and install: `pip install -r requirements.txt`
-
-### Can't find plugins directory
-- Create the directory if it doesn't exist
-- The path varies by KiCad version (use 9.0, 9.1, etc.)
-
-## More Information
-
-- Project: https://github.com/bbenchoff/OrthoRoute
-- KiCad IPC API Docs: https://dev-docs.kicad.org/en/apis-and-binding/ipc-api/
-- Plugin Reference: https://github.com/hraftery/layout_stamp
-
-## Why Manual Installation?
-
-PCM (Plugin and Content Manager) support for IPC plugins is currently broken
-on Windows (GitLab issue #19465). Manual installation is the only reliable
-method for now. We'll add PCM support once KiCad fixes the issue.
-
----
-Generated: {datetime.now().strftime('%Y-%m-%d')}
-Version: {self.version}
-"""
-        with open(package_dir / "INSTALL.txt", 'w', encoding='utf-8') as f:
-            f.write(instructions)
-        logger.info("  [OK] Created INSTALL.txt")
-
-    def create_package_zip(self, package_dir: Path) -> Path:
-        """Create ZIP package for manual installation"""
-        zip_name = f"{self.plugin_identifier}-{self.version}.zip"
-        zip_path = self.build_dir / zip_name
-
-        logger.info(f"\nCreating installation package: {zip_name}")
-
-        # Create ZIP with the plugin folder inside
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Add INSTALL.txt at root of ZIP
-            install_file = package_dir / "INSTALL.txt"
-            if install_file.exists():
-                zipf.write(install_file, "INSTALL.txt")
-
-            # Add all plugin files under the plugin identifier folder
-            for file_path in package_dir.rglob('*'):
-                if file_path.is_file() and file_path.name != "INSTALL.txt":
-                    # Create archive path as: com.github.bbenchoff.orthoroute/...
-                    arcname = self.plugin_identifier + "/" + str(file_path.relative_to(package_dir))
-                    zipf.write(file_path, arcname)
-
-        # Calculate size
-        size_mb = zip_path.stat().st_size / (1024 * 1024)
-        logger.info(f"[OK] Package created: {zip_name} ({size_mb:.2f} MB)")
-
-        return zip_path
-
-    def build_package(self) -> Optional[Path]:
-        """Build the manual installation package"""
-        logger.info(f"Building OrthoRoute {self.version} manual installation package")
-        logger.info(f"Project root: {self.project_root}\n")
-
-        # Create package directory
-        package_dir = self.build_dir / self.plugin_identifier
-        package_dir.mkdir(parents=True, exist_ok=True)
-
-        # Copy files
-        self.copy_core_files(package_dir)
-
-        # Create installation instructions
-        self.create_installation_instructions(package_dir)
-
-        # Create ZIP package
-        zip_path = self.create_package_zip(package_dir)
-
-        return zip_path
-
-    def show_completion_message(self, zip_path: Path):
-        """Show completion message with installation instructions"""
-        size_mb = zip_path.stat().st_size / (1024 * 1024)
-
-        print("\n" + "="*70)
-        print("BUILD COMPLETE!")
-        print("="*70)
-        print(f"\nPackage: {zip_path.name} ({size_mb:.2f} MB)")
-        print(f"Location: {zip_path.parent}")
-        print("\n" + "="*70)
-        print("INSTALLATION INSTRUCTIONS")
-        print("="*70)
-        print("\n1. First, enable IPC API in KiCad:")
-        print("   - Open KiCad -> Preferences -> Plugins")
-        print("   - Check 'Enable Python API'")
-        print("   - Restart KiCad")
-        print("\n2. Install the plugin:")
-        print(f"   - Extract the ZIP file")
-        print(f"   - Copy the '{self.plugin_identifier}' folder to your plugins directory:")
-        print(f"     * Windows: C:\\Users\\<username>\\Documents\\KiCad\\9.0\\plugins\\")
-        print(f"     * macOS: /Users/<username>/Documents/KiCad/9.0/plugins/")
-        print(f"     * Linux: ~/.local/share/KiCad/9.0/plugins/")
-        print("\n3. Restart KiCad")
-        print("\n4. Look for the OrthoRoute button in PCB Editor toolbar")
-        print("\n" + "="*70)
-        print("Full instructions included in INSTALL.txt inside the ZIP")
-        print("="*70 + "\n")
-
-    def create_pcm_metadata(self) -> Dict:
-        """Create metadata.json for PCM installation (SWIG plugin)"""
-        return {
-            "$schema": "https://go.kicad.org/pcm/schemas/v1",
-            "name": self.plugin_name,
-            "description": "GPU-accelerated PCB autorouter with Manhattan routing",
-            "description_full": "Advanced PCB autorouter that leverages GPU acceleration for high-performance routing. Features intelligent pathfinding, real-time visualization, and seamless KiCad integration.",
-            "identifier": self.plugin_identifier,
-            "type": "plugin",
-            "author": {
-                "name": "OrthoRoute Team",
-                "contact": {
-                    "web": "https://github.com/bbenchoff/OrthoRoute"
-                }
-            },
-            "maintainer": {
-                "name": "OrthoRoute Team",
-                "contact": {
-                    "web": "https://github.com/bbenchoff/OrthoRoute"
-                }
-            },
-            "license": "MIT",
-            "resources": {
-                "homepage": "https://github.com/bbenchoff/OrthoRoute",
-                "repository": "https://github.com/bbenchoff/OrthoRoute",
-                "issues": "https://github.com/bbenchoff/OrthoRoute/issues",
-                "icon": "resources/icon.png"
-            },
-            "tags": [
-                "autorouter",
-                "routing",
-                "pcb",
-                "gpu",
-                "automation"
-            ],
-            "versions": [
-                {
-                    "version": self.version,
-                    "status": "stable",
-                    "kicad_version": "9.0",
-                    "platforms": ["windows", "macos", "linux"],
-                    "runtime": "swig"
-                }
-            ]
-        }
-
-    def create_swig_init_py(self) -> str:
-        """Create __init__.py for SWIG ActionPlugin registration"""
-        return '''"""OrthoRoute KiCad SWIG Plugin"""
 import os
+import platform
+import re
+import shutil
 import sys
+import zipfile
+from pathlib import Path
+from typing import Iterable
 
-# Add plugin directory to path
-plugin_dir = os.path.dirname(os.path.abspath(__file__))
-if plugin_dir not in sys.path:
-    sys.path.insert(0, plugin_dir)
 
-try:
-    import pcbnew
+LOGGER = logging.getLogger("orthoroute.build")
+PLUGIN_IDENTIFIER = "com.github.bbenchoff.orthoroute"
+PLUGIN_NAME = "OrthoRoute"
+PLUGIN_MANIFEST = "plugin.json"
+PLUGIN_ENTRYPOINT = "kicad_plugin.py"
+PLUGIN_REQUIREMENTS = "requirements-kicad.txt"
+SWIG_PLUGIN_DIR_NAME = "com_github_bbenchoff_orthoroute"
 
-    class OrthoRoutePlugin(pcbnew.ActionPlugin):
-        """KiCad Action Plugin wrapper for OrthoRoute."""
 
-        def defaults(self):
-            """Set plugin defaults."""
-            self.name = "OrthoRoute"
-            self.category = "Routing"
-            self.description = "GPU-accelerated PCB autorouter"
-            self.show_toolbar_button = True
-            self.icon_file_name = os.path.join(os.path.dirname(__file__), "icon.png")
+def _read_version(project_root: Path) -> str:
+    setup_text = (project_root / "setup.py").read_text(encoding="utf-8")
+    match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', setup_text)
+    if not match:
+        raise RuntimeError("Could not determine version from setup.py")
+    return match.group(1)
 
-        def Run(self):
-            """Run the plugin."""
-            try:
-                # Import the main plugin class
-                from orthoroute.presentation.plugin.kicad_plugin import KiCadPlugin
 
-                # Create and run plugin
-                plugin = KiCadPlugin()
-                result = plugin.run_with_gui()
+def _documents_directory() -> Path:
+    """Return the OS documents directory, including Windows redirection."""
+    if platform.system() == "Windows":
+        try:
+            import winreg
 
-                if result:
-                    pcbnew.Refresh()
+            key_path = (
+                r"Software\Microsoft\Windows\CurrentVersion"
+                r"\Explorer\User Shell Folders"
+            )
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                value, _ = winreg.QueryValueEx(key, "Personal")
+            return Path(os.path.expandvars(value)).expanduser()
+        except (OSError, ImportError):
+            return Path.home() / "Documents"
+    if platform.system() == "Darwin":
+        return Path.home() / "Documents"
+    return Path.home() / ".local" / "share"
 
-            except Exception as e:
-                import traceback
-                import wx
-                error_msg = f"OrthoRoute error: {e}\n\n{traceback.format_exc()}"
-                wx.LogError(error_msg)  # KiCad 9 uses wx.LogError, not pcbnew.LogError
-                print(error_msg)  # Also print to console
 
-    # Register the plugin
-    OrthoRoutePlugin().register()
+def _version_key(value: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"\d+(?:\.\d+){1,2}", value):
+        return ()
+    return tuple(int(part) for part in value.split("."))
 
-except ImportError:
-    # pcbnew not available - running outside KiCad
-    pass
-'''
 
-    def build_pcm_package(self) -> Optional[Path]:
-        """Build PCM-installable SWIG plugin package"""
-        logger.info(f"Building OrthoRoute {self.version} PCM package (SWIG)")
-        logger.info(f"Project root: {self.project_root}\n")
+def find_kicad_version(kicad_root: Path, requested: str | None = None) -> str:
+    """Find the newest installed KiCad user-data version."""
+    if requested:
+        if not _version_key(requested):
+            raise ValueError(f"Invalid KiCad version: {requested!r}")
+        return requested
 
-        # Create package directory structure
-        package_dir = self.build_dir / "pcm_package"
-        package_dir.mkdir(parents=True, exist_ok=True)
+    candidates = [
+        path.name
+        for path in kicad_root.iterdir()
+        if path.is_dir() and _version_key(path.name)
+    ] if kicad_root.exists() else []
+    if not candidates:
+        raise RuntimeError(f"No KiCad user-data versions found under {kicad_root}")
+    return max(candidates, key=_version_key)
 
-        # NOTE: Files must be at root level, NOT in plugins/ subdirectory
-        resources_dir = package_dir / "resources"
-        resources_dir.mkdir(exist_ok=True)
 
-        logger.info("Copying files for PCM package...")
+def _assert_child(path: Path, parent: Path) -> None:
+    resolved_path = path.resolve()
+    resolved_parent = parent.resolve()
+    if resolved_path == resolved_parent or resolved_parent not in resolved_path.parents:
+        raise RuntimeError(f"Refusing operation outside {resolved_parent}: {resolved_path}")
 
-        # Copy orthoroute package to root level
-        orthoroute_src = self.project_root / "orthoroute"
-        if orthoroute_src.exists():
-            orthoroute_dst = package_dir / "orthoroute"
-            shutil.copytree(orthoroute_src, orthoroute_dst)
-            py_files = len(list(orthoroute_src.rglob('*.py')))
-            logger.info(f"  [OK] Copied orthoroute package: {py_files} Python files")
 
-        # Copy main.py to root level
-        main_file = self.project_root / "main.py"
-        if main_file.exists():
-            shutil.copy2(main_file, package_dir / "main.py")
-            logger.info(f"  [OK] Copied main.py")
+def _remove_tree(path: Path, parent: Path) -> None:
+    if not path.exists():
+        return
+    _assert_child(path, parent)
+    shutil.rmtree(path)
 
-        # Create __init__.py for SWIG registration at root level
-        init_content = self.create_swig_init_py()
-        with open(package_dir / "__init__.py", 'w', encoding='utf-8') as f:
-            f.write(init_content)
-        logger.info(f"  [OK] Created __init__.py (SWIG ActionPlugin)")
 
-        # Copy 24x24 icon to root level
-        graphics_src = self.project_root / "graphics"
-        if graphics_src.exists():
-            icon24_src = graphics_src / "icon24.png"
-            if icon24_src.exists():
-                shutil.copy2(icon24_src, package_dir / "icon.png")
-                logger.info(f"  [OK] Copied toolbar icon (24x24)")
+def _copy_tree(source: Path, destination: Path) -> None:
+    shutil.copytree(
+        source,
+        destination,
+        ignore=shutil.ignore_patterns(
+            "__pycache__",
+            "*.pyc",
+            "*.pyo",
+            ".pytest_cache",
+            "*.backup",
+        ),
+    )
 
-            # Copy 64x64 icon to resources/
-            icon64_src = graphics_src / "icon64.png"
-            if icon64_src.exists():
-                shutil.copy2(icon64_src, resources_dir / "icon.png")
-                logger.info(f"  [OK] Copied catalog icon (64x64)")
 
-        # Create metadata.json at package root
-        metadata = self.create_pcm_metadata()
-        with open(package_dir / "metadata.json", 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2)
-        logger.info(f"  [OK] Created metadata.json (PCM)")
+class KiCadPluginBuilder:
+    """Assemble, validate, archive, and deploy OrthoRoute."""
 
-        # Create ZIP package
-        zip_name = f"{self.plugin_identifier}-pcm-{self.version}.zip"
-        zip_path = self.build_dir / zip_name
+    def __init__(
+        self,
+        project_root: Path | None = None,
+        output_root: Path | None = None,
+    ) -> None:
+        self.project_root = (project_root or Path(__file__).parent).resolve()
+        self.output_root = (
+            output_root or self.project_root / "build" / "kicad-plugin"
+        ).resolve()
+        self.version = _read_version(self.project_root)
+        self.package_dir = self.output_root / PLUGIN_IDENTIFIER
+        self.swig_package_dir = self.output_root / SWIG_PLUGIN_DIR_NAME
+        self.zip_path = (
+            self.project_root
+            / "build"
+            / f"OrthoRoute-{self.version}-KiCad-IPC.zip"
+        )
 
-        logger.info(f"\nCreating PCM package: {zip_name}")
+    @property
+    def required_files(self) -> tuple[str, ...]:
+        return (
+            PLUGIN_MANIFEST,
+            PLUGIN_ENTRYPOINT,
+            "main.py",
+            "requirements.txt",
+            "orthoroute.json",
+            "LICENSE",
+            "graphics/icon24.png",
+            "graphics/icon64.png",
+            "orthoroute/__init__.py",
+        )
 
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in package_dir.rglob('*'):
-                if file_path.is_file():
-                    arcname = str(file_path.relative_to(package_dir))
-                    zipf.write(file_path, arcname)
+    def clean(self) -> None:
+        self.output_root.parent.mkdir(parents=True, exist_ok=True)
+        _remove_tree(self.output_root, self.output_root.parent)
+        if self.zip_path.exists():
+            self.zip_path.unlink()
 
-        size_mb = zip_path.stat().st_size / (1024 * 1024)
-        logger.info(f"[OK] PCM package created: {zip_name} ({size_mb:.2f} MB)")
+    def _copy_files(self) -> None:
+        self.package_dir.mkdir(parents=True)
 
-        return zip_path
+        for name in (
+            PLUGIN_MANIFEST,
+            PLUGIN_ENTRYPOINT,
+            "main.py",
+            "orthoroute.json",
+            "LICENSE",
+            "README.md",
+        ):
+            shutil.copy2(self.project_root / name, self.package_dir / name)
 
-    def show_pcm_completion_message(self, zip_path: Path):
-        """Show completion message for PCM package"""
-        size_mb = zip_path.stat().st_size / (1024 * 1024)
+        shutil.copy2(
+            self.project_root / PLUGIN_REQUIREMENTS,
+            self.package_dir / "requirements.txt",
+        )
+        _copy_tree(
+            self.project_root / "orthoroute",
+            self.package_dir / "orthoroute",
+        )
 
-        print("\n" + "="*70)
-        print("BUILD COMPLETE - PCM PACKAGE")
-        print("="*70)
-        print(f"\nPackage: {zip_path.name} ({size_mb:.2f} MB)")
-        print(f"Location: {zip_path.parent}")
-        print("\n" + "="*70)
-        print("INSTALLATION INSTRUCTIONS")
-        print("="*70)
-        print("\n1. Open KiCad")
-        print("2. Go to Tools -> Plugin and Content Manager")
-        print("3. Click 'Install from File'")
-        print(f"4. Select: {zip_path}")
-        print("5. Restart KiCad")
-        print("6. Look for OrthoRoute button in PCB Editor toolbar")
-        print("\n" + "="*70)
-        print("NOTE: This is a SWIG plugin using KiCad's embedded Python")
-        print("Some features may differ from the IPC version")
-        print("="*70 + "\n")
+        graphics_dir = self.package_dir / "graphics"
+        graphics_dir.mkdir()
+        for name in ("icon24.png", "icon64.png"):
+            shutil.copy2(
+                self.project_root / "graphics" / name,
+                graphics_dir / name,
+            )
 
-def main():
-    """Main build script entry point"""
-    import argparse
+        install_text = f"""# OrthoRoute {self.version} for KiCad
 
-    parser = argparse.ArgumentParser(description='OrthoRoute Build System')
-    parser.add_argument('--version', default='1.0.0', help='Version number')
-    parser.add_argument('--clean', action='store_true', help='Clean build directory only')
-    parser.add_argument('--pcm', action='store_true', help='Build PCM package (SWIG) instead of manual IPC package')
+This is a native KiCad IPC plugin.
 
-    args = parser.parse_args()
+1. Copy `{PLUGIN_IDENTIFIER}` into the KiCad `<version>/plugins` directory.
+2. In KiCad, enable the API server under Preferences > Plugins.
+3. Restart PCB Editor and wait for the plugin environment to finish installing.
+4. Launch OrthoRoute from the PCB Editor toolbar.
 
-    builder = OrthoRouteBuildSystem()
-    builder.version = args.version
+KiCad installs the dependencies in `requirements.txt` into an isolated
+environment. The first load can take several minutes because the GUI and GPU
+runtime wheels are large.
+"""
+        (self.package_dir / "INSTALL.md").write_text(
+            install_text,
+            encoding="utf-8",
+        )
+
+        # PR #17's KiCad 9/10 compatibility bridge.  This intentionally has
+        # no plugin.json: the native descriptor above remains the sole IPC
+        # registration, while the SWIG loader supplies a reliable toolbar
+        # button that launches it.
+        self.swig_package_dir.mkdir(parents=True)
+        shutil.copy2(
+            self.project_root / "swig_init.py",
+            self.swig_package_dir / "__init__.py",
+        )
+        shutil.copy2(
+            self.project_root / "graphics" / "icon24.png",
+            self.swig_package_dir / "icon-24.png",
+        )
+
+    def validate(self) -> dict:
+        missing = [
+            relative
+            for relative in self.required_files
+            if not (self.package_dir / relative).is_file()
+        ]
+        if missing:
+            raise RuntimeError(f"Plugin package is missing required files: {missing}")
+
+        manifest = json.loads(
+            (self.package_dir / PLUGIN_MANIFEST).read_text(encoding="utf-8")
+        )
+        required_keys = {"identifier", "name", "description", "runtime", "actions"}
+        missing_keys = required_keys - manifest.keys()
+        if missing_keys:
+            raise RuntimeError(f"plugin.json is missing fields: {sorted(missing_keys)}")
+        if manifest["identifier"] != PLUGIN_IDENTIFIER:
+            raise RuntimeError("plugin.json identifier does not match package directory")
+        if manifest["runtime"].get("type") != "python":
+            raise RuntimeError("OrthoRoute must use KiCad's native Python IPC runtime")
+        if not manifest["actions"]:
+            raise RuntimeError("plugin.json has no actions")
+
+        for action in manifest["actions"]:
+            entrypoint = action.get("entrypoint")
+            if not entrypoint or not (self.package_dir / entrypoint).is_file():
+                raise RuntimeError(f"Invalid action entrypoint: {entrypoint!r}")
+
+        requirements = (
+            self.package_dir / "requirements.txt"
+        ).read_text(encoding="utf-8")
+        forbidden = ("pytest", "flake8", "mypy", "sphinx", "\nblack")
+        if any(name in requirements.lower() for name in forbidden):
+            raise RuntimeError("Development dependency found in plugin requirements")
+
+        for relative in ("__init__.py", "icon-24.png"):
+            if not (self.swig_package_dir / relative).is_file():
+                raise RuntimeError(f"SWIG bridge is missing required file: {relative}")
+        if (self.swig_package_dir / PLUGIN_MANIFEST).exists():
+            raise RuntimeError("SWIG bridge must not duplicate the native plugin.json")
+        return manifest
+
+    def create_zip(self) -> Path:
+        self.zip_path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(
+            self.zip_path,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as archive:
+            for source in sorted(self.package_dir.rglob("*")):
+                if source.is_file():
+                    relative = source.relative_to(self.package_dir)
+                    archive.write(
+                        source,
+                        (Path(PLUGIN_IDENTIFIER) / relative).as_posix(),
+                    )
+        return self.zip_path
+
+    def build(self, make_zip: bool = True) -> Path:
+        LOGGER.info("Building %s %s native KiCad IPC plugin", PLUGIN_NAME, self.version)
+        self.clean()
+        self._copy_files()
+        self.validate()
+        if make_zip:
+            self.create_zip()
+        LOGGER.info("Package: %s", self.package_dir)
+        if make_zip:
+            LOGGER.info("ZIP: %s", self.zip_path)
+        return self.package_dir
+
+    def deploy(
+        self,
+        kicad_version: str | None = None,
+        kicad_root: Path | None = None,
+    ) -> Path:
+        root = (kicad_root or _documents_directory() / "KiCad").resolve()
+        version = find_kicad_version(root, kicad_version)
+        plugins_dir = (root / version / "plugins").resolve()
+        destination = plugins_dir / PLUGIN_IDENTIFIER
+        swig_plugins_dir = (root / version / "3rdparty" / "plugins").resolve()
+        swig_destination = swig_plugins_dir / SWIG_PLUGIN_DIR_NAME
+
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+        swig_plugins_dir.mkdir(parents=True, exist_ok=True)
+        _assert_child(destination, plugins_dir)
+        _assert_child(swig_destination, swig_plugins_dir)
+        _remove_tree(destination, plugins_dir)
+        _remove_tree(swig_destination, swig_plugins_dir)
+        shutil.copytree(self.package_dir, destination)
+        shutil.copytree(self.swig_package_dir, swig_destination)
+        LOGGER.info("Deployed to KiCad %s: %s", version, destination)
+        LOGGER.info("Deployed PR #17 ActionPlugin bridge: %s", swig_destination)
+        return destination
+
+
+def _remove_legacy_build_artifacts(project_root: Path) -> Iterable[Path]:
+    build_root = project_root / "build"
+    legacy = (
+        build_root / PLUGIN_IDENTIFIER,
+        build_root / "pcm_package",
+        build_root / f"{PLUGIN_IDENTIFIER}-pcm-1.0.0.zip",
+    )
+    for path in legacy:
+        if path.is_dir():
+            _remove_tree(path, build_root)
+            yield path
+        elif path.is_file():
+            _assert_child(path, build_root)
+            path.unlink()
+            yield path
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Build and deploy the OrthoRoute native KiCad IPC plugin",
+    )
+    parser.add_argument(
+        "--deploy",
+        action="store_true",
+        help="Install the built plugin into the local KiCad plugins directory",
+    )
+    parser.add_argument(
+        "--kicad-version",
+        help="KiCad user-data version to deploy to (default: newest installed)",
+    )
+    parser.add_argument(
+        "--no-zip",
+        action="store_true",
+        help="Skip creation of the manual-install ZIP",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove generated plugin build artifacts and exit",
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    builder = KiCadPluginBuilder()
 
     if args.clean:
-        builder.clean_build_directory()
+        builder.clean()
+        for path in _remove_legacy_build_artifacts(builder.project_root):
+            LOGGER.info("Removed legacy build artifact: %s", path)
         return 0
 
-    # Clean and build
-    builder.clean_build_directory()
+    builder.build(make_zip=not args.no_zip)
+    if args.deploy:
+        builder.deploy(kicad_version=args.kicad_version)
+        LOGGER.info(
+            "Enable the KiCad API server and restart PCB Editor to load OrthoRoute."
+        )
+    return 0
 
-    if args.pcm:
-        # Build PCM-installable SWIG package
-        zip_path = builder.build_pcm_package()
-        if zip_path and zip_path.exists():
-            builder.show_pcm_completion_message(zip_path)
-            return 0
-    else:
-        # Build manual installation IPC package
-        zip_path = builder.build_package()
-        if zip_path and zip_path.exists():
-            builder.show_completion_message(zip_path)
-            return 0
-
-    logger.error("[ERROR] Build failed!")
-    return 1
 
 if __name__ == "__main__":
     sys.exit(main())

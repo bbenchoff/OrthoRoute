@@ -47,7 +47,7 @@ def fetch_board_and_drc():
     try:
         kc = KiCad()                                   # IPC session (nng under the hood)
         board = kc.get_board()                         # Active PCB document
-        project = kc.get_project()                     # Project owning the board
+        project = kc.get_project(board.document)       # Project owning the board
 
         # Layers / stackup
         layer_cnt = board.get_copper_layer_count()
@@ -55,16 +55,26 @@ def fetch_board_and_drc():
         stackup = board.get_stackup() if hasattr(board, 'get_stackup') else None
 
         # Nets and classes
-        nets = board.get_nets()                        # [{id, name, ...}, ...]
-        net_names = [n.get("name", "") for n in nets if n.get("name")]
-        netclass_by_net = board.get_netclass_for_nets(net_names) if net_names else {}
+        nets = board.get_nets()
+        raw_netclass_by_net = board.get_netclass_for_nets(nets) if nets else {}
+        netclass_by_net = {
+            net_name: getattr(netclass, "name", "Default")
+            for net_name, netclass in raw_netclass_by_net.items()
+        }
 
         # All net classes (for defaults/fallbacks)
-        all_netclasses = {nc.get("name", "Default"): nc for nc in project.get_net_classes()}
+        all_netclasses = {
+            nc.name: {
+                "track_width": nc.track_width,
+                "via_size": nc.via_diameter,
+                "clearance": nc.clearance,
+            }
+            for nc in project.get_net_classes()
+        }
 
-        # Pad polygons (for DRC keepouts)
-        # returns dict keyed by pad or (ref, pad_name) -> polygon(s)
-        pad_polys = board.get_pad_shapes_as_polygons(include_holes=False) if hasattr(board, 'get_pad_shapes_as_polygons') else {}
+        # Pad polygons require an explicit pad list and layer in the native API.
+        # Detailed pad geometry is already extracted by _extract_pads().
+        pad_polys = {}
 
         return {
             "board": board,
