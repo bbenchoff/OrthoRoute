@@ -1,5 +1,23 @@
 # Hardening audit findings — branch `hardening/audit-2026-07`
 
+## Summary
+
+All phases complete (Phase 8: 3 of 4 extractions; the fourth skipped deliberately).
+
+| Metric | Before | After |
+|---|---|---|
+| Unit+integration suite | 342 passed / 9 skipped | **345 passed / 9 skipped** (+3 new strict-mode tests) |
+| Engine smoke suite | 80 passed | **80 passed** |
+| Removed tests | — | **none** (no test referenced deleted code) |
+| `cuda_dijkstra.py` | 5,928 lines | 3,922 |
+| `unified_pathfinder.py` | 11,367 lines | ~9,220 (three collaborator modules extracted) |
+| `persistent_kernel.py` | 702 lines | ~500 (dead kernel variant removed; occupancy sizing added) |
+
+New modules: `pathfinder/cuda_common.py` (shared device preamble),
+`shared/profiling.py` (ORTHO_PROFILE instrumentation), `manhattan/geometry_emitter.py`,
+`manhattan/via_accounting.py`, `manhattan/hotset_policy.py`.
+New env vars: `ORTHO_PROFILE=1`, `ORTHO_STRICT=1`. No routing-semantics changes anywhere.
+
 Implementation log for the July 2026 audit hardening task. One section per phase.
 Ground rules observed: no routing-semantics changes, tests are the contract, one commit
 per phase.
@@ -201,7 +219,41 @@ Tests: **345 passed / 9 skipped** (+3 new) + 80, green.
 
 ## Phase 8 — God-class decomposition
 
-_(pending)_
+Three of the four extractions completed, one commit each, both suites green after each.
+`unified_pathfinder.py`: 11,367 → ~9,220 lines. All extractions use delegation: method
+bodies moved verbatim with `self.` → `self._router.`; thin delegating methods stay on
+`PathFinderRouter` so every internal and external call site is unchanged.
+
+1. **Geometry emission** → `manhattan/geometry_emitter.py` (`GeometryEmitter`, 10
+   methods, ~515 lines). `GeometryPayload` moved with it and is re-imported by
+   `unified_pathfinder` for compatibility.
+2. **Via accounting & barrel ownership** → `manhattan/via_accounting.py`
+   (`ViaAccounting`, 15 methods, ~1,150 lines).
+3. **Hotset & stagnation policy** → `manhattan/hotset_policy.py` (`HotsetPolicy`, 13
+   methods incl. the `_rolling_progress_*`/`_pressure_*` pair and two staticmethods,
+   ~700 lines). The HOTSET MECHANISM and BLIND/BURIED VIA docstring sections moved
+   from the giant header into these modules (geometry had no dedicated section).
+4. **Escape/portal planning — SKIPPED**, per the plan's own bail-out clause. The
+   router carries ~40 portal/escape methods entangled with accounting, hotsets, via
+   ownership, and GPU seeding, and they overlap conceptually with the existing
+   1,785-line `pad_escape_planner.py`. The reconciliation is not obvious on inspection;
+   attempting it would have been rewriting, not moving.
+
+Notable mechanics discovered during extraction (why the test contract mattered):
+- The engine smoke tests construct routers with `object.__new__(PathFinderRouter)` and
+  even call methods unbound with duck-typed fixture objects
+  (`UnifiedPathFinder._rank_stagnation_offenders(fixture, ...)`). Collaborators are
+  therefore exposed as `functools.cached_property` (geometry, via accounting) or
+  constructed inline in the delegator (hotset policy) rather than assigned in
+  `__init__`.
+- Five multi-line `getattr(self, "...")` reads (line-wrapped, so the mechanical
+  `getattr(self, ` transform missed them) initially pointed at the collaborator
+  instead of the router. The smoke suite caught the behavioral difference
+  (`_effective_history_hotset_cap` returned 256 instead of 512; hotset composition
+  changed) before commit — fixed and re-verified.
+
+Tests after Phase 8: **345 passed / 9 skipped + 80 passed** — baseline plus the three
+Phase 7 tests, nothing lost.
 
 ## Unanticipated findings
 
@@ -221,3 +273,15 @@ _(collected as encountered; recorded, not fixed, per the task rules)_
 - A Metal/MLX backend exists (`orthoroute/algorithms/manhattan/pathfinder/metal_dijkstra.py`,
   `mlx` on Darwin in requirements). The audit task doesn't mention it. It is left untouched;
   changes were checked to not import or alter it.
+- The audit's Phase 4 dead list wrongly included `find_paths_on_rois` and the K_pool
+  batch machinery — they are live via `find_path_roi_gpu` (details in Phase 4).
+- `_fallback_cpu_dijkstra` (cuda_dijkstra.py) has zero callers but was not on the audit
+  list; left in place as the only in-class CPU fallback. Future-cut candidate.
+- The engine smoke tests call some router methods unbound with duck-typed fixture
+  objects — any future refactor of `_rank_stagnation_offenders` /
+  `_select_stagnation_victims` / `_effective_history_hotset_cap` must preserve that.
+- The docstring FILE ORGANIZATION class list carried stale line numbers ("line ~380"
+  etc., off by hundreds of lines); dropped the numbers and added the collaborator
+  modules during Phase 8.
+- `benchmarks/` and `scripts/` reference no solver entry points at all (nothing had to
+  be kept for tooling).

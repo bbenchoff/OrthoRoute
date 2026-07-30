@@ -406,20 +406,26 @@ MEMORY USAGE:
 FILE ORGANIZATION
 ═══════════════════════════════════════════════════════════════════════════════
 
-CLASSES (in order):
-1. PathFinderConfig (line ~380): Configuration dataclass
-2. CSRGraph (line ~430): Compressed sparse row graph with memory-efficient construction
-3. EdgeAccountant (line ~490): Edge usage/cost accounting
-4. Lattice3D (line ~550): 3D grid geometry with H/V discipline
-5. ROIExtractor (line ~720): Region-of-interest extraction
-6. SimpleDijkstra (line ~780): Heap-based O(E log V) shortest path solver
-7. PathFinderRouter (line ~860): Main routing engine
+CLASSES (in this module, in order):
+1. PathFinderConfig: Configuration dataclass
+2. CSRGraph: Compressed sparse row graph with memory-efficient construction
+3. EdgeAccountant: Edge usage/cost accounting
+4. Lattice3D: 3D grid geometry with H/V discipline
+5. ROIExtractor: Region-of-interest extraction
+6. SimpleDijkstra: Heap-based O(E log V) shortest path solver (CPU fallback)
+7. PathFinderRouter: Main routing engine
+
+COLLABORATOR MODULES (extracted from PathFinderRouter; the router keeps thin
+delegating methods, so call sites are unchanged):
+• geometry_emitter.py — GeometryEmitter: track/via geometry emission
+• via_accounting.py — ViaAccounting: via pools, barrel ownership, conflicts
+• hotset_policy.py — HotsetPolicy: hotset selection & stagnation ripping
 
 KEY METHODS:
 • initialize_graph(): Build lattice, graph, accounting structures
 • route_multiple_nets(): Main entry, calls negotiation
 • _pathfinder_negotiation(): Core PathFinder (30 iteration limit)
-• _route_all(): Route hotset nets with ROI-based Dijkstra
+• _route_all(): Route hotset nets (GPU full-graph primary, ROI fallback)
 • _build_hotset(): Identify nets touching overused edges (adaptive)
 • _rebuild_usage_from_committed_nets(): Clean accounting
 • _apply_portal_discount(): Reduce via cost at terminals
