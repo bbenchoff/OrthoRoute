@@ -5,6 +5,38 @@ Extracted verbatim from unified_pathfinder.py (hardening audit, Phase 8
 extraction 2). ViaAccounting is a collaborator operating on the router
 instance passed to its constructor; PathFinderRouter keeps thin delegating
 methods so every internal and external call site is unchanged.
+
+BLIND/BURIED VIA SUPPORT
+═══════════════════════════════════════════════════════════════════════════════
+
+VIA POLICY: ALL LAYER PAIRS ALLOWED
+───────────────────────────────────────────────────────────────────────────────
+• Any layer can connect to any other layer at same (x,y)
+• Examples:
+  - F.Cu ↔ In1.Cu (microvia)
+  - In5.Cu ↔ In12.Cu (buried via)
+  - F.Cu ↔ B.Cu (through via)
+  - F.Cu ↔ In10.Cu (blind via)
+
+VIA COSTING (encourages short spans but allows long):
+───────────────────────────────────────────────────────────────────────────────
+• Base cost: via_cost = 3.0
+• Span penalty: cost = via_cost × (1 + 0.15 × (span - 1))
+  - span=1 (adjacent): 3.0
+  - span=5: 4.8
+  - span=10: 7.05
+  - span=17 (through): 10.2
+
+• Portal discount (applied after graph build):
+  - First hop from pad terminals: cost × 0.4
+  - Escape via F.Cu → In1.Cu: 3.0 × 0.4 = 1.2 (cheap)
+  - Makes entering grid economical, encourages immediate layer spreading
+
+VIA EDGE REPRESENTATION:
+───────────────────────────────────────────────────────────────────────────────
+• Count: C(18,2) × x_steps × y_steps = 153 via pairs/cell × 88,206 cells = 27M edges
+• Storage: Boolean numpy array (30MB) marks which edges are vias
+• Used for: via-specific overuse tracking and annealing policy
 """
 
 import logging
