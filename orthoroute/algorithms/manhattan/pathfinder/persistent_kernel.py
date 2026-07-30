@@ -4,12 +4,84 @@ Single-launch kernel that runs until convergence or destination found.
 Eliminates kernel launch overhead by running persistently on device.
 """
 
+import logging
+
 try:
     import cupy as cp
     CUDA_AVAILABLE = True
 except ImportError:
     cp = None
     CUDA_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+# Cooperative launches require every block to be resident on the device at
+# once, so the grid size must respect this GPU's capacity rather than assume
+# an RTX 4090.  Computed once per (kernel, block size) by
+# _cooperative_grid_size() and cached here for the life of the process.
+_launch_config_cache = {}
+
+# Conservative fallback when occupancy queries fail: small enough to be
+# resident on any CUDA GPU that can run this kernel at all.
+_FALLBACK_NUM_BLOCKS = 32
+_MAX_NUM_BLOCKS = 512
+
+
+def _cooperative_grid_size(kernel, threads_per_block):
+    """Return the number of blocks for a cooperative launch of ``kernel``.
+
+    A cooperative kernel launch fails outright if the grid exceeds
+    ``sm_count * max_active_blocks_per_sm`` for the kernel, so query both at
+    runtime instead of hardcoding a grid sized for one specific GPU.  Any
+    query failure falls back to a conservative fixed grid with a one-line
+    warning; the result is cached per (function pointer, block size).
+    """
+    try:
+        func_ptr = kernel.kernel.ptr
+    except AttributeError:
+        func_ptr = None
+
+    cache_key = (func_ptr, threads_per_block)
+    cached = _launch_config_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    num_blocks = _FALLBACK_NUM_BLOCKS
+    try:
+        sm_count = int(cp.cuda.Device().attributes['MultiProcessorCount'])
+    except Exception as exc:
+        logger.warning(
+            "Persistent kernel: MultiProcessorCount query failed (%s); "
+            "using fallback grid of %d blocks", exc, num_blocks
+        )
+        sm_count = 0
+
+    if sm_count > 0 and func_ptr is not None:
+        try:
+            blocks_per_sm = int(
+                cp.cuda.driver.occupancyMaxActiveBlocksPerMultiprocessor(
+                    func_ptr, threads_per_block, 0
+                )
+            )
+            num_blocks = max(1, min(sm_count * blocks_per_sm, _MAX_NUM_BLOCKS))
+        except Exception as exc:
+            logger.warning(
+                "Persistent kernel: occupancyMaxActiveBlocksPerMultiprocessor "
+                "query failed (%s); using fallback grid of %d blocks",
+                exc, num_blocks
+            )
+    elif sm_count > 0:
+        logger.warning(
+            "Persistent kernel: kernel function pointer unavailable for "
+            "occupancy query; using fallback grid of %d blocks", num_blocks
+        )
+
+    logger.debug(
+        "Persistent kernel launch config: %d blocks x %d threads",
+        num_blocks, threads_per_block
+    )
+    _launch_config_cache[cache_key] = num_blocks
+    return num_blocks
 
 # PERSISTENT SSSP KERNEL
 # This kernel launches ONCE per net and runs until:
@@ -646,10 +718,10 @@ def launch_persistent_kernel(
                 f"expected {num_dsts}"
             )
 
-    # Kernel launch config
-    # Use many blocks for persistent execution
+    # Kernel launch config: cooperative launches need every block resident,
+    # so size the grid from this GPU's occupancy instead of a hardcoded 80.
     threads_per_block = 256
-    num_blocks = 80  # 80 SMs on RTX 4090, or adjust based on GPU
+    num_blocks = _cooperative_grid_size(kernel, threads_per_block)
 
     # Launch kernel (SINGLE LAUNCH!)
     kernel(

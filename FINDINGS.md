@@ -23,7 +23,23 @@ Pre-existing working-tree change carried into this branch: one `.gitignore` line
 
 ## Phase 1 — Cooperative launch occupancy query
 
-_(pending)_
+Replaced the hardcoded `num_blocks = 80` in `launch_persistent_kernel()` with
+`_cooperative_grid_size(kernel, threads_per_block)`:
+
+- SM count from `cp.cuda.Device().attributes['MultiProcessorCount']`.
+- Max resident blocks/SM for this kernel from
+  `cp.cuda.driver.occupancyMaxActiveBlocksPerMultiprocessor(kernel.kernel.ptr, 256, 0)`
+  (the compiled `Function` behind a `RawKernel` is `kernel.kernel`; its `.ptr` fetch is
+  guarded by `AttributeError`).
+- Grid = `sm_count * blocks_per_sm`, clamped to [1, 512].
+- Any query failure → conservative fallback of 32 blocks with a one-line WARNING naming
+  the failed query; chosen config logged once at DEBUG.
+- Result cached in a module dict keyed by (function pointer, block size) — computed once
+  per process.
+
+CuPy import remains lazy/guarded (module-level `try/except ImportError` was already
+present); code is unreachable without CuPy. Only one launch site exists
+(`cuda_dijkstra.py:5754`), unchanged. Tests: 342/9 + 80, green.
 
 ## Phase 2 — Exception discipline in the GPU fast path
 
