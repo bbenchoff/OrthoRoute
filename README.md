@@ -115,6 +115,19 @@ _Testing / examples are the following_:
 
 ### Installation Methods
 
+For KiCad 10, run `python build.py`, then open **Plugin and Content
+Manager > Install from File...** and select:
+
+```text
+build/OrthoRoute-1.0.0-KiCad-PCM.zip
+```
+
+Enable the API server under **Preferences > Plugins**, restart PCB Editor, and
+allow several minutes for KiCad to create OrthoRoute's isolated Python
+environment and install its GUI and accelerator dependencies.
+
+For development or a source checkout:
+
 1. Clone the repository.
 2. Build and deploy the native IPC plugin:
    ```bash
@@ -125,7 +138,7 @@ _Testing / examples are the following_:
    and installs its dependencies; the first load can take several minutes.
 5. Open a board and click **Launch OrthoRoute** on the PCB Editor toolbar.
 
-`python build.py` also creates a manual-install ZIP under `build/`.
+`python build.py` also creates a manual native-IPC ZIP under `build/`.
 Standalone development remains available with `python main.py`.
 
 ## Will it work with _my_ GPU?
@@ -286,6 +299,11 @@ I don't know what to tell you about this. I'll start an issue with KiCad or some
 ```bash
 python build.py
 ```
+
+This creates:
+
+- `OrthoRoute-1.0.0-KiCad-PCM.zip` for KiCad 10 **Install from File...**
+- `OrthoRoute-1.0.0-KiCad-IPC.zip` for manual native-plugin installation
 
 Build and install directly into the newest local KiCad version:
 ```bash

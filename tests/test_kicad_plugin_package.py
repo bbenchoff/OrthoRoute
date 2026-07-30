@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from build import (
+    PCM_MIN_KICAD_VERSION,
+    PCM_SCHEMA,
     PLUGIN_ENTRYPOINT,
     PLUGIN_IDENTIFIER,
     SWIG_PLUGIN_DIR_NAME,
@@ -23,6 +25,7 @@ def built_plugin(tmp_path):
         output_root=tmp_path / "package",
     )
     builder.zip_path = tmp_path / "OrthoRoute.zip"
+    builder.pcm_zip_path = tmp_path / "OrthoRoute-PCM.zip"
     builder.build()
     return builder
 
@@ -75,6 +78,36 @@ def test_zip_extracts_as_one_plugin_directory(built_plugin):
     assert all(name.startswith(prefix) for name in names)
     assert f"{prefix}plugin.json" in names
     assert f"{prefix}{PLUGIN_ENTRYPOINT}" in names
+
+
+def test_pcm_zip_has_kicad_install_from_file_layout(built_plugin):
+    with zipfile.ZipFile(built_plugin.pcm_zip_path) as archive:
+        names = archive.namelist()
+        metadata = json.loads(archive.read("metadata.json"))
+
+    assert names
+    assert "metadata.json" in names
+    assert "resources/icon.png" in names
+    assert "plugins/plugin.json" in names
+    assert f"plugins/{PLUGIN_ENTRYPOINT}" in names
+    assert "plugins/requirements.txt" in names
+    assert all(
+        name == "metadata.json"
+        or name.startswith("plugins/")
+        or name.startswith("resources/")
+        for name in names
+    )
+    assert not any(name.startswith(f"{PLUGIN_IDENTIFIER}/") for name in names)
+
+    assert metadata["$schema"] == PCM_SCHEMA
+    assert metadata["identifier"] == PLUGIN_IDENTIFIER
+    assert metadata["type"] == "plugin"
+    assert len(metadata["versions"]) == 1
+    version = metadata["versions"][0]
+    assert version["runtime"] == "ipc"
+    assert version["kicad_version"] == PCM_MIN_KICAD_VERSION
+    assert not any(key.startswith("download_") for key in version)
+    assert "install_size" not in version
 
 
 def test_deploy_targets_requested_kicad_version(built_plugin, tmp_path):
