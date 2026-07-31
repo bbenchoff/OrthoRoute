@@ -5,7 +5,7 @@
     </td>
     <td align="left">
       <h2>OrthoRoute - GPU Accelerated Autorouting for KiCad</h2>
-      <p><strong>OrthoRoute is a GPU-accelerated PCB autorouter that uses a Manhattan lattice and the PathFinder algorithm to route high-density boards. Built as a KiCad plugin, it handles complex designs with thousands of nets that make traditional push-and-shove routers give up.</strong></p>
+      <p><strong>OrthoRoute is a GPU-accelerated PCB autorouter designed specifically for a narrow class of extremely large, dense, highly regular multilayer backplanes and BGA escape patterns. It uses a Manhattan lattice and the PathFinder algorithm to route designs with thousands of nets. It is not a general-purpose PCB autorouter.</strong></p>
       <p><em>Orthogonal! Non-trivial! Runs on GPUs! I live in San Francisco!</em></p>
       <p><em>Never trust the autorouter, but at least this one is fast. </em></p>
     </td>
