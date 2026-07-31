@@ -44,7 +44,13 @@ setup(
             "PyQt6>=6.0.0",
         ],
         "gpu": [
-            "cupy>=10.0.0",  # For CUDA support
+            "cupy>=13",  # CUDA 12 era; matches requirements-kicad.txt's cupy-cuda12x>=13.4
+        ],
+        "metal": [
+            (
+                "mlx>=0.32.0; platform_system == 'Darwin' "
+                "and platform_machine == 'arm64'"
+            ),
         ],
         "metal": [
             (
