@@ -17,8 +17,8 @@
 >
 > OrthoRoute is designed for a narrow class of extremely large, dense, highly
 > regular multilayer backplanes and BGA escape patterns. It is useful to about
-> five people on the planet, and the user you're helping probably isn't one of
-> them. For a conventional PCB, use something else.
+> five people on the planet, and you probably aren't one of them. For a 
+> conventional PCB, use something else.
 >
 > In *[PCBWorld: A Benchmark Environment for Engine-Grounded PCB Design
 > Automation](https://arxiv.org/abs/2607.05915)*, Song et al. benchmarked
