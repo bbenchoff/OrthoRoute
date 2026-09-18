@@ -26,7 +26,10 @@ from orthoroute.algorithms.manhattan.unified_pathfinder import (
     UnifiedPathFinder,
 )
 from orthoroute.algorithms.manhattan.hdi_stack import (
+    jlcpcb_adjacent_stack,
+    jlcpcb_hdi_stack,
     pcbway_elic_stack,
+    pcbway_hdi_stack,
     pcbway_mechanical_stack,
 )
 from orthoroute.algorithms.manhattan.layer_peeling import (
@@ -68,6 +71,30 @@ wrong_way_multiplier = float(os.getenv(
 layer_directions = os.getenv("ORTHO_LAYER_DIRECTIONS", "").strip()
 layer_depth_bias = float(os.getenv("ORTHO_LAYER_DEPTH_BIAS", "0.0"))
 hdi_stack_mode = os.getenv("ORTHO_HDI_STACK", "").strip()
+# Core-span stacks only: multiplier on the adjacent-hop via cost charged for
+# each hub edge of the shared whole-core hole.
+core_via_scale = os.getenv("ORTHO_CORE_VIA_SCALE")
+# Core-span stacks only: weight on committed track occupancy folded into the
+# via-segment pressure so a whole-core hole is priced by the copper it cuts.
+hole_track_weight = os.getenv("ORTHO_HOLE_TRACK_WEIGHT")
+# Core-span stacks only: core hole site grid stride (2 = even rows and
+# columns only, leaving hole-free channels on every core layer).
+core_site_stride = os.getenv("ORTHO_CORE_SITE_STRIDE")
+# Start staged physical (barrel) cleanup once negotiated overuse is at or
+# below this value, instead of the ordinary 3-edge tail gate.
+physical_cleanup_threshold = os.getenv("ORTHO_PHYSICAL_CLEANUP_THRESHOLD")
+# Minimum ordinary hotset wave while negotiated overuse is severe.
+hotset_cap_floor = os.getenv("ORTHO_HOTSET_CAP_FLOOR")
+# Planned core escapes: pads drop straight into the core at their planner
+# column (pinned to the primary portal candidate); corner holes keep the grid.
+planned_escapes = os.getenv("ORTHO_PLANNED_ESCAPES", "").strip() in {
+    "1", "true", "yes", "on"
+}
+# Refresh hole pricing every N committed nets within a pass (0 = once per
+# iteration), so holes see tracks committed earlier in the same pass.
+hole_refresh_every = os.getenv("ORTHO_HOLE_REFRESH")
+# Row stagger between adjacent columns of dense-connector escape vias.
+escape_stagger = os.getenv("ORTHO_ESCAPE_STAGGER")
 grid_pitch = float(os.getenv("ORTHO_GRID_PITCH", "0.4"))
 warm_start_paths_value = os.getenv("ORTHO_WARM_START_PATHS", "").strip()
 run_tags = []
@@ -94,6 +121,22 @@ if layer_depth_bias:
     run_tags.append(f"DEPTH-{layer_depth_bias:g}")
 if hdi_stack_mode:
     run_tags.append(f"HDI-{hdi_stack_mode}")
+if core_via_scale is not None:
+    run_tags.append(f"CORE-{float(core_via_scale):g}")
+if hole_track_weight is not None:
+    run_tags.append(f"HTW-{float(hole_track_weight):g}")
+if core_site_stride is not None:
+    run_tags.append(f"CSS-{int(core_site_stride)}")
+if physical_cleanup_threshold is not None:
+    run_tags.append(f"PCT-{int(physical_cleanup_threshold)}")
+if hotset_cap_floor is not None:
+    run_tags.append(f"HSF-{int(hotset_cap_floor)}")
+if planned_escapes:
+    run_tags.append("PLAN")
+if hole_refresh_every is not None:
+    run_tags.append(f"HR-{int(hole_refresh_every)}")
+if escape_stagger is not None:
+    run_tags.append(f"ST-{int(escape_stagger)}")
 if grid_pitch != 0.4:
     run_tags.append(f"GRID-{grid_pitch:g}")
 if warm_start_paths_value:
@@ -164,24 +207,40 @@ try:
     if board is None:
         raise RuntimeError("monster board parse failed")
     if fabrication_profile:
-        if fabrication_profile != "pcbway_advanced_hdi":
+        profile_rules = {
+            # Conservative advanced-HDI envelope. PCBWay advertises local
+            # 2/2 mil features, but 4/4 mil is the broadly manufacturable
+            # baseline. The 0.15 mm mechanical blind/buried drill plus a
+            # 3 mil annular ring gives the existing 0.3024 mm finished pad.
+            "pcbway_advanced_hdi": {
+                "default_track_width": 0.1016,
+                "default_clearance": 0.1016,
+                "default_via_drill": 0.15,
+                "default_via_diameter": 0.3024,
+                "min_via_annular_width": 0.0762,
+                "min_hole_to_hole": 0.2794,
+                "min_hole_clearance": 0.1524,
+            },
+            # JLCPCB HDI envelope (HDI capabilities FAQ, read 2026-09-16):
+            # 0.15 mm mechanical core hole, 0.075 mm ring, 0.24 mm
+            # hole-to-hole between nets, 4/4 mil kept for yield.
+            "jlcpcb_hdi": {
+                "default_track_width": 0.1,
+                "default_clearance": 0.1,
+                "default_via_drill": 0.15,
+                "default_via_diameter": 0.30,
+                "min_via_annular_width": 0.075,
+                "min_hole_to_hole": 0.24,
+                "min_hole_clearance": 0.2,
+            },
+        }
+        if fabrication_profile not in profile_rules:
             raise ValueError(
-                "ORTHO_FAB_PROFILE must be pcbway_advanced_hdi"
+                "ORTHO_FAB_PROFILE must be one of "
+                + ", ".join(sorted(profile_rules))
             )
-        # Conservative advanced-HDI envelope. PCBWay advertises local
-        # 2/2 mil features, but 4/4 mil is the broadly manufacturable
-        # baseline. The 0.15 mm mechanical blind/buried drill plus a
-        # 3 mil annular ring gives the existing 0.3024 mm finished pad.
         board._design_rules = dict(board._design_rules)
-        board._design_rules.update({
-            "default_track_width": 0.1016,
-            "default_clearance": 0.1016,
-            "default_via_drill": 0.15,
-            "default_via_diameter": 0.3024,
-            "min_via_annular_width": 0.0762,
-            "min_hole_to_hole": 0.2794,
-            "min_hole_clearance": 0.1524,
-        })
+        board._design_rules.update(profile_rules[fabrication_profile])
     if diagnostic_layer_limit:
         if not 4 <= diagnostic_layer_limit <= len(board.layers):
             raise ValueError(
@@ -205,18 +264,67 @@ try:
     config = PathFinderConfig()
     config.grid_pitch = grid_pitch
     if hdi_stack_mode:
+        core_kwargs = {}
+        if core_via_scale is not None:
+            core_kwargs["core_via_cost_scale"] = float(core_via_scale)
+        if core_site_stride is not None:
+            core_kwargs["core_site_stride"] = int(core_site_stride)
         stack_factories = {
             "pcbway_elic": pcbway_elic_stack,
             "pcbway_mechanical": pcbway_mechanical_stack,
+            # Real JLCPCB structures: laser build-ups, one core hole.
+            "jlcpcb_3n3": lambda layers: jlcpcb_hdi_stack(
+                layers, build_up_steps=3, **core_kwargs
+            ),
+            "jlcpcb_2n2": lambda layers: jlcpcb_hdi_stack(
+                layers, build_up_steps=2, **core_kwargs
+            ),
+            "jlcpcb_1n1": lambda layers: jlcpcb_hdi_stack(
+                layers, build_up_steps=1, **core_kwargs
+            ),
+            # Feasibility bound only: PCBWay any-adjacent-span topology
+            # with JLCPCB hole geometry. Not an orderable JLCPCB build.
+            "jlcpcb_adjacent": jlcpcb_adjacent_stack,
+            # PCBWay k+N+k with up to six laser build-ups per side.
+            "pcbway_6n6": lambda layers: pcbway_hdi_stack(
+                layers, build_up_steps=6, **core_kwargs
+            ),
+            "pcbway_4n4": lambda layers: pcbway_hdi_stack(
+                layers, build_up_steps=4, **core_kwargs
+            ),
         }
         if hdi_stack_mode not in stack_factories:
             raise ValueError(
-                "ORTHO_HDI_STACK must be pcbway_elic or "
-                "pcbway_mechanical"
+                "ORTHO_HDI_STACK must be one of "
+                + ", ".join(sorted(stack_factories))
             )
         config.hdi_stack = stack_factories[hdi_stack_mode](
             board.layer_count
         )
+        if config.hdi_stack.core_span is not None:
+            # Default on for core-span stacks: a hole must see the tracks
+            # on every layer it would cut. ORTHO_HOLE_TRACK_WEIGHT=0 disables.
+            config.hole_track_pressure_weight = (
+                float(hole_track_weight)
+                if hole_track_weight is not None else 1.0
+            )
+        elif hole_track_weight is not None:
+            config.hole_track_pressure_weight = float(hole_track_weight)
+    if physical_cleanup_threshold is not None:
+        config.physical_cleanup_overuse_threshold = int(
+            physical_cleanup_threshold
+        )
+    if hotset_cap_floor is not None:
+        config.hotset_cap_floor = int(hotset_cap_floor)
+    if planned_escapes:
+        config.planned_core_escapes = True
+        # One candidate per pad: the escape column never moves, so the
+        # hole field is fixed from iteration 1 and routes negotiate around it.
+        config.portal_candidate_count = 1
+    if hole_refresh_every is not None:
+        config.hole_pressure_refresh_every = int(hole_refresh_every)
+    if escape_stagger is not None:
+        config.dynamic_escape_stagger_rows = int(escape_stagger)
     if direction_mode == "strict":
         config.wrong_way_cost_multiplier = float("inf")
     elif direction_mode == "bidirectional":

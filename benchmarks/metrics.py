@@ -131,11 +131,16 @@ def collect_route_metrics(pf, board, timings: Optional[Dict[str, float]] = None)
             f"{via.get('from_layer')}->{via.get('to_layer')}"
             for via in geometry.vias
         )
+        # A via is topologically valid when it is itself one legal drilled
+        # hole of the stack: an adjacent hop for ELIC/CNC stacks, or the
+        # whole-core buried hole of a core-span stack.
         nonadjacent = 0
         for via in geometry.vias:
             start = pf._layer_name_to_index(via.get("from_layer"))
             end = pf._layer_name_to_index(via.get("to_layer"))
-            if start is None or end is None or abs(end - start) != 1:
+            if start is None or end is None:
+                nonadjacent += 1
+            elif not hdi_stack.is_physical_span(start, end):
                 nonadjacent += 1
         hdi_metrics = {
             "name": hdi_stack.name,

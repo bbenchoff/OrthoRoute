@@ -635,6 +635,37 @@ class PathFinderConfig:
     allow_any_layer_via: Optional[bool] = None
     # Adjacent graph hops represent segments of one physical multi-layer via.
     adjacent_via_step_scale: float = 4.0
+    # Core-span stacks: weight on the committed track occupancy of every
+    # layer a hole would cut, folded into via-segment present congestion so
+    # a whole-core hole is priced by the copper it destroys. Zero disables.
+    hole_track_pressure_weight: float = 0.0
+    # Start staged physical cleanup (frozen terminals, one-sided barrel
+    # repair in large waves) once negotiated overuse is at or below this
+    # value instead of waiting for the ordinary 3-edge tail. None keeps the
+    # tail gate. Core-span stacks carry most of their conflicts as barrel
+    # conflicts, which the ordinary hotset cannot work off in useful time.
+    physical_cleanup_overuse_threshold: Optional[int] = None
+    # Minimum ordinary hotset wave while negotiated overuse exceeds 2,048.
+    # Zero keeps the overuse staircase (100/180/256). Physical repair waves
+    # refill node overuse faster than a 180-net wave can clear it.
+    hotset_cap_floor: int = 0
+    # Planned core escapes: with a core hole grid active, let each pad's
+    # planner-chosen escape column drop straight into the core at its own
+    # site (one laser column plus one core hole, priced as such), instead of
+    # forcing a fan-out on the build-up layers to reach a grid-legal hub
+    # site. Escape holes then sit where the escape planner put them; only
+    # mid-route corner holes are confined to the grid.
+    planned_core_escapes: bool = False
+    # Refresh the hole-track pressure (and the via pooling penalties built
+    # from it) every N committed nets inside an iteration, so a hole placed
+    # late in a pass already sees the tracks committed earlier in the same
+    # pass. Zero keeps one refresh per iteration. GPU full-graph path only.
+    hole_pressure_refresh_every: int = 0
+    # Row stagger between adjacent columns of a dense connector's escape
+    # vias. 1 reproduces the historical adjacent-row stagger; 2 leaves a
+    # hole-free row between the two escape rows so tracks can cross the band
+    # with one jog instead of meeting a wall on every via layer.
+    dynamic_escape_stagger_rows: int = 1
 
     # Iteration 1 policy: always-connect mode for maximum connectivity
     iter1_always_connect: bool = True  # Use soft costs in iteration 1 instead of hard blocks
@@ -1525,11 +1556,25 @@ class Lattice3D:
     def _via_site_policy(required_spacing: float, pitch: float):
         """Return the sublattice policy satisfying one center spacing."""
         required_spacing = max(0.0, float(required_spacing))
-        if required_spacing < pitch - 1e-9:
+        # A spacing exactly equal to the pitch is satisfiable on every site:
+        # the copper gap equals the rule, which DRC accepts.
+        if required_spacing <= pitch + 1e-9:
             return "all", 1
         if required_spacing <= pitch * np.sqrt(2.0) + 1e-9:
             return "checkerboard", 1
         return "stride", max(2, int(np.ceil(required_spacing / pitch)))
+
+    @staticmethod
+    def _stricter_site_policy(first, second):
+        """Return whichever site policy keeps fewer lattice sites."""
+        def fraction(policy):
+            mode, stride = policy
+            if mode == "all":
+                return 1.0
+            if mode == "checkerboard":
+                return 0.5
+            return 1.0 / (max(1, int(stride)) ** 2)
+        return second if fraction(second) < fraction(first) else first
 
     @staticmethod
     def _matches_via_site_policy(
@@ -1574,6 +1619,12 @@ class Lattice3D:
         min_via_center_spacing: float = 0.0,
         via_pair_center_spacing: Optional[
             Dict[Tuple[int, int], float]
+        ] = None,
+        via_pair_cost_scale: Optional[
+            Dict[Tuple[int, int], float]
+        ] = None,
+        via_pair_site_policy: Optional[
+            Dict[Tuple[int, int], Tuple[str, int]]
         ] = None,
     ) -> CSRGraph:
         """
@@ -1623,6 +1674,13 @@ class Lattice3D:
             and legal_via_pairs_set
             and all(abs(b - a) == 1 for a, b in legal_via_pairs_set)
         )
+        # An explicit fabrication stack prices each graph pair itself, e.g.
+        # a core-span stack charges every hub edge as a share of one
+        # whole-core hole regardless of how many layers the hop skips.
+        explicit_cost_scale = {
+            canonical_pair(int(a), int(b)): float(scale)
+            for (a, b), scale in (via_pair_cost_scale or {}).items()
+        }
         # A via is a physical hole and annulus, not a zero-area graph edge.
         # If adjacent lattice sites cannot satisfy the board's center-to-
         # center spacing, restrict vias to a DRC-spaced sublattice. A
@@ -1641,6 +1699,15 @@ class Lattice3D:
             pair: self._via_site_policy(spacing, self.pitch)
             for pair, spacing in pair_spacing.items()
         }
+        # A fabrication stack may pin some spans to a coarser site grid than
+        # DRC spacing alone requires, e.g. a core hole grid that leaves
+        # hole-free channels. Only ever tighten the spacing-derived policy.
+        for pair, policy in (via_pair_site_policy or {}).items():
+            pair = canonical_pair(int(pair[0]), int(pair[1]))
+            if pair in pair_policies:
+                pair_policies[pair] = self._stricter_site_policy(
+                    pair_policies[pair], (str(policy[0]), int(policy[1]))
+                )
         self._via_pair_site_policies = pair_policies
 
         # Calls without a layer pair use the most restrictive process. This
@@ -1748,7 +1815,10 @@ class Lattice3D:
                         continue
                     # Only add if this specific pair is legal
                     span = abs(z_to - z_from)
-                    if adjacent_only:
+                    pair_scale = explicit_cost_scale.get((z_from, z_to))
+                    if pair_scale is not None:
+                        cost = via_cost * pair_scale
+                    elif adjacent_only:
                         cost = via_cost * adjacent_via_step_scale
                     else:
                         span_alpha = 0.15
@@ -2744,6 +2814,10 @@ class PathFinderRouter:
             self.config.allowed_via_spans = set(
                 hdi_stack.allowed_via_spans
             )
+            self._build_via_extent_tables(hdi_stack)
+        else:
+            self._via_extent_lo = None
+            self._via_extent_hi = None
 
         # Domain boards store Layer objects, while geometry and keepout code
         # require string names. Prefer the board's exact copper stackup; the
@@ -2773,12 +2847,13 @@ class PathFinderRouter:
         logger.info(f"Using {self.config.layer_count} layers from board")
         if hdi_stack is not None:
             logger.info(
-                "[HDI-STACK] %s (%s), %d explicit adjacent spans, "
-                "central core pair %s",
+                "[HDI-STACK] %s (%s), %d explicit graph spans, "
+                "core pair %s, core hole %s",
                 hdi_stack.name,
                 hdi_stack.notation,
                 len(hdi_stack.allowed_via_spans),
                 hdi_stack.core_pair,
+                hdi_stack.core_span,
             )
 
         preferred_layer_directions = (
@@ -2846,6 +2921,16 @@ class PathFinderRouter:
             ),
             via_pair_center_spacing=(
                 hdi_stack.center_spacing_by_span()
+                if hdi_stack is not None else None
+            ),
+            via_pair_cost_scale=(
+                hdi_stack.via_cost_scale_by_span(
+                    getattr(self.config, "adjacent_via_step_scale", 4.0)
+                )
+                if hdi_stack is not None else None
+            ),
+            via_pair_site_policy=(
+                hdi_stack.site_policy_by_span()
                 if hdi_stack is not None else None
             ),
         )
@@ -3375,6 +3460,26 @@ class PathFinderRouter:
             if self.lattice.layers > 2
             else [1]
         )
+        hdi_stack = getattr(self.config, "hdi_stack", None)
+        core_span_stack = (
+            hdi_stack is not None and hdi_stack.core_span is not None
+        )
+        planned = bool(getattr(self.config, "planned_core_escapes", False))
+        if (
+            core_span_stack
+            and int(getattr(hdi_stack, "core_site_stride", 1)) > 1
+            and not planned
+        ):
+            # With a core hole grid, the escape column may only reach the
+            # hub layer; the core is entered through graph hub edges, which
+            # exist solely on grid-legal sites. Entering deeper here would
+            # drill a core hole wherever the pad happens to sit. Planned
+            # escapes accept exactly that hole: the planner already placed
+            # the column in a copper-free band beside the pad row.
+            hub = int(hdi_stack.core_hub_layer)
+            routing_layers = [
+                layer for layer in routing_layers if layer <= hub
+            ]
         if portal.dynamic_entry:
             # The off-grid via reaches its lattice anchor with a short
             # horizontal entry segment, so only horizontal layers are legal.
@@ -3390,7 +3495,12 @@ class PathFinderRouter:
             node_idx = self.lattice.node_idx(
                 portal.x_idx, portal.y_idx, layer
             )
-            depth = abs(layer - portal.pad_layer)
+            if core_span_stack:
+                # Price the escape by the holes it drills: every core layer
+                # costs the same laser column plus one core hole.
+                depth = len(hdi_stack.physical_spans(portal.pad_layer, layer))
+            else:
+                depth = abs(layer - portal.pad_layer)
             seeds.append((node_idx, via_base * discount * depth))
         return seeds
 
@@ -4321,6 +4431,8 @@ class PathFinderRouter:
         seg_pool = seg_use is not None
 
         previous_via_xy = None
+        # Segment interval already charged during the current column visit.
+        run_lo = run_hi = None
         for u, v in zip(node_path, node_path[1:]):
             xu, yu, zu = idx_to_coord(u)
             xv, yv, zv = idx_to_coord(v)
@@ -4331,26 +4443,35 @@ class PathFinderRouter:
                 # of vertical hops. Count that contiguous chain once in the
                 # column pool, while retaining per-segment occupancy below.
                 via_xy = (xu, yu)
-                if col_pool and via_xy != previous_via_xy:
-                    col_use[xu, yu] += 1
+                if via_xy != previous_via_xy:
+                    if col_pool:
+                        col_use[xu, yu] += 1
+                    run_lo = run_hi = None
                 previous_via_xy = via_xy
 
-                # Segment pooling: increment each segment crossed
+                # Segment pooling: increment each segment crossed. Hops of
+                # one column visit that share a physical hole (core-span hub
+                # hops such as 10->3->15) charge that hole's segments once.
                 if seg_pool:
-                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    z_lo, z_hi = self._via_physical_extent(zu, zv)
                     # Clamp to routing layers: 1..Nz-2
                     z_lo = max(1, min(z_lo, self._Nz - 2))
                     z_hi = max(1, min(z_hi, self._Nz - 2))
                     # Increment each segment z→z+1 in range [z_lo, z_hi)
                     for z in range(z_lo, z_hi):
+                        if run_lo is not None and run_lo <= z < run_hi:
+                            continue
                         seg_idx = z - 1  # Segment z→z+1 stored at index z-1
                         if 0 <= seg_idx < self._segZ:
                             seg_use[xu, yu, seg_idx] += 1
+                    if z_hi > z_lo:
+                        run_lo = z_lo if run_lo is None else min(run_lo, z_lo)
+                        run_hi = z_hi if run_hi is None else max(run_hi, z_hi)
 
                 # Register via keepouts for ALL layers the via touches (including endpoints!)
                 # This prevents other nets from routing tracks through via locations
                 if net_id:
-                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    z_lo, z_hi = self._via_physical_extent(zu, zv)
                     for z in range(z_lo, z_hi + 1):  # Include both endpoints!
                         key = (z, xu, yu)
                         # First owner wins
@@ -4358,6 +4479,7 @@ class PathFinderRouter:
                             self._via_keepouts_map[key] = net_id
             else:
                 previous_via_xy = None
+                run_lo = run_hi = None
 
     def _rebuild_via_usage_from_committed(self):
         """Incrementally update via column/segment usage from committed net paths.
@@ -4489,30 +4611,47 @@ class PathFinderRouter:
         seg_keys = []
         keepout_keys = []
 
+        previous_via_xy = None
+        run_lo = run_hi = None
         for u, v in zip(path, path[1:]):
             xu, yu, zu = idx_to_coord(u)
             xv, yv, zv = idx_to_coord(v)
 
             if xu == xv and yu == yv and zu != zv:
-                if col_pool:
-                    self.via_col_use[xu, yu] += 1
-                    col_keys.append((xu, yu))
+                # Match the full rebuild: one column visit counts once, and
+                # hops sharing a physical hole charge its segments once.
+                via_xy = (xu, yu)
+                if via_xy != previous_via_xy:
+                    if col_pool:
+                        self.via_col_use[xu, yu] += 1
+                        col_keys.append((xu, yu))
+                    run_lo = run_hi = None
+                previous_via_xy = via_xy
 
                 if seg_pool:
-                    z_lo = max(1, min(min(zu, zv), Nz - 2))
-                    z_hi = max(1, min(max(zu, zv), Nz - 2))
+                    ext_lo, ext_hi = self._via_physical_extent(zu, zv)
+                    z_lo = max(1, min(ext_lo, Nz - 2))
+                    z_hi = max(1, min(ext_hi, Nz - 2))
                     for z in range(z_lo, z_hi):
+                        if run_lo is not None and run_lo <= z < run_hi:
+                            continue
                         seg_idx = z - 1
                         if 0 <= seg_idx < segZ:
                             self.via_seg_use[xu, yu, seg_idx] += 1
                             seg_keys.append((xu, yu, seg_idx))
+                    if z_hi > z_lo:
+                        run_lo = z_lo if run_lo is None else min(run_lo, z_lo)
+                        run_hi = z_hi if run_hi is None else max(run_hi, z_hi)
 
-                z_lo2, z_hi2 = (zu, zv) if zu < zv else (zv, zu)
+                z_lo2, z_hi2 = self._via_physical_extent(zu, zv)
                 for z in range(z_lo2, z_hi2 + 1):
                     key = (z, xu, yu)
                     if key not in self._via_keepouts_map:
                         self._via_keepouts_map[key] = net_id
                         keepout_keys.append(key)
+            else:
+                previous_via_xy = None
+                run_lo = run_hi = None
 
         self._via_contribution_cache[net_id] = {
             'col_keys': col_keys,
@@ -4615,12 +4754,62 @@ class PathFinderRouter:
             f"{owned_count:,}",
             f"{len(self._portal_clearance_owner_members):,}",
         )
+        self._reserve_planned_escape_barrels(sync_gpu=False)
         if self.node_owner_gpu is not None:
             self.node_owner_gpu[:] = cp.asarray(self.node_owner)
         if self.portal_clearance_owner_gpu is not None:
             self.portal_clearance_owner_gpu[:] = cp.asarray(
                 self.portal_clearance_owner
             )
+
+    def _reserve_planned_escape_barrels(self, sync_gpu: bool = True) -> int:
+        """Own every planned escape column for its net before any routing.
+
+        With planned core escapes each pad's escape column is fixed and
+        drills the whole core, so its barrel is known before iteration 1.
+        Marking it up front makes every search route around every escape
+        column from the first net instead of discovering them one commit at
+        a time and repairing the crossings for hours.
+        """
+        if not getattr(self.config, "planned_core_escapes", False):
+            return 0
+        hdi_stack = getattr(self.config, "hdi_stack", None)
+        if (
+            hdi_stack is None
+            or hdi_stack.core_span is None
+            or not hasattr(self, "portal_clearance_owner")
+            or not getattr(self, "net_pad_ids", None)
+        ):
+            return 0
+        core_lo, _core_hi = hdi_stack.core_span
+        # Any entry below the core top drills the whole core hole.
+        entry_layer = min(core_lo + 1, self.lattice.layers - 2)
+        marked = 0
+        for net_name, pad_ids in self.net_pad_ids.items():
+            net_id = self._get_net_id(net_name)
+            for pad_id in pad_ids:
+                portal = self.portals.get(pad_id)
+                if portal is None:
+                    continue
+                nodes = self._portal_clearance_nodes(portal, entry_layer)
+                for node_idx in nodes.tolist():
+                    members = self._portal_clearance_owner_members.setdefault(
+                        node_idx, set()
+                    )
+                    members.add(net_id)
+                    self.portal_clearance_owner[node_idx] = (
+                        net_id if len(members) == 1 else -2
+                    )
+                marked += int(nodes.size)
+        if sync_gpu and self.portal_clearance_owner_gpu is not None:
+            self.portal_clearance_owner_gpu[:] = cp.asarray(
+                self.portal_clearance_owner
+            )
+        logger.info(
+            "[PLANNED-ESCAPES] Reserved %s clearance nodes for planned "
+            "escape columns", f"{marked:,}"
+        )
+        return marked
 
     def _get_net_id(self, net_name: str) -> int:
         """Map net name to integer ID for node ownership"""
@@ -4805,9 +4994,9 @@ class PathFinderRouter:
 
         xy_by_axis = self._portal_clearance_xy_nodes(portal)
         plane = self.lattice.x_steps * self.lattice.y_steps
-        z_lo, z_hi = sorted((
+        z_lo, z_hi = self._via_physical_extent(
             int(portal.pad_layer), int(entry_layer)
-        ))
+        )
         chunks = []
         for layer in range(z_lo, z_hi + 1):
             xy_nodes = xy_by_axis["via"]
@@ -4841,14 +5030,17 @@ class PathFinderRouter:
             return cached
         nodes = self._portal_clearance_nodes(portal, entry_layer)
         pad_layer = int(portal.pad_layer)
-        step = 1 if entry_layer > pad_layer else -1
         plane = self.lattice.x_steps * self.lattice.y_steps
         xy = portal.y_idx * self.lattice.x_steps + portal.x_idx
-        chain = (
-            np.arange(
-                pad_layer, entry_layer, step, dtype=np.int64
-            ) * plane + xy
+        # The centerline chain is every layer the terminal hole physically
+        # occupies except the entry seed itself.  For adjacent-span stacks
+        # that is pad_layer..entry_layer-1, as before.
+        z_lo, z_hi = self._via_physical_extent(pad_layer, int(entry_layer))
+        chain_layers = np.array(
+            [z for z in range(z_lo, z_hi + 1) if z != int(entry_layer)],
+            dtype=np.int64,
         )
+        chain = chain_layers * plane + xy
         result = np.setdiff1d(
             nodes, chain, assume_unique=False
         ).astype(np.int32, copy=False)
@@ -4947,12 +5139,38 @@ class PathFinderRouter:
         self._portal_clearance_xy_cache[cache_key] = result
         return result
 
+    def _build_via_extent_tables(self, hdi_stack) -> None:
+        """Precompute the physical barrel extent of every vertical hop.
+
+        Adjacent-span stacks occupy exactly the hop's own layers.  Core-span
+        stacks realise any hop that touches the core with one whole-core
+        hole, so the barrel covers every core layer at that site.
+        """
+        layers = int(hdi_stack.layer_count)
+        lo = np.empty((layers, layers), dtype=np.int32)
+        hi = np.empty((layers, layers), dtype=np.int32)
+        for a in range(layers):
+            for b in range(layers):
+                lo[a, b], hi[a, b] = hdi_stack.physical_extent(a, b)
+        self._via_extent_lo = lo
+        self._via_extent_hi = hi
+
+    def _via_physical_extent(self, z_a: int, z_b: int) -> Tuple[int, int]:
+        """Copper layers occupied by the hole(s) realising one vertical hop."""
+        lo_table = getattr(self, "_via_extent_lo", None)
+        if lo_table is None:
+            return (min(z_a, z_b), max(z_a, z_b))
+        return (
+            int(lo_table[z_a, z_b]),
+            int(self._via_extent_hi[z_a, z_b]),
+        )
+
     def _via_nodes_for_hop(self, u: int, v: int) -> List[int]:
         xu, yu, zu = self.lattice.idx_to_coord(u)
         xv, yv, zv = self.lattice.idx_to_coord(v)
         if xu != xv or yu != yv or zu == zv:
             return []
-        z_lo, z_hi = sorted((zu, zv))
+        z_lo, z_hi = self._via_physical_extent(zu, zv)
         return [
             self.lattice.node_idx(xu, yu, z)
             for z in range(z_lo, z_hi + 1)
@@ -5215,9 +5433,11 @@ class PathFinderRouter:
             if z_lo is None or z_hi is None:
                 continue
 
-            # Ensure z_lo < z_hi
+            # Ensure z_lo < z_hi, then widen to the physical barrel: a
+            # core-span escape is a laser column plus one whole-core hole.
             if z_lo > z_hi:
                 z_lo, z_hi = z_hi, z_lo
+            z_lo, z_hi = self._via_physical_extent(z_lo, z_hi)
 
             # Track in column usage
             if col_use is not None:
@@ -5732,7 +5952,7 @@ class PathFinderRouter:
 
                 # Segment penalty (use prefix for fast range sum)
                 if hasattr(self, 'via_seg_prefix'):
-                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    z_lo, z_hi = self._via_physical_extent(zu, zv)
                     z_lo = max(1, min(z_lo, self._Nz - 2))
                     z_hi = max(1, min(z_hi, self._Nz - 2))
                     if z_hi >= z_lo:  # Allow equal (single-segment vias)
@@ -6003,7 +6223,18 @@ class PathFinderRouter:
 
             if hasattr(self, 'via_seg_use'):
                 over = np.maximum(0, self.via_seg_use - self.via_seg_cap).astype(np.float32)
-                self.via_seg_pres = alpha * over + beta * self.via_seg_pres
+                # Smooth only the via overuse term; the hole-track pressure
+                # is instantaneous so it can be refreshed within a pass.
+                previous_via = getattr(self, "_via_seg_pres_via", None)
+                if previous_via is None:
+                    previous_via = self.via_seg_pres
+                self._via_seg_pres_via = alpha * over + beta * previous_via
+                track_pressure = self._hole_track_pressure()
+                self.via_seg_pres = (
+                    self._via_seg_pres_via + track_pressure
+                    if track_pressure is not None
+                    else self._via_seg_pres_via.copy()
+                )
                 # Build cumulative prefix along z axis for fast range queries
                 np.cumsum(self.via_seg_pres, axis=2, out=self.via_seg_prefix)
 
@@ -6124,7 +6355,19 @@ class PathFinderRouter:
 
             # STEP 2.5: Apply via column/segment pooling penalties
             # NOTE: Layer balancing now enabled (vectorized, applied in update_costs)
-            self._apply_via_pooling_penalties(pres_fac)
+            self._via_pool_penalty_last = None
+            self._hole_refresh_counter = 0
+            self._hole_refresh_pres_fac = pres_fac
+            live_pool_penalty = None
+            if int(getattr(cfg, "hole_pressure_refresh_every", 0)) > 0:
+                live_pool_penalty = self._via_pooling_penalty_vector(pres_fac)
+            if live_pool_penalty is not None:
+                # Keep the applied vector so in-pass refreshes can apply a
+                # delta while live present costs also move the same array.
+                self.accounting.total_cost += live_pool_penalty
+                self._via_pool_penalty_last = live_pool_penalty
+            else:
+                self._apply_via_pooling_penalties(pres_fac)
 
             # STEP 2.6: Hard-block via edges with spatial collisions (iteration 2+)
             # This prevents PathFinder from using edges that would cause via collisions
@@ -6385,6 +6628,9 @@ class PathFinderRouter:
                     3,
                 )),
                 overuse_total=negotiated_overuse,
+                total_threshold=getattr(
+                    cfg, "physical_cleanup_overuse_threshold", None
+                ),
             ):
                 entering_cleanup = not getattr(
                     self, "_freeze_selected_portals", False
@@ -7614,6 +7860,7 @@ class PathFinderRouter:
         ):
             self._plan_escape_assignment()
         self._rebuild_escape_occupancy()
+        self._reserve_planned_escape_barrels()
 
         # Start with costs from iteration-level update
         # NOTE: For GPU, keep as CuPy array (don't .get() to CPU)
@@ -7841,6 +8088,7 @@ class PathFinderRouter:
                                 # CRITICAL: Mark via barrel ownership IMMEDIATELY for next net in same iteration!
                                 self._mark_via_barrel_ownership_for_path(net_id, path)
                                 self._mark_path_node_use(path)
+                                self._maybe_refresh_hole_pressure()
 
                                 self._mark_escape_occupancy(
                                     net_id,
@@ -8547,7 +8795,14 @@ class PathFinderRouter:
         configured_cap = max(1, int(self.config.hotset_cap))
         if effective_cap > base_cap:
             configured_cap = max(configured_cap, effective_cap)
-        return min(configured_cap, effective_cap)
+        cap = min(configured_cap, effective_cap)
+        # A regime whose negotiated overuse is refilled every iteration by
+        # physical repair waves needs a larger ordinary wave than the
+        # staircase grants; the floor applies only while overuse is severe.
+        floor = int(getattr(self.config, "hotset_cap_floor", 0))
+        if floor > 0 and total_overuse > 2_048:
+            cap = max(cap, floor)
+        return cap
 
     @staticmethod
     def _hotset_exploration_fraction(total_overuse: float) -> float:
@@ -8867,6 +9122,14 @@ class PathFinderRouter:
             "portal_cleanup_edge_threshold",
             3,
         ))
+        # Barrel-dominated regimes (whole-core holes) may admit the physical
+        # repair wave before the ordinary tail; see
+        # physical_cleanup_overuse_threshold.
+        widened_threshold = getattr(
+            self.config, "physical_cleanup_overuse_threshold", None
+        )
+        if widened_threshold is not None:
+            cleanup_threshold = max(cleanup_threshold, int(widened_threshold))
 
         # Initialize clean iteration tracking
         if not hasattr(self, '_net_clean_iters'):
@@ -9106,7 +9369,7 @@ class PathFinderRouter:
                 if col_over is not None and col_over[xu, yu]:
                     net_resources.add(("col", xu, yu))
                 if seg_over is not None:
-                    z_lo, z_hi = sorted((zu, zv))
+                    z_lo, z_hi = self._via_physical_extent(zu, zv)
                     z_lo = max(1, min(z_lo, self._Nz - 2))
                     z_hi = max(1, min(z_hi, self._Nz - 2))
                     for z in range(z_lo, z_hi):
@@ -9841,9 +10104,9 @@ class PathFinderRouter:
             self.lattice.y_steps - 1,
             portal.y_idx + search_steps,
         )
-        z_lo, z_hi = sorted((
+        z_lo, z_hi = self._via_physical_extent(
             int(portal.pad_layer), int(entry_layer)
-        ))
+        )
         edges = set()
 
         for layer in range(z_lo, z_hi + 1):
@@ -9954,14 +10217,23 @@ class PathFinderRouter:
         already_active: bool,
         edge_threshold: int = 0,
         overuse_total: Optional[float] = None,
+        total_threshold: Optional[int] = None,
     ) -> bool:
-        """Run only while ordinary graph edges remain below the tail gate."""
+        """Run only while ordinary graph edges remain below the tail gate.
+
+        ``total_threshold`` widens the gate for regimes where physical
+        conflicts dominate long before negotiated overuse reaches the tail,
+        e.g. whole-core buried holes whose barrels cut dozens of layers.
+        """
         if overuse_total is None:
             overuse_total = overused_edges
+        gate = max(0, int(edge_threshold))
+        if total_threshold is not None:
+            gate = max(gate, int(total_threshold))
         return (
             physical_conflicts > 0
-            and overused_edges <= max(0, int(edge_threshold))
-            and overuse_total <= max(0, int(edge_threshold))
+            and overused_edges <= gate
+            and overuse_total <= gate
         )
 
     @staticmethod
@@ -10109,9 +10381,9 @@ class PathFinderRouter:
                     int(entry_layer),
                 )
                 center = self.escape_planner._portal_world(portal)
-                z_lo, z_hi = sorted((
+                z_lo, z_hi = self._via_physical_extent(
                     int(portal.pad_layer), int(entry_layer)
-                ))
+                )
                 x_lo = max(0, portal.x_idx - search_steps)
                 x_hi = min(
                     self.lattice.x_steps - 1,
@@ -10268,6 +10540,116 @@ class PathFinderRouter:
         # paths if state was refreshed during a diagnostic call.
         measured_nodes = set(members)
         return pairs, measured_nodes, dict(scores)
+
+    def _hole_track_pressure(self):
+        """Committed path occupancy per (x, y, segment) that a hole would cut.
+
+        Core-span stacks realise every core transition with one hole through
+        all core layers. Via-segment present congestion is the only cost the
+        search applies across a hole's whole extent, so charging each
+        segment with the number of committed path nodes on its layer makes a
+        hole see the copper it would destroy and migrate to empty columns.
+        Segment ``s`` lies between layers ``s+1`` and ``s+2``; it carries the
+        occupancy of layer ``s+1``. Returns ``None`` when disabled.
+        """
+        weight = float(getattr(
+            self.config, "hole_track_pressure_weight", 0.0
+        ))
+        if (
+            weight <= 0.0
+            or not hasattr(self, "path_node_use")
+            or not hasattr(self, "via_seg_use")
+        ):
+            return None
+        nz = int(getattr(self, "_Nz", 0))
+        ny = int(getattr(self, "_Ny", 0))
+        nx = int(getattr(self, "_Nx", 0))
+        # numpy 2 arrays also expose ``.device``; test the type explicitly.
+        seg_on_gpu = GPU_AVAILABLE and isinstance(self.via_seg_use, cp.ndarray)
+        use_gpu_source = (
+            seg_on_gpu
+            and getattr(self, "path_node_use_gpu", None) is not None
+        )
+        if use_gpu_source:
+            xp = cp
+            use = self.path_node_use_gpu
+        else:
+            xp = np
+            use = np.asarray(self.path_node_use)
+        if nz < 3 or use.size != nz * ny * nx:
+            return None
+        volume = use.reshape(nz, ny, nx)[1:nz - 1]
+        pressure = xp.ascontiguousarray(
+            xp.transpose(volume, (2, 1, 0))
+        ).astype(xp.float32)
+        pressure *= xp.float32(weight)
+        if seg_on_gpu and xp is np:
+            return cp.asarray(pressure)
+        return pressure
+
+    def _via_pooling_penalty_vector(self, pres_fac: float):
+        """Return the via pooling penalty per edge as a fresh GPU vector."""
+        metadata = getattr(self, "_via_edge_metadata", None)
+        manager = getattr(self, "via_kernel_manager", None)
+        if (
+            metadata is None
+            or manager is None
+            or not getattr(manager, "use_gpu", False)
+            or not GPU_AVAILABLE
+            or not isinstance(self.accounting.total_cost, cp.ndarray)
+        ):
+            return None
+        scratch = cp.zeros(
+            self.accounting.total_cost.shape, dtype=cp.float32
+        )
+        col_weight = float(getattr(self.config, "via_column_weight", 1.0))
+        seg_weight = float(getattr(self.config, "via_segment_weight", 1.0))
+        manager.apply_via_penalties(
+            via_metadata=metadata,
+            via_col_pres_gpu=self.via_col_pres,
+            via_seg_pres_gpu=(
+                self.via_seg_pres if hasattr(self, "via_seg_pres") else None
+            ),
+            col_weight=col_weight * float(pres_fac),
+            seg_weight=seg_weight * float(pres_fac),
+            total_cost_gpu=scratch,
+            Ny=self._Ny,
+            segZ=self._segZ if hasattr(self, "_segZ") else 0,
+        )
+        return scratch
+
+    def _refresh_hole_pressure_live(self) -> None:
+        """Re-price via edges from the tracks committed so far this pass."""
+        last = getattr(self, "_via_pool_penalty_last", None)
+        base = getattr(self, "_via_seg_pres_via", None)
+        if last is None or base is None:
+            return
+        pressure = self._hole_track_pressure()
+        self.via_seg_pres = (
+            base + pressure if pressure is not None else base.copy()
+        )
+        np.cumsum(self.via_seg_pres, axis=2, out=self.via_seg_prefix)
+        penalty = self._via_pooling_penalty_vector(
+            float(getattr(self, "_hole_refresh_pres_fac", 1.0))
+        )
+        if penalty is None:
+            return
+        # Live present costs may have moved other edges meanwhile; apply
+        # only the pooling delta. Hard-blocked (infinite) edges stay so.
+        self.accounting.total_cost += penalty - last
+        self._via_pool_penalty_last = penalty
+
+    def _maybe_refresh_hole_pressure(self) -> None:
+        """Count committed nets and refresh hole pricing on schedule."""
+        every = int(getattr(
+            self.config, "hole_pressure_refresh_every", 0
+        ))
+        if every <= 0:
+            return
+        count = int(getattr(self, "_hole_refresh_counter", 0)) + 1
+        self._hole_refresh_counter = count
+        if count % every == 0:
+            self._refresh_hole_pressure_live()
 
     def _compute_path_node_overuse(self) -> Tuple[int, int]:
         """Return excess uses and over-capacity capacity-one graph nodes."""

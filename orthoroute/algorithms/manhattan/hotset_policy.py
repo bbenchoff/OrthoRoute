@@ -200,7 +200,14 @@ class HotsetPolicy:
         configured_cap = max(1, int(self._router.config.hotset_cap))
         if effective_cap > base_cap:
             configured_cap = max(configured_cap, effective_cap)
-        return min(configured_cap, effective_cap)
+        cap = min(configured_cap, effective_cap)
+        # A regime whose negotiated overuse is refilled every iteration by
+        # physical repair waves needs a larger ordinary wave than the
+        # staircase grants; the floor applies only while overuse is severe.
+        floor = int(getattr(self._router.config, "hotset_cap_floor", 0))
+        if floor > 0 and total_overuse > 2_048:
+            cap = max(cap, floor)
+        return cap
 
     @staticmethod
     def _hotset_exploration_fraction(total_overuse: float) -> float:
@@ -434,6 +441,14 @@ class HotsetPolicy:
             "portal_cleanup_edge_threshold",
             3,
         ))
+        # Barrel-dominated regimes (whole-core holes) may admit the physical
+        # repair wave before the ordinary tail; see
+        # physical_cleanup_overuse_threshold.
+        widened_threshold = getattr(
+            self._router.config, "physical_cleanup_overuse_threshold", None
+        )
+        if widened_threshold is not None:
+            cleanup_threshold = max(cleanup_threshold, int(widened_threshold))
 
         # Initialize clean iteration tracking
         if not hasattr(self._router, '_net_clean_iters'):

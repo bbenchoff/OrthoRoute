@@ -1113,15 +1113,11 @@ class OrthoRouteMainWindow(QMainWindow):
         fabrication_layout = QHBoxLayout()
         fabrication_layout.addWidget(QLabel("Fabrication:"))
         self.fabrication_combo = QComboBox()
-        self.fabrication_combo.addItem("Board defaults", "board_default")
-        self.fabrication_combo.addItem(
-            "PCBWay mechanical blind/buried",
-            "pcbway_mechanical",
+        from ...algorithms.manhattan.hdi_stack import (
+            MANUFACTURING_PROFILES,
         )
-        self.fabrication_combo.addItem(
-            "PCBWay ELIC microvia",
-            "pcbway_elic",
-        )
+        for profile_id, label in MANUFACTURING_PROFILES:
+            self.fabrication_combo.addItem(label, profile_id)
         self.fabrication_combo.setToolTip(
             "Select the explicit via topology used to construct the "
             "routing graph. Final stackup still requires fabricator DFM."

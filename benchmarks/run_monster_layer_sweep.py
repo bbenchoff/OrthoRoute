@@ -17,6 +17,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+# Fabrication profile handed to every candidate route. main() overrides
+# these from the command line; the defaults reproduce the PCBWay sweep.
+SWEEP_FAB_PROFILE = "pcbway_advanced_hdi"
+SWEEP_HDI_STACK = "pcbway_mechanical"
+SWEEP_CORE_VIA_SCALE: Optional[float] = None
+SWEEP_HOLE_TRACK_WEIGHT: Optional[float] = None
+SWEEP_CORE_SITE_STRIDE: Optional[int] = None
+SWEEP_HDI_STACK_CHOICES = (
+    "pcbway_mechanical",
+    "pcbway_elic",
+    "jlcpcb_3n3",
+    "jlcpcb_2n2",
+    "jlcpcb_1n1",
+    "jlcpcb_adjacent",
+)
+
+
 def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -58,7 +75,7 @@ def _latest_progress(results_dir: Path, layer_count: int) -> Optional[Path]:
     candidates = sorted(
         results_dir.glob(
             f"Backplane-{layer_count}L-{layer_count}L-"
-            "*HDI-pcbway_mechanical-*-progress.json"
+            f"*HDI-{SWEEP_HDI_STACK}-*-progress.json"
         ),
         key=lambda path: path.stat().st_mtime,
     )
@@ -84,15 +101,27 @@ def _run_candidate(
         "ORTHO_DIAGNOSTIC_OWNER_PENALTY": "10",
         "ORTHO_DIAGNOSTIC_PATH_NODE_PENALTY": "10",
         "ORTHO_DIAGNOSTIC_MAX_ITERATIONS": str(max_iterations),
-        "ORTHO_FAB_PROFILE": "pcbway_advanced_hdi",
+        "ORTHO_FAB_PROFILE": SWEEP_FAB_PROFILE,
         "ORTHO_DIRECTION_MODE": "guided",
         "ORTHO_WRONG_WAY_MULTIPLIER": "4",
         "ORTHO_LAYER_DEPTH_BIAS": str(layer_depth_bias),
-        "ORTHO_HDI_STACK": "pcbway_mechanical",
+        "ORTHO_HDI_STACK": SWEEP_HDI_STACK,
         "ORTHO_GRID_PITCH": "0.4",
         "ORTHO_SOURCE_BOARD": str(source_board.resolve()),
         "ORTHO_OUTPUT_DIR": str(results_dir.resolve()),
     })
+    if SWEEP_CORE_VIA_SCALE is not None:
+        environment["ORTHO_CORE_VIA_SCALE"] = str(SWEEP_CORE_VIA_SCALE)
+    else:
+        environment.pop("ORTHO_CORE_VIA_SCALE", None)
+    if SWEEP_HOLE_TRACK_WEIGHT is not None:
+        environment["ORTHO_HOLE_TRACK_WEIGHT"] = str(SWEEP_HOLE_TRACK_WEIGHT)
+    else:
+        environment.pop("ORTHO_HOLE_TRACK_WEIGHT", None)
+    if SWEEP_CORE_SITE_STRIDE is not None:
+        environment["ORTHO_CORE_SITE_STRIDE"] = str(SWEEP_CORE_SITE_STRIDE)
+    else:
+        environment.pop("ORTHO_CORE_SITE_STRIDE", None)
     if warm_start_paths is not None:
         environment["ORTHO_WARM_START_PATHS"] = str(
             warm_start_paths.resolve()
@@ -101,11 +130,11 @@ def _run_candidate(
         environment.pop("ORTHO_WARM_START_PATHS", None)
     stdout_path = (
         repo_root / "benchmarks" / "results"
-        / f"monster-full-{layer_count}L-mechanical-sweep.stdout.log"
+        / f"monster-full-{layer_count}L-{SWEEP_HDI_STACK}-sweep.stdout.log"
     )
     stderr_path = (
         repo_root / "benchmarks" / "results"
-        / f"monster-full-{layer_count}L-mechanical-sweep.stderr.log"
+        / f"monster-full-{layer_count}L-{SWEEP_HDI_STACK}-sweep.stderr.log"
     )
     started = time.time()
     return_code = None
@@ -425,12 +454,56 @@ def _qualify_candidate(
 
 
 def main() -> None:
+    global SWEEP_FAB_PROFILE, SWEEP_HDI_STACK, SWEEP_CORE_VIA_SCALE
+    global SWEEP_HOLE_TRACK_WEIGHT, SWEEP_CORE_SITE_STRIDE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("initial_progress", type=Path)
     parser.add_argument("results_dir", type=Path)
     parser.add_argument("source_board", type=Path)
     parser.add_argument("--max-iterations", type=int, default=240)
     parser.add_argument("--max-layers", type=int, default=20)
+    parser.add_argument(
+        "--fab-profile",
+        choices=["pcbway_advanced_hdi", "jlcpcb_hdi"],
+        default=SWEEP_FAB_PROFILE,
+        help="design-rule envelope handed to every candidate route",
+    )
+    parser.add_argument(
+        "--hdi-stack",
+        choices=list(SWEEP_HDI_STACK_CHOICES),
+        default=SWEEP_HDI_STACK,
+        help=(
+            "explicit via topology; jlcpcb_3n3/2n2/1n1 are laser build-ups "
+            "over one whole-core mechanical hole, jlcpcb_adjacent is a "
+            "non-orderable feasibility bound"
+        ),
+    )
+    parser.add_argument(
+        "--core-via-scale",
+        type=float,
+        help=(
+            "core-span stacks only: multiplier on the adjacent-hop via cost "
+            "charged per hub edge of the shared core hole (default 2.0)"
+        ),
+    )
+    parser.add_argument(
+        "--hole-track-weight",
+        type=float,
+        help=(
+            "core-span stacks only: weight on committed track occupancy "
+            "folded into via-segment pressure so a whole-core hole is priced "
+            "by the copper it cuts (default 1.0; 0 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--core-site-stride",
+        type=int,
+        help=(
+            "core-span stacks only: core hole site grid stride; 2 keeps "
+            "holes on even rows and columns so odd rows and columns are "
+            "hole-free channels (default 1)"
+        ),
+    )
     parser.add_argument(
         "--layer-depth-bias",
         type=float,
@@ -486,6 +559,11 @@ def main() -> None:
             "--peel-min-layers must be even, at least 4, and no greater "
             "than --max-layers"
         )
+    SWEEP_FAB_PROFILE = args.fab_profile
+    SWEEP_HDI_STACK = args.hdi_stack
+    SWEEP_CORE_VIA_SCALE = args.core_via_scale
+    SWEEP_HOLE_TRACK_WEIGHT = args.hole_track_weight
+    SWEEP_CORE_SITE_STRIDE = args.core_site_stride
     repo_root = Path(__file__).resolve().parent.parent
     state_path = (
         repo_root / "benchmarks" / "results"
@@ -496,6 +574,11 @@ def main() -> None:
         "started": datetime.now().isoformat(timespec="seconds"),
         "candidate_max_iterations": args.max_iterations,
         "max_layers": args.max_layers,
+        "fab_profile": SWEEP_FAB_PROFILE,
+        "hdi_stack": SWEEP_HDI_STACK,
+        "core_via_scale": SWEEP_CORE_VIA_SCALE,
+        "hole_track_weight": SWEEP_HOLE_TRACK_WEIGHT,
+        "core_site_stride": SWEEP_CORE_SITE_STRIDE,
         "candidate_layers": args.candidate_layers,
         "layer_depth_bias": args.layer_depth_bias,
         "retry_initial": args.retry_initial,

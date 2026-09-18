@@ -95,6 +95,8 @@ class ViaAccounting:
         seg_pool = seg_use is not None
 
         previous_via_xy = None
+        # Segment interval already charged during the current column visit.
+        run_lo = run_hi = None
         for u, v in zip(node_path, node_path[1:]):
             xu, yu, zu = idx_to_coord(u)
             xv, yv, zv = idx_to_coord(v)
@@ -105,26 +107,35 @@ class ViaAccounting:
                 # of vertical hops. Count that contiguous chain once in the
                 # column pool, while retaining per-segment occupancy below.
                 via_xy = (xu, yu)
-                if col_pool and via_xy != previous_via_xy:
-                    col_use[xu, yu] += 1
+                if via_xy != previous_via_xy:
+                    if col_pool:
+                        col_use[xu, yu] += 1
+                    run_lo = run_hi = None
                 previous_via_xy = via_xy
 
-                # Segment pooling: increment each segment crossed
+                # Segment pooling: increment each segment crossed. Hops of
+                # one column visit that share a physical hole (core-span hub
+                # hops such as 10->3->15) charge that hole's segments once.
                 if seg_pool:
-                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    z_lo, z_hi = self._router._via_physical_extent(zu, zv)
                     # Clamp to routing layers: 1..Nz-2
                     z_lo = max(1, min(z_lo, self._router._Nz - 2))
                     z_hi = max(1, min(z_hi, self._router._Nz - 2))
                     # Increment each segment z→z+1 in range [z_lo, z_hi)
                     for z in range(z_lo, z_hi):
+                        if run_lo is not None and run_lo <= z < run_hi:
+                            continue
                         seg_idx = z - 1  # Segment z→z+1 stored at index z-1
                         if 0 <= seg_idx < self._router._segZ:
                             seg_use[xu, yu, seg_idx] += 1
+                    if z_hi > z_lo:
+                        run_lo = z_lo if run_lo is None else min(run_lo, z_lo)
+                        run_hi = z_hi if run_hi is None else max(run_hi, z_hi)
 
                 # Register via keepouts for ALL layers the via touches (including endpoints!)
                 # This prevents other nets from routing tracks through via locations
                 if net_id:
-                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    z_lo, z_hi = self._router._via_physical_extent(zu, zv)
                     for z in range(z_lo, z_hi + 1):  # Include both endpoints!
                         key = (z, xu, yu)
                         # First owner wins
@@ -132,6 +143,7 @@ class ViaAccounting:
                             self._router._via_keepouts_map[key] = net_id
             else:
                 previous_via_xy = None
+                run_lo = run_hi = None
 
     def _rebuild_via_usage_from_committed(self):
         """Incrementally update via column/segment usage from committed net paths.
@@ -219,30 +231,47 @@ class ViaAccounting:
         seg_keys = []
         keepout_keys = []
 
+        previous_via_xy = None
+        run_lo = run_hi = None
         for u, v in zip(path, path[1:]):
             xu, yu, zu = idx_to_coord(u)
             xv, yv, zv = idx_to_coord(v)
 
             if xu == xv and yu == yv and zu != zv:
-                if col_pool:
-                    self._router.via_col_use[xu, yu] += 1
-                    col_keys.append((xu, yu))
+                # Match the full rebuild: one column visit counts once, and
+                # hops sharing a physical hole charge its segments once.
+                via_xy = (xu, yu)
+                if via_xy != previous_via_xy:
+                    if col_pool:
+                        self._router.via_col_use[xu, yu] += 1
+                        col_keys.append((xu, yu))
+                    run_lo = run_hi = None
+                previous_via_xy = via_xy
 
                 if seg_pool:
-                    z_lo = max(1, min(min(zu, zv), Nz - 2))
-                    z_hi = max(1, min(max(zu, zv), Nz - 2))
+                    ext_lo, ext_hi = self._router._via_physical_extent(zu, zv)
+                    z_lo = max(1, min(ext_lo, Nz - 2))
+                    z_hi = max(1, min(ext_hi, Nz - 2))
                     for z in range(z_lo, z_hi):
+                        if run_lo is not None and run_lo <= z < run_hi:
+                            continue
                         seg_idx = z - 1
                         if 0 <= seg_idx < segZ:
                             self._router.via_seg_use[xu, yu, seg_idx] += 1
                             seg_keys.append((xu, yu, seg_idx))
+                    if z_hi > z_lo:
+                        run_lo = z_lo if run_lo is None else min(run_lo, z_lo)
+                        run_hi = z_hi if run_hi is None else max(run_hi, z_hi)
 
-                z_lo2, z_hi2 = (zu, zv) if zu < zv else (zv, zu)
+                z_lo2, z_hi2 = self._router._via_physical_extent(zu, zv)
                 for z in range(z_lo2, z_hi2 + 1):
                     key = (z, xu, yu)
                     if key not in self._router._via_keepouts_map:
                         self._router._via_keepouts_map[key] = net_id
                         keepout_keys.append(key)
+            else:
+                previous_via_xy = None
+                run_lo = run_hi = None
 
         self._router._via_contribution_cache[net_id] = {
             'col_keys': col_keys,
@@ -375,7 +404,7 @@ class ViaAccounting:
         xv, yv, zv = self._router.lattice.idx_to_coord(v)
         if xu != xv or yu != yv or zu == zv:
             return []
-        z_lo, z_hi = sorted((zu, zv))
+        z_lo, z_hi = self._router._via_physical_extent(zu, zv)
         return [
             self._router.lattice.node_idx(xu, yu, z)
             for z in range(z_lo, z_hi + 1)
@@ -570,7 +599,7 @@ class ViaAccounting:
 
                 # Segment penalty (use prefix for fast range sum)
                 if hasattr(self._router, 'via_seg_prefix'):
-                    z_lo, z_hi = (zu, zv) if zu < zv else (zv, zu)
+                    z_lo, z_hi = self._router._via_physical_extent(zu, zv)
                     z_lo = max(1, min(z_lo, self._router._Nz - 2))
                     z_hi = max(1, min(z_hi, self._router._Nz - 2))
                     if z_hi >= z_lo:  # Allow equal (single-segment vias)
@@ -783,11 +812,23 @@ class ViaAccounting:
             zv = v_indices // plane_size
 
             via_xy_coords = cp.stack([xu, yu], axis=1).astype(cp.int32)
+            # Physical barrel extent per hop: a core-span stack realises a
+            # core hop with one whole-core hole, so the segment range must
+            # cover every core layer, not just the hop endpoints.
+            extent_lo_table = getattr(self._router, "_via_extent_lo", None)
+            if extent_lo_table is not None:
+                extent_lo_gpu = cp.asarray(extent_lo_table)
+                extent_hi_gpu = cp.asarray(self._router._via_extent_hi)
+                extent_lo = extent_lo_gpu[zu, zv]
+                extent_hi = extent_hi_gpu[zu, zv]
+            else:
+                extent_lo = cp.minimum(zu, zv)
+                extent_hi = cp.maximum(zu, zv)
             z_lo = cp.clip(
-                cp.minimum(zu, zv), 1, self._router.lattice.layers - 2
+                extent_lo, 1, self._router.lattice.layers - 2
             ).astype(cp.int32)
             z_hi = cp.clip(
-                cp.maximum(zu, zv), 1, self._router.lattice.layers - 2
+                extent_hi, 1, self._router.lattice.layers - 2
             ).astype(cp.int32)
 
             self._router._via_edge_metadata = {
@@ -837,9 +878,15 @@ class ViaAccounting:
         # Store just one (x,y) coordinate per via edge
         via_xy_coords = np.stack([xu, yu], axis=1).astype(np.int32)
 
-        # Store z ranges (lo, hi) for each via edge
-        z_lo = np.minimum(zu, zv)
-        z_hi = np.maximum(zu, zv)
+        # Store z ranges (lo, hi) for each via edge using the physical
+        # barrel extent (whole-core hole for core-span stacks).
+        extent_lo_table = getattr(self._router, "_via_extent_lo", None)
+        if extent_lo_table is not None:
+            z_lo = extent_lo_table[zu, zv]
+            z_hi = self._router._via_extent_hi[zu, zv]
+        else:
+            z_lo = np.minimum(zu, zv)
+            z_hi = np.maximum(zu, zv)
 
         # Clamp z values to valid routing layers (1..Nz-2)
         z_lo = np.clip(z_lo, 1, self._router.lattice.layers - 2)

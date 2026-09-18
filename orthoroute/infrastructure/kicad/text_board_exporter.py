@@ -360,6 +360,44 @@ def _via_span_rows(
     return rows
 
 
+def _vendor_for_vias(vias: Sequence[Dict[str, Any]]) -> str:
+    """Infer the fabricator from the stack name recorded on routed vias."""
+    for item in vias:
+        stack_name = str(item.get("hdi_stack") or "").lower()
+        if stack_name.startswith("jlcpcb"):
+            return "jlcpcb"
+    return "pcbway"
+
+
+# KiCad project rule floors per fabricator envelope. Kept local so the
+# infrastructure layer does not import the routing algorithms.
+_VENDOR_PROJECT_RULES = {
+    "pcbway": {
+        "min_clearance": 0.1,
+        "min_hole_clearance": 0.1524,
+        "min_hole_to_hole": 0.2794,
+    },
+    "jlcpcb": {
+        "min_clearance": 0.1,
+        "min_hole_clearance": 0.2,
+        "min_hole_to_hole": 0.24,
+    },
+}
+
+_VENDOR_LABELS = {
+    "pcbway": (
+        "PCBWay",
+        "pcbway_advanced_hdi_mechanical",
+        "preliminary_requires_pcbway_dfm_approval",
+    ),
+    "jlcpcb": (
+        "JLCPCB",
+        "jlcpcb_hdi_laser_buildup_mechanical_core",
+        "preliminary_requires_jlcpcb_dfm_approval",
+    ),
+}
+
+
 def _write_fabrication_manifest(
     output_path: Path,
     geometry: Dict[str, Any],
@@ -368,21 +406,24 @@ def _write_fabrication_manifest(
     consolidate_mechanical_vias: bool,
     limit: Optional[int],
 ) -> Dict[str, str]:
-    """Write the exact exported via schedule for PCBWay DFM review."""
+    """Write the exact exported via schedule for fabricator DFM review."""
     vias = geometry["vias"]
     if consolidate_mechanical_vias:
         vias = _consolidate_mechanical_vias(vias, copper_layers)
     if limit is not None:
         vias = vias[:limit]
     rows = _via_span_rows(vias, copper_layers)
+    vendor = _vendor_for_vias(vias)
+    vendor_name, profile_label, qualification = _VENDOR_LABELS[vendor]
     stem = output_path.with_name(output_path.stem + "-fabrication")
     json_path = stem.with_suffix(".json")
     csv_path = stem.with_suffix(".csv")
     markdown_path = stem.with_suffix(".md")
     payload = {
         "board": str(output_path),
-        "fabrication_profile": "pcbway_advanced_hdi_mechanical",
-        "qualification": "preliminary_requires_pcbway_dfm_approval",
+        "fabrication_profile": profile_label,
+        "fabricator": vendor,
+        "qualification": qualification,
         "layer_count": len(copper_layers),
         "copper_layers": list(copper_layers),
         "board_thickness_mm": float(thickness_mm),
@@ -417,15 +458,21 @@ def _write_fabrication_manifest(
         "count",
     ]
     lines = [
-        "# Preliminary PCBWay mechanical via-span schedule",
+        f"# Preliminary {vendor_name} via-span schedule",
         "",
         f"- Board: `{output_path.name}`",
         f"- Copper layers: {len(copper_layers)}",
         f"- Thickness: {float(thickness_mm):g} mm",
         "- Grid pitch: 0.4 mm",
-        "- Status: requires PCBWay stackup/DFM approval",
-        "- Interpretation: contiguous adjacent routing hops are exported as "
-        "one normal mechanical blind/buried via.",
+        f"- Status: requires {vendor_name} stackup/DFM approval",
+        (
+            "- Interpretation: laser microvias join build-up layers; every "
+            "core transition is one mechanical buried via spanning the "
+            "whole core."
+            if vendor == "jlcpcb" else
+            "- Interpretation: contiguous adjacent routing hops are "
+            "exported as one normal mechanical blind/buried via."
+        ),
         "",
         "| " + " | ".join(columns) + " |",
         "|" + "|".join("---" for _ in columns) + "|",
@@ -551,9 +598,7 @@ def export_project_for_geometry(
     ]
     rules = project["board"]["design_settings"]["rules"]
     rules.update({
-        "min_clearance": 0.1,
-        "min_hole_clearance": 0.1524,
-        "min_hole_to_hole": 0.2794,
+        **_VENDOR_PROJECT_RULES[_vendor_for_vias(vias)],
         "min_track_width": track_width,
         "min_via_annular_width": annular,
         "min_via_diameter": min(float(v["diameter"]) for v in vias),

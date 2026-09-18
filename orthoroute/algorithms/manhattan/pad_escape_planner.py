@@ -673,7 +673,16 @@ class PadEscapePlanner:
                     stagger_rank = full_column_ranks.get(
                         physical_x, column_rank
                     )
-                    delta_steps = min_steps + (stagger_rank % 2)
+                    # Alternate columns between two escape rows. With a
+                    # one-row stagger the two hole rows are adjacent and
+                    # together block every column of the band on every layer
+                    # the vias occupy; a two-row stagger leaves a hole-free
+                    # row between them so a crossing track can jog from an
+                    # odd column to an even one and pass both rows.
+                    stagger_rows = max(1, int(getattr(
+                        self.config, "dynamic_escape_stagger_rows", 1
+                    )))
+                    delta_steps = min_steps + stagger_rows * (stagger_rank % 2)
                     for row_rank, entry in enumerate(ordered_rows):
                         (
                             _pad,

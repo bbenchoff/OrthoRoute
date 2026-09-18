@@ -38,17 +38,11 @@ def run(args) -> dict:
     config = PathFinderConfig()
     if args.grid_pitch is not None:
         config.grid_pitch = args.grid_pitch
-    if args.hdi_stack in {"pcbway-elic", "pcbway-mechanical"}:
+    if args.hdi_stack != "none":
         from orthoroute.algorithms.manhattan.hdi_stack import (
-            pcbway_elic_stack,
-            pcbway_mechanical_stack,
+            stack_for_profile,
         )
-        factory = (
-            pcbway_elic_stack
-            if args.hdi_stack == "pcbway-elic"
-            else pcbway_mechanical_stack
-        )
-        config.hdi_stack = factory(args.layers)
+        config.hdi_stack = stack_for_profile(args.hdi_stack, args.layers)
     config.portal_x_snap_max = 0.75  # pads sit half a pitch off-grid (see conftest)
     if args.direction_mode == "strict":
         config.wrong_way_cost_multiplier = float("inf")
@@ -171,9 +165,21 @@ def main():
     )
     parser.add_argument(
         "--hdi-stack",
-        choices=["none", "pcbway-elic", "pcbway-mechanical"],
+        choices=[
+            "none",
+            "pcbway-elic",
+            "pcbway-mechanical",
+            "jlcpcb-3n3",
+            "jlcpcb-2n2",
+            "jlcpcb-1n1",
+            "jlcpcb-adjacent",
+        ],
         default="none",
-        help="explicit fabrication via topology",
+        help=(
+            "explicit fabrication via topology; jlcpcb-* are laser "
+            "build-ups over one whole-core mechanical hole, "
+            "jlcpcb-adjacent is a non-orderable feasibility bound"
+        ),
     )
     backend = parser.add_mutually_exclusive_group()
     backend.add_argument("--gpu", dest="use_gpu", action="store_true",
