@@ -8,6 +8,7 @@ methods so every internal and external call site is unchanged.
 """
 
 import logging
+import os
 from typing import List, Tuple
 
 import numpy as np
@@ -328,7 +329,8 @@ class GeometryEmitter:
                 x1, y1, z1 = self._router.lattice.idx_to_coord(node)
 
                 # Drop any planar segment on outer layers (shouldn't happen once graph/ROI are fixed)
-                if z0 == z1 and (z0 == 0 or z0 == self._router.lattice.layers - 1):
+                if z0 == z1 and (z0 == 0 or z0 == self._router.lattice.layers - 1) \
+                        and os.environ.get("ORTHO_LATERAL_ALL", "0") != "1":
                     logger.error(f"[EMIT-GUARD] refusing planar segment on outer layer {z0} for net {net_id}")
                     prev = node
                     prev_layer = z1
