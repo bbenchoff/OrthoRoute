@@ -2111,6 +2111,7 @@ class CUDADijkstra:
 
         except Exception as e:
             logger.warning(f"[CUDA-ROI] GPU pathfinding failed: {e}, skipping (fail fast mode)")
+            import traceback as _tb; logger.warning("[CUDA-ROI] LOCAL PATCH traceback:\n" + _tb.format_exc())
             # Return None for all paths instead of slow CPU fallback
             return [None] * len(roi_batch)
 
@@ -2326,7 +2327,7 @@ class CUDADijkstra:
                                 logger.error(f"[TEST-A1-GPU-XFER] Edge {edge_idx}: CPU={cpu_val:.2e} -> GPU={gpu_val:.2e} ❌ LOST INFINITY!")
 
             # Phase 1: STAMP TRICK - Lazy-allocate pools on first use
-            if self.dist_val_pool is None:
+            if self.dist_val_pool is None or self.dist_stamp_pool is None:  # LOCAL PATCH: GPU-SEEDS path allocates dist_val_pool only
                 # Calculate K_pool dynamically from available GPU memory
                 if self.K_pool is None or not self._k_pool_calculated:
                     # Query actual GPU memory
@@ -2432,7 +2433,7 @@ class CUDADijkstra:
             batch_weights = cp.zeros((K, max_edges), dtype=cp.float32)
 
             # Phase 1: STAMP TRICK - Lazy-allocate pools on first use
-            if self.dist_val_pool is None:
+            if self.dist_val_pool is None or self.dist_stamp_pool is None:  # LOCAL PATCH: GPU-SEEDS path allocates dist_val_pool only
                 # Calculate K_pool dynamically from available GPU memory
                 if self.K_pool is None or not self._k_pool_calculated:
                     # Query actual GPU memory

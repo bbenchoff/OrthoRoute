@@ -510,6 +510,40 @@ def run_headless(
         # Create PathFinder config with custom max iterations
         pf_config = PathFinderConfig()
         pf_config.max_routing_iterations = max_iterations
+        # headless set board.layer_names but never the CONFIG, so the
+        # geometry emitter used the default 6-layer KiCad names. A 4-layer export
+        # of F/In2/In4/B came back labelled F.Cu/In1.Cu/In2.Cu -- i.e. routed
+        # copper landed on the GND PLANE on import (2,998 tracks on In1.Cu).
+        _ln = board_data.get("layer_names") or []
+        if _ln:
+            pf_config.layer_names = list(_ln)
+            logging.warning(f"[EXISTING-COPPER] layer_names from ORP: {pf_config.layer_names}")
+        pf_config.layer_count = layer_count
+        # the authors' own fail-fast for "full-graph SSSP said
+        # unreachable" only fires at >= 1,000,000 lattice nodes. the board under test exported
+        # 854,016 nodes, so every unroutable net fell through to a whole-graph
+        # "ROI" search costing ~49 s to re-prove the same inf. The ROI is a
+        # SUBSET of the full graph, so it cannot find a path the full graph
+        # lacks. Threshold lowered below our node count.
+        pf_config.gpu_fullgraph_fail_fast_nodes = 400_000
+        # the live cap was pres_fac_max=32 with hist_gain=0.20, and
+        # overuse plateaued near 380 of ~11,900 tracks -- PathFinder cannot force
+        # a detour it cannot make expensive. Overridable so the numbers stay in
+        # the run log instead of in a patch.
+        # via_cost ships at 0.7 -- CHEAPER than one lateral step -- so the router
+        # hops layers constantly: 260 vias to close 40 short incremental edges,
+        # and 206 of the resulting KiCad hole-clearance errors. A via's 0.60 mm
+        # copper needs 0.60 mm to a 0.20 mm track's centre, which is more than
+        # the 0.40 mm lattice pitch, and the lattice models no via halo.
+        for _env, _attr, _cast in (("ORTHO_PRES_FAC_MAX", "pres_fac_max", float),
+                                   ("ORTHO_HIST_GAIN", "hist_gain", float),
+                                   ("ORTHO_HIST_WEIGHT", "hist_cost_weight", float),
+                                   ("ORTHO_VIA_COST", "via_cost", float)):
+            import os as _os
+            _v = _os.environ.get(_env)
+            if _v:
+                setattr(pf_config, _attr, _cast(_v))
+                logging.warning(f"[EXISTING-COPPER] {_attr} = {_cast(_v)} (from {_env})")
 
         pf = UnifiedPathFinder(config=pf_config, use_gpu=use_gpu_mode)
         logging.info(f"[HEADLESS] Created UnifiedPathFinder (instance_tag={pf._instance_tag})")
