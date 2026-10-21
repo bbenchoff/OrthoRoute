@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple, Optional
 import numpy as np
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,10 @@ def preferred_layer_directions_for_board(
     demand_h_pct = (
         demand_dx / total_demand if total_demand > 1e-9 else 0.5
     )
-    signal_layers = list(range(1, max(1, int(layer_count) - 1)))
+    if os.environ.get("ORTHO_LATERAL_ALL", "0") == "1":
+        signal_layers = list(range(int(layer_count)))
+    else:
+        signal_layers = list(range(1, max(1, int(layer_count) - 1)))
     h_layers, v_layers = assign_layer_axes_by_demand(
         signal_layers,
         demand_h_pct,
@@ -179,7 +183,10 @@ def analyze_board_characteristics(
         board_height_mm = lattice.y_steps * grid_pitch_mm
 
     # All layers except F.Cu (0) and B.Cu (Nz-1)
-    signal_layers = list(range(1, layer_count - 1))
+    if os.environ.get("ORTHO_LATERAL_ALL", "0") == "1":
+        signal_layers = list(range(int(layer_count)))
+    else:
+        signal_layers = list(range(1, layer_count - 1))
     plane_layers = set()  # Could be extracted from board_data if available
 
     logger.info(f"Board: {board_width_mm:.1f}mm × {board_height_mm:.1f}mm")

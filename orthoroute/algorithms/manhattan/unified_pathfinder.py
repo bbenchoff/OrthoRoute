@@ -1006,6 +1006,36 @@ class CSRGraph:
 # EDGE ACCOUNTING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+def _expand_via_halo(h, edge_indices):
+    """Add the planar edges around every via in a path, on all layers.
+
+    The lattice charges a via for the barrel alone. Physically the via's copper
+    also forbids another net's track on any neighbouring node, which at 0.40 mm
+    pitch is exactly the 4-neighbour ring. Reserving those edges is what makes
+    two nets negotiate over that space instead of both taking it.
+    """
+    indptr, indices, src = h["indptr"], h["indices"], h["src"]
+    plane, Nz = h["plane"], h["Nz"]
+    out = set(int(e) for e in edge_indices)
+    cols = set()
+    for e in edge_indices:
+        a, b = int(src[e]), int(indices[e])
+        if a // plane != b // plane:          # a via edge
+            cols.add(a % plane)
+    for c in cols:
+        for z in range(Nz):
+            n = z * plane + c
+            for e in range(int(indptr[n]), int(indptr[n + 1])):
+                m = int(indices[e])
+                if m // plane == z:            # planar edge out of the ring node
+                    out.add(e)
+                    for e2 in range(int(indptr[m]), int(indptr[m + 1])):
+                        if int(indices[e2]) == n:
+                            out.add(e2)
+                            break
+    return sorted(out)
+
 class EdgeAccountant:
     """Edge usage tracking"""
 
@@ -1072,6 +1102,9 @@ class EdgeAccountant:
         """
         if not edge_indices:
             return
+        _halo = getattr(self, "_via_halo", None)
+        if _halo is not None:
+            edge_indices = _expand_via_halo(_halo, edge_indices)
         for idx in edge_indices:
             self.canonical[idx] = self.canonical.get(idx, 0) + 1
         arr = self.xp.asarray(edge_indices, dtype=np.int64)
@@ -1326,6 +1359,21 @@ class EdgeAccountant:
             self._present_cost_scale = float(pres_fac)
 
         self.total_cost = adjusted_base + present_term + hist_weight * self.history
+
+        # existing copper is not "expensive", it is impossible. A
+        # finite block cost let the GPU full-graph search push nets straight
+        # through kept copper (p3o2: a via landed on a +3V3 track, 0.00 mm).
+        _blocked = getattr(self, "_blocked_edges", None)
+        if _blocked is not None:
+            _mb = xp.asarray(_blocked)
+            if _mb.shape == self.total_cost.shape:
+                self.total_cost[_mb] = xp.float32("inf")
+                self._inf_edges = int(_mb.sum())
+            else:
+                logger.error(
+                    f"[EXISTING-COPPER] blocked-edge mask {_mb.shape} != total_cost "
+                    f"{self.total_cost.shape}; NOT applied"
+                )
 
         # Add per-edge epsilon jitter to break ties (stable across iterations)
         if add_jitter:
@@ -1640,7 +1688,14 @@ class Lattice3D:
         # Lateral routing layers: inner layers only (outer layers are reserved
         # for pads/escapes), EXCEPT on 2-layer boards where no inner layers
         # exist and F.Cu/B.Cu must carry the lateral routing themselves.
-        if self.layers > 2:
+        if os.environ.get("ORTHO_LATERAL_ALL", "0") == "1":
+            # our export lists exactly the board's routing layers.
+            lateral_layers = range(self.layers)
+            logger.warning(
+                f"[EXISTING-COPPER] ORTHO_LATERAL_ALL: lateral routing on all "
+                f"{self.layers} layers"
+            )
+        elif self.layers > 2:
             lateral_layers = range(1, self.layers - 1)
         else:
             lateral_layers = range(self.layers)
@@ -1964,8 +2019,12 @@ class ROIExtractor:
         max_y = int(min(self.lattice.y_steps - 1, max_y + corridor_buffer))
 
         # Add layer margin (clamp to inner layers only - exclude outer layers 0 and layers-1)
-        min_z = max(1, min_z - layer_margin)
-        max_z = min(self.lattice.layers - 2, max_z + layer_margin)
+        if os.environ.get("ORTHO_LATERAL_ALL", "0") == "1":
+            min_z = max(0, min_z - layer_margin)
+            max_z = min(self.lattice.layers - 1, max_z + layer_margin)
+        else:
+            min_z = max(1, min_z - layer_margin)
+            max_z = min(self.lattice.layers - 2, max_z + layer_margin)
 
         # Generate L-shaped corridor using SET for O(1) deduplication
         x_steps = self.lattice.x_steps
@@ -2885,11 +2944,10 @@ class PathFinderRouter:
             self.config.grid_pitch,
             self.config.layer_count,
             preferred_layer_directions=preferred_layer_directions,
-            wrong_way_cost_multiplier=getattr(
-                self.config,
-                "wrong_way_cost_multiplier",
-                float("inf"),
-            ),
+            wrong_way_cost_multiplier=float(__import__("os").environ.get(
+                "ORTHO_WRONG_WAY",
+                getattr(self.config, "wrong_way_cost_multiplier", float("inf")),
+            )),
         )
 
         allow_any_layer_via = getattr(
@@ -3108,6 +3166,9 @@ class PathFinderRouter:
         Called from initialize_graph() after the graph is built.
         (From PR #17 by RolandWa, with dst-layer lookup vectorised.)
         """
+        from . import existing_copper as _mo
+        if _mo.active():
+            _mo.apply_to_graph(self)
         keepouts = getattr(board, 'keepouts', [])
         if not keepouts:
             return
@@ -3210,6 +3271,9 @@ class PathFinderRouter:
         so we extract pads from board.nets (which IS available) rather than
         board.components (which may be incomplete).
         """
+        from . import existing_copper as _mo
+        if _mo.active() and _mo._load().get("bounds"):
+            return tuple(_mo._load()["bounds"])
         pads_with_nets = []
         ROUTING_MARGIN = 3.0  # mm
 
@@ -11401,7 +11465,8 @@ class PathFinderRouter:
                 x1, y1, z1 = self.lattice.idx_to_coord(node)
 
                 # Drop any planar segment on outer layers (shouldn't happen once graph/ROI are fixed)
-                if z0 == z1 and (z0 == 0 or z0 == self.lattice.layers - 1):
+                if z0 == z1 and (z0 == 0 or z0 == self.lattice.layers - 1) \
+                        and os.environ.get("ORTHO_LATERAL_ALL", "0") != "1":
                     logger.error(f"[EMIT-GUARD] refusing planar segment on outer layer {z0} for net {net_id}")
                     prev = node
                     prev_layer = z1

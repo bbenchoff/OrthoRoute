@@ -51,6 +51,16 @@ from .pathfinder.config import PAD_CLEARANCE_MM
 logger = logging.getLogger(__name__)
 
 
+def _mana_same_net(a, b):
+    """pads of one real net may overlap (one physical pad can be an
+    endpoint of several 2-pad pseudo-nets). Inactive unless ORTHO_OBSTACLES is set."""
+    from . import existing_copper as _mo
+    if not _mo.active():
+        return False
+    na = _mo.pad_net(a)
+    return na is not None and na == _mo.pad_net(b)
+
+
 @dataclass
 class Portal:
     """
@@ -326,6 +336,26 @@ class PadEscapePlanner:
             pad_geometries,
             spatial_index,
         )
+
+        # endpoints the exporter already escaped (its own F.Cu/inner
+        # maze stub ends on a legal via site snapped to a lattice node) get a
+        # zero-length portal on their own cell instead of a planned stub.
+        from . import existing_copper as _mo
+        if _mo.active():
+            _direct = set(_mo._load().get("direct", []))
+            _keep = []
+            for _e in pad_list:
+                _pad, _pid, _xi, _yi, _px, _py, _pl = _e
+                if _pid in _direct:
+                    self.portals[_pid] = Portal(
+                        x_idx=_xi, y_idx=_yi, pad_layer=0, delta_steps=0, direction=1,
+                        pad_x=_px, pad_y=_py, entry_layer=1, score=0.0, retarget_count=0,
+                    )
+                    self._occupied_portal_cells.add((_xi, _yi))
+                else:
+                    _keep.append(_e)
+            logger.warning(f"[OBSTACLES] direct portals {len(pad_list) - len(_keep)}; planner handles {len(_keep)}")
+            pad_list = _keep
 
         # STEP 2: Group remaining pads by snapped lattice column.
         columns = {}  # x_idx -> [(pad_obj, pad_id, y_idx, pad_x, pad_y, pad_layer), ...]
@@ -1167,6 +1197,13 @@ class PadEscapePlanner:
             ):
                 return None
 
+        from . import existing_copper as _mo
+        if _mo.active() and not _mo.portal_ok(
+            pad_id, portal_x_mm, portal_y_mm,
+            self._escape_segments(pad_x, pad_y, portal_x_mm, portal_y_mm),
+        ):
+            return None
+
         # DRC passed! Claim the cell and create the portal
         if claim_cell:
             self._occupied_portal_cells.add(portal_cell)
@@ -1291,6 +1328,8 @@ class PadEscapePlanner:
 
         for other_pad_id in pads_to_check:
             if other_pad_id == current_pad_id:
+                continue
+            if _mana_same_net(other_pad_id, current_pad_id):
                 continue
             geom = pad_geometries[other_pad_id]
             half_width = geom["width"] * 0.5 + centerline_clearance
@@ -1683,6 +1722,8 @@ class PadEscapePlanner:
         for pad_id in pads_to_check:
             if pad_id == current_pad_id:
                 continue  # Skip self
+            if _mana_same_net(pad_id, current_pad_id):
+                continue
 
             geom = pad_geometries[pad_id]
             pad_x = geom['x']
